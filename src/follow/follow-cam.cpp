@@ -83,7 +83,7 @@ struct FollowCam {
 	obs_source_t *self = nullptr;
 
 	// Set on OBS's UI thread (update), read while drawing.
-	std::mutex lock;
+	std::mutex lock, find_lock;
 	std::string camera_name;
 	obs_weak_source_t *camera = nullptr;
 	std::atomic<uint32_t> width{1080}, height{1920};
@@ -120,19 +120,38 @@ struct FollowCam {
 		return camera ? obs_weak_source_get_source(camera) : nullptr;
 	}
 
+	// Looks the camera up by its name (from OBS's UI thread, or the
+	// graphics thread when a lost one comes back).
 	void find_camera()
 	{
-		std::lock_guard<std::mutex> l(lock);
-		obs_weak_source_release(camera);
-		camera = nullptr;
-		if (camera_name.empty())
-			return;
-		obs_source_t *found = obs_get_source_by_name(camera_name.c_str());
-		// Never itself or another follow cam (each would draw the other
-		// forever).
-		if (found && std::strcmp(obs_source_get_id(found), SOURCE_ID) != 0) {
-			camera = obs_source_get_weak_source(found);
+		std::lock_guard<std::mutex> finding(find_lock);
+		std::string name;
+		{
+			std::lock_guard<std::mutex> l(lock);
+			name = camera_name;
 		}
+		obs_source_t *found = name.empty() ? nullptr : obs_get_source_by_name(name.c_str());
+		// Never another follow cam (each would draw the other forever).
+		if (found && std::strcmp(obs_source_get_id(found), SOURCE_ID) == 0) {
+			obs_source_release(found);
+			found = nullptr;
+		}
+		obs_source_t *old = get_camera();
+		if (old != found) {
+			// While this shows, so does the camera (and it runs): OBS is
+			// told which camera that is now. A camera that has this in it
+			// (a scene with this follow cam) can't be.
+			if (old)
+				obs_source_remove_active_child(self, old);
+			if (found && !obs_source_add_active_child(self, found)) {
+				obs_source_release(found);
+				found = nullptr;
+			}
+			std::lock_guard<std::mutex> l(lock);
+			obs_weak_source_release(camera);
+			camera = found ? obs_source_get_weak_source(found) : nullptr;
+		}
+		obs_source_release(old);
 		obs_source_release(found);
 	}
 

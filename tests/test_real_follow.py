@@ -135,6 +135,62 @@ def test_it_keeps_you_in_the_picture(run):
         c.disconnect()
 
 
+def test_the_camera_runs_while_only_the_follow_cam_shows_it(run):
+    """A camera in no scene that's on (only in the tall picture's follow
+    cam, say) still has to run - and stops running when the follow cam
+    goes, or follows another camera."""
+    c = run.client()
+
+    def active(name):
+        return send(c, "GetSourceActive", {"sourceName": name})[
+            "videoActive"]
+    try:
+        send(c, "CreateScene", {"sceneName": "Spare"})
+        for name in ("Cam A", "Cam B"):
+            send(c, "CreateInput", {
+                "sceneName": "Spare", "inputName": name,
+                "inputKind": "color_source_v3",
+                "inputSettings": {"width": 640, "height": 360}})
+        assert not active("Cam A") and not active("Cam B")
+        made = send(c, "CreateInput", {
+            "sceneName": SCENE, "inputName": "Cam follow",
+            "inputKind": "direbot_follow_cam",
+            "inputSettings": {"source": "Cam A", "width": 360,
+                              "height": 640}})
+        assert wait_for(lambda: active("Cam A"), 5)
+        send(c, "SetInputSettings", {"inputName": "Cam follow",
+                                     "inputSettings": {"source": "Cam B"}})
+        assert wait_for(lambda: active("Cam B") and not active("Cam A"), 5)
+        send(c, "RemoveSceneItem", {"sceneName": SCENE,
+                                    "sceneItemId": made["sceneItemId"]})
+        assert wait_for(lambda: not active("Cam B"), 5)
+        # The scene it's in as its camera: it would draw itself forever.
+        # OBS won't put it in that scene...
+        with pytest.raises(obsws.error.OBSSDKRequestError):
+            send(c, "CreateInput", {
+                "sceneName": "Spare", "inputName": "Loop",
+                "inputKind": "direbot_follow_cam",
+                "inputSettings": {"source": "Spare", "width": 360,
+                                  "height": 640}})
+        # ...and picked afterwards, it isn't taken: the picture carries on.
+        send(c, "CreateInput", {
+            "sceneName": "Spare", "inputName": "Loop",
+            "inputKind": "direbot_follow_cam",
+            "inputSettings": {"source": "Cam A", "width": 360,
+                              "height": 640}})
+        send(c, "SetInputSettings", {"inputName": "Loop",
+                                     "inputSettings": {"source": "Spare"}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Spare"})
+        time.sleep(0.5)
+        shot = send(c, "GetSourceScreenshot", {
+            "sourceName": "Spare", "imageFormat": "png", "imageWidth": 64})
+        assert shot["imageData"].startswith("data:image/png")
+        assert vendor(c, "GetInfo")["features"]["follow_cam"] is True
+        send(c, "SetCurrentProgramScene", {"sceneName": SCENE})
+    finally:
+        c.disconnect()
+
+
 def test_closing_obs_leaves_nothing_behind(run):
     assert run.close() == 0
     log = run.log()
