@@ -230,6 +230,7 @@ static void test_frames()
 struct FakeBackend : link::Backend {
 	int calls = 0;
 	link::json last_set;
+	std::string server = "auto";
 	link::RequestResult call(const std::string &type, const link::json &data) override
 	{
 		calls++;
@@ -244,7 +245,7 @@ struct FakeBackend : link::Backend {
 				"",
 				{{"streamServiceType", "rtmp_common"},
 				 {"streamServiceSettings",
-				  {{"service", "Twitch"}, {"server", "auto"}, {"key", "live_123_secret"}, {"password", ""}}}}};
+				  {{"service", "Twitch"}, {"server", server}, {"key", "live_123_secret"}, {"password", ""}}}}};
 		if (type == "SetStreamServiceSettings") {
 			last_set = data;
 			return {link::status::Success, "", nullptr};
@@ -417,22 +418,42 @@ static void test_protocol()
 			     {{"requestType", "Echo"}, {"inputVariables", {{"x", "k"}}}}}}},
 		      keys, going);
 	CHECK(reply.find("live_123_secret") == std::string::npos && reply.find("Twitch") != std::string::npos);
-	// Sent back as read: the stars are left out, so OBS keeps the real key.
-	settings["server"] = "rtmp://live.twitch.tv/app";
-	s.run(6,
-	      json{{"requestType", "SetStreamServiceSettings"},
-		   {"requestId", "s"},
-		   {"requestData", {{"streamServiceType", "rtmp_common"}, {"streamServiceSettings", settings}}}},
-	      keys, going);
-	CHECK(!keys.last_set["streamServiceSettings"].contains("key") &&
-	      keys.last_set["streamServiceSettings"]["server"] == "rtmp://live.twitch.tv/app");
-	// A new key goes in as it is.
+	// Only the server changed, or sent back as read (the stars): refused -
+	// OBS would keep the real key and send it to that server.
+	keys.last_set = nullptr;
+	settings["server"] = "rtmp://somewhere.else/app";
+	json no = parse(s.run(6,
+			      json{{"requestType", "SetStreamServiceSettings"},
+				   {"requestId", "s"},
+				   {"requestData",
+				    {{"streamServiceType", "rtmp_common"}, {"streamServiceSettings", settings}}}},
+			      keys, going));
+	CHECK(no["d"]["requestStatus"]["result"] == false && keys.last_set.is_null());
+	settings.erase("key");
+	no = parse(s.run(6,
+			 json{{"requestType", "SetStreamServiceSettings"},
+			      {"requestId", "s2"},
+			      {"requestData", {{"streamServiceType", "rtmp_custom"}, {"streamServiceSettings", settings}}}},
+			 keys, going));
+	CHECK(no["d"]["requestStatus"]["result"] == false && keys.last_set.is_null());
+	// A key inside a custom server's address is hidden too.
+	FakeBackend in_url;
+	in_url.server = "rtmp://evil.example/app/live_abc_secret?x=1";
+	got = parse(s.run(6, json{{"requestType", "GetStreamServiceSettings"}, {"requestId", "u"}}, in_url, going));
+	CHECK(got["d"]["responseData"]["streamServiceSettings"]["server"] ==
+	      std::string("rtmp://evil.example/app/") + link::HIDDEN_SECRET);
+	in_url.server = "rtmps://a.rtmp.youtube.com/live2";
+	got = parse(s.run(6, json{{"requestType", "GetStreamServiceSettings"}, {"requestId", "u2"}}, in_url, going));
+	CHECK(got["d"]["responseData"]["streamServiceSettings"]["server"] == "rtmps://a.rtmp.youtube.com/live2");
+	// A new key goes in as it is, and no old password or token goes along.
 	s.run(6,
 	      json{{"requestType", "SetStreamServiceSettings"},
 		   {"requestId", "n"},
 		   {"requestData",
 		    {{"streamServiceType", "rtmp_common"}, {"streamServiceSettings", {{"key", "live_new"}}}}}},
 	      keys, going);
+	CHECK(keys.last_set["streamServiceSettings"]["password"] == "" &&
+	      keys.last_set["streamServiceSettings"]["bearer_token"] == "");
 	CHECK(keys.last_set["streamServiceSettings"]["key"] == "live_new");
 }
 

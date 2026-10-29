@@ -182,7 +182,7 @@ void Canvas::release()
 	}
 	obs_canvas_release(canvas_);
 	canvas_ = nullptr;
-	current_.clear();
+	set_current("");
 }
 
 video_t *Canvas::video() const
@@ -318,14 +318,14 @@ bool Canvas::switch_to(const std::string &name, bool animate)
 	if (!scene)
 		return false;
 	if (transition_) {
-		if (animate && awake_ && name != current_) {
+		if (animate && awake_ && name != current()) {
 			uint32_t ms = (uint32_t)obs_frontend_get_transition_duration();
 			obs_transition_start(transition_, OBS_TRANSITION_MODE_AUTO, ms ? ms : DEFAULT_FADE_MS, scene);
 		} else {
 			obs_transition_set(transition_, scene);
 		}
 	}
-	current_ = name;
+	set_current(name);
 	obs_source_release(scene);
 	return true;
 }
@@ -354,7 +354,7 @@ SceneRow Canvas::create_scene(const std::string &name, std::string &problem)
 	SceneRow row{obs_source_get_name(source), obs_source_get_uuid(source)};
 	obs_scene_release(scene); // the canvas holds it
 	// The first scene in an empty picture goes on.
-	if (current_.empty())
+	if (current().empty())
 		switch_to(row.name, false);
 	return row;
 }
@@ -372,7 +372,7 @@ bool Canvas::remove_scene(const std::string &name, std::string &problem)
 		problem = "The vertical picture keeps at least one scene.";
 		return false;
 	}
-	if (name == current_) {
+	if (name == current()) {
 		for (const std::string &other : names)
 			if (other != name) {
 				switch_to(other, false);
@@ -423,7 +423,10 @@ void Canvas::scene_renamed(void *self, calldata_t *cd)
 	auto *c = static_cast<Canvas *>(self);
 	const char *from = calldata_string(cd, "prev_name");
 	const char *to = calldata_string(cd, "new_name");
-	if (from && to && c->current_ == from)
+	if (!from || !to)
+		return;
+	std::lock_guard<std::mutex> l(c->current_lock_);
+	if (c->current_ == from)
 		c->current_ = to;
 }
 

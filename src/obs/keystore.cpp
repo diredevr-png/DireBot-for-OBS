@@ -77,8 +77,9 @@ bool unbase64(const std::string &in, std::string &out)
 	return true;
 }
 
-// Ties the lock to this add-on as well as the Windows account: another
-// program of the same user can't unlock it without knowing this.
+// Marks the lock as this add-on's. It isn't a secret (anyone can read it
+// from the DLL), so it doesn't keep other programs of the same Windows
+// user out: the Windows account is what protects the key.
 const char ENTROPY[] = "DireBot for OBS: stream keys";
 
 bool protect(const std::string &secret, std::string &out)

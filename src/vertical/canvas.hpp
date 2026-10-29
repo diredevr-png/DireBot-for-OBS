@@ -36,6 +36,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -89,7 +90,11 @@ public:
 
 	std::vector<SceneRow> scenes() const;
 	std::vector<std::string> scene_names() const;
-	std::string current() const { return current_; }
+	std::string current() const
+	{
+		std::lock_guard<std::mutex> l(current_lock_);
+		return current_;
+	}
 	// Puts a scene on; a fade when it's awake and `animate`.
 	bool switch_to(const std::string &name, bool animate);
 	// Makes a scene (a new name: " 2" added when it's taken).
@@ -106,7 +111,15 @@ private:
 	obs_source_t *transition_ = nullptr;
 	bool awake_ = false;
 	uint32_t width_ = 0, height_ = 0;
+	// Which scene is on. A scene renamed through obs-websocket is renamed
+	// on its thread (scene_renamed), the rest is on OBS's UI thread.
+	mutable std::mutex current_lock_;
 	std::string current_;
+	void set_current(const std::string &name)
+	{
+		std::lock_guard<std::mutex> l(current_lock_);
+		current_ = name;
+	}
 
 	bool video_info(uint32_t width, uint32_t height, obs_video_info &ovi) const;
 	void make_transition();

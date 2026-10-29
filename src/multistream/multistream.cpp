@@ -472,9 +472,22 @@ void Multistream::save()
 	if (!dirty_ || file_.empty())
 		return;
 	dirty_ = false;
-	const std::string body =
-		places_.to_file([](const std::string &key) { return obs::keystore::lock(key); })
-			.dump(1, ' ', false, json::error_handler_t::replace);
+	int unlocked = 0;
+	const std::string body = places_
+					 .to_file([&unlocked](const std::string &key) {
+						 std::string locked = obs::keystore::lock(key);
+						 if (locked.empty() && !key.empty())
+							 unlocked++;
+						 return locked;
+					 })
+					 .dump(1, ' ', false, json::error_handler_t::replace);
+	// Windows wouldn't lock a key: it isn't saved, so after a restart it
+	// would look as if none had been typed - say so now.
+	if (unlocked)
+		obs_log(LOG_WARNING,
+			"Multistream: Windows couldn't lock %d stream key(s), so they weren't saved. They work until "
+			"OBS closes; type them in again after.",
+			unlocked);
 	if (!os_quick_write_utf8_file_safe(file_.c_str(), body.c_str(), body.size(), false, "tmp", nullptr))
 		obs_log(LOG_WARNING, "Multistream: couldn't save this profile's places.");
 }
@@ -527,6 +540,9 @@ void Multistream::on_frontend(enum obs_frontend_event event)
 		start_with_stream();
 		break;
 	case OBS_FRONTEND_EVENT_STREAMING_STOPPING:
+	// OBS only says "stopping" when you press Stop: a stream that ends on
+	// its own (the connection gave up) only says "stopped".
+	case OBS_FRONTEND_EVENT_STREAMING_STOPPED:
 		stop_with_stream();
 		break;
 	case OBS_FRONTEND_EVENT_PROFILE_CHANGING: {
@@ -549,11 +565,13 @@ void Multistream::on_frontend(enum obs_frontend_event event)
 	case OBS_FRONTEND_EVENT_EXIT: {
 		{
 			std::lock_guard<std::mutex> l(lock_);
-			if (closing_)
-				break;
-			closing_ = true;
-			save();
-			unload(true);
+			// Scripting's shutdown comes first: by OBS's exit the places
+			// are already saved, but the window still has to go.
+			if (!closing_) {
+				closing_ = true;
+				save();
+				unload(true);
+			}
 		}
 		if (event == OBS_FRONTEND_EVENT_EXIT)
 			window_.stop();
@@ -1105,12 +1123,25 @@ bool Multistream::request(const std::string &type, const json &data, json &answe
 		}
 		const std::string id = id_in(data);
 		if (id.empty() || id == "lighter") {
-			Lighter &lt = places_.lighter;
+			// Worked out on a copy: a wrongly typed value is refused
+			// before anything changes (one bad "height" used to leave
+			// an unchecked bitrate in place).
+			Lighter lt = places_.lighter;
+			for (const char *name : {"kbps", "height"})
+				if (changes->contains(name) && !(*changes)[name].is_number_integer()) {
+					answer = fail(std::string("\"") + name + "\" is a whole number.");
+					return true;
+				}
+			if (changes->contains("encoder") && !(*changes)["encoder"].is_string()) {
+				answer = fail("\"encoder\" is a name.");
+				return true;
+			}
 			lt.kbps = changes->value("kbps", lt.kbps);
 			lt.height = changes->value("height", lt.height);
-			if (changes->contains("encoder") && (*changes)["encoder"].is_string())
+			if (changes->contains("encoder"))
 				lt.encoder = (*changes)["encoder"].get<std::string>();
 			tidy(lt);
+			places_.lighter = lt;
 			apply_lighter_bitrate();
 			dirty_ = true;
 			push_lighter();

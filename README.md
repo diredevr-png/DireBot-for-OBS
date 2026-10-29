@@ -134,7 +134,7 @@ Tests (Linux):
     BUILD_DIR=/tmp/b tools/build-linux-test.sh
     DIREBOT_OBS_PLUGIN=/tmp/b/direbot-for-obs.so pytest tests/test_real_obs.py
 
-`test_real_obs.py` runs a real OBS (`apt install obs-studio libobs-dev xvfb`)
+`test_real_obs.py` runs a real OBS 31.1 or newer (`ppa:obsproject/obs-studio`, then `apt install obs-studio xvfb`)
 with its own empty settings on a pretend screen, and checks the link with
 obsws-python, the client DireBot uses. `test_real_obs_multistream.py` and
 `test_real_vertical.py` stream to ffmpeg on the same PC. The vertical

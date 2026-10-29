@@ -5,7 +5,8 @@ settings, so nothing of anyone's is touched, and nothing streams.
 
 Skipped unless OBS, Xvfb and the test build are there (Linux):
 
-    apt install obs-studio libobs-dev xvfb xdotool
+    add-apt-repository ppa:obsproject/obs-studio   (OBS 31.1 or newer)
+    apt install obs-studio xvfb xdotool
     BUILD_DIR=/tmp/direbot-obs tools/build-linux-test.sh
     DIREBOT_OBS_PLUGIN=/tmp/direbot-obs/direbot-for-obs.so \\
         python3 -m pytest tests/test_real_obs.py
@@ -332,11 +333,26 @@ def test_the_stream_key_never_comes_back_through_the_link(obs):
                           raw=True)["streamServiceSettings"]
         assert settings["key"] == "********"
         assert settings["server"] == "rtmp://127.0.0.1/live"
-        # Sent back as read: OBS keeps the real key, not the stars.
+        # Another server without the key itself (the stars sent back, or
+        # no key): refused - OBS would send the real key there.
         settings["server"] = "rtmp://127.0.0.1/other"
+        for sent in (settings, {"server": "rtmp://127.0.0.1/other"}):
+            with pytest.raises(Exception):
+                c.send("SetStreamServiceSettings", {
+                    "streamServiceType": "rtmp_custom",
+                    "streamServiceSettings": sent})
+        # A key inside the server's address is hidden too.
         c.send("SetStreamServiceSettings", {
             "streamServiceType": "rtmp_custom",
-            "streamServiceSettings": settings})
+            "streamServiceSettings": {"server": "rtmp://127.0.0.1/live/IN-URL-KEY",
+                                      "key": "PROBE-KEY-1234"}})
+        settings = c.send("GetStreamServiceSettings",
+                          raw=True)["streamServiceSettings"]
+        assert "IN-URL-KEY" not in json.dumps(settings)
+        c.send("SetStreamServiceSettings", {
+            "streamServiceType": "rtmp_custom",
+            "streamServiceSettings": {"server": "rtmp://127.0.0.1/live",
+                                      "key": "PROBE-KEY-1234"}})
     finally:
         c.disconnect()
     plain = obsws.ReqClient(host="127.0.0.1", port=obs.ws_port, password="",
@@ -345,7 +361,7 @@ def test_the_stream_key_never_comes_back_through_the_link(obs):
         real = plain.send("GetStreamServiceSettings",
                           raw=True)["streamServiceSettings"]
         assert real["key"] == "PROBE-KEY-1234"
-        assert real["server"] == "rtmp://127.0.0.1/other"
+        assert real["server"] == "rtmp://127.0.0.1/live"
     finally:
         plain.disconnect()
 

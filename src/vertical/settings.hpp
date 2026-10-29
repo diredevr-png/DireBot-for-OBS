@@ -54,13 +54,22 @@ public:
 	// Puts the options (not the keys) in the window's settings: when they
 	// load, and when DireBot changes them.
 	static void fill(obs_data_t *settings, const Options &options);
+	// Another profile is in use (OBS's UI thread): a window still open
+	// shows the last profile's places and its keys, so nothing in it is
+	// kept until it's closed and opened again.
+	void profile_changed();
 
 private:
 	std::function<const Options &()> get_;
 	std::function<void(const Options &)> set_;
 	bool open_ = false;
+	static void forget_keys(obs_data_t *settings);
+	// Opened for another profile than the one in use now.
+	bool stale_ = false;
 	// The keys when the window opened (locked), for Cancel.
 	std::array<std::string, Options::SLOTS> key_at_open_;
+	// ...and the site each was for: another site doesn't get it.
+	std::array<std::string, Options::SLOTS> site_at_open_;
 	// A key that couldn't be unlocked when the window opened (locked on
 	// another PC or Windows account).
 	std::array<bool, Options::SLOTS> unreadable_{};

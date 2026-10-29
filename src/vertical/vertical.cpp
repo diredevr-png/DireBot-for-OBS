@@ -79,6 +79,20 @@ int number(const json &j, const char *key, int fallback)
 	return v == v && v > -1e9 && v < 1e9 ? (int)v : fallback;
 }
 
+// Given, but not a whole number / not true or false: refused, rather than
+// read as "not given" (a slot of "1" would mean every place).
+bool bad_number(const json &j, const char *key)
+{
+	auto it = j.find(key);
+	return it != j.end() && !it->is_number_integer();
+}
+
+bool bad_flag(const json &j, const char *key)
+{
+	auto it = j.find(key);
+	return it != j.end() && !it->is_boolean();
+}
+
 bool flag(const json &j, const char *key, bool fallback)
 {
 	auto it = j.find(key);
@@ -108,6 +122,10 @@ struct Job {
 	std::mutex lock;
 	std::condition_variable done_cv;
 	bool done = false;
+	// Begun on the UI thread; or given up on before it began, so it never
+	// does (the one asking was told it didn't happen).
+	bool started = false;
+	bool cancelled = false;
 	json result;
 	std::function<json()> work;
 };
@@ -116,6 +134,12 @@ void run_job(void *param)
 {
 	std::unique_ptr<std::shared_ptr<Job>> holder(static_cast<std::shared_ptr<Job> *>(param));
 	std::shared_ptr<Job> job = *holder;
+	{
+		std::lock_guard<std::mutex> l(job->lock);
+		if (job->cancelled)
+			return;
+		job->started = true;
+	}
 	json result;
 	try {
 		result = job->work();
@@ -249,9 +273,17 @@ json Vertical::request(const std::string &type, const json &data)
 	};
 	obs_queue_task(OBS_TASK_UI, run_job, new std::shared_ptr<Job>(job), false);
 	std::unique_lock<std::mutex> l(job->lock);
-	if (!job->done_cv.wait_for(l, std::chrono::milliseconds(REQUEST_WAIT_MS), [&] { return job->done; }))
+	if (job->done_cv.wait_for(l, std::chrono::milliseconds(REQUEST_WAIT_MS), [&] { return job->done; }))
+		return job->result;
+	if (!job->started) {
+		// Not begun: it never will, so "it didn't happen" stays true.
+		job->cancelled = true;
 		return fail("OBS is busy right now. Try again in a moment.");
-	return job->result;
+	}
+	// Begun just now: what it did is the answer.
+	if (job->done_cv.wait_for(l, std::chrono::milliseconds(REQUEST_WAIT_MS), [&] { return job->done; }))
+		return job->result;
+	return fail("OBS is still doing that. Look again in a moment.");
 }
 
 void Vertical::tick()
@@ -423,12 +455,17 @@ json Vertical::do_request(const std::string &type, const json &data)
 				Destination &d = next.places[slot - 1];
 				const std::string site = text(row, "platform");
 				if (!site.empty() && site != d.platform) {
+					const std::string was_platform = d.platform;
 					const std::string old_usual = rules::usual_server(d.platform);
 					Options probe;
 					probe.places[0].platform = site;
 					d.platform = Options::from_file(probe.to_file()).places[0].platform;
 					if (d.server.empty() || d.server == old_usual)
 						d.server = rules::usual_server(d.platform);
+					// The last site's key would go to this one's
+					// servers: none until one's typed in OBS.
+					if (d.platform != was_platform)
+						d.key_locked.clear();
 				}
 				d.enabled = flag(row, "enabled", d.enabled);
 				// Its sound: an audio track, 0 for the one OBS's stream
@@ -439,6 +476,11 @@ json Vertical::do_request(const std::string &type, const json &data)
 		set_options(next, true);
 		return state();
 	}
+
+	if ((type == "VerticalStartStream" || type == "VerticalStopStream") && bad_number(data, "slot"))
+		return fail("\"slot\" is a number: 1, 2 or 3 (or left out for all of them).");
+	if (type == "VerticalPauseRecord" && bad_flag(data, "pause"))
+		return fail("\"pause\" is true or false.");
 
 	if (type == "VerticalStartStream") {
 		const int slot = number(data, "slot", 0);
@@ -700,11 +742,13 @@ void Vertical::on_frontend(enum obs_frontend_event event, void *self)
 		v->changed();
 		break;
 	case OBS_FRONTEND_EVENT_PROFILE_CHANGING:
+		v->page_.profile_changed();
 		v->leave_profile();
 		break;
 	case OBS_FRONTEND_EVENT_PROFILE_CHANGED:
 		// OBS 31 and up makes a new profile and switches to it without
 		// saying it's changing first.
+		v->page_.profile_changed();
 		v->leave_profile();
 		v->load_options();
 		v->changed();
@@ -742,6 +786,12 @@ void Vertical::on_frontend(enum obs_frontend_event event, void *self)
 			v->outputs_.stop_streams();
 		break;
 	case OBS_FRONTEND_EVENT_STREAMING_STOPPED:
+		// OBS only says "stopping" when you press Stop: a stream that
+		// ends on its own (the connection gave up) only says "stopped".
+		if (v->streams_with_main_) {
+			v->outputs_.stop_streams();
+			v->streams_with_main_ = false;
+		}
 		v->main_starting_ = false;
 		v->update_awake();
 		break;
@@ -752,6 +802,14 @@ void Vertical::on_frontend(enum obs_frontend_event event, void *self)
 	case OBS_FRONTEND_EVENT_RECORDING_STOPPING:
 		if (v->record_with_main_)
 			v->outputs_.stop_record();
+		break;
+	case OBS_FRONTEND_EVENT_RECORDING_STOPPED:
+		// A recording that ended on its own (the disk filled up, say)
+		// never said "stopping".
+		if (v->record_with_main_) {
+			v->outputs_.stop_record();
+			v->record_with_main_ = false;
+		}
 		break;
 	case OBS_FRONTEND_EVENT_RECORDING_PAUSED:
 	case OBS_FRONTEND_EVENT_RECORDING_UNPAUSED:
