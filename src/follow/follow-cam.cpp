@@ -102,6 +102,10 @@ struct FollowCam {
 	float window = 0.3f; // the crop's width, a share of the camera's
 	std::vector<uint8_t> grey;
 	bool drawing = false;
+	// The crop was drawn this frame: shown in more than one place (the
+	// tall picture and a main scene, both scenes of a fade), it's drawn
+	// once and the same picture shown again.
+	bool drawn = false;
 
 	~FollowCam()
 	{
@@ -228,18 +232,14 @@ struct FollowCam {
 		}
 		if (!out)
 			out = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-		bool drawn = false;
-		if (out) {
-			gs_texrender_reset(out);
-			if (gs_texrender_begin(out, w, h)) {
-				vec4 clear;
-				vec4_zero(&clear);
-				gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
-				gs_ortho(r.x, r.x + r.w, r.y, r.y + r.h, -100.0f, 100.0f);
-				obs_source_video_render(cam);
-				gs_texrender_end(out);
-				drawn = true;
-			}
+		if (out && !drawn && gs_texrender_begin(out, w, h)) {
+			vec4 clear;
+			vec4_zero(&clear);
+			gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+			gs_ortho(r.x, r.x + r.w, r.y, r.y + r.h, -100.0f, 100.0f);
+			obs_source_video_render(cam);
+			gs_texrender_end(out);
+			drawn = true;
 		}
 		gs_blend_state_pop();
 		obs_source_release(cam);
@@ -264,6 +264,9 @@ struct FollowCam {
 
 	void tick(float dt)
 	{
+		// A new frame: the crop is drawn afresh the first time it shows.
+		drawn = false;
+		gs_texrender_reset(out);
 		since_look += dt;
 		since_find += dt;
 		if (since_find >= FIND_EVERY) {
