@@ -317,9 +317,17 @@ def test_the_key_window_opens_in_obs(run):
     assert wait_for(lambda: v(run, "VerticalGetState")["settings_open"], 10)
     if shutil.which("xdotool"):
         env = dict(os.environ, DISPLAY=run["obs"].display)
-        subprocess.run(["xdotool", "search", "--name", "DireBot Vertical",
-                        "windowactivate", "--sync", "key", "Escape"],
-                       env=env, capture_output=True, timeout=10)
+
+        def xdo(*args):
+            return subprocess.run(["xdotool", *args], env=env,
+                                  capture_output=True, text=True,
+                                  timeout=10).stdout.split()
+        # Focus, not activate: the pretend screen has no window manager.
+        assert wait_for(lambda: xdo("search", "--name", "DireBot Vertical"),
+                        10)
+        win = xdo("search", "--name", "DireBot Vertical")[0]
+        xdo("windowfocus", "--sync", win)
+        xdo("key", "Escape")
         assert wait_for(
             lambda: not v(run, "VerticalGetState")["settings_open"], 10)
 
