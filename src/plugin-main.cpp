@@ -34,12 +34,15 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // earlier could freeze OBS.
 //
 // The vertical picture (vertical/vertical.hpp): DireBot's own tall
-// picture for TikTok, Shorts and Reels, in place of the Aitum Vertical
-// plugin. Its "Vertical..." vendor requests and events go through here.
+// picture for TikTok, Shorts and Reels. Its "Vertical..." vendor requests
+// and events go through here.
 //
-// Later parts plug in beside these: multistream, auto-duck and captions
-// each get their own folder under src/, their own vendor requests, and a
-// line in features().
+// Multistream (multistream/): your stream to YouTube, Kick and the rest
+// as well, sent by OBS itself. DireBot asks and presses through vendor
+// requests; stream keys are only ever typed into their windows in OBS.
+//
+// Later parts plug in beside these: each gets its own folder under src/,
+// its own vendor requests, and a line in features().
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
@@ -56,6 +59,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "link/crypto.hpp"
 #include "link/server.hpp"
+#include "multistream/multistream.hpp"
 #include "obs/link-file.hpp"
 #include "obs/meters.hpp"
 #include "obs/usage.hpp"
@@ -101,28 +105,33 @@ public:
 
 	void post_load()
 	{
-		// The vertical picture works without obs-websocket too (OBS's
-		// Tools menu and its own stream button).
+		// The vertical picture and multistream work without obs-websocket
+		// (from their windows in OBS, and OBS's own stream button);
+		// DireBot reaches them through the link or OBS's websocket.
 		vertical_.start([this](const std::string &type, const json &data) { emit(type, data); });
-		obs_frontend_add_event_callback(&Plugin::on_frontend, this);
-		frontend_ = true;
-		ws_ok_ = ws_.find();
-		if (ws_ok_) {
+		multistream_.start();
+		link_ok_ = ws_.find();
+		if (!link_ok_)
+			obs_log(LOG_WARNING,
+				"OBS's websocket plugin (obs-websocket) is missing or too old, so DireBot Link is off. "
+				"DireBot can still connect with the websocket password.");
+		if (ws_.present()) {
 			std::vector<std::string> requests = {"GetInfo", "GetUsage"};
-			const auto &vertical = vertical::Vertical::requests();
-			requests.insert(requests.end(), vertical.begin(), vertical.end());
+			for (const std::string &r : vertical::Vertical::requests())
+				requests.push_back(r);
+			for (const std::string &r : multistream::Multistream::requests())
+				requests.push_back(r);
 			ws_.connect([this](const std::string &type, const json &data,
 					   bool &found) { return vendor_request(type, data, found); },
 				    [this](uint64_t intent, const char *type, const char *data) {
 					    on_event(intent, type, data);
 				    },
 				    requests);
-			server_.on_wanted_changed = [this](uint64_t) { poke(); };
-		} else {
-			obs_log(LOG_WARNING,
-				"OBS's websocket plugin (obs-websocket) is missing or too old, so DireBot Link is off. "
-				"DireBot can still connect with the websocket password.");
 		}
+		if (link_ok_)
+			server_.on_wanted_changed = [this](uint64_t) { poke(); };
+		obs_frontend_add_event_callback(&Plugin::on_frontend, this);
+		frontend_ = true;
 		ticker_ = std::thread([this] { run(); });
 	}
 
@@ -147,8 +156,9 @@ private:
 	obs::Meters meters_;
 	obs::Usage usage_;
 	vertical::Vertical vertical_;
+	multistream::Multistream multistream_;
 	bool frontend_ = false;
-	bool ws_ok_ = false;
+	bool link_ok_ = false;
 
 	std::thread ticker_;
 	std::mutex lock_;
@@ -162,6 +172,7 @@ private:
 	static void on_frontend(enum obs_frontend_event event, void *param)
 	{
 		auto *p = static_cast<Plugin *>(param);
+		p->multistream_.on_frontend(event);
 		switch (event) {
 		case OBS_FRONTEND_EVENT_FINISHED_LOADING:
 			p->loaded_ = true;
@@ -234,7 +245,7 @@ private:
 	// plugins. Any thread.
 	void emit(const std::string &type, const json &data)
 	{
-		if (ws_ok_)
+		if (ws_.present())
 			ws_.emit(type, data);
 		if (server_.running() && (server_.wanted() & link::subs::Vendors)) {
 			const json event = {{"vendorName", obs::WebSocket::VendorName}, {"eventType", type}, {"eventData", data}};
@@ -252,6 +263,9 @@ private:
 			return usage_.report();
 		if (vertical::Vertical::handles(type))
 			return vertical_.request(type, data);
+		json answer;
+		if (multistream_.request(type, data, answer))
+			return answer;
 		found = false;
 		return nullptr;
 	}
@@ -263,7 +277,8 @@ private:
 			{"obs", obs_get_version_string()},
 			{"link", server_.running()},
 			{"link_port", server_.port()},
-			{"features", {{"link", true}, {"meters", true}, {"usage", true}, {"vertical", true}}}};
+			{"features",
+			 {{"link", true}, {"meters", true}, {"usage", true}, {"vertical", true}, {"multistream", true}}}};
 	}
 
 	// One small thread for everything that runs on a clock: opening the
@@ -279,7 +294,7 @@ private:
 			uint64_t until = next_second;
 			if (meters_.attached())
 				until = std::min(until, next_meters);
-			if (ws_ok_ && loaded_ && !closing_ && !server_.running() && listen_failures < MAX_LISTEN_TRIES)
+			if (link_ok_ && loaded_ && !closing_ && !server_.running() && listen_failures < MAX_LISTEN_TRIES)
 				until = std::min(until, next_try);
 			const uint64_t before = os_gettime_ns();
 			if (until > before)
@@ -305,7 +320,7 @@ private:
 	{
 		const uint64_t now = os_gettime_ns();
 		const bool closing = closing_;
-		if (ws_ok_ && loaded_ && !closing && !server_.running() && listen_failures < MAX_LISTEN_TRIES &&
+		if (link_ok_ && loaded_ && !closing && !server_.running() && listen_failures < MAX_LISTEN_TRIES &&
 		    now >= next_try) {
 			// The next try is set first: if this one throws, it isn't
 			// tried again straight away.
@@ -344,8 +359,10 @@ private:
 		if (now >= next_second) {
 			next_second = now + 1000 * MS;
 			usage_.tick();
-			if (!closing)
+			if (!closing) {
 				vertical_.tick();
+				multistream_.tick();
+			}
 		}
 	}
 

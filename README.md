@@ -1,7 +1,8 @@
 # DireBot for OBS
 
 An OBS add-on that connects OBS to [DireBot](https://github.com/diredevr-png/DireBot)
-by itself, and shows what's slowing OBS down.
+by itself, shows what's slowing OBS down, and streams to more than one
+site at once.
 
 ## What it does
 
@@ -26,6 +27,24 @@ never include web addresses, file paths or device names.
 **Audio levels.** DireBot's talking avatar follows your mic. The link sends
 OBS's audio levels (the same numbers as OBS's Audio Mixer) only while
 something is listening.
+
+**Multistream.** The add-on sends your stream to YouTube, Kick, TikTok
+or any other site at the same time as your main stream. **Tools →
+DireBot Multistream** opens its window: add a site, paste its stream key
+(and, for "Another site", its server). Each site sends the same picture
+as your stream, a shared **Lighter** picture (one smaller encoder every
+Lighter site shares), or a picture of its own; and the stream's sound or
+one of OBS's audio tracks, so each site can get its own mix of sounds
+(DireBot's Studio → Multistream → Sounds for each site sets them up). Sites
+start and end with your stream unless you untick that, and reconnect by
+themselves when the connection drops. The keys are saved with the
+profile, locked to your Windows account (DPAPI) - on another PC or
+account the window asks for them again. Two sites with the same server
+and key are flagged. Sites from **Multiple RTMP outputs** or **Aitum
+Multistream** can be brought over once, keys and all: the add-on reads
+their saved settings itself and the sites arrive switched off. Nothing
+about a site's server or key is ever sent to DireBot - only whether one
+is filled in.
 
 The link never hands out your stream key: `GetStreamServiceSettings`
 through it shows the key (and a custom server's password or token) as
@@ -68,6 +87,13 @@ The add-on's own requests go through `CallVendorRequest` with
 | requestType | answers |
 |---|---|
 | `GetInfo` | `plugin` version, `api` (1), `obs` version, `link` on?, `link_port`, `features` |
+| `GetMultistream` | `ok`, `api`, `profile`, `file_problem`, `window_open`, `main` (your stream: `live`, `multitrack`, `video_kbps`, `audio_kbps`, `audio_track`, `encoder`, `encoder_name`, `codec`, `width`, `height`, `fps`, `delay`), `lighter` (`kbps`, `height`, `encoder`), `tracks` (`track`, `name`), `encoders` (`id`, `name`), `sites` (`key`, `label`, `where`), and `places`: `id`, `name`, `site`, `label`, `host`, `protocol`, `on`, `with_stream`, `stop_with_stream`, `key_set`, `key_lost`, `server_set`, `video` (`same`/`lighter`/`own`), `kbps`, `height`, `encoder`, `track` (0: the stream's sound), `came_from`, `twin` (an earlier place with the same server and key), `output`, `state` (`off`/`starting`/`sending`/`reconnecting`/`stopping`), `error`, `ready`, and while running `bytes`, `frames`, `dropped`, `congestion`, `seconds`, `sending_video`, `sending_kbps` - never a server or a key |
+| `MultistreamStart` / `MultistreamStop` `{id}` | `ok`, `note` / `error` in words ("Go live first..." for a place that sends the stream's own picture or sound) |
+| `MultistreamStopAll` | `ok`, `stopped` |
+| `MultistreamAdd` `{site, open}` | `ok`, `id`, `name` (its window opens on it when `open`) |
+| `MultistreamSet` `{id, changes}` | `ok`, `place`; `changes` may have `name`, `on`, `with_stream`, `stop_with_stream`, `video`, `kbps`, `height`, `encoder`, `track` - never `server` or `key`. With `id` `"lighter"`: the Lighter picture's `kbps`, `height`, `encoder` |
+| `MultistreamOpen` `{id}` | `ok` - the window opens (on that place) |
+| `MultistreamImport` `{from: "multi_rtmp" / "aitum"}` | `ok`, `added` (`id`, `name`) - brought over switched off |
 | `GetUsage` | `measuring` (first 3 seconds), `fps`, `fps_now`, `frame_ms`, `frame_budget_ms`, `frames`, `frames_lagged`, `encoded`, `encoded_skipped`, `cpu`, `memory_mb`, `stream_frames`, `stream_dropped`, and `sources`: per input and filter `name`, `uuid`, `kind`, `type`, `active`, `showing`, `measured`, `tick_ms`, `render_ms`, `gpu_ms` (+ `_max_ms`), `fps_in`/`fps_shown` for cameras and media, `parent`/`enabled` for filters (and `own_ms`/`own_gpu_ms`: a filter's time takes in what it draws on, so this is its own part), and `hints` (browser size/fps/"shut down when hidden", whether it shows a page on this PC and its port, a short fingerprint of a camera to spot the same one added twice) |
 
 ## Building
@@ -108,12 +134,14 @@ obsws-python, the client DireBot uses.
     src/plugin-main.cpp   start and stop with OBS; the clock for meters
     src/link/             the link: WebSocket, obs-websocket's protocol, the server
     src/obs/              OBS's side: obs-websocket bridge, audio meters,
-                          usage report, link file
+                          usage report, link file, the key store, the
+                          DireBot Multistream window
+    src/multistream/      the extra streams: places (and their file), and
+                          the outputs, encoders and services that send them
     deps/                 nlohmann/json (MIT), obs-websocket's API header (GPL-2.0)
 
-Later parts (multistream, vertical, auto-duck, captions) each get their own
-folder under `src/`, their own `direbot` requests and a line in
-`features`.
+Later parts (vertical, auto-duck, captions) each get their own folder
+under `src/`, their own `direbot` requests and a line in `features`.
 
 ## Licence
 

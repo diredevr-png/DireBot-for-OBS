@@ -48,6 +48,7 @@ sources=(
 	src/link/crypto.cpp src/link/ws.cpp src/link/protocol.cpp src/link/server.cpp
 	src/obs/websocket.cpp src/obs/meters.cpp src/obs/usage.cpp src/obs/link-file.cpp src/obs/address.cpp
 	src/obs/keystore.cpp src/obs/settings-window.cpp
+	src/multistream/multistream.cpp src/multistream/places.cpp
 	src/vertical/rules.cpp src/vertical/options.cpp src/vertical/canvas.cpp src/vertical/outputs.cpp
 	src/vertical/settings.cpp src/vertical/vertical.cpp
 )

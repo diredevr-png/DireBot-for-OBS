@@ -45,11 +45,11 @@ bool WebSocket::find()
 
 bool WebSocket::connect(VendorHandler vendor, EventHandler events, const std::vector<std::string> &vendor_requests)
 {
-	if (api_version_ < NEEDED_API)
+	if (api_version_ < 1)
 		return false;
 	vendor_handler_ = std::move(vendor);
 	event_handler_ = std::move(events);
-	if (!events_on_)
+	if (!events_on_ && api_version_ >= NEEDED_API)
 		events_on_ = obs_websocket_register_event_callback(&WebSocket::on_event, this);
 	// Over OBS's normal websocket too. Not needed for the link, so a
 	// failure here only means those calls say "not found".
@@ -81,7 +81,9 @@ void WebSocket::disconnect()
 
 bool WebSocket::emit(const std::string &type, const json &data)
 {
-	if (!vendor_ || !events_on_)
+	// Vendor events need only the vendor, not the event callback (an
+	// obs-websocket too old for the link still passes them on).
+	if (!vendor_)
 		return false;
 	obs_data_t *event = obs_data_create_from_json(data.is_object() ? link::to_text(data).c_str() : "{}");
 	if (!event)

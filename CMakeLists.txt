@@ -61,4 +61,8 @@ target_sources(
     src/vertical/vertical.cpp
 )
 
+# Multistream: its own outputs to YouTube, Kick and the rest (their stream
+# keys are typed into its window in OBS, locked like the vertical ones).
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/multistream/multistream.cpp src/multistream/places.cpp)
+
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
