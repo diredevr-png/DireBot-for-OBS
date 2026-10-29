@@ -259,6 +259,14 @@ Outputs::~Outputs()
 
 bool Outputs::make_encoders(video_t *video, const Options &options, std::string &problem)
 {
+	if (video_ && video && obs_encoder_video(video_) != video) {
+		// Made for the picture before a resize: never fed the new one.
+		if (obs_encoder_active(video_)) {
+			problem = "The vertical picture changed size while it's in use. Stop it, then start again.";
+			return false;
+		}
+		release_encoders();
+	}
 	if (video_) {
 		// Already feeding something: only the bitrate can change now.
 		OBSDataAutoRelease s = obs_encoder_get_settings(video_);

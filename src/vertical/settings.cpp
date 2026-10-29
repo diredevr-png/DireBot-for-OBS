@@ -25,6 +25,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/config-file.h>
 
 #include "../obs/keystore.hpp"
+#include <plugin-support.h>
 #include "outputs.hpp"
 #include "rules.hpp"
 
@@ -141,6 +142,11 @@ obs_properties_t *SettingsPage::properties(obs_data_t *settings)
 {
 	const Options &now = get_();
 	obs_properties_t *props = obs_properties_create();
+	if (stale_) {
+		obs_property_t *gone = obs_properties_add_text(props, "stale", words("Vertical.Stale").c_str(),
+								 OBS_TEXT_INFO);
+		obs_property_text_set_info_type(gone, OBS_TEXT_INFO_WARNING);
+	}
 	obs_properties_add_text(props, "intro", words("Vertical.Intro").c_str(), OBS_TEXT_INFO);
 
 	for (int i = 1; i <= Options::SLOTS; i++) {
@@ -209,9 +215,49 @@ obs_properties_t *SettingsPage::properties(obs_data_t *settings)
 	return props;
 }
 
+void SettingsPage::forget_keys(obs_data_t *settings)
+{
+	for (int i = 1; i <= Options::SLOTS; i++) {
+		obs_data_erase(settings, field(i, "key").c_str());
+		obs_data_erase(settings, field(i, "clear").c_str());
+	}
+}
+
+void SettingsPage::profile_changed()
+{
+	if (!open_)
+		return;
+	stale_ = true;
+	for (int i = 1; i <= Options::SLOTS; i++) {
+		obs::keystore::wipe(key_at_open_[i - 1]);
+		key_at_open_[i - 1].clear();
+	}
+}
+
 void SettingsPage::changed(obs_data_t *settings)
 {
 	const Options &now = get_();
+	// OBS's Edit → Undo / Redo of the window's OK puts back all of its
+	// settings from then, typed keys and all, with the window shut. The
+	// places stay as they are, and the window's settings go back to
+	// matching them, without keys - so a key can't come back into the
+	// box (and its Show button) the next time it opens.
+	if (obs_data_has_user_value(settings, "undo_uuid")) {
+		obs_data_erase(settings, "undo_uuid");
+		if (!open_) {
+			obs_log(LOG_INFO, "Vertical: OBS's Undo / Redo doesn't change where it streams; the "
+					  "window's settings were put back.");
+			forget_keys(settings);
+			fill(settings, now);
+			return;
+		}
+	}
+	// A window opened for another profile: what's in it isn't this
+	// profile's, keys least of all.
+	if (stale_) {
+		forget_keys(settings);
+		return;
+	}
 	Options next = now;
 	for (int i = 1; i <= Options::SLOTS; i++) {
 		Destination &d = next.places[i - 1];
@@ -234,12 +280,27 @@ void SettingsPage::changed(obs_data_t *settings)
 			std::string before;
 			const bool same = obs::keystore::unlock(d.key_locked, before) && before == typed;
 			obs::keystore::wipe(before);
-			if (!same)
-				d.key_locked = obs::keystore::lock(typed);
+			if (!same) {
+				std::string locked = obs::keystore::lock(typed);
+				if (locked.empty())
+					// Windows wouldn't lock it: not saved, and the
+					// key it had stays.
+					obs_log(LOG_WARNING, "Vertical: Windows couldn't lock the stream key for place "
+							     "%d, so it wasn't saved. Type it in again.",
+						i);
+				else
+					d.key_locked = locked;
+			}
 		} else if (obs_data_get_bool(settings, field(i, "clear").c_str())) {
 			d.key_locked.clear();
-		} else {
+		} else if (d.platform == site_at_open_[i - 1]) {
 			d.key_locked = key_at_open_[i - 1];
+		} else {
+			// Another site than when the window opened: that site's
+			// key would go to this one's servers, so there's none
+			// until one's typed (picking the first site again puts
+			// it back).
+			d.key_locked.clear();
 		}
 		obs::keystore::wipe(typed);
 	}
@@ -263,6 +324,7 @@ bool SettingsPage::opened(obs_data_t *)
 	const Options &now = get_();
 	for (int i = 1; i <= Options::SLOTS; i++) {
 		key_at_open_[i - 1] = now.places[i - 1].key_locked;
+		site_at_open_[i - 1] = now.places[i - 1].platform;
 		std::string key;
 		unreadable_[i - 1] = !obs::keystore::unlock(key_at_open_[i - 1], key);
 		obs::keystore::wipe(key);
@@ -273,12 +335,14 @@ bool SettingsPage::opened(obs_data_t *)
 void SettingsPage::closed(obs_data_t *settings)
 {
 	open_ = false;
+	stale_ = false;
 	for (int i = 1; i <= Options::SLOTS; i++) {
 		// Out of OBS's hands as soon as it's no longer on screen.
 		obs_data_erase(settings, field(i, "key").c_str());
 		obs_data_erase(settings, field(i, "clear").c_str());
 		obs::keystore::wipe(key_at_open_[i - 1]);
 		key_at_open_[i - 1].clear();
+		site_at_open_[i - 1].clear();
 		unreadable_[i - 1] = false;
 	}
 }

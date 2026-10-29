@@ -48,7 +48,8 @@ inline std::string to_text(const json &j)
 }
 
 // What a stream key (or a custom server's password or token) reads as
-// through the link: GetStreamServiceSettings never hands the real one out.
+// through the link: GetStreamServiceSettings never hands the real one out
+// (nor a server address's path past its first folder, where a key can be).
 constexpr const char *HIDDEN_SECRET = "********";
 
 // obs-websocket's close codes (WebSocketCloseCode).
@@ -79,6 +80,7 @@ enum : int {
 	GenericError = 205,
 	NotReady = 207,
 	MissingRequestField = 300,
+	InvalidRequestField = 400,
 	InvalidRequestFieldType = 401,
 	RequestFieldOutOfRange = 402,
 	ResourceNotFound = 600,

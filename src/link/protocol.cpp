@@ -57,9 +57,25 @@ json status_json(const RequestResult &r)
 
 // The secrets in OBS's stream settings: the stream key, and a custom
 // server's password or token. DireBot only ever needs to know one is set,
-// so the link never hands them out - whoever has the link file can still
-// put a key in, but can't read yours back.
+// so the link never hands them out.
 const char *const STREAM_SECRETS[] = {"key", "password", "bearer_token"};
+
+// A key in the server address itself (rtmp://host/app/KEY, or ?key=...):
+// the address is shown up to its first folder, and the rest as stars.
+std::string hide_server_path(const std::string &server)
+{
+	const size_t scheme = server.find("://");
+	const size_t host_start = scheme == std::string::npos ? 0 : scheme + 3;
+	const size_t path = server.find_first_of("/?#", host_start);
+	if (path == std::string::npos)
+		return server;
+	if (server[path] != '/')
+		return server.substr(0, path) + "/" + HIDDEN_SECRET;
+	const size_t second = server.find_first_of("/?#", path + 1);
+	if (second == std::string::npos || second + 1 >= server.size())
+		return server;
+	return server.substr(0, second) + "/" + HIDDEN_SECRET;
+}
 
 void hide_stream_secrets(RequestResult &r)
 {
@@ -71,28 +87,55 @@ void hide_stream_secrets(RequestResult &r)
 	for (const char *name : STREAM_SECRETS)
 		if (settings.contains(name) && settings[name].is_string() && !settings[name].get<std::string>().empty())
 			settings[name] = HIDDEN_SECRET;
+	if (settings.contains("server") && settings["server"].is_string())
+		settings["server"] = hide_server_path(settings["server"].get<std::string>());
 }
 
-// Settings read through the link and sent back as they were: a hidden
-// secret is left out, so OBS keeps the real one instead of the stars.
-json keep_stream_secrets(const json &data)
+// Where OBS streams can only change through the link along with a key (or
+// a custom server's token) sent with it: OBS keeps the key it has when only
+// the server changes, so otherwise anyone with the link file could send
+// your key to a server of theirs. Every secret not sent is emptied, so none
+// of the old ones go along to the new server. "" when it may go on, else
+// why not.
+std::string guard_stream_secrets(const json &data, json &out)
 {
+	out = data;
 	if (!data.is_object() || !data.contains("streamServiceSettings") ||
 	    !data["streamServiceSettings"].is_object())
-		return data;
-	json out = data;
+		return "";
+	json &settings = out["streamServiceSettings"];
+	bool given = false;
+	for (const char *name : STREAM_SECRETS) {
+		if (!settings.contains(name))
+			continue;
+		const json &v = settings[name];
+		if (v == HIDDEN_SECRET)
+			return "Send the stream key itself: the stars read back from OBS aren't it.";
+		if (v.is_string() && !v.get<std::string>().empty())
+			given = true;
+	}
+	if (!given)
+		return "Changing where OBS streams needs the stream key sent with it.";
+	if (settings.contains("server") && settings["server"].is_string() &&
+	    settings["server"].get<std::string>().find(HIDDEN_SECRET) != std::string::npos)
+		return "Send the server address itself: the stars read back from OBS aren't it.";
 	for (const char *name : STREAM_SECRETS)
-		if (out["streamServiceSettings"].contains(name) && out["streamServiceSettings"][name] == HIDDEN_SECRET)
-			out["streamServiceSettings"].erase(name);
-	return out;
+		if (!settings.contains(name))
+			settings[name] = "";
+	return "";
 }
 
 RequestResult call_one(const std::string &type, const json &data, Backend &backend)
 {
 	if (type.empty())
 		return {status::MissingRequestType, "Your request is missing a `requestType`.", nullptr};
-	if (type == "SetStreamServiceSettings")
-		return backend.call(type, keep_stream_secrets(data));
+	if (type == "SetStreamServiceSettings") {
+		json guarded;
+		const std::string refused = guard_stream_secrets(data, guarded);
+		if (!refused.empty())
+			return {status::InvalidRequestField, refused, nullptr};
+		return backend.call(type, guarded);
+	}
 	RequestResult r = backend.call(type, data);
 	if (type == "GetStreamServiceSettings")
 		hide_stream_secrets(r);

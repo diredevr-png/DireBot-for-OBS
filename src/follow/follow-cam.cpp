@@ -180,7 +180,11 @@ struct FollowCam {
 		}
 
 		const uint32_t sw = Tracker::WIDTH;
-		const uint32_t sh = std::max<uint32_t>(8, (uint32_t)std::lround((double)sw * ch / cw) & ~1u);
+		// At most 8 times as tall as it's wide: a very tall source would
+		// want a look bigger than a graphics card makes (and fail every
+		// frame). Where it moves is in fractions of the picture, so a
+		// squashed look still follows.
+		const uint32_t sh = std::clamp<uint32_t>((uint32_t)std::lround((double)sw * ch / cw) & ~1u, 8, sw * 8);
 		if (!stage || stage_w != sw || stage_h != sh) {
 			gs_stagesurface_destroy(stage);
 			stage = gs_stagesurface_create(sw, sh, GS_RGBA);
@@ -308,11 +312,19 @@ struct FollowCam {
 		auto *f = static_cast<FollowCam *>(data);
 		const char *was = calldata_string(cd, "prev_name");
 		const char *now = calldata_string(cd, "new_name");
-		if (!was || !now)
+		obs_source_t *renamed = static_cast<obs_source_t *>(calldata_ptr(cd, "source"));
+		if (!was || !now || !renamed)
 			return;
 		{
 			std::lock_guard<std::mutex> l(f->lock);
 			if (f->camera_name != was)
+				return;
+			// Only the camera itself: a filter (or anything else) that
+			// happened to have its name isn't it. With the camera gone
+			// for now, a source by that name that's renamed still is.
+			if (f->camera ? !obs_weak_source_references_source(f->camera, renamed)
+				      : obs_source_get_type(renamed) != OBS_SOURCE_TYPE_INPUT &&
+						obs_source_get_type(renamed) != OBS_SOURCE_TYPE_SCENE)
 				return;
 			f->camera_name = now;
 		}
@@ -381,7 +393,7 @@ obs_properties_t *get_properties(void *data)
 	if (f) {
 		// One that's gone still shows, so it isn't lost by opening this.
 		std::lock_guard<std::mutex> l(f->lock);
-		if (!f->camera_name.empty() && !f->camera)
+		if (!f->camera_name.empty() && (!f->camera || obs_weak_source_expired(f->camera)))
 			obs_property_list_add_string(list, f->camera_name.c_str(), f->camera_name.c_str());
 	}
 	obs_property_t *follow = obs_properties_add_bool(props, "follow", text("FollowCam.Follow"));
