@@ -128,6 +128,15 @@ std::string follow_pick(const std::string &main_scene, const std::vector<std::st
 	return "";
 }
 
+int sound_track(int wanted, bool simple, int stream_track)
+{
+	if (wanted >= 1 && wanted <= 6)
+		return wanted;
+	if (simple)
+		return 1;
+	return stream_track >= 1 && stream_track <= 6 ? stream_track : 1;
+}
+
 std::string pick_encoder(const std::string &wanted, bool simple, const std::string &main,
 			 const std::set<std::string> &available)
 {

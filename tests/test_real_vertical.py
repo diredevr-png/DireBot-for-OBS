@@ -74,12 +74,12 @@ def send(run, request, data=None):
         c.disconnect()
 
 
-def probe(path):
+def probe(path, what="v:0", entries="stream=width,height"):
     if not shutil.which("ffprobe"):
         return None
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-         "stream=width,height", "-of", "csv=p=0", path],
+        ["ffprobe", "-v", "error", "-select_streams", what, "-show_entries",
+         entries, "-of", "csv=p=0", path],
         capture_output=True, text=True).stdout.strip()
     return out
 
@@ -245,6 +245,8 @@ def test_recording_a_tall_file(run):
     send(run, "SetRecordDirectory", {"recordDirectory": run["records"]})
     state = v(run, "VerticalStartRecord")
     assert state["ok"] and state["recording"] and state["awake"]
+    # Its sound: the track OBS's own stream sends (1, in Simple mode).
+    assert state["outputs"]["recording"]["track"] == 1
     time.sleep(2.5)
     state = v(run, "VerticalPauseRecord", {"pause": True})
     assert state["outputs"]["recording"]["paused"] is True
@@ -305,7 +307,7 @@ def test_direbot_picks_a_site_but_never_a_server_or_key(run):
                                           "places": [{"slot": 7}]})
     assert state["options"]["kbps"] == 20000
     assert state["options"]["audio_track"] == 6
-    v(run, "VerticalSetOptions", {"kbps": 6000, "audio_track": 1})
+    v(run, "VerticalSetOptions", {"kbps": 6000, "audio_track": 0})
 
 
 def test_the_key_window_opens_in_obs(run):
@@ -374,6 +376,10 @@ def test_streaming_with_its_key_and_never_telling_it(run):
     # Listening where the saved server says.
     listener = Listener(folder, KEY, run["vertical_port"])
     try:
+        # Its own sound: OBS's audio track 3 (DireBot's sound grid picks).
+        state = v(run, "VerticalSetOptions", {"places": [
+            {"slot": 1, "audio_track": 3}]})
+        assert state["options"]["places"][0]["audio_track"] == 3
         state = v(run, "VerticalStartStream", {"slot": 1})
         assert state["ok"], state
         assert wait_for(lambda: v(run, "VerticalGetState")["outputs"]
@@ -381,6 +387,7 @@ def test_streaming_with_its_key_and_never_telling_it(run):
         time.sleep(3)
         state = v(run, "VerticalGetState")
         assert state["outputs"]["streams"][0]["kbps"] > 0
+        assert state["outputs"]["streams"][0]["track"] == 3
         assert state["awake"] is True
         v(run, "VerticalStopStream", {"slot": 1})
         assert wait_for(lambda: not v(run, "VerticalGetState")["streaming"],
@@ -388,11 +395,14 @@ def test_streaming_with_its_key_and_never_telling_it(run):
         file = listener.done()
         assert os.path.getsize(file) > 10000
         assert probe(file) in (None, "1080,1920")
+        assert probe(file, "a:0", "stream=codec_name") in (None, "aac")
         time.sleep(0.5)
     finally:
         if listener.proc.poll() is None:
             listener.proc.kill()
         events.disconnect()
+        v(run, "VerticalSetOptions", {"places": [
+            {"slot": 1, "audio_track": 0}]})
     # The key went to OBS's stream and nowhere else.
     assert KEY not in json.dumps(v(run, "VerticalGetState"))
     assert got and not any(KEY in e for e in got)

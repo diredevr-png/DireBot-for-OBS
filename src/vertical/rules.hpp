@@ -82,6 +82,11 @@ std::string follow_pick(const std::string &main_scene, const std::vector<std::st
 std::string pick_encoder(const std::string &wanted, bool simple, const std::string &main,
 			 const std::set<std::string> &available);
 
+// The audio track (1-6) a place or the recording takes its sound from.
+// `wanted` 0 is the one OBS's own stream sends: track 1 in Simple output
+// mode (`simple`), else `stream_track` (Advanced mode's choice).
+int sound_track(int wanted, bool simple, int stream_track);
+
 // A recording's file type, from OBS's own recording setting ("mkv",
 // "hybrid_mp4", "fragmented_mov"...): the extension, and the OBS output
 // that writes it.

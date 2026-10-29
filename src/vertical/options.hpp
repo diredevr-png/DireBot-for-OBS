@@ -45,6 +45,9 @@ struct Destination {
 	// keystore::lock()'s text, never the key itself.
 	std::string key_locked;
 	bool enabled = false;
+	// Which of OBS's audio tracks this place's sound comes from; 0 is the
+	// one OBS's own stream sends.
+	int audio_track = 0;
 };
 
 struct Options {
@@ -53,8 +56,9 @@ struct Options {
 	int kbps = 6000;
 	// An encoder id, or "auto": the same kind as the wide stream's.
 	std::string encoder = "auto";
-	// Which of OBS's audio tracks the tall picture takes its sound from.
-	int audio_track = 1;
+	// Which of OBS's audio tracks the tall recording takes its sound from;
+	// 0 is the one OBS's own stream sends. (Each place has its own.)
+	int audio_track = 0;
 	// Start and stop with OBS's own stream.
 	bool with_stream = false;
 	// Record the tall picture whenever OBS records.

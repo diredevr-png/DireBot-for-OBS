@@ -409,11 +409,11 @@ json Vertical::do_request(const std::string &type, const json &data)
 			const std::string encoder = text(data, "encoder");
 			next.encoder = encoder.empty() ? "auto" : encoder;
 		}
-		next.audio_track = std::clamp(number(data, "audio_track", next.audio_track), 1, 6);
+		next.audio_track = std::clamp(number(data, "audio_track", next.audio_track), 0, 6);
 		next.with_stream = flag(data, "with_stream", next.with_stream);
 		next.record_with_main = flag(data, "record_with_main", next.record_with_main);
-		// Which site and on or off. Servers and keys only from OBS's
-		// window.
+		// Which site, on or off, and its sound. Servers and keys only
+		// from OBS's window.
 		auto places = data.find("places");
 		if (places != data.end() && places->is_array()) {
 			for (const json &row : *places) {
@@ -431,6 +431,9 @@ json Vertical::do_request(const std::string &type, const json &data)
 						d.server = rules::usual_server(d.platform);
 				}
 				d.enabled = flag(row, "enabled", d.enabled);
+				// Its sound: an audio track, 0 for the one OBS's stream
+				// sends. Used from its next start.
+				d.audio_track = std::clamp(number(row, "audio_track", d.audio_track), 0, 6);
 			}
 		}
 		set_options(next, true);

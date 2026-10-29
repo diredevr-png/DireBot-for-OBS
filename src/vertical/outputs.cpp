@@ -259,7 +259,7 @@ Outputs::~Outputs()
 
 bool Outputs::make_encoders(video_t *video, const Options &options, std::string &problem)
 {
-	if (video_ && audio_) {
+	if (video_) {
 		// Already feeding something: only the bitrate can change now.
 		OBSDataAutoRelease s = obs_encoder_get_settings(video_);
 		if (obs_data_get_int(s, "bitrate") != options.kbps &&
@@ -287,28 +287,52 @@ bool Outputs::make_encoders(video_t *video, const Options &options, std::string 
 	video_ = obs_video_encoder_create(encoder_id_.c_str(), VIDEO_ENCODER, settings, nullptr);
 	obs_data_release(settings);
 
-	OBSDataAutoRelease audio_settings = obs_data_create();
-	obs_data_set_int(audio_settings, "bitrate", audio_kbps(config, options.audio_track));
-	audio_ = obs_audio_encoder_create(audio_encoder_id(), AUDIO_ENCODER, audio_settings,
-					  (size_t)std::clamp(options.audio_track - 1, 0, 5), nullptr);
-
-	if (!video_ || !audio_) {
+	if (!video_) {
 		release_encoders();
 		problem = "OBS couldn't make an encoder for the vertical picture.";
 		return false;
 	}
 	obs_encoder_set_video(video_, video);
-	obs_encoder_set_audio(audio_, obs_get_audio());
 	obs_log(LOG_INFO, "Vertical: encoding with %s at %d kbps.", encoder_id_.c_str(), options.kbps);
 	return true;
+}
+
+obs_encoder_t *Outputs::audio_for(int wanted, int &track, std::string &problem)
+{
+	config_t *config = obs_frontend_get_profile_config();
+	const int stream_track = config ? (int)config_get_int(config, "AdvOut", "TrackIndex") : 1;
+	track = rules::sound_track(wanted, simple_mode(config), stream_track);
+	obs_encoder_t *&enc = audio_[track - 1];
+	if (enc)
+		return enc;
+	OBSDataAutoRelease settings = obs_data_create();
+	obs_data_set_int(settings, "bitrate", audio_kbps(config, track));
+	const std::string name = std::string(AUDIO_ENCODER) + "_" + std::to_string(track);
+	enc = obs_audio_encoder_create(audio_encoder_id(), name.c_str(), settings, (size_t)(track - 1), nullptr);
+	if (!enc) {
+		problem = "OBS couldn't make a sound encoder for audio track " + std::to_string(track) + ".";
+		return nullptr;
+	}
+	obs_encoder_set_audio(enc, obs_get_audio());
+	return enc;
+}
+
+bool Outputs::audio_active() const
+{
+	for (obs_encoder_t *enc : audio_)
+		if (enc && obs_encoder_active(enc))
+			return true;
+	return false;
 }
 
 void Outputs::release_encoders()
 {
 	obs_encoder_release(video_);
-	obs_encoder_release(audio_);
 	video_ = nullptr;
-	audio_ = nullptr;
+	for (obs_encoder_t *&enc : audio_) {
+		obs_encoder_release(enc);
+		enc = nullptr;
+	}
 }
 
 void Outputs::watch(obs_output_t *output, int slot)
@@ -370,6 +394,13 @@ std::string Outputs::start_streams(video_t *video, const Options &options, int s
 			note(label, problem);
 			break;
 		}
+		int track = 0;
+		obs_encoder_t *audio = audio_for(d.audio_track, track, problem);
+		if (!audio) {
+			obs::keystore::wipe(key);
+			note(label, problem);
+			continue;
+		}
 
 		Stream &s = streams_[i - 1];
 		release_stream(s, i);
@@ -399,7 +430,7 @@ std::string Outputs::start_streams(video_t *video, const Options &options, int s
 						  delay > 0 ? delay : 2);
 		obs_output_set_service(s.output, s.service);
 		obs_output_set_video_encoder(s.output, video_);
-		obs_output_set_audio_encoder(s.output, audio_, 0);
+		obs_output_set_audio_encoder(s.output, audio, 0);
 		watch(s.output, i);
 
 		{
@@ -408,6 +439,7 @@ std::string Outputs::start_streams(video_t *video, const Options &options, int s
 			s.reconnecting = false;
 			s.started = true;
 		}
+		s.track = track;
 		s.bytes = 0;
 		s.at_ns = os_gettime_ns();
 		s.kbps = 0;
@@ -443,6 +475,11 @@ std::string Outputs::start_record(video_t *video, const Options &options)
 	std::string problem;
 	if (!make_encoders(video, options, problem))
 		return problem;
+	obs_encoder_t *audio = audio_for(options.audio_track, record_track_, problem);
+	if (!audio) {
+		tidy();
+		return problem;
+	}
 
 	release_record();
 	config_t *config = obs_frontend_get_profile_config();
@@ -475,7 +512,7 @@ std::string Outputs::start_record(video_t *video, const Options &options)
 		return "OBS couldn't set up the recording.";
 	}
 	obs_output_set_video_encoder(record_, video_);
-	obs_output_set_audio_encoder(record_, audio_, 0);
+	obs_output_set_audio_encoder(record_, audio, 0);
 	watch(record_, 0);
 	{
 		std::lock_guard<std::mutex> hold(lock_);
@@ -606,8 +643,7 @@ void Outputs::tidy()
 		release_record();
 	// Only once they've finished: an encoder let go while it still
 	// encodes takes the output's frames with it.
-	if (!streaming() && !recording() && !(video_ && obs_encoder_active(video_)) &&
-	    !(audio_ && obs_encoder_active(audio_)))
+	if (!streaming() && !recording() && !(video_ && obs_encoder_active(video_)) && !audio_active())
 		release_encoders();
 }
 
@@ -657,6 +693,7 @@ json Outputs::status(const Options &options)
 				  {"connecting", connecting},
 				  {"reconnecting", active && reconnecting},
 				  {"kbps", active ? (int)(s.kbps + 0.5) : 0},
+				  {"track", active ? s.track : 0},
 				  {"dropped", dropped},
 				  {"frames", frames},
 				  {"problem", problem}});
@@ -683,6 +720,7 @@ json Outputs::status(const Options &options)
 		  {"paused", rec && obs_output_paused(record_)},
 		  {"seconds", seconds},
 		  {"file", record_file_.empty() ? "" : file_name(record_file_)},
+		  {"track", rec ? record_track_ : 0},
 		  {"problem", record_problem}}},
 		{"encoder", encoder_name()},
 		{"encoder_id", encoder_id_}};

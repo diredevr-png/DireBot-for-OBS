@@ -145,16 +145,30 @@ static void test_files()
 	CHECK(rules::recording_muxer_settings("mkv").empty());
 }
 
+static void test_sound()
+{
+	// 0: the track OBS's own stream sends - always 1 in Simple mode.
+	CHECK(rules::sound_track(0, true, 4) == 1);
+	CHECK(rules::sound_track(0, false, 4) == 4);
+	CHECK(rules::sound_track(0, false, 0) == 1);
+	CHECK(rules::sound_track(0, false, 9) == 1);
+	CHECK(rules::sound_track(3, true, 4) == 3);
+	CHECK(rules::sound_track(6, false, 1) == 6);
+	CHECK(rules::sound_track(7, false, 2) == 2);
+}
+
 static void test_options()
 {
 	Options plain;
-	CHECK(plain.kbps == 6000 && plain.encoder == "auto" && plain.audio_track == 1);
+	CHECK(plain.kbps == 6000 && plain.encoder == "auto" && plain.audio_track == 0);
+	CHECK(plain.places[0].audio_track == 0);
 	CHECK(!plain.with_stream && !plain.record_with_main && !plain.any_ready());
 
 	Options o;
 	o.places[0] = {"youtube", "rtmp://a.rtmp.youtube.com/live2", obs::keystore::lock("yt-SECRET-key"), true};
 	o.places[1] = {"tiktok", "rtmp://push.tiktok.com/live/stream-SECRET", obs::keystore::lock("tt-SECRET"), false};
 	o.places[2] = {"other", "https://wrong.example.com", obs::keystore::lock("x-SECRET"), true};
+	o.places[1].audio_track = 5;
 	o.kbps = 8000;
 	o.with_stream = true;
 	CHECK(o.ready(1));
@@ -188,20 +202,23 @@ static void test_options()
 	CHECK(told["places"][2]["server_ok"] == false);
 	CHECK(told["places"][2]["label"] == "Another site");
 	CHECK(told["kbps"] == 8000 && told["with_stream"] == true);
+	CHECK(told["places"][0]["audio_track"] == 0 && told["places"][1]["audio_track"] == 5);
+	CHECK(back.places[1].audio_track == 5);
 	CHECK(no_key.to_public()["places"][0]["key_set"] == false);
 
 	// A damaged or odd file: what can be read, the rest as it starts.
 	CHECK(Options::from_file(json()).to_file() == plain.to_file());
 	CHECK(Options::from_file(json::array()).to_file() == plain.to_file());
 	const Options odd = Options::from_file(json::parse(R"({
-		"places": [{"platform": "myspace", "enabled": "yes", "server": 5}, 7,
-			   {"platform": "kick", "enabled": true}, {"platform": "x"}],
-		"kbps": 99999999, "audio_track": 0, "encoder": "", "with_stream": 1})"));
+		"places": [{"platform": "myspace", "enabled": "yes", "server": 5, "audio_track": 9}, 7,
+			   {"platform": "kick", "enabled": true, "audio_track": "2"}, {"platform": "x"}],
+		"kbps": 99999999, "audio_track": -3, "encoder": "", "with_stream": 1})"));
 	CHECK(odd.places[0].platform == "other" && !odd.places[0].enabled && odd.places[0].server.empty());
 	CHECK(odd.places[1].platform == plain.places[1].platform); // a 7 is skipped
 	CHECK(odd.places[2].platform == "kick" && odd.places[2].enabled);
 	CHECK(odd.kbps == rules::MAX_KBPS);
-	CHECK(odd.audio_track == 1);
+	CHECK(odd.audio_track == 0);
+	CHECK(odd.places[0].audio_track == 6 && odd.places[2].audio_track == 0);
 	CHECK(odd.encoder == "auto");
 	CHECK(!odd.with_stream);
 	CHECK(Options::from_file(json::parse(R"({"kbps": 1})")).kbps == rules::MIN_KBPS);
@@ -214,6 +231,7 @@ int main()
 	test_follow();
 	test_encoders();
 	test_files();
+	test_sound();
 	test_options();
 	std::printf("vertical: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;

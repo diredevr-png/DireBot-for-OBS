@@ -70,7 +70,8 @@ json Options::to_file() const
 		list.push_back({{"platform", d.platform},
 				{"server", d.server},
 				{"key", d.key_locked},
-				{"enabled", d.enabled}});
+				{"enabled", d.enabled},
+				{"audio_track", d.audio_track}});
 	return {{"format", FORMAT},
 		{"places", list},
 		{"kbps", kbps},
@@ -96,13 +97,14 @@ Options Options::from_file(const json &j)
 			d.server = text(row, "server");
 			d.key_locked = text(row, "key");
 			d.enabled = flag(row, "enabled", false);
+			d.audio_track = number(row, "audio_track", 0, 0, 6);
 		}
 	}
 	o.kbps = number(j, "kbps", o.kbps, rules::MIN_KBPS, rules::MAX_KBPS);
 	o.encoder = text(j, "encoder", "auto");
 	if (o.encoder.empty())
 		o.encoder = "auto";
-	o.audio_track = number(j, "audio_track", 1, 1, 6);
+	o.audio_track = number(j, "audio_track", 0, 0, 6);
 	o.with_stream = flag(j, "with_stream", false);
 	o.record_with_main = flag(j, "record_with_main", false);
 	return o;
@@ -121,6 +123,7 @@ json Options::to_public() const
 				{"server_set", !d.server.empty()},
 				{"server_ok", rules::server_ok(d.server)},
 				{"key_set", !d.key_locked.empty()},
+				{"audio_track", d.audio_track},
 				{"output", rules::stream_output_name(i + 1)}});
 	}
 	return {{"places", list},

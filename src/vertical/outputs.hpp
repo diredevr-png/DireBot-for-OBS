@@ -20,10 +20,11 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // Instagram...) and its own recording, a file of its own beside OBS's
 // wide one, in OBS's recording folder and file type.
 //
-// One video encoder and one audio encoder feed all of them, made when the
-// first one starts and let go when the last one stops: the tall picture
-// is encoded once however many places it goes, and costs nothing while
-// it goes nowhere. The encoder is the same kind as the wide stream's
+// One video encoder feeds all of them, and one audio encoder for each of
+// OBS's audio tracks they take their sound from (each place picks its
+// own), made when the first one starts and let go when the last one
+// stops: the tall picture is encoded once however many places it goes,
+// and costs nothing while it goes nowhere. The encoder is the same kind as the wide stream's
 // (NVENC, AMD, Quick Sync or x264) unless another is picked.
 //
 // Stream keys come out of their lock (keystore.hpp) only to start a
@@ -90,6 +91,7 @@ private:
 		std::string problem;       // why it last stopped, in words
 		bool started = false;      // from its start until its "stop"
 		bool reconnecting = false;
+		int track = 0;             // the audio track it sends (1-6)
 		uint64_t bytes = 0, at_ns = 0;
 		double kbps = 0;
 	};
@@ -97,9 +99,11 @@ private:
 	obs_output_t *record_ = nullptr;
 	bool record_started_ = false;
 	std::string record_problem_, record_file_;
+	int record_track_ = 0;
 	uint64_t record_started_ns_ = 0, record_paused_ns_ = 0, pause_at_ns_ = 0;
 	obs_encoder_t *video_ = nullptr;
-	obs_encoder_t *audio_ = nullptr;
+	// By audio track: [0] is track 1.
+	std::array<obs_encoder_t *, 6> audio_{};
 	std::string encoder_id_;
 	// The problems, started and reconnecting, which signals set.
 	mutable std::mutex lock_;
@@ -114,6 +118,10 @@ private:
 	std::array<Who, Options::SLOTS + 1> who_;
 
 	bool make_encoders(video_t *video, const Options &options, std::string &problem);
+	// The audio encoder for a place's or the recording's sound (`wanted`
+	// 0: the track OBS's own stream sends); `track` says which it is.
+	obs_encoder_t *audio_for(int wanted, int &track, std::string &problem);
+	bool audio_active() const;
 	void release_encoders();
 	void release_stream(Stream &s, int slot);
 	void release_record();

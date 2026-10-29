@@ -20,7 +20,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <string>
 
+#include <obs-frontend-api.h>
 #include <obs-module.h>
+#include <util/config-file.h>
 
 #include "../obs/keystore.hpp"
 #include "outputs.hpp"
@@ -57,6 +59,25 @@ std::string trimmed(const char *text)
 	return out;
 }
 
+// A sound choice: "Same as your stream", then OBS's six audio tracks, by
+// the names given them in OBS (Settings → Output → Audio).
+void add_sounds(obs_property_t *list)
+{
+	obs_property_list_add_int(list, words("Vertical.SoundSame").c_str(), 0);
+	config_t *profile = obs_frontend_get_profile_config();
+	for (int t = 1; t <= 6; t++) {
+		std::string label = words("Vertical.SoundTrack");
+		const size_t at = label.find("%1");
+		if (at != std::string::npos)
+			label.replace(at, 2, std::to_string(t));
+		const std::string key = "Track" + std::to_string(t) + "Name";
+		const char *named = profile ? config_get_string(profile, "AdvOut", key.c_str()) : nullptr;
+		if (named && *named)
+			label += std::string(" (") + named + ")";
+		obs_property_list_add_int(list, label.c_str(), t);
+	}
+}
+
 bool is_usual_server(const std::string &server)
 {
 	if (server.empty())
@@ -91,8 +112,10 @@ SettingsPage::SettingsPage(std::function<const Options &()> get, std::function<v
 void SettingsPage::defaults(obs_data_t *settings)
 {
 	const Options plain;
-	for (int i = 1; i <= Options::SLOTS; i++)
+	for (int i = 1; i <= Options::SLOTS; i++) {
 		obs_data_set_default_string(settings, field(i, "site").c_str(), SITES[(i - 1) % 3]);
+		obs_data_set_default_int(settings, field(i, "track").c_str(), 0);
+	}
 	obs_data_set_default_int(settings, "kbps", plain.kbps);
 	obs_data_set_default_string(settings, "encoder", plain.encoder.c_str());
 	obs_data_set_default_int(settings, "audio_track", plain.audio_track);
@@ -105,6 +128,7 @@ void SettingsPage::fill(obs_data_t *settings, const Options &options)
 		obs_data_set_bool(settings, field(i, "on").c_str(), d.enabled);
 		obs_data_set_string(settings, field(i, "site").c_str(), d.platform.c_str());
 		obs_data_set_string(settings, field(i, "server").c_str(), d.server.c_str());
+		obs_data_set_int(settings, field(i, "track").c_str(), d.audio_track);
 	}
 	obs_data_set_int(settings, "kbps", options.kbps);
 	obs_data_set_string(settings, "encoder", options.encoder.c_str());
@@ -150,6 +174,11 @@ obs_properties_t *SettingsPage::properties(obs_data_t *settings)
 		if (!d.key_locked.empty())
 			obs_properties_add_bool(group, field(i, "clear").c_str(), words("Vertical.KeyClear").c_str());
 
+		obs_property_t *sound = obs_properties_add_list(group, field(i, "track").c_str(),
+								words("Vertical.Sound").c_str(), OBS_COMBO_TYPE_LIST,
+								OBS_COMBO_FORMAT_INT);
+		add_sounds(sound);
+
 		std::string title = words("Vertical.Place");
 		const size_t at = title.find("%1");
 		if (at != std::string::npos)
@@ -169,8 +198,7 @@ obs_properties_t *SettingsPage::properties(obs_data_t *settings)
 		obs_property_list_add_string(encoder, row.name.c_str(), row.id.c_str());
 	obs_property_t *track = obs_properties_add_list(quality, "audio_track", words("Vertical.AudioTrack").c_str(),
 							OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	for (int t = 1; t <= 6; t++)
-		obs_property_list_add_int(track, std::to_string(t).c_str(), t);
+	add_sounds(track);
 	obs_properties_add_group(props, "quality", words("Vertical.Quality").c_str(), OBS_GROUP_NORMAL, quality);
 
 	obs_properties_t *with = obs_properties_create();
@@ -192,6 +220,8 @@ void SettingsPage::changed(obs_data_t *settings)
 		d.platform = site.empty() ? d.platform : site;
 		std::string server = trimmed(obs_data_get_string(settings, field(i, "server").c_str()));
 		d.server = server;
+		const int sound = (int)obs_data_get_int(settings, field(i, "track").c_str());
+		d.audio_track = sound >= 0 && sound <= 6 ? sound : d.audio_track;
 
 		// The key, only from the open window: a key typed (not empty)
 		// replaces it, "remove" takes it away, and anything else - Cancel
@@ -219,7 +249,7 @@ void SettingsPage::changed(obs_data_t *settings)
 	const std::string encoder = obs_data_get_string(settings, "encoder");
 	next.encoder = encoder.empty() ? "auto" : encoder;
 	const int track = (int)obs_data_get_int(settings, "audio_track");
-	next.audio_track = track >= 1 && track <= 6 ? track : now.audio_track;
+	next.audio_track = track >= 0 && track <= 6 ? track : now.audio_track;
 	next.with_stream = obs_data_get_bool(settings, "with_stream");
 	next.record_with_main = obs_data_get_bool(settings, "record_with_main");
 
