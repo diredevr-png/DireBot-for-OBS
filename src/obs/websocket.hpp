@@ -30,7 +30,6 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <cstdint>
 #include <functional>
-#include <initializer_list>
 #include <memory>
 #include <string>
 #include <vector>
@@ -54,14 +53,18 @@ public:
 	static constexpr const char *VendorName = "direbot";
 
 	// Finds obs-websocket. Only from obs_module_post_load or later: it may
-	// load after this plugin. False when it isn't in this OBS.
+	// load after this plugin. False when it isn't in this OBS, or is too
+	// old for the link.
 	bool find();
+	// In this OBS at all (any version): the plugin's requests still work
+	// over OBS's normal websocket.
+	bool present() const { return api_version_ >= 1; }
 	unsigned api_version() const { return api_version_; }
 
-	// Starts and stops the events, and the plugin's requests over OBS's
-	// normal websocket. Not from obs_module_unload: obs-websocket may be
-	// gone by then.
-	bool connect(VendorHandler vendor, EventHandler events, std::initializer_list<const char *> vendor_requests);
+	// Starts and stops the events (for the link), and the plugin's
+	// requests over OBS's normal websocket. Not from obs_module_unload:
+	// obs-websocket may be gone by then.
+	bool connect(VendorHandler vendor, EventHandler events, const std::vector<std::string> &vendor_requests);
 	void disconnect();
 
 	link::RequestResult call(const std::string &type, const json &data) override;

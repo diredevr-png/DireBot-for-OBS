@@ -45,4 +45,15 @@ target_sources(
     src/obs/address.cpp
 )
 
+# Multistream: its own outputs to YouTube, Kick and the rest, and the
+# window in OBS where their stream keys are typed (kept locked to the
+# Windows account with crypt32).
+target_sources(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE src/multistream/multistream.cpp src/multistream/places.cpp src/obs/keystore.cpp src/obs/settings-window.cpp
+)
+if(WIN32)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE crypt32)
+endif()
+
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

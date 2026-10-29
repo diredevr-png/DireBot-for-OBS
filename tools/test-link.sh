@@ -12,7 +12,8 @@ cxx="${CXX:-g++}"
 flags=(-std=c++17 -O1 -g -Wall -Wextra -pthread -I"$here/deps" ${EXTRA_FLAGS:-})
 link_src=("$here/src/link/crypto.cpp" "$here/src/link/ws.cpp" "$here/src/link/protocol.cpp")
 
-"$cxx" "${flags[@]}" -o "$out/unit" "$here/tests/unit.cpp" "${link_src[@]}" "$here/src/obs/address.cpp"
+"$cxx" "${flags[@]}" -o "$out/unit" "$here/tests/unit.cpp" "${link_src[@]}" "$here/src/obs/address.cpp" \
+	"$here/src/multistream/places.cpp" "$here/src/obs/keystore.cpp"
 "$out/unit"
 
 "$cxx" "${flags[@]}" -o "$out/harness" "$here/tests/harness.cpp" "$here/src/link/server.cpp" "${link_src[@]}"

@@ -15,6 +15,8 @@ flags=(-O1 -g -fPIC -fvisibility=hidden -Wall -Wextra -Wno-unused-parameter -Wno
 gcc -std=c17 "${flags[@]}" -c "$out/gen/plugin-support.c" -o "$out/plugin-support.o"
 g++ -std=c++17 "${flags[@]}" -shared -o "$out/$name.so" \
 	"$here/src/plugin-main.cpp" "$here"/src/link/{crypto,ws,protocol,server}.cpp \
-	"$here"/src/obs/{websocket,meters,usage,link-file,address}.cpp "$out/plugin-support.o" \
+	"$here"/src/obs/{websocket,meters,usage,link-file,address}.cpp \
+	"$here"/src/multistream/{multistream,places}.cpp "$here"/src/obs/{keystore,settings-window}.cpp \
+	"$out/plugin-support.o" \
 	-lobs -lobs-frontend-api -pthread -Wl,--no-undefined
 echo "Built $out/$name.so"

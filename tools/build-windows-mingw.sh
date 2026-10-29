@@ -47,6 +47,7 @@ sources=(
 	src/plugin-main.cpp
 	src/link/crypto.cpp src/link/ws.cpp src/link/protocol.cpp src/link/server.cpp
 	src/obs/websocket.cpp src/obs/meters.cpp src/obs/usage.cpp src/obs/link-file.cpp src/obs/address.cpp
+	src/multistream/multistream.cpp src/multistream/places.cpp src/obs/keystore.cpp src/obs/settings-window.cpp
 )
 objects=()
 for src in "${sources[@]}"; do
@@ -141,7 +142,7 @@ EOF
 
 dll="$out/$name.dll"
 "${prefix}g++" -shared -o "$dll" "${objects[@]}" "$out/obj/resource.o" "$out/lib/$name.def" \
-	"$out/lib/libobs.dll.a" "$out/lib/libobs-frontend-api.dll.a" -lws2_32 -lbcrypt \
+	"$out/lib/libobs.dll.a" "$out/lib/libobs-frontend-api.dll.a" -lws2_32 -lbcrypt -lcrypt32 \
 	-static-libgcc -static-libstdc++ -static \
 	-Wl,--no-undefined -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va -s
 

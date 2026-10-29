@@ -43,22 +43,23 @@ bool WebSocket::find()
 	return api_version_ >= NEEDED_API;
 }
 
-bool WebSocket::connect(VendorHandler vendor, EventHandler events, std::initializer_list<const char *> vendor_requests)
+bool WebSocket::connect(VendorHandler vendor, EventHandler events, const std::vector<std::string> &vendor_requests)
 {
-	if (api_version_ < NEEDED_API)
+	if (api_version_ < 1)
 		return false;
 	vendor_handler_ = std::move(vendor);
 	event_handler_ = std::move(events);
-	if (!events_on_)
+	if (!events_on_ && api_version_ >= NEEDED_API)
 		events_on_ = obs_websocket_register_event_callback(&WebSocket::on_event, this);
 	// Over OBS's normal websocket too. Not needed for the link, so a
 	// failure here only means those calls say "not found".
 	if (!vendor_)
 		vendor_ = obs_websocket_register_vendor(VendorName);
 	if (vendor_ && registered_.empty()) {
-		for (const char *type : vendor_requests) {
+		for (const std::string &type : vendor_requests) {
 			auto r = std::make_unique<VendorRequest>(VendorRequest{this, type});
-			if (obs_websocket_vendor_register_request(vendor_, type, &WebSocket::on_vendor_request, r.get()))
+			if (obs_websocket_vendor_register_request(vendor_, type.c_str(), &WebSocket::on_vendor_request,
+								  r.get()))
 				registered_.push_back(std::move(r));
 		}
 	}

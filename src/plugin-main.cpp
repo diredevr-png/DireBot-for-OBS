@@ -33,9 +33,13 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // the window (switching scene collection does), so waiting for it any
 // earlier could freeze OBS.
 //
-// Later parts plug in beside these: multistream, vertical, auto-duck and
-// captions each get their own folder under src/, their own vendor
-// requests, and a line in features().
+// Multistream (multistream/): your stream to YouTube, Kick and the rest
+// as well, sent by OBS itself. DireBot asks and presses through vendor
+// requests; stream keys are only ever typed into its window in OBS.
+//
+// Later parts plug in beside these: vertical, auto-duck and captions each
+// get their own folder under src/, their own vendor requests, and a line
+// in features().
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
@@ -52,6 +56,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "link/crypto.hpp"
 #include "link/server.hpp"
+#include "multistream/multistream.hpp"
 #include "obs/link-file.hpp"
 #include "obs/meters.hpp"
 #include "obs/usage.hpp"
@@ -96,17 +101,27 @@ public:
 
 	void post_load()
 	{
-		if (!ws_.find()) {
+		// Multistream works without obs-websocket (from its window in
+		// OBS); DireBot reaches it through the link or OBS's websocket.
+		multistream_.start();
+		link_ok_ = ws_.find();
+		if (!link_ok_)
 			obs_log(LOG_WARNING,
 				"OBS's websocket plugin (obs-websocket) is missing or too old, so DireBot Link is off. "
 				"DireBot can still connect with the websocket password.");
-			return;
+		if (ws_.present()) {
+			std::vector<std::string> requests = {"GetInfo", "GetUsage"};
+			for (const std::string &r : multistream::Multistream::requests())
+				requests.push_back(r);
+			ws_.connect([this](const std::string &type, const json &data,
+					   bool &found) { return vendor_request(type, data, found); },
+				    [this](uint64_t intent, const char *type, const char *data) {
+					    on_event(intent, type, data);
+				    },
+				    requests);
 		}
-		ws_.connect([this](const std::string &type, const json &data,
-				   bool &found) { return vendor_request(type, data, found); },
-			    [this](uint64_t intent, const char *type, const char *data) { on_event(intent, type, data); },
-			    {"GetInfo", "GetUsage"});
-		server_.on_wanted_changed = [this](uint64_t) { poke(); };
+		if (link_ok_)
+			server_.on_wanted_changed = [this](uint64_t) { poke(); };
 		obs_frontend_add_event_callback(&Plugin::on_frontend, this);
 		frontend_ = true;
 		ticker_ = std::thread([this] { run(); });
@@ -131,7 +146,9 @@ private:
 	obs::LinkFile link_file_;
 	obs::Meters meters_;
 	obs::Usage usage_;
+	multistream::Multistream multistream_;
 	bool frontend_ = false;
+	bool link_ok_ = false;
 
 	std::thread ticker_;
 	std::mutex lock_;
@@ -145,6 +162,7 @@ private:
 	static void on_frontend(enum obs_frontend_event event, void *param)
 	{
 		auto *p = static_cast<Plugin *>(param);
+		p->multistream_.on_frontend(event);
 		switch (event) {
 		case OBS_FRONTEND_EVENT_FINISHED_LOADING:
 			p->loaded_ = true;
@@ -212,13 +230,16 @@ private:
 		server_.broadcast(intent, link::event_message(type, intent, data));
 	}
 
-	json vendor_request(const std::string &type, const json &, bool &found)
+	json vendor_request(const std::string &type, const json &data, bool &found)
 	{
 		found = true;
 		if (type == "GetInfo")
 			return info();
 		if (type == "GetUsage")
 			return usage_.report();
+		json answer;
+		if (multistream_.request(type, data, answer))
+			return answer;
 		found = false;
 		return nullptr;
 	}
@@ -230,7 +251,7 @@ private:
 			{"obs", obs_get_version_string()},
 			{"link", server_.running()},
 			{"link_port", server_.port()},
-			{"features", {{"link", true}, {"meters", true}, {"usage", true}}}};
+			{"features", {{"link", true}, {"meters", true}, {"usage", true}, {"multistream", true}}}};
 	}
 
 	// One small thread for everything that runs on a clock: opening the
@@ -246,7 +267,7 @@ private:
 			uint64_t until = next_second;
 			if (meters_.attached())
 				until = std::min(until, next_meters);
-			if (loaded_ && !closing_ && !server_.running() && listen_failures < MAX_LISTEN_TRIES)
+			if (link_ok_ && loaded_ && !closing_ && !server_.running() && listen_failures < MAX_LISTEN_TRIES)
 				until = std::min(until, next_try);
 			const uint64_t before = os_gettime_ns();
 			if (until > before)
@@ -272,7 +293,7 @@ private:
 	{
 		const uint64_t now = os_gettime_ns();
 		const bool closing = closing_;
-		if (loaded_ && !closing && !server_.running() && listen_failures < MAX_LISTEN_TRIES &&
+		if (link_ok_ && loaded_ && !closing && !server_.running() && listen_failures < MAX_LISTEN_TRIES &&
 		    now >= next_try) {
 			// The next try is set first: if this one throws, it isn't
 			// tried again straight away.
@@ -311,6 +332,8 @@ private:
 		if (now >= next_second) {
 			next_second = now + 1000 * MS;
 			usage_.tick();
+			if (!closing)
+				multistream_.tick();
 		}
 	}
 

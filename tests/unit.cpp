@@ -1,12 +1,16 @@
 // Unit tests for the parts of DireBot for OBS that don't need OBS: hashing,
-// the WebSocket handshake and frames, the obs-websocket protocol, and the
-// usage report's "is this address on this PC" check.
+// the WebSocket handshake and frames, the obs-websocket protocol, the
+// usage report's "is this address on this PC" check, and multistream's
+// places (its settings file, and bringing places over from other
+// add-ons).
 // Build and run: tools/test-link.sh (Linux, any C++17 compiler).
 
 #include "../src/link/crypto.hpp"
 #include "../src/link/protocol.hpp"
 #include "../src/link/ws.hpp"
+#include "../src/multistream/places.hpp"
 #include "../src/obs/address.hpp"
+#include "../src/obs/keystore.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -452,6 +456,243 @@ static void test_addresses()
 	CHECK(obs::local_address("http://127.0.0.1:/x", port) && port == 0);
 }
 
+static void test_places_words()
+{
+	using namespace multistream;
+	// Only ever the host: never a path (where a key can be) or a login.
+	CHECK(host_of("rtmps://a.rtmps.youtube.com:443/live2") == "a.rtmps.youtube.com");
+	CHECK(host_of("rtmp://me:secret@Live.Example.com:1935/app/KEY123") == "live.example.com");
+	CHECK(host_of("  rtmp://[::1]:1935/live ") == "::1");
+	CHECK(host_of("live.example.com/app?key=1") == "live.example.com");
+	CHECK(host_of("rtmp://bad host/x").empty());
+	CHECK(host_of("").empty());
+	CHECK(guess_site("YT main", "") == "youtube");
+	CHECK(guess_site("Backup", "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app/") == "kick");
+	CHECK(guess_site("", "rtmp://live.twitch.tv/app") == "twitch");
+	CHECK(guess_site("Kick!", "rtmp://example.com/") == "kick");
+	CHECK(guess_site("Kickstarter", "rtmp://notyoutube.com/") == "other");
+	CHECK(guess_site("Restream", "rtmp://live.restream.io/live") == "other");
+	CHECK(find_site("youtube") && find_site("other") && !find_site("myspace"));
+	CHECK(find_site("kick")->needs_h264 && !find_site("youtube")->needs_h264);
+	CHECK(stop_words(0).empty());
+	CHECK(stop_words(-3).find("stream key") != std::string::npos);
+	CHECK(!stop_words(-99).empty());
+}
+
+static void test_places_tidy()
+{
+	using namespace multistream;
+	Place p;
+	p.name = "  My\tYouTube\n ";
+	p.site = "myspace";
+	p.server = "  rtmp://example.com/live  ";
+	p.key = " abc ";
+	p.video = "huge";
+	p.kbps = 999999;
+	p.height = 123;
+	p.track = 9;
+	p.came_from = "somewhere";
+	tidy(p);
+	CHECK(p.name == "My YouTube");
+	CHECK(p.site == "other");
+	CHECK(p.server == "rtmp://example.com/live");
+	CHECK(p.key == "abc");
+	CHECK(p.video == SAME);
+	CHECK(p.kbps == 50000);
+	CHECK(p.height == 0);
+	CHECK(p.track == 6);
+	CHECK(p.came_from.empty());
+	// Long names are cut between characters, never inside one.
+	Place q;
+	q.name = std::string(39, 'a') + "\xc3\xa9\xc3\xa9";
+	tidy(q);
+	CHECK(q.name == std::string(39, 'a'));
+	q.name = "";
+	q.site = "kick";
+	tidy(q);
+	CHECK(q.name == "Kick");
+	Lighter l;
+	l.kbps = 0;
+	l.height = 7;
+	tidy(l);
+	CHECK(l.kbps == 3500 && l.height == 720);
+
+	Place r;
+	r.name = "YouTube";
+	CHECK(not_ready(r).find("no server") != std::string::npos);
+	r.server = "rtmp://example.com/live";
+	CHECK(not_ready(r).find("no stream key") != std::string::npos);
+	r.locked_key = "dpapi:xyz";
+	CHECK(r.key_lost() && not_ready(r).find("typed in again") != std::string::npos);
+	r.key = "abc";
+	CHECK(!r.key_lost() && r.key_set() && not_ready(r).empty());
+
+	// Two places with one server and one key: the second is the first's twin.
+	Places all;
+	Place a, b, c;
+	a.id = "a";
+	a.server = "rtmp://a.rtmp.youtube.com/live2";
+	a.key = "k1";
+	b = a;
+	b.id = "b";
+	b.server = "rtmp://A.rtmp.youtube.com/live2/";
+	c = a;
+	c.id = "c";
+	c.key = "k2";
+	all.list = {a, b, c};
+	CHECK(twin_of(all, a).empty());
+	CHECK(twin_of(all, b) == "a");
+	CHECK(twin_of(all, c).empty());
+	all.list[0].on = false;
+	CHECK(twin_of(all, all.list[1]).empty());
+}
+
+static void test_places_file()
+{
+	using namespace multistream;
+	auto lock = [](const std::string &key) { return "L:" + key; };
+	auto unlock = [](const std::string &locked, std::string &key) {
+		if (locked.compare(0, 2, "L:") != 0)
+			return false;
+		key = locked.substr(2);
+		return true;
+	};
+	Places a;
+	Place p;
+	p.id = "abcd2345";
+	p.name = "YouTube";
+	p.site = "youtube";
+	p.server = "rtmps://a.rtmps.youtube.com:443/live2";
+	p.key = "SECRET-1";
+	p.video = LIGHTER;
+	p.track = 2;
+	a.list.push_back(p);
+	Place q;
+	q.id = "efgh6789";
+	q.name = "Kick";
+	q.site = "kick";
+	q.server = "rtmps://x/app/";
+	q.locked_key = "dpapi:from-another-pc"; // can't be unlocked here
+	q.on = false;
+	q.video = OWN;
+	q.kbps = 6000;
+	q.height = 1080;
+	a.list.push_back(q);
+	a.lighter.kbps = 2500;
+	a.lighter.height = 540;
+	json file = a.to_file(lock);
+	const std::string text = file.dump();
+	CHECK(text.find("SECRET-1") == text.find("L:SECRET-1") + 2); // only ever locked
+	CHECK(text.find("dpapi:from-another-pc") != std::string::npos); // kept as it was
+	CHECK(file["format"] == 1);
+
+	Places b = Places::from_file(json::parse(text), unlock);
+	CHECK(b.list.size() == 2);
+	CHECK(b.list[0].key == "SECRET-1" && b.list[0].video == LIGHTER && b.list[0].track == 2);
+	CHECK(b.list[1].key.empty() && b.list[1].key_lost() && !b.list[1].on);
+	CHECK(b.list[1].kbps == 6000 && b.list[1].height == 1080 && b.list[1].video == OWN);
+	CHECK(b.lighter.kbps == 2500 && b.lighter.height == 540);
+	CHECK(b.find("efgh6789") == &b.list[1] && !b.find("nope"));
+	// Saved again, a key that can't be unlocked here is never lost.
+	CHECK(b.to_file(lock).dump().find("dpapi:from-another-pc") != std::string::npos);
+
+	// Anything odd is left out or set right, never thrown.
+	json odd = {{"places",
+		     {1, "x", {{"name", "No id"}}, {{"id", "aaaa"}, {"name", 5}, {"kbps", "lots"}, {"on", "yes"}},
+		      {{"id", "aaaa"}, {"name", "Twin"}}}},
+		    {"lighter", "big"}};
+	Places c = Places::from_file(odd, unlock);
+	CHECK(c.list.size() == 1 && c.list[0].id == "aaaa" && c.list[0].name == "Another site");
+	CHECK(c.list[0].kbps == 0 && c.list[0].on);
+	CHECK(c.lighter.kbps == 3500 && c.lighter.height == 720);
+	CHECK(Places::from_file(json(nullptr), unlock).list.empty());
+	CHECK(Places::from_file(json::array(), unlock).list.empty());
+	json many = {{"places", json::array()}};
+	for (int i = 0; i < 20; i++)
+		many["places"].push_back({{"id", "p" + std::to_string(i)}});
+	CHECK(Places::from_file(many, unlock).list.size() == 12);
+
+	// New ids: 8 letters and digits nobody has.
+	int calls = 0;
+	std::string id = b.new_id([&](size_t n) {
+		calls++;
+		return std::string(n, calls == 1 ? '\0' : '\1');
+	});
+	CHECK(id == "aaaaaaaa" && calls == 1);
+	b.list[0].id = "aaaaaaaa";
+	calls = 0;
+	id = b.new_id([&](size_t n) {
+		calls++;
+		return std::string(n, calls == 1 ? '\0' : '\1');
+	});
+	CHECK(id == "bbbbbbbb" && calls == 2);
+	// No random numbers at all: still a free id.
+	CHECK(b.new_id([](size_t) { return std::string(); }) == "place3");
+}
+
+static void test_places_from_other_addons()
+{
+	using namespace multistream;
+	// Multiple RTMP outputs (obs-multi-rtmp.json in the OBS profile).
+	json multi = json::parse(R"({
+		"targets": [
+			{"id": "t1", "name": "YouTube", "sync-start": true, "sync-stop": true,
+			 "service-param": {"server": "rtmp://a.rtmp.youtube.com/live2", "key": "YT-KEY"},
+			 "video-config": "", "audio-config": "a1"},
+			{"id": "t2", "name": "Backup", "sync-start": false,
+			 "service-param": {"server": "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app/", "key": "KICK-KEY"},
+			 "video-config": "v1"},
+			"junk", {"name": "Empty"}
+		],
+		"video_configs": [{"id": "v1", "encoder": "obs_x264", "height": 720}],
+		"audio_configs": [{"id": "a1", "encoder": "ffmpeg_aac", "mixerId": 1}]
+	})");
+	std::vector<Place> got = from_multi_rtmp(multi);
+	CHECK(got.size() == 3);
+	CHECK(got[0].name == "YouTube" && got[0].site == "youtube" && got[0].key == "YT-KEY");
+	CHECK(got[0].with_stream && got[0].stop_with_stream && got[0].video == SAME && got[0].track == 2);
+	CHECK(!got[0].on && got[0].came_from == "multi_rtmp"); // never twice at once
+	CHECK(got[1].site == "kick" && got[1].video == LIGHTER && !got[1].with_stream && got[1].track == 0);
+	CHECK(got[2].name == "Empty" && got[2].key.empty());
+	CHECK(from_multi_rtmp(json::parse("{}")).empty());
+	CHECK(from_multi_rtmp(json(nullptr)).empty());
+
+	// Aitum Multistream (its config.json, every profile).
+	json aitum = json::parse(R"({
+		"profiles": [
+			{"name": "Gaming", "outputs": [
+				{"name": "TikTok", "stream_server": "rtmp://push.tiktokcdn.com/live/", "stream_key": "TT-KEY", "advanced": true},
+				{"name": "", "stream_server": "x"}
+			]},
+			{"name": "IRL", "outputs": [{"name": "YouTube", "stream_server": "rtmp://y/", "stream_key": "K"}]}
+		]
+	})");
+	got = from_aitum(aitum, "Gaming");
+	CHECK(got.size() == 1 && got[0].site == "tiktok" && got[0].key == "TT-KEY" && got[0].video == LIGHTER);
+	CHECK(!got[0].on && !got[0].with_stream && got[0].came_from == "aitum");
+	CHECK(from_aitum(aitum, "Untitled").empty()); // which profile isn't known: none
+	json one = json::parse(R"({"profiles": [{"name": "Old", "outputs": [{"name": "Kick", "stream_server": "s", "stream_key": "k"}]}]})");
+	CHECK(from_aitum(one, "Untitled").size() == 1); // only one: that one
+}
+
+static void test_keystore()
+{
+	std::string key;
+	CHECK(obs::keystore::lock("").empty());
+	CHECK(obs::keystore::unlock("", key) && key.empty());
+#ifndef _WIN32
+	const std::string locked = obs::keystore::lock("live_123");
+	CHECK(locked == "plain:live_123");
+	CHECK(obs::keystore::unlock(locked, key) && key == "live_123");
+	// Locked on Windows: can't be opened here.
+	CHECK(!obs::keystore::unlock("dpapi:AAAA", key) && key.empty());
+#endif
+	CHECK(!obs::keystore::unlock("something else", key));
+	std::string secret = "wipe me";
+	obs::keystore::wipe(secret);
+	CHECK(secret.empty());
+}
+
 int main()
 {
 	test_hashes();
@@ -459,6 +700,11 @@ int main()
 	test_frames();
 	test_protocol();
 	test_addresses();
+	test_places_words();
+	test_places_tidy();
+	test_places_file();
+	test_places_from_other_addons();
+	test_keystore();
 	std::printf("%d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;
 }
