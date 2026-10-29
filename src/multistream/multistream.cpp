@@ -429,6 +429,7 @@ void Multistream::load()
 {
 	const std::string dir = profile_dir();
 	file_ = dir.empty() ? std::string() : dir + "/" + FILE_NAME;
+	profile_ = profile_name();
 	places_ = Places();
 	file_problem_.clear();
 	generation_++;
@@ -478,6 +479,14 @@ void Multistream::save()
 		obs_log(LOG_WARNING, "Multistream: couldn't save this profile's places.");
 }
 
+// Leaving this profile: its places are saved to its own file, and stop.
+void Multistream::leave()
+{
+	leaving_ = true;
+	save();
+	unload(true);
+}
+
 // Every place stops (OBS closing, or another profile), and the encoders
 // go.
 void Multistream::unload(bool force)
@@ -522,12 +531,17 @@ void Multistream::on_frontend(enum obs_frontend_event event)
 		break;
 	case OBS_FRONTEND_EVENT_PROFILE_CHANGING: {
 		std::lock_guard<std::mutex> l(lock_);
-		save();
-		unload(true);
+		leave();
 		break;
 	}
 	case OBS_FRONTEND_EVENT_PROFILE_CHANGED: {
 		std::lock_guard<std::mutex> l(lock_);
+		// From OBS 31 on, a new, duplicated or renamed profile comes with
+		// no "changing" first: the last profile's places are saved and
+		// stopped now (its file is still the one they came from).
+		if (!leaving_)
+			leave();
+		leaving_ = false;
 		load();
 		break;
 	}
@@ -956,7 +970,7 @@ json Multistream::report()
 		sites_out.push_back({{"key", s.key}, {"label", s.label}, {"where", s.where}});
 	return {{"ok", true},
 		{"api", API},
-		{"profile", profile_name()},
+		{"profile", profile_},
 		{"file_problem", file_problem_},
 		{"window_open", window_.is_open()},
 		{"main", m},

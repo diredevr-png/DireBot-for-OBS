@@ -82,8 +82,8 @@ class Listener:
     """A pretend streaming site: ffmpeg taking one RTMP stream into a
     file."""
 
-    def __init__(self, folder, name):
-        self.port = free_port()
+    def __init__(self, folder, name, port=None):
+        self.port = port or free_port()
         self.server = "rtmp://127.0.0.1:%d/live" % self.port
         self.file = os.path.join(folder, name + ".flv")
         self.log = open(os.path.join(folder, name + ".log"), "w")
@@ -91,6 +91,17 @@ class Listener:
             ["ffmpeg", "-nostdin", "-loglevel", "error", "-listen", "1",
              "-i", self.server + "/x", "-c", "copy", "-y", self.file],
             stdout=self.log, stderr=subprocess.STDOUT)
+
+    def listening(self):
+        """ffmpeg is waiting for the stream (without connecting: it takes
+        one connection only)."""
+        try:
+            rows = open("/proc/net/tcp").read().splitlines()[1:]
+        except OSError:
+            return True
+        port = ":%04X" % self.port
+        return any(r.split()[1].endswith(port) and r.split()[3] == "0A"
+                   for r in rows)
 
     def finish(self, seconds=15):
         try:
@@ -549,6 +560,33 @@ def test_another_profile_with_a_damaged_file(obs):
     # Kept beside, never written over.
     assert open(os.path.join(folder, "direbot-multistream.json.damaged")
                 ).read() == "{not json"
+    obs.profile(PROFILE)
+    assert len(obs.vendor("GetMultistream")["places"]) == 7
+
+
+def test_a_new_profile_saves_and_stops_this_ones_places(obs, tmp_path):
+    # From OBS 31 on, OBS makes a new profile without first saying it's
+    # leaving this one.
+    site = Listener(str(tmp_path), "again", obs.one.port)
+    assert wait_for(site.listening, 10)
+    assert obs.vendor("MultistreamStart", {"id": "lighter1"})["ok"] is True
+    assert wait_for(lambda: place(obs.vendor("GetMultistream"),
+                                  "Renamed")["state"] == "sending", 20)
+    # Changed a moment before.
+    obs.vendor("MultistreamSet", {"id": "same0001",
+                                  "changes": {"name": "Same again"}})
+    obs.profile("DireBotC", create=True)
+    assert obs.vendor("GetMultistream")["places"] == []
+
+    def ours_sending():
+        return [o["outputName"] for o in obs.c.get_output_list().outputs
+                if o["outputName"].startswith("direbot_multistream_")
+                and o["outputActive"]]
+    assert wait_for(lambda: not ours_sending(), 10), ours_sending()
+    site.finish()
+    saved = json.load(open(os.path.join(obs.profile_dir(PROFILE),
+                                        "direbot-multistream.json")))
+    assert "Same again" in [p["name"] for p in saved["places"]]
     obs.profile(PROFILE)
     assert len(obs.vendor("GetMultistream")["places"]) == 7
 

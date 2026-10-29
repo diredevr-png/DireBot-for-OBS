@@ -93,10 +93,14 @@ private:
 	std::mutex lock_;
 	Places places_;
 	std::string file_;         // this profile's settings file
+	std::string profile_;      // and its name (OBS's own changes first)
 	std::string file_problem_; // "" or "damaged"
 	bool loaded_ = false;
 	bool dirty_ = false;
 	bool closing_ = false;
+	// OBS said it's leaving this profile (it doesn't, from OBS 31 on, when
+	// a new profile is made, duplicated or renamed: it just changes).
+	bool leaving_ = false;
 	// Places DireBot just added, not in the window's settings yet.
 	std::set<std::string> pending_;
 	// Keys as they were when the window opened, for its Cancel.
@@ -118,6 +122,7 @@ private:
 	// Under lock_ unless said.
 	void load();
 	void save();
+	void leave();
 	void unload(bool force);
 	std::string start_place(Place &p, bool by_hand);
 	bool stop_place(const std::string &id, bool now);
