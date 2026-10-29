@@ -404,9 +404,10 @@ def test_closing_obs_while_direbot_is_connected(obs):
     assert code == 0
     log = obs.log()
     assert "[direbot-for-obs] unloaded" in log
-    # Its own lines only: nothing it did made OBS complain (obs-websocket
-    # itself makes one of these on the way out).
-    assert log.count("Tried to call obs_frontend_remove_event_callback") <= 1
+    # Its own lines only: nothing it did made OBS complain (OBS makes one
+    # or two of these on the way out by itself: obs-websocket's, and on
+    # OBS 32 another).
+    assert log.count("Tried to call obs_frontend_remove_event_callback") <= 2
     assert "Number of memory leaks: 0" in log
     # The link file goes with OBS.
     assert not os.path.exists(obs.link_path)

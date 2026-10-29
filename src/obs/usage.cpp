@@ -216,6 +216,18 @@ void release_all(std::vector<obs_source_t *> &list)
 	list.clear();
 }
 
+// Only Direct3D (Windows) can time the GPU. On OpenGL, OBS's profiler
+// still makes a GPU timer for every source every frame and can't let go
+// of them (OBS 31-32: they're freed outside the graphics context), so
+// asking there gives no numbers and loses memory.
+bool can_time_gpu()
+{
+	obs_enter_graphics();
+	const bool d3d = gs_get_device_type() == GS_DEVICE_DIRECT3D_11;
+	obs_leave_graphics();
+	return d3d;
+}
+
 } // namespace
 
 Usage::~Usage()
@@ -241,7 +253,7 @@ void Usage::turn_on()
 	ours_ = !already;
 	if (ours_) {
 		source_profiler_enable(true);
-		source_profiler_gpu_enable(true);
+		source_profiler_gpu_enable(can_time_gpu());
 	}
 	on_ = true;
 	since_ = os_gettime_ns();
