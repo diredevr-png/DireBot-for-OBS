@@ -1,0 +1,60 @@
+# Builds DireBot for OBS for Windows, and tests it - in a real OBS too
+# (Linux, on a pretend screen). The Windows zip comes out as a download
+# on the run's page. It isn't signed here: DireBot only installs a copy
+# signed by DireBot's own publisher, so a release's zip is signed first
+# (DireBot's tools/sign_obs_plugin.py) and then added to the release.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (inside a real OBS)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OBS and the test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -t noble-backports obs-studio libobs-dev
+          sudo apt-get install -y xvfb g++
+          python3 -m pip install --user --break-system-packages pytest obsws-python websocket-client
+      - name: Link tests
+        run: BUILD_DIR="$RUNNER_TEMP/link" tools/test-link.sh
+      - name: Inside OBS
+        run: |
+          BUILD_DIR="$RUNNER_TEMP/linux" tools/build-linux-test.sh
+          DIREBOT_OBS_PLUGIN="$RUNNER_TEMP/linux/direbot-for-obs.so" python3 -m pytest -q tests/test_real_obs.py
+
+  windows:
+    name: Build for Windows
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: pwsh
+        run: .github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+      - name: Pack
+        shell: pwsh
+        run: .github/scripts/Package-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+      - name: Fingerprint
+        shell: pwsh
+        run: |
+          Get-ChildItem release/*.zip | ForEach-Object {
+            "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Out-File -Encoding ascii release/SHA256SUMS.txt
+          Get-Content release/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: direbot-for-obs-windows-x64-${{ github.sha }}
+          path: |
+            release/*.zip
+            release/SHA256SUMS.txt
