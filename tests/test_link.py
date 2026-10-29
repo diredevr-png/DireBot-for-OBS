@@ -263,8 +263,16 @@ def test_a_big_message_before_logging_in_is_turned_away(link):
     # Without the password nobody gets OBS to hold a big message.
     ws = raw(link)
     ws.recv()                      # hello
-    ws.send("x" * (65 * 1024))
-    assert closed_with(ws) == 1009
+    # Turned away with 1009 - or, when the server closes while the rest is
+    # still being sent, a reset that can overtake the close frame.
+    try:
+        ws.send("x" * (65 * 1024))
+        assert closed_with(ws) == 1009
+    except (ConnectionResetError, BrokenPipeError):
+        pass
+    with pytest.raises((OSError, websocket.WebSocketException)):
+        ws.send("again")
+        ws.recv()
     # Once logged in, big ones are fine.
     ws2 = raw(link)
     login(ws2)
