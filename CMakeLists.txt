@@ -28,6 +28,8 @@ if(WIN32)
   target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
   # Sockets for the link, and Windows' random numbers for its password.
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32 bcrypt)
+  # Windows' data protection, which locks stream keys to the Windows account.
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE crypt32)
 endif()
 
 target_sources(
@@ -43,6 +45,20 @@ target_sources(
     src/obs/usage.cpp
     src/obs/link-file.cpp
     src/obs/address.cpp
+    src/obs/keystore.cpp
+    src/obs/settings-window.cpp
+)
+
+# The vertical picture (src/vertical).
+target_sources(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE
+    src/vertical/rules.cpp
+    src/vertical/options.cpp
+    src/vertical/canvas.cpp
+    src/vertical/outputs.cpp
+    src/vertical/settings.cpp
+    src/vertical/vertical.cpp
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

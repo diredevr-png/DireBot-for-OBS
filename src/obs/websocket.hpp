@@ -30,7 +30,6 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <cstdint>
 #include <functional>
-#include <initializer_list>
 #include <memory>
 #include <string>
 #include <vector>
@@ -61,8 +60,12 @@ public:
 	// Starts and stops the events, and the plugin's requests over OBS's
 	// normal websocket. Not from obs_module_unload: obs-websocket may be
 	// gone by then.
-	bool connect(VendorHandler vendor, EventHandler events, std::initializer_list<const char *> vendor_requests);
+	bool connect(VendorHandler vendor, EventHandler events, const std::vector<std::string> &vendor_requests);
 	void disconnect();
+
+	// A "direbot" vendor event (obs-websocket's VendorEvent), to everyone
+	// listening for vendor events - DireBot over the link too. Any thread.
+	bool emit(const std::string &type, const json &data);
 
 	link::RequestResult call(const std::string &type, const json &data) override;
 

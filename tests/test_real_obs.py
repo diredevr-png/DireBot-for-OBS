@@ -70,21 +70,30 @@ def sine_wav(path, seconds=2, rate=48000, hz=440, level=0.5):
 
 
 class Obs:
-    """One OBS, from start to a proper close."""
+    """One OBS, from start to a proper close. `home`: start again with the
+    settings of one that closed (its scene collection, profile...)."""
 
-    def __init__(self):
-        self.home = tempfile.mkdtemp(prefix="direbot-obs-home-")
+    def __init__(self, home=None):
+        self.home = home or tempfile.mkdtemp(prefix="direbot-obs-home-")
         config = os.path.join(self.home, ".config", "obs-studio")
+        self.config = config
         plugin = os.path.join(config, "plugins", "direbot-for-obs")
-        os.makedirs(os.path.join(plugin, "bin", "64bit"))
+        os.makedirs(os.path.join(plugin, "bin", "64bit"), exist_ok=True)
         shutil.copy(PLUGIN, os.path.join(plugin, "bin", "64bit"))
         shutil.copytree(os.path.join(HERE, "data"),
-                        os.path.join(plugin, "data"))
+                        os.path.join(plugin, "data"), dirs_exist_ok=True)
         # OBS's normal websocket too, to check the plugin's requests work
         # over it as well.
         self.ws_port = free_port()
+        # Not a first start: OBS's first-run setup wizard would hold its
+        # outputs (no recording or streaming while it's open).
+        for ini in ("user.ini", "global.ini"):    # OBS 31+, OBS 30
+            path = os.path.join(config, ini)
+            if not os.path.exists(path):
+                with open(path, "w") as f:
+                    f.write("[General]\nFirstRun=true\n")
         ws = os.path.join(config, "plugin_config", "obs-websocket")
-        os.makedirs(ws)
+        os.makedirs(ws, exist_ok=True)
         with open(os.path.join(ws, "config.json"), "w") as f:
             json.dump({"alerts_enabled": False, "auth_required": False,
                        "first_load": False, "server_enabled": True,
@@ -127,7 +136,10 @@ class Obs:
         # for its services list), and adding a scene waits for the window.
         warm = obsws.ReqClient(host="127.0.0.1", port=self.link["port"],
                                password=self.link["password"], timeout=60)
-        warm.create_scene("Warm up")
+        try:
+            warm.create_scene("Warm up")
+        except obsws.error.OBSSDKRequestError:
+            pass                # there from last time
         warm.disconnect()
 
     def log(self):
@@ -280,7 +292,7 @@ def test_the_plugins_own_requests_over_the_link_and_obs_websocket(obs):
         assert info["plugin"] == "0.1.0" and info["api"] == 1
         assert info["link"] is True and info["link_port"] == obs.link["port"]
         assert info["features"] == {"link": True, "meters": True,
-                                    "usage": True}
+                                    "usage": True, "vertical": True}
         usage = vendor(c, "GetUsage")
         assert usage["fps"] > 0 and usage["frame_budget_ms"] > 0
         assert usage["memory_mb"] > 10

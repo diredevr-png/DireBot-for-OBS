@@ -43,7 +43,7 @@ bool WebSocket::find()
 	return api_version_ >= NEEDED_API;
 }
 
-bool WebSocket::connect(VendorHandler vendor, EventHandler events, std::initializer_list<const char *> vendor_requests)
+bool WebSocket::connect(VendorHandler vendor, EventHandler events, const std::vector<std::string> &vendor_requests)
 {
 	if (api_version_ < NEEDED_API)
 		return false;
@@ -56,9 +56,10 @@ bool WebSocket::connect(VendorHandler vendor, EventHandler events, std::initiali
 	if (!vendor_)
 		vendor_ = obs_websocket_register_vendor(VendorName);
 	if (vendor_ && registered_.empty()) {
-		for (const char *type : vendor_requests) {
+		for (const std::string &type : vendor_requests) {
 			auto r = std::make_unique<VendorRequest>(VendorRequest{this, type});
-			if (obs_websocket_vendor_register_request(vendor_, type, &WebSocket::on_vendor_request, r.get()))
+			if (obs_websocket_vendor_register_request(vendor_, type.c_str(), &WebSocket::on_vendor_request,
+								  r.get()))
 				registered_.push_back(std::move(r));
 		}
 	}
@@ -76,6 +77,18 @@ void WebSocket::disconnect()
 		for (auto &r : registered_)
 			obs_websocket_vendor_unregister_request(vendor_, r->type.c_str());
 	registered_.clear();
+}
+
+bool WebSocket::emit(const std::string &type, const json &data)
+{
+	if (!vendor_ || !events_on_)
+		return false;
+	obs_data_t *event = obs_data_create_from_json(data.is_object() ? link::to_text(data).c_str() : "{}");
+	if (!event)
+		return false;
+	const bool sent = obs_websocket_vendor_emit_event(vendor_, type.c_str(), event);
+	obs_data_release(event);
+	return sent;
 }
 
 link::RequestResult WebSocket::call(const std::string &type, const json &data)
