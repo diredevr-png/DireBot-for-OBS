@@ -41,6 +41,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // as well, sent by OBS itself. DireBot asks and presses through vendor
 // requests; stream keys are only ever typed into their windows in OBS.
 //
+// "DireBot Follow Cam" (follow/): a source that keeps you in the middle
+// of a crop of your camera, for the tall picture's scenes.
+//
 // Later parts plug in beside these: each gets its own folder under src/,
 // its own vendor requests, and a line in features().
 
@@ -59,6 +62,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "link/crypto.hpp"
 #include "link/server.hpp"
+#include "follow/follow-cam.hpp"
 #include "multistream/multistream.hpp"
 #include "obs/link-file.hpp"
 #include "obs/meters.hpp"
@@ -278,7 +282,8 @@ private:
 			{"link", server_.running()},
 			{"link_port", server_.port()},
 			{"features",
-			 {{"link", true}, {"meters", true}, {"usage", true}, {"vertical", true}, {"multistream", true}}}};
+			 {{"link", true}, {"meters", true}, {"usage", true}, {"vertical", true}, {"multistream", true},
+			  {"follow_cam", true}}}};
 	}
 
 	// One small thread for everything that runs on a clock: opening the
@@ -413,6 +418,7 @@ Plugin *plugin = nullptr;
 
 bool obs_module_load(void)
 {
+	direbot::follow::register_source();
 	obs_log(LOG_INFO, "version %s loaded", PLUGIN_VERSION);
 	return true;
 }

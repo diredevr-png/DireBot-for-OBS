@@ -293,7 +293,7 @@ def test_the_plugins_own_requests_over_the_link_and_obs_websocket(obs):
         assert info["link"] is True and info["link_port"] == obs.link["port"]
         assert info["features"] == {"link": True, "meters": True,
                                     "usage": True, "vertical": True,
-                                    "multistream": True}
+                                    "multistream": True, "follow_cam": True}
         usage = vendor(c, "GetUsage")
         assert usage["fps"] > 0 and usage["frame_budget_ms"] > 0
         assert usage["memory_mb"] > 10

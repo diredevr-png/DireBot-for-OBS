@@ -61,6 +61,9 @@ target_sources(
     src/vertical/vertical.cpp
 )
 
+# "Follow me": a crop of your camera that keeps you in the middle.
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/follow/tracker.cpp src/follow/follow-cam.cpp)
+
 # Multistream: its own outputs to YouTube, Kick and the rest (their stream
 # keys are typed into its window in OBS, locked like the vertical ones).
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/multistream/multistream.cpp src/multistream/places.cpp)
