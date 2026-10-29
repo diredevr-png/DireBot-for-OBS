@@ -47,6 +47,10 @@ inline std::string to_text(const json &j)
 	return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
+// What a stream key (or a custom server's password or token) reads as
+// through the link: GetStreamServiceSettings never hands the real one out.
+constexpr const char *HIDDEN_SECRET = "********";
+
 // obs-websocket's close codes (WebSocketCloseCode).
 namespace close_code {
 enum : uint16_t {

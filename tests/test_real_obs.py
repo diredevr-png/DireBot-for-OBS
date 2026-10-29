@@ -307,6 +307,36 @@ def test_the_plugins_own_requests_over_the_link_and_obs_websocket(obs):
         plain.disconnect()
 
 
+def test_the_stream_key_never_comes_back_through_the_link(obs):
+    # Whoever reads link.json can put a key in, but never read one back.
+    c = obs.client()
+    try:
+        c.send("SetStreamServiceSettings", {
+            "streamServiceType": "rtmp_custom",
+            "streamServiceSettings": {"server": "rtmp://127.0.0.1/live",
+                                      "key": "PROBE-KEY-1234"}})
+        settings = c.send("GetStreamServiceSettings",
+                          raw=True)["streamServiceSettings"]
+        assert settings["key"] == "********"
+        assert settings["server"] == "rtmp://127.0.0.1/live"
+        # Sent back as read: OBS keeps the real key, not the stars.
+        settings["server"] = "rtmp://127.0.0.1/other"
+        c.send("SetStreamServiceSettings", {
+            "streamServiceType": "rtmp_custom",
+            "streamServiceSettings": settings})
+    finally:
+        c.disconnect()
+    plain = obsws.ReqClient(host="127.0.0.1", port=obs.ws_port, password="",
+                            timeout=5)
+    try:
+        real = plain.send("GetStreamServiceSettings",
+                          raw=True)["streamServiceSettings"]
+        assert real["key"] == "PROBE-KEY-1234"
+        assert real["server"] == "rtmp://127.0.0.1/other"
+    finally:
+        plain.disconnect()
+
+
 def test_a_browser_overlays_address_is_never_reported(obs):
     c = obs.client()
     try:

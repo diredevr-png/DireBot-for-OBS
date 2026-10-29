@@ -225,6 +225,7 @@ static void test_frames()
 
 struct FakeBackend : link::Backend {
 	int calls = 0;
+	link::json last_set;
 	link::RequestResult call(const std::string &type, const link::json &data) override
 	{
 		calls++;
@@ -234,6 +235,16 @@ struct FakeBackend : link::Backend {
 			return {link::status::Success, "", data};
 		if (type == "SetThing")
 			return {link::status::Success, "", nullptr};
+		if (type == "GetStreamServiceSettings")
+			return {link::status::Success,
+				"",
+				{{"streamServiceType", "rtmp_common"},
+				 {"streamServiceSettings",
+				  {{"service", "Twitch"}, {"server", "auto"}, {"key", "live_123_secret"}, {"password", ""}}}}};
+		if (type == "SetStreamServiceSettings") {
+			last_set = data;
+			return {link::status::Success, "", nullptr};
+		}
 		return {link::status::UnknownRequestType, "Your request type is not valid.", nullptr};
 	}
 };
@@ -386,6 +397,39 @@ static void test_protocol()
 	}
 	CHECK(!threw);
 	CHECK(reply.find("Mic \xef\xbf\xbd") != std::string::npos);
+
+	// The stream key never comes back through the link, alone or in a
+	// batch (where a variable could pass it on); an empty one stays empty,
+	// so "is a key set?" still has an answer.
+	FakeBackend keys;
+	json got = parse(s.run(6, json{{"requestType", "GetStreamServiceSettings"}, {"requestId", "k"}}, keys, going));
+	json settings = got["d"]["responseData"]["streamServiceSettings"];
+	CHECK(settings["key"] == link::HIDDEN_SECRET && settings["password"] == "" && settings["service"] == "Twitch");
+	reply = s.run(8,
+		      json{{"requestId", "kb"},
+			   {"requests",
+			    {{{"requestType", "GetStreamServiceSettings"},
+			      {"outputVariables", {{"k", "streamServiceSettings"}}}},
+			     {{"requestType", "Echo"}, {"inputVariables", {{"x", "k"}}}}}}},
+		      keys, going);
+	CHECK(reply.find("live_123_secret") == std::string::npos && reply.find("Twitch") != std::string::npos);
+	// Sent back as read: the stars are left out, so OBS keeps the real key.
+	settings["server"] = "rtmp://live.twitch.tv/app";
+	s.run(6,
+	      json{{"requestType", "SetStreamServiceSettings"},
+		   {"requestId", "s"},
+		   {"requestData", {{"streamServiceType", "rtmp_common"}, {"streamServiceSettings", settings}}}},
+	      keys, going);
+	CHECK(!keys.last_set["streamServiceSettings"].contains("key") &&
+	      keys.last_set["streamServiceSettings"]["server"] == "rtmp://live.twitch.tv/app");
+	// A new key goes in as it is.
+	s.run(6,
+	      json{{"requestType", "SetStreamServiceSettings"},
+		   {"requestId", "n"},
+		   {"requestData",
+		    {{"streamServiceType", "rtmp_common"}, {"streamServiceSettings", {{"key", "live_new"}}}}}},
+	      keys, going);
+	CHECK(keys.last_set["streamServiceSettings"]["key"] == "live_new");
 }
 
 static void test_addresses()

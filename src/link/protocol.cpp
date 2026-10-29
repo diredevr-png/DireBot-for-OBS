@@ -55,11 +55,48 @@ json status_json(const RequestResult &r)
 	return s;
 }
 
+// The secrets in OBS's stream settings: the stream key, and a custom
+// server's password or token. DireBot only ever needs to know one is set,
+// so the link never hands them out - whoever has the link file can still
+// put a key in, but can't read yours back.
+const char *const STREAM_SECRETS[] = {"key", "password", "bearer_token"};
+
+void hide_stream_secrets(RequestResult &r)
+{
+	if (!r.data.is_object() || !r.data.contains("streamServiceSettings"))
+		return;
+	json &settings = r.data["streamServiceSettings"];
+	if (!settings.is_object())
+		return;
+	for (const char *name : STREAM_SECRETS)
+		if (settings.contains(name) && settings[name].is_string() && !settings[name].get<std::string>().empty())
+			settings[name] = HIDDEN_SECRET;
+}
+
+// Settings read through the link and sent back as they were: a hidden
+// secret is left out, so OBS keeps the real one instead of the stars.
+json keep_stream_secrets(const json &data)
+{
+	if (!data.is_object() || !data.contains("streamServiceSettings") ||
+	    !data["streamServiceSettings"].is_object())
+		return data;
+	json out = data;
+	for (const char *name : STREAM_SECRETS)
+		if (out["streamServiceSettings"].contains(name) && out["streamServiceSettings"][name] == HIDDEN_SECRET)
+			out["streamServiceSettings"].erase(name);
+	return out;
+}
+
 RequestResult call_one(const std::string &type, const json &data, Backend &backend)
 {
 	if (type.empty())
 		return {status::MissingRequestType, "Your request is missing a `requestType`.", nullptr};
-	return backend.call(type, data);
+	if (type == "SetStreamServiceSettings")
+		return backend.call(type, keep_stream_secrets(data));
+	RequestResult r = backend.call(type, data);
+	if (type == "GetStreamServiceSettings")
+		hide_stream_secrets(r);
+	return r;
 }
 
 // "Sleep" only means something inside a batch, so the batch does it here.
