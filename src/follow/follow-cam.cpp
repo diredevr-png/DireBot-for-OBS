@@ -40,6 +40,9 @@ namespace {
 
 // How often it looks for you, in seconds.
 constexpr float LOOK_EVERY = 0.1f;
+// Not looked for this long (not shown, or not following): what it saw
+// last is too old to compare with.
+constexpr float STALE = 0.5f;
 // How long a lost camera (renamed away, removed) waits between looks for
 // it again, in seconds.
 constexpr float FIND_EVERY = 1.0f;
@@ -160,7 +163,7 @@ struct FollowCam {
 			stage = gs_stagesurface_create(sw, sh, GS_RGBA);
 			stage_w = sw;
 			stage_h = sh;
-			tracker.reset();
+			tracker.forget();
 		}
 		if (!small)
 			small = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
@@ -197,6 +200,10 @@ struct FollowCam {
 		const Rect r = crop((int)cw, (int)ch, (int)w, (int)h, zoom, smoother.now());
 		window = r.w / (float)cw;
 		if (following && since_look >= LOOK_EVERY) {
+			if (since_look > STALE) {
+				staged = false;
+				tracker.forget();
+			}
 			since_look = 0;
 			look(cam, cw, ch);
 		}

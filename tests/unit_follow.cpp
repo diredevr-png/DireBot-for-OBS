@@ -177,6 +177,23 @@ static void test_you_walk_over_and_stop()
 	CHECK(near(s.x, (100 + 6) / 128.0f, 0.03f));
 }
 
+static void test_forgetting_keeps_where_you_were()
+{
+	Tracker t;
+	Camera c;
+	c.people.push_back({90, 18, 16, 44, 3});
+	Spot s = feed(t, c, 15);
+	CHECK(s.seen && near(s.x, (90 + 8 + 1.5f) / 128.0f, 0.04f));
+	// Not shown for a while, and you moved meanwhile: the old picture
+	// isn't compared with the new one, and it starts from where you were.
+	t.forget();
+	c.people[0].x = 30;
+	s = feed(t, c, 1);
+	CHECK(!s.seen && near(s.x, (90 + 8 + 1.5f) / 128.0f, 0.04f));
+	s = feed(t, c, 12);
+	CHECK(s.seen && near(s.x, (30 + 8 + 1.5f) / 128.0f, 0.04f));
+}
+
 static void test_the_lights_change()
 {
 	Tracker t;
@@ -245,6 +262,7 @@ int main()
 	test_a_pet_behind_you_doesnt_pull_it_away();
 	test_you_walk_across();
 	test_you_walk_over_and_stop();
+	test_forgetting_keeps_where_you_were();
 	test_the_lights_change();
 	test_grain_alone_says_nothing();
 	test_smoother();

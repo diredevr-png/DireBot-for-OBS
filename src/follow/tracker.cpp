@@ -93,14 +93,11 @@ Rect crop(int src_w, int src_h, int out_w, int out_h, float zoom, Spot spot)
 	return r;
 }
 
-void Tracker::reset()
+void Tracker::forget()
 {
-	prev_.clear();
-	trace_.clear();
-	weight_.clear();
 	w_ = h_ = 0;
-	spot_ = Spot();
 	away_ = 0;
+	spot_.seen = false;
 }
 
 Spot Tracker::update(const uint8_t *grey, int w, int h, float window)
@@ -141,15 +138,16 @@ Spot Tracker::update(const uint8_t *grey, int w, int h, float window)
 		t *= t;
 		weight_[i] = t * t;
 	}
-	std::vector<float> cols(w, 0.0f);
+	std::vector<float> &cols = cols_;
+	cols.assign(w, 0.0f);
 	for (int y = 0; y < h; y++) {
 		const float *line = &weight_[(size_t)y * w];
 		for (int x = 0; x < w; x++)
 			cols[x] += line[x];
 	}
-	std::vector<float> sorted(cols);
-	std::nth_element(sorted.begin(), sorted.begin() + w / 2, sorted.end());
-	const float grain = sorted[w / 2] * GRAIN + 1.0f;
+	sorted_.assign(cols.begin(), cols.end());
+	std::nth_element(sorted_.begin(), sorted_.begin() + w / 2, sorted_.end());
+	const float grain = sorted_[w / 2] * GRAIN + 1.0f;
 	float total = 0;
 	for (float &c : cols) {
 		c = std::max(0.0f, c - grain);
@@ -196,7 +194,8 @@ Spot Tracker::update(const uint8_t *grey, int w, int h, float window)
 
 	// Your head: near the top of the movement under the crop.
 	const int lo = std::max(0, (int)std::lround(x) - half), hi = std::min(w, (int)std::lround(x) + half);
-	std::vector<float> rows(h, 0.0f);
+	std::vector<float> &rows = rows_;
+	rows.assign(h, 0.0f);
 	float rows_total = 0;
 	for (int y = 0; y < h; y++) {
 		const float *line = &trace_[(size_t)y * w];

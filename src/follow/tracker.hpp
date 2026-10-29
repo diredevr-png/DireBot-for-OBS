@@ -67,12 +67,15 @@ public:
 	// is, as a share of the picture's width. Returns where you are.
 	Spot update(const uint8_t *grey, int w, int h, float window);
 	Spot spot() const { return spot_; }
-	void reset();
+	// Forgets the pictures (after a while not looking, or a new size) but
+	// not where you were: the next look starts afresh from there.
+	void forget();
 
 private:
 	std::vector<uint8_t> prev_;
 	std::vector<float> trace_; // where it moved lately, fading
 	std::vector<float> weight_; // the trace, the newest counting most
+	std::vector<float> cols_, sorted_, rows_; // kept, so no look allocates
 	int w_ = 0, h_ = 0;
 	Spot spot_;
 	int away_ = 0; // updates in a row with the movement elsewhere

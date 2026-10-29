@@ -121,6 +121,16 @@ def test_it_keeps_you_in_the_picture(run):
         assert got["inputSettings"]["source"] == "My camera"
         time.sleep(1.5)
         assert white_share(c, "Follow Cam")[0] > 0.03
+        # Hidden a while and shown again: it starts from where you were.
+        item = send(c, "GetSceneItemId", {
+            "sceneName": SCENE, "sourceName": "Follow Cam"})["sceneItemId"]
+        for on in (False, True):
+            send(c, "SetSceneItemEnabled", {
+                "sceneName": SCENE, "sceneItemId": item,
+                "sceneItemEnabled": on})
+            time.sleep(1.5)
+        share, across = white_share(c, "Follow Cam")
+        assert share > 0.3 and 0.25 < across < 0.75
     finally:
         c.disconnect()
 
