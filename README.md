@@ -1,8 +1,8 @@
 # DireBot for OBS
 
 An OBS add-on that connects OBS to [DireBot](https://github.com/diredevr-png/DireBot)
-by itself, shows what's slowing OBS down, and streams to more than one
-site at once.
+by itself, shows what's slowing OBS down, streams to more than one site at
+once, and makes a tall (9:16) picture for TikTok, Shorts and Reels.
 
 ## What it does
 
@@ -45,6 +45,21 @@ Multistream** can be brought over once, keys and all: the add-on reads
 their saved settings itself and the sites arrive switched off. Nothing
 about a site's server or key is ever sent to DireBot - only whether one
 is filled in.
+
+**Vertical.** A second, tall picture in OBS - **DireBot Vertical**, 1080 ×
+1920 to start with (720 × 1280, 1080 × 1350 and 1440 × 2560 too) - with
+scenes of its own, which can switch with your usual ones. It needs OBS
+31.1 or newer (it's an OBS "canvas"). **Tools → DireBot Vertical** opens
+its window: up to three places it streams to (TikTok, YouTube, Instagram,
+Kick, Facebook, X or another), each with its server and stream key, locked
+the same way as multistream's; its own bitrate and encoder (the same kind
+as your stream's unless you pick another); which of OBS's audio tracks
+each place, and its recording, sends; whether it starts and ends with
+your stream; and a recording of its own beside OBS's. The tall picture is
+encoded once however many places it goes to, and isn't drawn at all
+while nothing uses it. Twitch's phone viewers get it too: pick DireBot
+Vertical as Enhanced Broadcasting's **Additional canvas** in OBS's
+Settings → Stream.
 
 The link never hands out your stream key: `GetStreamServiceSettings`
 through it shows the key (and a custom server's password or token) as
@@ -94,6 +109,13 @@ The add-on's own requests go through `CallVendorRequest` with
 | `MultistreamSet` `{id, changes}` | `ok`, `place`; `changes` may have `name`, `on`, `with_stream`, `stop_with_stream`, `video`, `kbps`, `height`, `encoder`, `track` - never `server` or `key`. With `id` `"lighter"`: the Lighter picture's `kbps`, `height`, `encoder` |
 | `MultistreamOpen` `{id}` | `ok` - the window opens (on that place) |
 | `MultistreamImport` `{from: "multi_rtmp" / "aitum"}` | `ok`, `added` (`id`, `name`) - brought over switched off |
+| `VerticalGetState` | `exists`, `uuid`, `name`, `width`, `height`, `fps`, `current` scene, `scenes` (`name`, `uuid`), `follow` (`on`, `links`), `video`, `awake`, `streaming`, `recording`, `twitch` (Twitch's phone viewers get it), `settings_open`, `with_main`, `problem`, `options` (`kbps`, `encoder`, `audio_track`, `with_stream`, `record_with_main`, and `places`: `slot`, `platform`, `enabled`, `key_set`, `server_set`, `server_ok`, `host`, `audio_track`) and `outputs` (`encoder`, `streams`: `slot`, `active`, `live`, `connecting`, `reconnecting`, `kbps`, `dropped`, `track`, `problem`; `recording`: `active`, `paused`, `seconds`, `file`, `track`, `problem`) - never a server or a key |
+| `VerticalSetUp` `{width, height}` / `VerticalSetSize` `{width, height}` | makes the tall picture / changes its size (not while it's sending or recording) |
+| `VerticalSetScene` / `VerticalRemoveScene` `{scene}`, `VerticalCreateScene` `{name}`, `VerticalRenameScene` `{scene, to}` | its scenes (`VerticalCreateScene` answers the new `scene`'s `name` and `uuid`) |
+| `VerticalSetFollow` `{on, links: [{main, tall}]}` | switch with your usual scenes |
+| `VerticalSetOptions` | `kbps`, `encoder`, `audio_track`, `with_stream`, `record_with_main`, `places` (`slot`, `platform`, `enabled`, `audio_track`) - never a server or a key |
+| `VerticalStartStream` / `VerticalStopStream` `{slot}` (none: all), `VerticalStartRecord` / `VerticalStopRecord`, `VerticalPauseRecord` `{pause}` | `ok`, or `error` in words |
+| `VerticalOpenSettings`, `VerticalLook` `{seconds}` (draw it for a picture), `VerticalGetEncoders` | the window opens / `ok` / `encoders` (`id`, `name`) and `auto` |
 | `GetUsage` | `measuring` (first 3 seconds), `fps`, `fps_now`, `frame_ms`, `frame_budget_ms`, `frames`, `frames_lagged`, `encoded`, `encoded_skipped`, `cpu`, `memory_mb`, `stream_frames`, `stream_dropped`, and `sources`: per input and filter `name`, `uuid`, `kind`, `type`, `active`, `showing`, `measured`, `tick_ms`, `render_ms`, `gpu_ms` (+ `_max_ms`), `fps_in`/`fps_shown` for cameras and media, `parent`/`enabled` for filters (and `own_ms`/`own_gpu_ms`: a filter's time takes in what it draws on, so this is its own part), and `hints` (browser size/fps/"shut down when hidden", whether it shows a page on this PC and its port, a short fingerprint of a camera to spot the same one added twice) |
 
 ## Building
@@ -114,7 +136,11 @@ Tests (Linux):
 
 `test_real_obs.py` runs a real OBS (`apt install obs-studio libobs-dev xvfb`)
 with its own empty settings on a pretend screen, and checks the link with
-obsws-python, the client DireBot uses.
+obsws-python, the client DireBot uses. `test_real_obs_multistream.py` and
+`test_real_vertical.py` stream to ffmpeg on the same PC. The vertical
+picture needs OBS 31.1 or newer, newer than some Linux PCs have: build
+OBS from source and point the build at it with `OBS_PREFIX=/path/to/obs`
+(and `DIREBOT_OBS_PRELOAD` for libraries of its own that must load first).
 
 ## Releasing
 
@@ -138,10 +164,12 @@ obsws-python, the client DireBot uses.
                           DireBot Multistream window
     src/multistream/      the extra streams: places (and their file), and
                           the outputs, encoders and services that send them
+    src/vertical/         the tall picture: its canvas and scenes, its
+                          places and recording, its window in OBS
     deps/                 nlohmann/json (MIT), obs-websocket's API header (GPL-2.0)
 
-Later parts (vertical, auto-duck, captions) each get their own folder
-under `src/`, their own `direbot` requests and a line in `features`.
+Later parts each get their own folder under `src/`, their own `direbot`
+requests and a line in `features`.
 
 ## Licence
 
