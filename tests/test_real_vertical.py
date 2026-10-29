@@ -27,9 +27,10 @@ import pytest
 obsws = pytest.importorskip("obsws_python")
 
 from test_real_obs import Obs, free_port, vendor, wait_for  # noqa: E402
+from test_real_obs import pytestmark as needs_obs  # noqa: E402
 
-pytestmark = pytest.mark.skipif(
-    not shutil.which("ffmpeg"), reason="needs ffmpeg to listen for streams")
+pytestmark = [needs_obs, pytest.mark.skipif(
+    not shutil.which("ffmpeg"), reason="needs ffmpeg to listen for streams")]
 
 KEY = "vkey-SECRET-123"
 MAIN_KEY = "main-SECRET-456"
