@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds direbot-for-obs.so against the OBS installed on this Linux PC
-# (apt install obs-studio libobs-dev), for trying the plugin in a real OBS
+# (OBS 31.1 or newer: ppa:obsproject/obs-studio), for trying the plugin in a real OBS
 # here - tests/test_real_obs.py does that. Not a release build.
 #
 # An OBS built from source elsewhere (the vertical picture needs OBS 31.1

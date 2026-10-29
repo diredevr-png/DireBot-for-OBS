@@ -21,11 +21,19 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # The tall picture needs OBS 31.1 or newer (its canvas API), newer
+      # than Ubuntu's own OBS - so OBS's own package, which has the headers
+      # too.
       - name: Install OBS and the test tools
         run: |
+          sudo add-apt-repository -y ppa:obsproject/obs-studio
           sudo apt-get update
-          sudo apt-get install -y -t noble-backports obs-studio libobs-dev
-          sudo apt-get install -y xvfb g++
+          sudo apt-get install -y obs-studio xvfb g++
+          grep -q obs_canvas_t /usr/include/obs/obs.h || {
+            echo "This OBS has no canvas API (needs OBS 31.1 or newer):"
+            dpkg -s obs-studio | grep '^Version'
+            exit 1
+          }
           python3 -m pip install --user --break-system-packages pytest obsws-python websocket-client
       - name: Link tests
         run: BUILD_DIR="$RUNNER_TEMP/link" tools/test-link.sh

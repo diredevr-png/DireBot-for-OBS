@@ -8,7 +8,8 @@ anyone's is touched, and nothing goes out to the internet.
 
 Skipped unless OBS, Xvfb, ffmpeg and the test build are there (Linux):
 
-    apt install obs-studio libobs-dev xvfb xdotool ffmpeg
+    add-apt-repository ppa:obsproject/obs-studio   (OBS 31.1 or newer)
+    apt install obs-studio xvfb xdotool ffmpeg
     BUILD_DIR=/tmp/direbot-obs tools/build-linux-test.sh
     DIREBOT_OBS_PLUGIN=/tmp/direbot-obs/direbot-for-obs.so \\
         python3 -m pytest tests/test_real_obs_multistream.py

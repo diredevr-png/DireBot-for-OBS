@@ -5,7 +5,8 @@ settings, so nothing of anyone's is touched, and nothing streams.
 
 Skipped unless OBS, Xvfb and the test build are there (Linux):
 
-    apt install obs-studio libobs-dev xvfb xdotool
+    add-apt-repository ppa:obsproject/obs-studio   (OBS 31.1 or newer)
+    apt install obs-studio xvfb xdotool
     BUILD_DIR=/tmp/direbot-obs tools/build-linux-test.sh
     DIREBOT_OBS_PLUGIN=/tmp/direbot-obs/direbot-for-obs.so \\
         python3 -m pytest tests/test_real_obs.py
