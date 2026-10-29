@@ -27,3 +27,7 @@
 
 # Exclude CMake build number cache
 /cmake/.CMakeBuildNumber
+
+# Exclude Python's caches (the tests make them)
+__pycache__/
+*.pyc

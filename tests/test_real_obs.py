@@ -173,6 +173,10 @@ def test_the_link_file_says_where_and_only_this_user_can_open_it(obs):
     assert link["format"] == 1 and link["plugin"] == "0.1.0"
     assert link["pid"] == obs.proc.pid
     assert len(link["password"]) >= 40
+    # Only this user can read it (Windows: the user's own AppData).
+    import stat
+    assert stat.S_IMODE(os.stat(obs.link_path).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(os.path.dirname(obs.link_path)).st_mode) == 0o700
     assert link["obs"].startswith(("30.", "31.", "32."))
     assert "DireBot Link is on (port %d" % link["port"] in obs.log()
     # The password is never in OBS's log.

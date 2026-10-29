@@ -3,12 +3,13 @@
 # the unit tests, then the link's network tests through obsws-python.
 # (tests/test_real_obs.py runs it inside a real OBS - see its top.)
 #   pip install pytest obsws-python websocket-client
+# A sanitizer build: EXTRA_FLAGS=-fsanitize=thread tools/test-link.sh
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 out="${BUILD_DIR:-$here/build-tests}"
 mkdir -p "$out"
 cxx="${CXX:-g++}"
-flags=(-std=c++17 -O1 -g -Wall -Wextra -pthread -I"$here/deps")
+flags=(-std=c++17 -O1 -g -Wall -Wextra -pthread -I"$here/deps" ${EXTRA_FLAGS:-})
 link_src=("$here/src/link/crypto.cpp" "$here/src/link/ws.cpp" "$here/src/link/protocol.cpp")
 
 "$cxx" "${flags[@]}" -o "$out/unit" "$here/tests/unit.cpp" "${link_src[@]}" "$here/src/obs/address.cpp"

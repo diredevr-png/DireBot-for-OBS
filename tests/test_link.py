@@ -259,6 +259,84 @@ def test_bad_messages_close_with_obs_websocket_codes(link):
     assert closed_with(ws2) == 4002
 
 
+def test_a_big_message_before_logging_in_is_turned_away(link):
+    # Without the password nobody gets OBS to hold a big message.
+    ws = raw(link)
+    ws.recv()                      # hello
+    ws.send("x" * (65 * 1024))
+    assert closed_with(ws) == 1009
+    # Once logged in, big ones are fine.
+    ws2 = raw(link)
+    login(ws2)
+    ws2.send(json.dumps({"op": 6, "d": {"requestType": "EchoTest",
+                                        "requestId": "big",
+                                        "requestData": {"x": "y" * 300000}}}))
+    reply = json.loads(ws2.recv())
+    assert reply["d"]["responseData"]["x"] == "y" * 300000
+    ws2.close()
+
+
+def rss_mb(pid):
+    with open(f"/proc/{pid}/status") as f:
+        for line in f:
+            if line.startswith("VmRSS"):
+                return int(line.split()[1]) // 1024
+    return 0
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/self/status")
+                    or "sanitize" in os.environ.get("EXTRA_FLAGS", ""),
+                    reason="Linux, and not a sanitizer build (those hold "
+                    "freed memory on purpose)")
+def test_pings_from_a_client_that_never_reads_cant_fill_obs_memory(link):
+    # No password, never reads its pongs: once it's behind, OBS stops
+    # reading it, and lets it go.
+    socks = []
+    for _ in range(8):
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        s.connect(("127.0.0.1", link.port))
+        s.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+                  b"Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+                  b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+        socks.append(s)
+    ping = (bytes([0x89, 0x80 | 125]) + b"\0\0\0\0" + b"x" * 125) * 2000
+    peak = 0
+
+    def flood(s):
+        try:
+            for _ in range(100):
+                s.sendall(ping)
+        except OSError:
+            pass
+    threads = [threading.Thread(target=flood, args=(s,)) for s in socks]
+    for t in threads:
+        t.start()
+    while any(t.is_alive() for t in threads):
+        peak = max(peak, rss_mb(link.proc.pid))
+        time.sleep(0.02)
+    for s in socks:
+        s.close()
+    # 8 clients x 26 MB of pings: before, all their pongs were kept.
+    assert peak < 100, peak
+
+
+def test_a_full_house_of_strangers_cant_keep_direbot_out(link):
+    # 24 connections that never log in hold every place...
+    strangers = [raw(link) for _ in range(24)]
+    try:
+        # ...and DireBot still gets in, in a stranger's place.
+        client = req(link)
+        assert client.get_version().obs_version == "32.2.2"
+        client.disconnect()
+    finally:
+        for ws in strangers:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
 def test_many_clients_come_and_go(link):
     clients = [req(link) for _ in range(6)]
     assert link.ask("clients", "CLIENTS") == "6"

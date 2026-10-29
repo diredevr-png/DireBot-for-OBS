@@ -73,6 +73,12 @@ public:
 	// Takes one item from the front of `buffer` (removing what it used).
 	// False when more bytes are needed first.
 	bool next(std::string &buffer, Item &out);
+	// The same from `at` on, moving `at` past what it used, so many small
+	// frames don't each shift the rest of the buffer down: the caller
+	// erases the used part once.
+	bool next(const std::string &buffer, size_t &at, Item &out);
+	// The biggest message taken from now on.
+	void limit(size_t max_message) { max_message_ = max_message; }
 
 private:
 	size_t max_message_;

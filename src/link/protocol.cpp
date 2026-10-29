@@ -243,7 +243,7 @@ std::string Session::run(int op, const json &d, Backend &backend, const std::ato
 		json out = {{"requestType", type}, {"requestId", d["requestId"]}, {"requestStatus", status_json(r)}};
 		if (r.data.is_object())
 			out["responseData"] = r.data;
-		return json({{"op", RequestResponse}, {"d", out}}).dump();
+		return to_text(json({{"op", RequestResponse}, {"d", out}}));
 	}
 
 	// A batch. Parallel and per-frame batches run one after another too:
@@ -291,7 +291,7 @@ std::string Session::run(int op, const json &d, Backend &backend, const std::ato
 		if (halt && r.code != status::Success)
 			break;
 	}
-	return json({{"op", RequestBatchResponse}, {"d", {{"requestId", d["requestId"]}, {"results", results}}}}).dump();
+	return to_text(json({{"op", RequestBatchResponse}, {"d", {{"requestId", d["requestId"]}, {"results", results}}}}));
 }
 
 std::string event_message(const std::string &type, uint64_t intent, const std::string &data_json)

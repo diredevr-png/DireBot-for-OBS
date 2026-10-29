@@ -256,51 +256,62 @@ private:
 			if (quit_)
 				break;
 			l.unlock();
-
-			const uint64_t now = os_gettime_ns();
-			const bool closing = closing_;
-			if (loaded_ && !closing && !server_.running() && listen_failures < MAX_LISTEN_TRIES &&
-			    now >= next_try) {
-				switch (open_link()) {
-				case Opened:
-					break;
-				case NotReady:
-					next_try = now + 1000 * MS;
-					break;
-				case Failed:
-					listen_failures++;
-					next_try = now + 15000 * MS;
-					break;
-				}
+			// Anything thrown out of this thread would end OBS.
+			try {
+				tick(next_try, next_meters, next_second, listen_failures);
+			} catch (const std::exception &e) {
+				obs_log(LOG_WARNING, "Something went wrong: %s", e.what());
 			}
-
-			const bool want_meters = !closing && server_.running() &&
-						 (server_.wanted() & link::subs::InputVolumeMeters);
-			if (want_meters && !meters_.attached()) {
-				meters_.attach();
-				next_meters = now;
-			} else if (!want_meters && meters_.attached()) {
-				meters_.detach();
-			}
-			if (meters_.attached() && now >= next_meters) {
-				server_.broadcast(link::subs::InputVolumeMeters,
-						  link::event_message("InputVolumeMeters", link::subs::InputVolumeMeters,
-								      meters_.read()),
-						  true);
-				// Keeps to the beat even when a wake-up comes late.
-				next_meters += METER_EVERY_NS;
-				if (next_meters <= now)
-					next_meters = now + METER_EVERY_NS;
-			}
-			if (now >= next_second) {
-				usage_.tick();
-				next_second = now + 1000 * MS;
-			}
-
 			l.lock();
 		}
 		l.unlock();
 		meters_.detach();
+	}
+
+	void tick(uint64_t &next_try, uint64_t &next_meters, uint64_t &next_second, int &listen_failures)
+	{
+		const uint64_t now = os_gettime_ns();
+		const bool closing = closing_;
+		if (loaded_ && !closing && !server_.running() && listen_failures < MAX_LISTEN_TRIES &&
+		    now >= next_try) {
+			// The next try is set first: if this one throws, it isn't
+			// tried again straight away.
+			next_try = now + 15000 * MS;
+			switch (open_link()) {
+			case Opened:
+				break;
+			case NotReady:
+				next_try = now + 1000 * MS;
+				break;
+			case Failed:
+				listen_failures++;
+				break;
+			}
+		}
+
+		const bool want_meters = !closing && server_.running() &&
+					 (server_.wanted() & link::subs::InputVolumeMeters);
+		if (want_meters && !meters_.attached()) {
+			meters_.attach();
+			next_meters = now;
+		} else if (!want_meters && meters_.attached()) {
+			meters_.detach();
+		}
+		if (meters_.attached() && now >= next_meters) {
+			// Keeps to the beat even when a wake-up comes late (and moves
+			// on before reading, so a reading that throws can't spin).
+			next_meters += METER_EVERY_NS;
+			if (next_meters <= now)
+				next_meters = now + METER_EVERY_NS;
+			server_.broadcast(link::subs::InputVolumeMeters,
+					  link::event_message("InputVolumeMeters", link::subs::InputVolumeMeters,
+							      meters_.read()),
+					  true);
+		}
+		if (now >= next_second) {
+			next_second = now + 1000 * MS;
+			usage_.tick();
+		}
 	}
 
 	enum OpenResult { Opened, NotReady, Failed };

@@ -225,7 +225,7 @@ std::string Meters::read()
 	}
 	for (obs_source_t *input : held)
 		obs_source_release(input);
-	return json({{"inputs", std::move(inputs)}}).dump();
+	return link::to_text(json({{"inputs", std::move(inputs)}}));
 }
 
 } // namespace direbot::obs

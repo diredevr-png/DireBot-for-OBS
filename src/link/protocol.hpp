@@ -39,6 +39,14 @@ namespace direbot::link {
 
 using json = nlohmann::json;
 
+// JSON text that never throws: OBS names aren't always valid UTF-8 (a
+// script or plugin can make any), and a plain dump() throws on those. Bad
+// bytes come out as U+FFFD.
+inline std::string to_text(const json &j)
+{
+	return j.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
 // obs-websocket's close codes (WebSocketCloseCode).
 namespace close_code {
 enum : uint16_t {

@@ -100,11 +100,20 @@ const int SEND_FLAGS = MSG_NOSIGNAL;
 #endif
 
 constexpr auto HANDSHAKE_TIME = std::chrono::seconds(10);
-constexpr auto IDENTIFY_TIME = std::chrono::seconds(60);
-// A client this far behind on its mail skips audio meter updates...
+// DireBot identifies the moment it has the Hello; a client that doesn't is
+// only holding a place.
+constexpr auto IDENTIFY_TIME = std::chrono::seconds(10);
+// A client this far behind on its mail skips audio meter updates, and
+// nothing more is read from it until it catches up...
 constexpr size_t DROPPABLE_BEHIND = 1 * 1024 * 1024;
 // ...and one this far behind is let go: it isn't reading.
 constexpr size_t TOO_FAR_BEHIND = 64 * 1024 * 1024;
+// Before it's logged in, a client gets small messages only (an Identify is
+// a few hundred bytes), and is let go far sooner: without the password it
+// mustn't be able to make OBS hold much.
+constexpr size_t LOGIN_MESSAGE = 64 * 1024;
+constexpr size_t LOGIN_BEHIND = 256 * 1024;
+constexpr size_t MAX_MESSAGE = 32 * 1024 * 1024;
 constexpr size_t MAX_JOBS = 512;
 
 } // namespace
@@ -117,7 +126,7 @@ struct Server::Client {
 	std::atomic<bool> gone{false};
 	bool closing = false; // network thread: close once `out` is sent
 	std::string in;
-	ws::Reader reader;
+	ws::Reader reader{LOGIN_MESSAGE};
 	std::unique_ptr<Session> session;
 
 	std::mutex out_lock;
@@ -299,7 +308,8 @@ void Server::send(const std::shared_ptr<Client> &client, const std::string &fram
 			return;
 		if (droppable && client->out_bytes > DROPPABLE_BEHIND)
 			return;
-		if (client->out_bytes + frame.size() > TOO_FAR_BEHIND) {
+		const bool identified = client->open && client->session->identified();
+		if (client->out_bytes + frame.size() > (identified ? TOO_FAR_BEHIND : LOGIN_BEHIND)) {
 			client->overflowed = true;
 		} else {
 			client->out.push_back(frame);
@@ -420,9 +430,20 @@ void Server::accept_clients()
 			continue;
 		}
 		size_t count;
+		std::shared_ptr<Client> waiting; // the longest a client hasn't logged in
 		{
 			std::lock_guard<std::mutex> l(clients_lock_);
 			count = clients_.size();
+			for (auto &c : clients_)
+				if (!c->gone && !(c->open && c->session->identified()) &&
+				    (!waiting || c->started < waiting->started))
+					waiting = c;
+		}
+		// Full: a place held by someone who hasn't logged in goes to the
+		// newcomer, so nobody without the password can keep DireBot out.
+		if (count >= options_.max_clients && waiting) {
+			drop_client(waiting);
+			count--;
 		}
 		if (count >= options_.max_clients || !nonblocking(s)) {
 			close_socket(s);
@@ -459,8 +480,12 @@ void Server::read_from(const std::shared_ptr<Client> &client)
 
 void Server::process(const std::shared_ptr<Client> &client)
 {
-	if (client->gone || client->closing)
+	if (client->gone)
 		return;
+	if (client->closing) {
+		client->in.clear(); // going: what it sends now is never read
+		return;
+	}
 	if (!client->open) {
 		ws::Handshake h = ws::read_handshake(client->in);
 		if (h.state == ws::Handshake::State::NeedMore)
@@ -482,7 +507,12 @@ void Server::process(const std::shared_ptr<Client> &client)
 	}
 
 	ws::Reader::Item item;
-	while (!client->closing && client->reader.next(client->in, item)) {
+	size_t used = 0;
+	// An overflowed client is let go next: nothing more of it is worth reading.
+	while (!client->closing && !client->overflowed) {
+		client->reader.limit(client->session->identified() ? MAX_MESSAGE : LOGIN_MESSAGE);
+		if (!client->reader.next(client->in, used, item))
+			break;
 		switch (item.kind) {
 		case ws::Reader::Item::Kind::Text:
 		case ws::Reader::Item::Kind::Binary: {
@@ -515,6 +545,7 @@ void Server::process(const std::shared_ptr<Client> &client)
 			break;
 		}
 	}
+	client->in.erase(0, used);
 }
 
 void Server::write_to(const std::shared_ptr<Client> &client)
@@ -555,11 +586,16 @@ void Server::network_loop()
 			polled = clients_;
 		}
 		for (auto &c : polled) {
-			short events = POLLIN;
+			short events = 0;
 			{
 				std::lock_guard<std::mutex> l(c->out_lock);
 				if (!c->out.empty())
 					events |= POLLOUT;
+				// Not reading what it sends while it isn't reading what we
+				// send (its pings, its requests' answers): that's what
+				// keeps it from piling up OBS's memory.
+				if (c->out_bytes <= DROPPABLE_BEHIND)
+					events |= POLLIN;
 			}
 			fds.push_back(pollfd{S(c->sock), events, 0});
 		}

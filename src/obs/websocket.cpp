@@ -90,7 +90,7 @@ link::RequestResult WebSocket::call(const std::string &type, const json &data)
 	// Straight to obs-websocket as JSON text: obs-websocket's own
 	// obs_websocket_call_request() goes through obs_data, which can't hold
 	// every kind of JSON (a list of plain numbers, for one).
-	const std::string body = data.is_object() ? data.dump() : std::string();
+	const std::string body = data.is_object() ? link::to_text(data) : std::string();
 	calldata_t cd = {0, 0, 0, 0};
 	calldata_set_string(&cd, "request_type", type.c_str());
 	calldata_set_string(&cd, "request_data", body.empty() ? nullptr : body.c_str());
@@ -166,7 +166,7 @@ void WebSocket::on_vendor_request(obs_data_t *request, obs_data_t *response, voi
 	}
 	if (!out.is_object())
 		return;
-	obs_data_t *answer = obs_data_create_from_json(out.dump().c_str());
+	obs_data_t *answer = obs_data_create_from_json(link::to_text(out).c_str());
 	if (answer) {
 		obs_data_apply(response, answer);
 		obs_data_release(answer);

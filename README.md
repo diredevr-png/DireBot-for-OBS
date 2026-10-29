@@ -27,8 +27,13 @@ never include web addresses, file paths or device names.
 OBS's audio levels (the same numbers as OBS's Audio Mixer) only while
 something is listening.
 
-Stream keys never pass through the add-on: it has no request of its own
-that reads or sets one, and it adds nothing to what obs-websocket allows.
+The add-on has no request of its own that reads or sets a stream key. But
+the link passes on every obs-websocket request, `GetStreamServiceSettings`
+included, so whoever has the link file's password can read the stream key,
+just as with OBS's websocket password. The link works whether or not OBS's
+websocket server is switched on, so the file is what keeps OBS safe: on
+Windows it's in your own AppData, elsewhere it's made readable by you alone
+(0600).
 
 ## Installing
 

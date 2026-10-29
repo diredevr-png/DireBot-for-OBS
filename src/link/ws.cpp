@@ -226,22 +226,32 @@ std::string close_frame(uint16_t code, const std::string &reason)
 
 bool Reader::next(std::string &buffer, Item &out)
 {
+	size_t used = 0;
+	const bool got = next(buffer, used, out);
+	buffer.erase(0, used);
+	return got;
+}
+
+bool Reader::next(const std::string &buffer, size_t &start, Item &out)
+{
 	for (;;) {
-		if (buffer.size() < 2)
+		if (start > buffer.size() || buffer.size() - start < 2)
 			return false;
-		const auto *p = (const unsigned char *)buffer.data();
+		const size_t left = buffer.size() - start;
+		const auto *p = (const unsigned char *)buffer.data() + start;
 		const bool fin = (p[0] & 0x80) != 0;
 		const uint8_t opcode = p[0] & 0x0f;
 		const bool masked = (p[1] & 0x80) != 0;
 		uint64_t length = p[1] & 0x7f;
 		size_t at = 2;
 
+		// Nothing after a broken frame is read.
 		auto fail = [&](uint16_t code, const char *why) {
 			out = Item();
 			out.kind = Item::Kind::Error;
 			out.code = code;
 			out.data = why;
-			buffer.clear();
+			start = buffer.size();
 			return true;
 		};
 
@@ -250,12 +260,12 @@ bool Reader::next(std::string &buffer, Item &out)
 		if (!masked)
 			return fail(1002, "a frame from the client wasn't masked");
 		if (length == 126) {
-			if (buffer.size() < 4)
+			if (left < 4)
 				return false;
 			length = ((uint64_t)p[2] << 8) | p[3];
 			at = 4;
 		} else if (length == 127) {
-			if (buffer.size() < 10)
+			if (left < 10)
 				return false;
 			length = 0;
 			for (int i = 0; i < 8; i++)
@@ -269,14 +279,14 @@ bool Reader::next(std::string &buffer, Item &out)
 			return fail(1002, "a control frame was split or too long");
 		if (!control && length > max_message_)
 			return fail(1009, "a message was too big");
-		if (buffer.size() < at + 4 + length)
+		if (left < at + 4 + length)
 			return false;
 
 		const unsigned char *mask = p + at;
-		std::string payload(buffer, at + 4, (size_t)length);
+		std::string payload(buffer, start + at + 4, (size_t)length);
 		for (size_t i = 0; i < payload.size(); i++)
 			payload[i] = (char)(payload[i] ^ mask[i % 4]);
-		buffer.erase(0, at + 4 + (size_t)length);
+		start += at + 4 + (size_t)length;
 
 		if (control) {
 			out = Item();

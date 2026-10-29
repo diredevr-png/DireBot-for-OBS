@@ -31,6 +31,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <process.h>
 #define current_pid() ((long long)_getpid())
 #else
+#include <cstdio>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #define current_pid() ((long long)getpid())
 #endif
@@ -38,6 +41,45 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 namespace direbot::obs {
 
 using link::json;
+
+namespace {
+
+#ifdef _WIN32
+// The user's own AppData already keeps everyone else out.
+bool write_private(const std::string &path, const std::string &body)
+{
+	return os_quick_write_utf8_file_safe(path.c_str(), body.c_str(), body.size(), false, "tmp", nullptr);
+}
+#else
+// Elsewhere OBS's settings folder is readable by everyone (0755, and files
+// 0644 under the usual umask), so the file is made 0600 from the start -
+// never readable by anyone else, not even for a moment - then swapped in.
+bool write_private(const std::string &path, const std::string &body)
+{
+	const std::string tmp = path + ".tmp";
+	::unlink(tmp.c_str());
+	int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return false;
+	size_t done = 0;
+	while (done < body.size()) {
+		ssize_t n = ::write(fd, body.data() + done, body.size() - done);
+		if (n <= 0) {
+			::close(fd);
+			::unlink(tmp.c_str());
+			return false;
+		}
+		done += (size_t)n;
+	}
+	if (::fsync(fd) != 0 || ::close(fd) != 0 || std::rename(tmp.c_str(), path.c_str()) != 0) {
+		::unlink(tmp.c_str());
+		return false;
+	}
+	return true;
+}
+#endif
+
+} // namespace
 
 bool LinkFile::write(uint16_t port, const std::string &password, const std::string &obs_version,
 		     const std::string &websocket_version)
@@ -50,6 +92,9 @@ bool LinkFile::write(uint16_t port, const std::string &password, const std::stri
 		char *file = obs_module_config_path("link.json");
 		if (folder && file) {
 			os_mkdirs(folder);
+#ifndef _WIN32
+			::chmod(folder, 0700); // the plugin's own folder: nobody else's business
+#endif
 			path_ = file;
 		}
 		bfree(folder);
@@ -68,7 +113,7 @@ bool LinkFile::write(uint16_t port, const std::string &password, const std::stri
 					 .dump(1);
 	// Written to link.json.tmp, then swapped in: DireBot never reads half
 	// a file. No backup copy is kept.
-	return os_quick_write_utf8_file_safe(path_.c_str(), body.c_str(), body.size(), false, "tmp", nullptr);
+	return write_private(path_, body);
 }
 
 void LinkFile::remove()

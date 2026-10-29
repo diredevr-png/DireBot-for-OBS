@@ -8,6 +8,7 @@
 #include "../src/link/ws.hpp"
 #include "../src/obs/address.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -146,6 +147,33 @@ static void test_handshake()
 
 static void test_frames()
 {
+	// Many small frames at once (4 MB of pings): read from an offset, so
+	// each one doesn't shift the rest down - that took seconds, holding up
+	// every client.
+	{
+		std::string in;
+		while (in.size() < 4 * 1024 * 1024)
+			in += client_frame(ws::Ping, std::string(125, 'p'));
+		ws::Reader many;
+		ws::Reader::Item item;
+		size_t at = 0, count = 0;
+		const auto started = std::chrono::steady_clock::now();
+		while (many.next(in, at, item) && item.kind == ws::Reader::Item::Kind::Ping)
+			count++;
+		const auto took = std::chrono::steady_clock::now() - started;
+		CHECK(at == in.size() && count == in.size() / 131);
+		CHECK(took < std::chrono::milliseconds(500));
+	}
+	// Its limit can change (the server keeps it small until a client logs in).
+	{
+		ws::Reader small(64);
+		std::string in = client_frame(ws::Text, std::string(65, 'x'));
+		ws::Reader::Item item;
+		CHECK(small.next(in, item) && item.kind == ws::Reader::Item::Kind::Error && item.code == 1009);
+		small.limit(1024);
+		in = client_frame(ws::Text, std::string(65, 'x'));
+		CHECK(small.next(in, item) && item.kind == ws::Reader::Item::Kind::Text && item.data.size() == 65);
+	}
 	ws::Reader r;
 	ws::Reader::Item item;
 	std::string buf = client_frame(ws::Text, "hello");
@@ -336,6 +364,28 @@ static void test_protocol()
 	CHECK(link::event_message("ExitStarted", 1, "null") ==
 	      R"({"op":5,"d":{"eventType":"ExitStarted","eventIntent":1}})");
 	CHECK(parse(link::event_message("Odd \"name\"", 1, "{}"))["d"]["eventType"] == "Odd \"name\"");
+
+	// An OBS name that isn't valid UTF-8 (a script can make one): answered,
+	// with the bad bytes as U+FFFD, never an exception.
+	CHECK(link::to_text(json{{"n", "Mic \xff\xfe"}}) == "{\"n\":\"Mic \xef\xbf\xbd\xef\xbf\xbd\"}");
+	struct BadName : link::Backend {
+		link::RequestResult call(const std::string &, const json &) override
+		{
+			return {link::status::Success, "", {{"inputName", "Mic \xff"}}};
+		}
+	} bad_name;
+	std::atomic<bool> going{false};
+	std::string reply;
+	bool threw = false;
+	try {
+		reply = s.run(6, json{{"requestType", "GetInputList"}, {"requestId", "u"}}, bad_name, going);
+		reply += s.run(8, json{{"requestId", "v"}, {"requests", {{{"requestType", "GetInputList"}}}}}, bad_name,
+			       going);
+	} catch (const std::exception &) {
+		threw = true;
+	}
+	CHECK(!threw);
+	CHECK(reply.find("Mic \xef\xbf\xbd") != std::string::npos);
 }
 
 static void test_addresses()
