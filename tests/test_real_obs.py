@@ -182,7 +182,7 @@ def obs():
 
 def test_the_link_file_says_where_and_only_this_user_can_open_it(obs):
     link = obs.link
-    assert link["format"] == 1 and link["plugin"] == "0.1.0"
+    assert link["format"] == 1 and link["plugin"] == "0.2.0"
     assert link["pid"] == obs.proc.pid
     assert len(link["password"]) >= 40
     # Only this user can read it (Windows: the user's own AppData).
@@ -289,7 +289,7 @@ def test_the_plugins_own_requests_over_the_link_and_obs_websocket(obs):
     c = obs.client()
     try:
         info = vendor(c, "GetInfo")
-        assert info["plugin"] == "0.1.0" and info["api"] == 1
+        assert info["plugin"] == "0.2.0" and info["api"] == 1
         assert info["link"] is True and info["link_port"] == obs.link["port"]
         assert info["features"] == {"link": True, "meters": True,
                                     "usage": True, "vertical": True,
@@ -314,7 +314,7 @@ def test_the_plugins_own_requests_over_the_link_and_obs_websocket(obs):
                             timeout=5)
     try:
         info = vendor(plain, "GetInfo")
-        assert info["plugin"] == "0.1.0"
+        assert info["plugin"] == "0.2.0"
         assert info["features"]["link"] is True
     finally:
         plain.disconnect()
