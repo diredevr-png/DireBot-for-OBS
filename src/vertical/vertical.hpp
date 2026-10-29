@@ -109,6 +109,7 @@ private:
 	json state();
 	void attach();
 	void let_go(uint32_t wait_ms);
+	void leave_profile();
 	void update_awake();
 	bool twitch_uses_it() const;
 	void follow_main(bool animate);

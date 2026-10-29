@@ -473,6 +473,38 @@ def test_a_site_dropping_then_ending_your_stream(run):
                 p.kill()
 
 
+def test_another_profile_stops_its_streams(run):
+    """Where it goes and the keys are the profile's, so switching profile
+    mid-stream stops it - on OBS 31 and up, making a new profile switches
+    to it without saying it's changing first. Back on yours, it's all
+    there."""
+    folder = os.path.join(run["obs"].home, "Streams")
+    tall = Listener(folder, KEY, run["vertical_port"])
+    mine = send(run, "GetProfileList")["currentProfileName"]
+    try:
+        assert v(run, "VerticalStartStream", {"slot": 1})["ok"]
+        assert wait_for(lambda: v(run, "VerticalGetState")["outputs"]
+                        ["streams"][0]["live"], 15)
+        time.sleep(2)
+        send(run, "CreateProfile", {"profileName": "Another"})
+        assert wait_for(lambda: send(run, "GetProfileList")
+                        ["currentProfileName"] == "Another", 10)
+        assert wait_for(lambda: not v(run, "VerticalGetState")["streaming"],
+                        10)
+        assert v(run, "VerticalGetState")["exists"]
+        assert not v(run, "VerticalGetState")["options"]["places"][0][
+            "key_set"]
+        assert os.path.getsize(tall.done()) > 10000
+        send(run, "SetCurrentProfile", {"profileName": mine})
+        assert wait_for(lambda: v(run, "VerticalGetState")["options"][
+            "places"][0]["key_set"], 10)
+    finally:
+        if tall.proc.poll() is None:
+            tall.proc.kill()
+    assert "Another profile: the vertical streams and recording stop" in \
+        run["obs"].log()
+
+
 def test_closing_obs_lets_everything_go(run):
     o = run["obs"]
     v(run, "VerticalLook", {"seconds": 30})

@@ -549,6 +549,20 @@ void Vertical::let_go(uint32_t wait_ms)
 		changed();
 }
 
+void Vertical::leave_profile()
+{
+	// Where it goes and the keys are the profile's: its streams and
+	// recording end with it. The tall picture stays (it's the scene
+	// collection's).
+	if (!outputs_.active())
+		return;
+	obs_log(LOG_INFO, "Another profile: the vertical streams and recording stop");
+	outputs_.release(CLOSE_WAIT_MS);
+	streams_with_main_ = record_with_main_ = false;
+	update_awake();
+	changed();
+}
+
 bool Vertical::twitch_uses_it() const
 {
 	if (!canvas_.exists())
@@ -685,7 +699,13 @@ void Vertical::on_frontend(enum obs_frontend_event event, void *self)
 		v->attach();
 		v->changed();
 		break;
+	case OBS_FRONTEND_EVENT_PROFILE_CHANGING:
+		v->leave_profile();
+		break;
 	case OBS_FRONTEND_EVENT_PROFILE_CHANGED:
+		// OBS 31 and up makes a new profile and switches to it without
+		// saying it's changing first.
+		v->leave_profile();
 		v->load_options();
 		v->changed();
 		break;
