@@ -369,6 +369,34 @@ static void test_protocol()
 	CHECK(r["d"]["results"][1]["responseData"]["b"] == 1);
 	CHECK(r["d"]["results"][2]["requestStatus"]["code"] == 100);
 	CHECK(r["d"]["results"][3]["requestStatus"]["code"] == 204);
+	// A batch's Sleeps together stop at a minute, however many there are.
+	{
+		json many = json::array();
+		for (int i = 0; i < 3; i++)
+			many.push_back({{"requestType", "Sleep"}, {"requestData", {{"sleepMillis", 50000}}}});
+		std::atomic<bool> closing{true};
+		json got = parse(s.run(8, json{{"requestId", "z"}, {"requests", many}}, backend, closing));
+		// Closing: each one answers at once (not ready) - the budget test
+		// below runs with time to spare instead.
+		CHECK(got["d"]["results"].size() == 3);
+		json two = json::array();
+		two.push_back({{"requestType", "Sleep"}, {"requestData", {{"sleepMillis", 70000}}}});
+		two.push_back({{"requestType", "Sleep"}, {"requestData", {{"sleepMillis", 5}}}});
+		got = parse(s.run(8, json{{"requestId", "y"}, {"requests", two}}, backend, stopping));
+		CHECK(got["d"]["results"][0]["requestStatus"]["code"] == 402); // out of range (over 50 s)
+		CHECK(got["d"]["results"][1]["requestStatus"]["code"] == 100);
+		// 10000 frames is a fine Sleep on its own, but over a minute: the
+		// batch's budget says no, without waiting.
+		json frames = json::array();
+		frames.push_back({{"requestType", "Sleep"}, {"requestData", {{"sleepFrames", 10000}}}});
+		auto started = std::chrono::steady_clock::now();
+		got = parse(s.run(8, json{{"requestId", "x"}, {"executionType", 1u}, {"requests", frames}}, backend,
+				  stopping));
+		CHECK(got["d"]["results"][0]["requestStatus"]["code"] == 402);
+		CHECK(got["d"]["results"][0]["requestStatus"]["comment"] ==
+		      "A batch can sleep for up to 60 seconds in all.");
+		CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
+	}
 	CHECK(s.handle(R"({"op":8,"d":{"requestId":"b","requests":{}}})").close ==
 	      link::close_code::InvalidDataFieldType);
 	CHECK(s.handle(R"({"op":8,"d":{"requestId":"b","executionType":7,"requests":[]}})").close ==

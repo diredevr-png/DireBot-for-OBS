@@ -142,8 +142,13 @@ RequestResult call_one(const std::string &type, const json &data, Backend &backe
 	return r;
 }
 
+// All the Sleeps in one batch together: a batch of a thousand long Sleeps
+// would hold one of the link's workers for days.
+constexpr double BATCH_SLEEP_MS = 60000;
+
 // "Sleep" only means something inside a batch, so the batch does it here.
-RequestResult sleep_for(const json &data, int execution, const std::atomic<bool> &stopping)
+// `budget` is what's left of the batch's sleeping, in ms.
+RequestResult sleep_for(const json &data, int execution, const std::atomic<bool> &stopping, double &budget)
 {
 	double ms = 0;
 	if (execution == SerialFrame) {
@@ -160,6 +165,9 @@ RequestResult sleep_for(const json &data, int execution, const std::atomic<bool>
 		if (ms < 0 || ms > 50000)
 			return {status::RequestFieldOutOfRange, "`sleepMillis` is out of range.", nullptr};
 	}
+	if (ms > budget)
+		return {status::RequestFieldOutOfRange, "A batch can sleep for up to 60 seconds in all.", nullptr};
+	budget -= ms;
 	auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds((long long)ms);
 	while (std::chrono::steady_clock::now() < until) {
 		if (stopping)
@@ -334,6 +342,7 @@ std::string Session::run(int op, const json &d, Backend &backend, const std::ato
 	const bool halt = d.contains("haltOnFailure") && d["haltOnFailure"].is_boolean() && d["haltOnFailure"].get<bool>();
 	json variables = d.contains("variables") && d["variables"].is_object() ? d["variables"] : json::object();
 	json results = json::array();
+	double sleep_left = BATCH_SLEEP_MS;
 	for (const auto &item : d["requests"]) {
 		const json request = item.is_object() ? item : json::object();
 		std::string type = request.contains("requestType") && request["requestType"].is_string()
@@ -352,7 +361,7 @@ std::string Session::run(int op, const json &d, Backend &backend, const std::ato
 		if (stopping)
 			r = {status::NotReady, "OBS is closing.", nullptr};
 		else if (type == "Sleep")
-			r = sleep_for(data, execution, stopping);
+			r = sleep_for(data, execution, stopping, sleep_left);
 		else
 			r = call_one(type, data, backend);
 		// Variables out: {"variableName": "responseField"}.
