@@ -68,6 +68,7 @@ private:
 		obs_canvas_t *canvas = nullptr;
 		obs_encoder_t *video = nullptr;
 		obs_encoder_t *audio = nullptr;
+		audio_t *silence = nullptr; // "No sound": a silent mix of its own
 		obs_output_t *output = nullptr;
 		std::string file;
 		uint64_t started_ns = 0;
