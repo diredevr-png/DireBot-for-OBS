@@ -41,6 +41,27 @@ constexpr uint64_t MS = 1'000'000;
 
 const std::vector<std::string> REQUESTS = {"RecordGetState", "RecordSetOptions", "RecordStart", "RecordStop"};
 
+// "No sound": OBS's file outputs won't start without a sound track, so
+// the file gets one of silence, from a sound mix of its own.
+bool silence_in(void *, uint64_t start_ts, uint64_t, uint64_t *new_ts, uint32_t, struct audio_output_data *)
+{
+	*new_ts = start_ts;
+	return true;
+}
+
+audio_t *open_silence()
+{
+	const struct audio_output_info *main = audio_output_get_info(obs_get_audio());
+	struct audio_output_info info = {};
+	info.name = "DireBot clean silence";
+	info.samples_per_sec = main ? main->samples_per_sec : 48000;
+	info.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	info.speakers = main ? main->speakers : SPEAKERS_STEREO;
+	info.input_callback = silence_in;
+	audio_t *audio = nullptr;
+	return audio_output_open(&audio, &info) == AUDIO_OUTPUT_SUCCESS ? audio : nullptr;
+}
+
 json fail(const std::string &words)
 {
 	return {{"ok", false}, {"error", words}};
@@ -329,17 +350,25 @@ std::string CleanRecordings::start_one(const Pick &pick)
 	}
 	obs_encoder_set_video(r.video, obs_canvas_get_video(r.canvas));
 
-	if (pick.audio_track > 0) {
-		OBSDataAutoRelease as = obs_data_create();
-		obs_data_set_int(as, "bitrate", obs::audio_kbps(config, pick.audio_track));
-		r.audio = obs_audio_encoder_create(obs::audio_encoder_id(), (name + " sound").c_str(), as,
-						   (size_t)(pick.audio_track - 1), nullptr);
-		if (!r.audio) {
+	audio_t *mix = obs_get_audio();
+	if (pick.audio_track <= 0) {
+		r.silence = open_silence();
+		if (!r.silence) {
 			release(r);
-			return "OBS couldn't make a sound encoder for it.";
+			return "OBS couldn't make a silent sound track for it.";
 		}
-		obs_encoder_set_audio(r.audio, obs_get_audio());
+		mix = r.silence;
 	}
+	const int track = pick.audio_track > 0 ? pick.audio_track : 1;
+	OBSDataAutoRelease as = obs_data_create();
+	obs_data_set_int(as, "bitrate", obs::audio_kbps(config, track));
+	r.audio = obs_audio_encoder_create(obs::audio_encoder_id(), (name + " sound").c_str(), as,
+					   pick.audio_track > 0 ? (size_t)(track - 1) : 0, nullptr);
+	if (!r.audio) {
+		release(r);
+		return "OBS couldn't make a sound encoder for it.";
+	}
+	obs_encoder_set_audio(r.audio, mix);
 
 	const obs::RecordPlace place = obs::record_place(config);
 	std::string id = vertical::rules::recording_output(place.format);
@@ -364,8 +393,7 @@ std::string CleanRecordings::start_one(const Pick &pick)
 		return "OBS couldn't set up the recording.";
 	}
 	obs_output_set_video_encoder(r.output, r.video);
-	if (r.audio)
-		obs_output_set_audio_encoder(r.output, r.audio, 0);
+	obs_output_set_audio_encoder(r.output, r.audio, 0);
 	signal_handler_connect(obs_output_get_signal_handler(r.output), "stop", &CleanRecordings::on_stop, this);
 	r.started_ns = os_gettime_ns();
 	if (!obs_output_start(r.output)) {
@@ -402,6 +430,10 @@ void CleanRecordings::release(Running &r)
 	if (r.audio) {
 		obs_encoder_release(r.audio);
 		r.audio = nullptr;
+	}
+	if (r.silence) {
+		audio_output_close(r.silence);
+		r.silence = nullptr;
 	}
 	if (r.canvas) {
 		obs_canvas_set_channel(r.canvas, 0, nullptr);
