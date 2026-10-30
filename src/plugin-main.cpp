@@ -44,6 +44,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // "DireBot Follow Cam" (follow/): a source that keeps you in the middle
 // of a crop of your camera, for the tall picture's scenes.
 //
+// 0.3.0: clean recordings (record/) - picked sources each recorded to a
+// file of their own with no overlay, through "Record..." vendor requests;
+// "DireBot Move" (moves/), a transition that slides what's in both
+// scenes into its new place; and "DireBot Blur" (filters/), which
+// DireBot's stream tricks use for Blur and Pixelate.
+//
 // Later parts plug in beside these: each gets its own folder under src/,
 // its own vendor requests, and a line in features().
 
@@ -62,12 +68,15 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "link/crypto.hpp"
 #include "link/server.hpp"
+#include "filters/blur-filter.hpp"
 #include "follow/follow-cam.hpp"
+#include "moves/move-transition.hpp"
 #include "multistream/multistream.hpp"
 #include "obs/link-file.hpp"
 #include "obs/meters.hpp"
 #include "obs/usage.hpp"
 #include "obs/websocket.hpp"
+#include "record/record.hpp"
 #include "vertical/vertical.hpp"
 
 OBS_DECLARE_MODULE()
@@ -113,6 +122,7 @@ public:
 		// (from their windows in OBS, and OBS's own stream button);
 		// DireBot reaches them through the link or OBS's websocket.
 		vertical_.start([this](const std::string &type, const json &data) { emit(type, data); });
+		record_.start([this](const std::string &type, const json &data) { emit(type, data); });
 		multistream_.start();
 		link_ok_ = ws_.find();
 		if (!link_ok_)
@@ -124,6 +134,8 @@ public:
 			for (const std::string &r : vertical::Vertical::requests())
 				requests.push_back(r);
 			for (const std::string &r : multistream::Multistream::requests())
+				requests.push_back(r);
+			for (const std::string &r : record::CleanRecordings::requests())
 				requests.push_back(r);
 			ws_.connect([this](const std::string &type, const json &data,
 					   bool &found) { return vendor_request(type, data, found); },
@@ -150,6 +162,7 @@ public:
 			obs_frontend_remove_event_callback(&Plugin::on_frontend, this);
 		frontend_ = false;
 		usage_.stop();
+		record_.unload();
 		vertical_.unload();
 	}
 
@@ -160,6 +173,7 @@ private:
 	obs::Meters meters_;
 	obs::Usage usage_;
 	vertical::Vertical vertical_;
+	record::CleanRecordings record_;
 	multistream::Multistream multistream_;
 	bool frontend_ = false;
 	bool link_ok_ = false;
@@ -267,6 +281,8 @@ private:
 			return usage_.report();
 		if (vertical::Vertical::handles(type))
 			return vertical_.request(type, data);
+		if (record::CleanRecordings::handles(type))
+			return record_.request(type, data);
 		json answer;
 		if (multistream_.request(type, data, answer))
 			return answer;
@@ -283,7 +299,7 @@ private:
 			{"link_port", server_.port()},
 			{"features",
 			 {{"link", true}, {"meters", true}, {"usage", true}, {"vertical", true}, {"multistream", true},
-			  {"follow_cam", true}}}};
+			  {"follow_cam", true}, {"record", true}, {"moves", true}, {"blur", true}}}};
 	}
 
 	// One small thread for everything that runs on a clock: opening the
@@ -367,6 +383,7 @@ private:
 			if (!closing) {
 				vertical_.tick();
 				multistream_.tick();
+				record_.tick();
 			}
 		}
 	}
@@ -419,6 +436,8 @@ Plugin *plugin = nullptr;
 bool obs_module_load(void)
 {
 	direbot::follow::register_source();
+	direbot::filters::register_blur();
+	direbot::moves::register_transition();
 	obs_log(LOG_INFO, "version %s loaded", PLUGIN_VERSION);
 	return true;
 }

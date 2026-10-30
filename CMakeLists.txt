@@ -47,6 +47,7 @@ target_sources(
     src/obs/address.cpp
     src/obs/keystore.cpp
     src/obs/settings-window.cpp
+    src/obs/recording.cpp
 )
 
 # The vertical picture (src/vertical).
@@ -67,5 +68,16 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/follow/tracker.cpp src/follow/f
 # Multistream: its own outputs to YouTube, Kick and the rest (their stream
 # keys are typed into its window in OBS, locked like the vertical ones).
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/multistream/multistream.cpp src/multistream/places.cpp)
+
+# 0.3.0: clean recordings, DireBot Move and DireBot Blur.
+target_sources(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE
+    src/record/rules.cpp
+    src/record/record.cpp
+    src/moves/plan.cpp
+    src/moves/move-transition.cpp
+    src/filters/blur-filter.cpp
+)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
