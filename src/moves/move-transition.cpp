@@ -19,6 +19,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "move-transition.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <string>
