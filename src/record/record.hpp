@@ -80,6 +80,7 @@ private:
 	std::atomic<bool> tick_queued_{false};
 	Emit emit_;
 	bool started_ = false;
+	bool frontend_ = false;
 	bool closing_ = false;
 	bool loaded_ = false;
 
