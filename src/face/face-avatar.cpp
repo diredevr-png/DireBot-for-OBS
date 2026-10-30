@@ -561,6 +561,10 @@ struct FaceAvatar {
 		}
 		if (!out)
 			out = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+		// A texrender draws once until it's reset: without this only the
+		// very first frame ever showed.
+		if (out && !drawn)
+			gs_texrender_reset(out);
 		if (out && !drawn && gs_texrender_begin(out, w, h)) {
 			vec4 clear;
 			vec4_zero(&clear);
