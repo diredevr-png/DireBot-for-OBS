@@ -24,5 +24,9 @@ link_src=("$here/src/link/crypto.cpp" "$here/src/link/ws.cpp" "$here/src/link/pr
 "$cxx" "${flags[@]}" -o "$out/unit-follow" "$here/tests/unit_follow.cpp" "$here/src/follow/tracker.cpp"
 "$out/unit-follow"
 
+"$cxx" "${flags[@]}" -o "$out/unit-record" "$here/tests/unit_record.cpp" "$here/src/record/rules.cpp" \
+	"$here/src/moves/plan.cpp"
+"$out/unit-record"
+
 "$cxx" "${flags[@]}" -o "$out/harness" "$here/tests/harness.cpp" "$here/src/link/server.cpp" "${link_src[@]}"
 DIREBOT_LINK_HARNESS="$out/harness" python3 -m pytest -q "$here/tests/test_link.py" "$@"
