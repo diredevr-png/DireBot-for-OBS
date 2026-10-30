@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds and runs the tests for DireBot for OBS that don't need OBS:
-# the unit tests (the link's, the vertical picture's, Follow me's), then the link's
+# the unit tests (the link's, the vertical picture's, Follow me's, clean recordings', the face tracker's), then the link's
 # network tests through obsws-python.
 # (tests/test_real_obs.py runs it inside a real OBS - see its top.)
 #   pip install pytest obsws-python websocket-client
@@ -27,6 +27,19 @@ link_src=("$here/src/link/crypto.cpp" "$here/src/link/ws.cpp" "$here/src/link/pr
 "$cxx" "${flags[@]}" -o "$out/unit-record" "$here/tests/unit_record.cpp" "$here/src/record/rules.cpp" \
 	"$here/src/moves/plan.cpp"
 "$out/unit-record"
+
+# The face tracker: its engine built as the add-on builds it (-O2, the AVX2
+# part with its own flags), the tests against the files in the repo.
+face_obj=()
+for src in net kernels kernels-sse2 kernels-avx2; do
+	extra=()
+	[ "$src" = kernels-avx2 ] && extra=(-mavx2 -mfma)
+	"$cxx" "${flags[@]}" -O2 ${extra[@]+"${extra[@]}"} -c "$here/src/face/nn/$src.cpp" -o "$out/face-$src.o"
+	face_obj+=("$out/face-$src.o")
+done
+"$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-face" "$here/tests/unit_face.cpp" \
+	"$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
+"$out/unit-face"
 
 "$cxx" "${flags[@]}" -o "$out/harness" "$here/tests/harness.cpp" "$here/src/link/server.cpp" "${link_src[@]}"
 DIREBOT_LINK_HARNESS="$out/harness" python3 -m pytest -q "$here/tests/test_link.py" "$@"

@@ -1,0 +1,72 @@
+// DireBot Face Avatar (src/face/face-avatar.cpp): the character's
+// pictures, and your eyes and mouth cut out of the camera with soft edges.
+// Straight (not premultiplied) colour out; the avatar's blend takes care
+// of the rest.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float opacity;
+// The cut-out: where its corner is in the camera's picture (0 to 1), and
+// how far its whole width and height go there - turned with your head.
+uniform float2 origin;
+uniform float2 across;
+uniform float2 down;
+// How much of the edge fades (0 to 1), and a colour it's tinted towards.
+uniform float feather;
+uniform float4 tint;
+uniform float tint_amount;
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float4 PSPicture(VertData v_in) : TARGET
+{
+	float4 c = image.Sample(textureSampler, v_in.uv);
+	return float4(c.rgb, c.a * opacity);
+}
+
+float4 PSCutout(VertData v_in) : TARGET
+{
+	float2 uv = origin + across * v_in.uv.x + down * v_in.uv.y;
+	float4 c = image.Sample(textureSampler, uv);
+	// An oval that fades out towards its edge.
+	float r = length((v_in.uv - 0.5) * 2.0);
+	float edge = max(feather, 0.001);
+	float a = 1.0 - smoothstep(1.0 - edge, 1.0, r);
+	float3 rgb = lerp(c.rgb, c.rgb * tint.rgb, tint_amount);
+	return float4(rgb, a * opacity);
+}
+
+technique Picture
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSPicture(v_in);
+	}
+}
+
+technique Cutout
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSCutout(v_in);
+	}
+}
