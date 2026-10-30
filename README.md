@@ -107,7 +107,7 @@ The link file is `%APPDATA%\obs-studio\plugin_config\direbot-for-obs\link.json`:
 
 ```json
 {"format": 1, "port": 4466, "password": "...", "pid": 1234,
- "obs": "32.0.2", "websocket": "5.6.3", "plugin": "0.1.0", "started": 1798000000}
+ "obs": "32.0.2", "websocket": "5.6.3", "plugin": "0.3.0", "started": 1798000000}
 ```
 
 Connect to `ws://127.0.0.1:<port>` exactly as to obs-websocket (protocol 5,
