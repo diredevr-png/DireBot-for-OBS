@@ -23,6 +23,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -45,14 +46,16 @@ using json = nlohmann::json;
 
 namespace {
 
-// How often it looks for your face, in seconds.
-constexpr float LOOK_EVERY = 1.0f / 30;
+// How often it looks for your face, in seconds ("Easy on my PC": half as
+// often).
+constexpr float LOOK_EVERY = 1.0f / 30, EASY_LOOK_EVERY = 1.0f / 15;
 // Not looked for this long (not shown): what it saw last is too old.
 constexpr float STALE = 0.5f;
 constexpr float FIND_EVERY = 1.0f;
 constexpr int MIN_SIZE = 64, MAX_SIZE = 4096;
-// The set-up still DireBot shows, at most this wide.
-constexpr int STILL_WIDTH = 640;
+// The picture the tracker gets: the camera, at most this big on its
+// longest side (the face models work on 256 x 256 of it at most).
+constexpr uint32_t LOOK_SIZE = 960;
 // Outfit layers at most.
 constexpr size_t MOST_LAYERS = 12;
 
@@ -70,23 +73,6 @@ uint32_t even_size(long long v)
 {
 	v = std::min<long long>(MAX_SIZE, std::max<long long>(MIN_SIZE, v));
 	return (uint32_t)(v & ~1LL);
-}
-
-struct Speed {
-	const char *id;
-	const char *words;
-	float seconds;
-};
-constexpr Speed SPEEDS[] = {{"slow", "FaceAvatar.Slow", 1.2f},
-			    {"normal", "FaceAvatar.Normal", 0.6f},
-			    {"quick", "FaceAvatar.Quick", 0.25f}};
-
-float seconds_for(const char *id)
-{
-	for (const Speed &s : SPEEDS)
-		if (id && std::strcmp(id, s.id) == 0)
-			return s.seconds;
-	return SPEEDS[1].seconds;
 }
 
 // A rectangle as shares of something (the character, the camera).
@@ -157,45 +143,44 @@ struct Layer {
 	bool behind = false;
 };
 
-// The tracker, on a thread of its own: OBS hands it the newest small grey
-// picture and carries on; what it found is picked up on a later frame.
+// The tracker, on a thread of its own: OBS hands it the newest picture
+// and carries on; what it found is picked up on a later frame. It loads
+// the face models itself, so OBS never waits for that either.
 class Worker {
 public:
-	Worker()
+	// `done`: "Set" has finished, with it as text (on this thread).
+	Worker(std::string models, std::function<void(const std::string &)> done)
+		: models_(std::move(models)),
+		  done_(std::move(done))
 	{
 		thread_ = std::thread([this] { run(); });
 	}
-	~Worker()
+	~Worker() { stop(); }
+
+	// Waits for the thread to finish (its "Set" callback included).
+	void stop()
 	{
 		{
 			std::lock_guard<std::mutex> l(lock_);
 			stop_ = true;
 		}
 		wake_.notify_all();
-		thread_.join();
+		if (thread_.joinable())
+			thread_.join();
 	}
 
-	// A new look (the graphics thread). One not yet worked on is
-	// replaced: only the newest matters.
-	void give(std::vector<uint8_t> &grey, int w, int h)
+	// A new look (the graphics thread): RGBA, row after row, and when it
+	// was taken. One not yet worked on is replaced: only the newest
+	// matters.
+	void give(std::vector<uint8_t> &rgba, int w, int h, uint64_t ns)
 	{
 		{
 			std::lock_guard<std::mutex> l(lock_);
-			in_.swap(grey);
+			in_.swap(rgba);
 			in_w_ = w;
 			in_h_ = h;
+			in_ns_ = ns;
 			have_ = true;
-		}
-		wake_.notify_one();
-	}
-
-	// A new set-up (from the settings), or none.
-	void set_up(const std::string &saved)
-	{
-		{
-			std::lock_guard<std::mutex> l(lock_);
-			saved_ = saved;
-			load_ = true;
 		}
 		wake_.notify_one();
 	}
@@ -206,48 +191,103 @@ public:
 		forget_ = true;
 	}
 
-	// The newest result and how many looks there have been.
-	Face face(uint64_t &looks, bool &ready, float &home_x, float &home_y) const
+	void set_smoothing(float amount) { smoothing_ = amount; }
+
+	// "Set": the next looks that find the face are its rest.
+	void start_rest()
+	{
+		{
+			std::lock_guard<std::mutex> l(lock_);
+			start_rest_ = true;
+		}
+		wake_.notify_one();
+	}
+	// A "Set" from the settings ("": none).
+	void load_rest(const std::string &text)
+	{
+		{
+			std::lock_guard<std::mutex> l(lock_);
+			rest_text_ = text;
+			load_rest_ = true;
+			start_rest_ = false;
+		}
+		wake_.notify_one();
+	}
+	// A "Set" finished here but not in the settings yet.
+	bool rest_pending() const
 	{
 		std::lock_guard<std::mutex> l(lock_);
-		looks = looks_;
-		ready = ready_;
-		home_x = home_x_;
-		home_y = home_y_;
-		return face_;
+		return pending_ || start_rest_ || setting_;
+	}
+	void rest_saved()
+	{
+		std::lock_guard<std::mutex> l(lock_);
+		pending_ = false;
 	}
 
-	float looks_per_second() const
+	struct State {
+		Face face;
+		Rest rest;
+		bool ready = false, setting = false;
+		std::string problem;
+		uint64_t looks = 0;
+		float rate = 0, ms = 0;
+	};
+	void state(State &out) const
 	{
 		std::lock_guard<std::mutex> l(lock_);
-		return rate_;
+		out.face = face_;
+		out.rest = rest_;
+		out.ready = ready_;
+		out.setting = setting_ || start_rest_;
+		out.problem = problem_;
+		out.looks = looks_;
+		out.rate = rate_;
+		out.ms = ms_;
 	}
 
 private:
 	void run()
 	{
 		Tracker tracker;
-		std::vector<uint8_t> grey;
+		std::string problem;
+		const bool ok = tracker.load_file(models_, &problem);
+		if (!ok)
+			obs_log(LOG_WARNING, "DireBot Face Avatar: %s", problem.c_str());
+		{
+			std::lock_guard<std::mutex> l(lock_);
+			ready_ = ok;
+			problem_ = problem;
+		}
+		std::vector<uint8_t> rgba;
 		uint64_t window_start = os_gettime_ns();
 		int window_looks = 0;
+		double window_ms = 0;
 		for (;;) {
 			int w = 0, h = 0;
-			bool look = false, load = false, forget = false;
-			std::string saved;
+			uint64_t ns = 0;
+			bool look = false, forget = false, start = false, load = false;
+			std::string text;
 			{
 				std::unique_lock<std::mutex> l(lock_);
-				wake_.wait(l, [this] { return stop_ || have_ || load_; });
+				wake_.wait(l, [this] { return stop_ || have_ || load_rest_ || start_rest_; });
 				if (stop_)
 					return;
-				if (load_) {
+				if (load_rest_) {
 					load = true;
-					saved.swap(saved_);
-					load_ = false;
+					text.swap(rest_text_);
+					load_rest_ = false;
+				}
+				if (start_rest_) {
+					start = true;
+					start_rest_ = false;
+					setting_ = true;
 				}
 				if (have_) {
-					grey.swap(in_);
+					rgba.swap(in_);
 					w = in_w_;
 					h = in_h_;
+					ns = in_ns_;
 					have_ = false;
 					look = true;
 				}
@@ -255,51 +295,85 @@ private:
 				forget_ = false;
 			}
 			if (load) {
-				tracker = Tracker();
-				if (!saved.empty() && !tracker.load(saved))
-					obs_log(LOG_WARNING, "DireBot Face Avatar: its set-up couldn't be read; set it up again in DireBot.");
+				if (text.empty())
+					tracker.clear_rest();
+				else if (!tracker.load_rest(text))
+					obs_log(LOG_WARNING,
+						"DireBot Face Avatar: its \"Set\" couldn't be read; press Set again in DireBot.");
 			}
+			if (start)
+				tracker.set_rest();
 			if (forget)
 				tracker.forget();
-			Face face;
-			if (look)
-				face = tracker.update(grey.data(), w, h);
+			tracker.set_smoothing(smoothing_);
+			const bool was_setting = tracker.setting();
+			if (look && ok)
+				tracker.look(Frame{rgba.data(), w, h, w * 4, false}, (double)ns / 1e9);
+			std::string finished;
+			if (was_setting && !tracker.setting() && tracker.has_rest())
+				finished = tracker.save_rest();
 			const uint64_t now = os_gettime_ns();
-			window_looks += look;
-			std::lock_guard<std::mutex> l(lock_);
-			ready_ = tracker.ready();
-			home_x_ = tracker.home_x();
-			home_y_ = tracker.home_y();
-			if (look) {
-				face_ = face;
-				looks_++;
-			} else if (load) {
-				face_ = Face();
+			if (look && ok) {
+				window_looks++;
+				window_ms += tracker.face().ms;
 			}
-			if (now - window_start >= 2'000'000'000ULL) {
-				rate_ = window_looks * 1e9f / (float)(now - window_start);
-				window_start = now;
-				window_looks = 0;
+			{
+				std::lock_guard<std::mutex> l(lock_);
+				if (look || load || forget)
+					face_ = tracker.face();
+				rest_ = tracker.rest();
+				setting_ = tracker.setting();
+				if (look)
+					looks_++;
+				if (!finished.empty())
+					pending_ = true;
+				if (now - window_start >= 2'000'000'000ULL) {
+					rate_ = window_looks * 1e9f / (float)(now - window_start);
+					ms_ = window_looks ? (float)(window_ms / window_looks) : 0;
+					window_start = now;
+					window_looks = 0;
+					window_ms = 0;
+				}
 			}
+			if (!finished.empty() && done_)
+				done_(finished);
 		}
 	}
 
+	const std::string models_;
+	const std::function<void(const std::string &)> done_;
+	std::atomic<float> smoothing_{0.5f};
 	mutable std::mutex lock_;
 	std::condition_variable wake_;
 	std::thread thread_;
-	bool stop_ = false, have_ = false, load_ = false, forget_ = false;
+	bool stop_ = false, have_ = false, forget_ = false, load_rest_ = false, start_rest_ = false;
+	bool pending_ = false, setting_ = false;
 	std::vector<uint8_t> in_;
 	int in_w_ = 0, in_h_ = 0;
-	std::string saved_;
+	uint64_t in_ns_ = 0;
+	std::string rest_text_;
 	Face face_;
+	Rest rest_;
 	uint64_t looks_ = 0;
 	bool ready_ = false;
-	float home_x_ = 0.5f, home_y_ = 0.5f;
-	float rate_ = 0;
+	std::string problem_;
+	float rate_ = 0, ms_ = 0;
 };
+
+// Where the face models are: data/face, next to the add-on.
+std::string models_path()
+{
+	char *path = obs_module_file("face/face_landmarker.task");
+	std::string out = path ? path : "";
+	bfree(path);
+	return out;
+}
+
+void save_rest_task(void *param);
 
 struct FaceAvatar {
 	obs_source_t *self = nullptr;
+	obs_weak_source_t *weak_self = nullptr;
 
 	// Set on OBS's UI thread (update), read while drawing.
 	std::mutex lock, find_lock;
@@ -311,41 +385,52 @@ struct FaceAvatar {
 	PicturePtr body, body_left, body_right, own_face;
 	std::vector<Layer> layers;
 	Rect spots[PARTS]; // on the character, as the viewer sees them: left eye, right eye, mouth
-	Rect boxes[PARTS]; // in the camera, as it sees them: first eye, second eye, mouth
 	bool have_spots = false;
-	std::string saved; // the tracker's set-up, as last handed over
+	std::string rest_seen; // "Set" as last read from the settings or saved to them (under `lock`)
 	float size = 0.85f, part_size = 1.0f, feather = 0.35f, tint_amount = 0;
 	vec4 tint;
 	bool mirror = true;
-	float follow_move = 0.6f, follow_grow = 0.6f, follow_tilt = 1.0f, seconds = 0.6f;
+	float follow_move = 0.6f, follow_grow = 0.6f, follow_tilt = 1.0f;
 	float most_move = 0.25f; // of the source's size
 	bool turn_pictures = true;
+	std::atomic<bool> easy{false};
 
-	// Only on OBS's graphics thread (video_tick and video_render).
 	Worker worker;
-	Smoother smoother;
-	std::atomic<bool> reset_smoother{false};
+	// Only on OBS's graphics thread (video_tick and video_render).
+	Shown shown;
+	std::atomic<bool> reset_shown{false};
 	uint64_t seen_looks = 0;
-	gs_texrender_t *cam_tex = nullptr; // the camera, as it is
+	Worker::State seen;
+	gs_texrender_t *cam_tex = nullptr; // the camera, as it is (held while the face is lost)
 	gs_texrender_t *small = nullptr;   // the camera, small, for a look
 	gs_texrender_t *out = nullptr;     // the avatar, drawn once a frame
 	gs_stagesurf_t *stage = nullptr;
 	uint32_t stage_w = 0, stage_h = 0;
 	bool staged = false;
+	uint64_t staged_ns = 0;
 	float since_look = 0, since_find = 0;
-	std::vector<uint8_t> grey;
+	float frame_dt = 0; // the last frame's length
+	std::vector<uint8_t> rgba;
 	gs_effect_t *effect = nullptr;
 	gs_eparam_t *p_image = nullptr, *p_opacity = nullptr, *p_origin = nullptr, *p_across = nullptr,
 		    *p_down = nullptr, *p_feather = nullptr, *p_tint = nullptr, *p_tint_amount = nullptr;
 	bool drawing = false, drawn = false;
 	// What it showed last, for FaceGetState.
 	std::mutex state_lock;
-	Smoother::Out shown_now;
-	Face face_now;
-	bool ready_now = false, showing_now = false;
+	Shown::Out shown_now;
+	Worker::State state_now;
+	bool showing_now = false;
 	uint64_t last_render = 0;
 
-	FaceAvatar()
+	explicit FaceAvatar(obs_source_t *source)
+		: self(source),
+		  weak_self(obs_source_get_weak_source(source)),
+		  worker(models_path(), [weak = weak_self](const std::string &text) {
+			  // Saved in the settings on OBS's UI thread (save_rest_task).
+			  obs_weak_source_addref(weak);
+			  auto *job = new std::pair<obs_weak_source_t *, std::string>(weak, text);
+			  obs_queue_task(OBS_TASK_UI, save_rest_task, job, false);
+		  })
 	{
 		vec4_set(&tint, 1, 1, 1, 1);
 		char *path = obs_module_file("effects/direbot-face.effect");
@@ -370,6 +455,7 @@ struct FaceAvatar {
 
 	~FaceAvatar()
 	{
+		worker.stop();
 		obs_enter_graphics();
 		gs_texrender_destroy(cam_tex);
 		gs_texrender_destroy(small);
@@ -378,6 +464,7 @@ struct FaceAvatar {
 		gs_effect_destroy(effect);
 		obs_leave_graphics();
 		obs_weak_source_release(camera);
+		obs_weak_source_release(weak_self);
 	}
 
 	obs_source_t *get_camera()
@@ -417,28 +504,26 @@ struct FaceAvatar {
 		obs_source_release(found);
 	}
 
-	// A small grey copy of the camera for the tracker: the one read back
-	// last time goes to it, and a new one is asked for.
+	// A copy of the camera for the tracker: the one read back last time
+	// goes to it, and a new one is asked for.
 	void look(obs_source_t *cam, uint32_t cw, uint32_t ch)
 	{
 		if (staged && stage) {
 			uint8_t *data = nullptr;
 			uint32_t line = 0;
 			if (gs_stagesurface_map(stage, &data, &line)) {
-				grey.resize((size_t)stage_w * stage_h);
-				for (uint32_t y = 0; y < stage_h; y++) {
-					const uint8_t *p = data + (size_t)y * line;
-					uint8_t *g = &grey[(size_t)y * stage_w];
-					for (uint32_t x = 0; x < stage_w; x++, p += 4)
-						g[x] = (uint8_t)((p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8);
-				}
+				rgba.resize((size_t)stage_w * stage_h * 4);
+				for (uint32_t y = 0; y < stage_h; y++)
+					std::memcpy(&rgba[(size_t)y * stage_w * 4], data + (size_t)y * line,
+						    (size_t)stage_w * 4);
 				gs_stagesurface_unmap(stage);
-				worker.give(grey, (int)stage_w, (int)stage_h);
+				worker.give(rgba, (int)stage_w, (int)stage_h, staged_ns);
 			}
 			staged = false;
 		}
-		const uint32_t sw = Tracker::WIDTH;
-		const uint32_t sh = std::clamp<uint32_t>((uint32_t)std::lround((double)sw * ch / cw) & ~1u, 32, sw * 4);
+		const double fit = std::min(1.0, (double)LOOK_SIZE / std::max(cw, ch));
+		const uint32_t sw = std::max<uint32_t>(32, (uint32_t)std::lround(cw * fit) & ~1u);
+		const uint32_t sh = std::max<uint32_t>(32, (uint32_t)std::lround(ch * fit) & ~1u);
 		if (!stage || stage_w != sw || stage_h != sh) {
 			gs_stagesurface_destroy(stage);
 			stage = gs_stagesurface_create(sw, sh, GS_RGBA);
@@ -460,6 +545,7 @@ struct FaceAvatar {
 			gs_texrender_end(small);
 			gs_stage_texture(stage, gs_texrender_get_texture(small));
 			staged = true;
+			staged_ns = os_gettime_ns();
 		}
 	}
 
@@ -477,17 +563,16 @@ struct FaceAvatar {
 	}
 
 	// One eye or the mouth, from the camera onto the character's spot.
-	void draw_cutout(gs_texture_t *cam, uint32_t cw, uint32_t ch, const Smoother::Out &o, int part, const Rect &spot,
+	void draw_cutout(gs_texture_t *cam, uint32_t cw, uint32_t ch, const Shown::Out &o, int part, const Rect &spot,
 			 float char_w, float char_h, float opacity)
 	{
 		if (!cam || opacity <= 0.001f)
 			return;
-		// In the camera: the part's box at set-up, as big as the face is
-		// now and turned with it (pixel middles: + half a pixel).
-		const float s = o.scale;
-		const float bw = boxes[part].w * cw * s, bh = boxes[part].h * ch * s;
-		const float c = std::cos(o.angle), sn = std::sin(o.angle);
-		const float px = (o.x[part] + 0.5f / Tracker::WIDTH) * cw, py = (o.y[part] + 0.5f / Tracker::WIDTH) * ch;
+		// In the camera: the part's box, turned with the eyes.
+		const Part &box = o.layout.parts[part];
+		const float bw = box.w * cw, bh = box.h * ch;
+		const float c = std::cos(o.layout.angle), sn = std::sin(o.layout.angle);
+		const float px = box.x * cw, py = box.y * ch;
 		float ax = c * bw, ay = sn * bw, dx = -sn * bh, dy = c * bh;
 		float ox = px - ax / 2 - dx / 2, oy = py - ay / 2 - dy / 2;
 		if (mirror) {
@@ -534,7 +619,9 @@ struct FaceAvatar {
 		drawing = true;
 		gs_blend_state_push();
 		if (cam && cw && ch) {
-			if (since_look >= LOOK_EVERY) {
+			// Within half a frame of time to look: a frame's length wobbles
+			// (OBS at 30 frames a second looks on every one of them).
+			if (since_look + frame_dt / 2 >= (easy ? EASY_LOOK_EVERY : LOOK_EVERY)) {
 				if (since_look > STALE) {
 					staged = false;
 					worker.forget();
@@ -543,10 +630,11 @@ struct FaceAvatar {
 				gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 				look(cam, cw, ch);
 			}
-			// The camera as it is, for the cut-outs.
+			// The camera as it is, for the cut-outs - kept as it was while
+			// the face is lost, so they never show anything else.
 			if (!cam_tex)
 				cam_tex = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-			if (!drawn && cam_tex) {
+			if (!drawn && cam_tex && !shown.now().holding) {
 				gs_texrender_reset(cam_tex);
 				gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 				if (gs_texrender_begin(cam_tex, cw, ch)) {
@@ -596,7 +684,7 @@ struct FaceAvatar {
 	void draw_avatar(gs_texture_t *cam, uint32_t cw, uint32_t ch, uint32_t w, uint32_t h)
 	{
 		std::lock_guard<std::mutex> l(pictures_lock);
-		const Smoother::Out o = smoother.now();
+		const Shown::Out o = shown.now();
 		// Which way it faces: turned pictures if there are any.
 		int turned = turn_pictures ? o.turned * (mirror ? -1 : 1) : 0;
 		const Picture *pic = body.get();
@@ -608,13 +696,9 @@ struct FaceAvatar {
 			return;
 		const float char_w = pic->width(), char_h = pic->height();
 		// Sized to fit, then following you: moved, grown and tilted as
-		// you are against the set-up still, within limits.
-		float home_x = 0.5f, home_y = 0.5f;
-		uint64_t looks;
-		bool ready;
-		worker.face(looks, ready, home_x, home_y);
+		// you are against "Set", within limits.
 		const float fit = std::min(w / char_w, h / char_h) * size;
-		float dx = (o.cx - home_x) * follow_move, dy = (o.cy - home_y) * follow_move;
+		float dx = (o.layout.cx - o.home_x) * follow_move, dy = (o.layout.cy - o.home_y) * follow_move;
 		if (mirror)
 			dx = -dx;
 		dx = clampf(dx, -most_move, most_move);
@@ -632,19 +716,19 @@ struct FaceAvatar {
 				draw_picture(layer.picture->texture(), layer.place.x * char_w, layer.place.y * char_h,
 					     layer.place.w * char_w, layer.place.h * char_h, 1);
 		draw_picture(pic->texture(), 0, 0, char_w, char_h, 1);
-		const float shown = ready && have_spots && cam ? o.shown : 0;
-		if (shown > 0) {
+		const float showing = seen.ready && have_spots && cam ? o.shown : 0;
+		if (showing > 0) {
 			for (int part = 0; part < PARTS; part++) {
 				// The camera's first eye is on the viewer's left - unless
 				// mirrored, when it's on their right.
 				int spot = part;
 				if (part != MOUTH && mirror)
 					spot = part == FIRST_EYE ? 1 : 0;
-				draw_cutout(cam, cw, ch, o, part, spots[spot], char_w, char_h, shown);
+				draw_cutout(cam, cw, ch, o, part, spots[spot], char_w, char_h, showing);
 			}
 		}
 		if (own_face)
-			draw_picture(own_face->texture(), 0, 0, char_w, char_h, 1 - shown);
+			draw_picture(own_face->texture(), 0, 0, char_w, char_h, 1 - showing);
 		for (const Layer &layer : layers)
 			if (!layer.behind && layer.picture)
 				draw_picture(layer.picture->texture(), layer.place.x * char_w, layer.place.y * char_h,
@@ -655,6 +739,7 @@ struct FaceAvatar {
 	void tick(float dt)
 	{
 		drawn = false;
+		frame_dt = dt;
 		since_look += dt;
 		since_find += dt;
 		if (since_find >= FIND_EVERY) {
@@ -665,19 +750,15 @@ struct FaceAvatar {
 			else
 				find_camera();
 		}
-		uint64_t looks;
-		bool ready;
-		float hx, hy;
-		const Face face = worker.face(looks, ready, hx, hy);
-		const bool fresh = looks != seen_looks;
-		seen_looks = looks;
-		if (reset_smoother.exchange(false))
-			smoother.reset();
-		const Smoother::Out o = smoother.step(face, dt, seconds, fresh);
+		worker.state(seen);
+		const bool fresh = seen.looks != seen_looks;
+		seen_looks = seen.looks;
+		if (reset_shown.exchange(false))
+			shown.reset();
+		const Shown::Out o = shown.step(seen.face, seen.rest, dt, fresh);
 		std::lock_guard<std::mutex> l(state_lock);
 		shown_now = o;
-		face_now = face;
-		ready_now = ready;
+		state_now = seen;
 		if (os_gettime_ns() - last_render > 500'000'000ULL)
 			showing_now = false;
 	}
@@ -696,21 +777,22 @@ struct FaceAvatar {
 		if (changed)
 			find_camera();
 
-		// The set-up (from DireBot's FaceSetUp): how the parts look, and
-		// each one's box in the camera at the time.
-		const json face = json::parse(obs_data_get_string(settings, "face"), nullptr, false);
-		std::string tracker_text;
-		Rect got[PARTS];
-		bool have_boxes = false;
-		if (face.is_object() && face.contains("boxes") && face["boxes"].is_array() && face["boxes"].size() == PARTS) {
-			have_boxes = true;
-			for (int i = 0; i < PARTS; i++)
-				have_boxes = have_boxes && rect_from(face["boxes"][i], got[i]);
-			if (face.contains("tracker") && face["tracker"].is_string())
-				tracker_text = face["tracker"].get<std::string>();
+		// "Set" (from DireBot's FaceSet, saved here by save_rest_task),
+		// unless one has just finished and isn't saved yet.
+		const char *rest_text = obs_data_get_string(settings, "rest");
+		const std::string rest_now = rest_text ? rest_text : "";
+		bool new_rest = false;
+		{
+			std::lock_guard<std::mutex> l(lock);
+			if (rest_seen != rest_now && !worker.rest_pending()) {
+				rest_seen = rest_now;
+				new_rest = true;
+			}
 		}
-		if (!have_boxes)
-			tracker_text.clear();
+		if (new_rest) {
+			worker.load_rest(rest_now);
+			reset_shown = true;
+		}
 		const json spot_json = json::parse(obs_data_get_string(settings, "spots"), nullptr, false);
 		Rect got_spots[PARTS];
 		bool have = spot_json.is_object();
@@ -762,18 +844,11 @@ struct FaceAvatar {
 			body_right.swap(next_right);
 			own_face.swap(next_face);
 			layers.swap(worn);
-			if (have_boxes)
-				std::copy(got, got + PARTS, boxes);
 			have_spots = have;
 			if (have)
 				std::copy(got_spots, got_spots + PARTS, spots);
 		}
 		next_layers.clear();
-		if (tracker_text != saved) {
-			saved = tracker_text;
-			worker.set_up(saved);
-			reset_smoother = true;
-		}
 
 		size = clampf((float)obs_data_get_int(settings, "size") / 100.0f, 0.2f, 1.0f);
 		part_size = clampf((float)obs_data_get_int(settings, "part_size") / 100.0f, 0.5f, 2.0f);
@@ -787,33 +862,68 @@ struct FaceAvatar {
 		follow_grow = clampf((float)obs_data_get_int(settings, "follow_grow") / 100.0f, 0, 1);
 		follow_tilt = clampf((float)obs_data_get_int(settings, "follow_tilt") / 100.0f, 0, 1);
 		most_move = clampf((float)obs_data_get_int(settings, "most_move") / 100.0f, 0, 0.5f);
-		seconds = seconds_for(obs_data_get_string(settings, "speed"));
+		worker.set_smoothing(clampf((float)obs_data_get_int(settings, "smoothing") / 100.0f, 0, 1));
+		easy = obs_data_get_bool(settings, "easy");
 	}
 
-	json state()
+	// "Set" is in the settings now (save_rest_task, on the UI thread).
+	void rest_saved(const std::string &text)
+	{
+		{
+			std::lock_guard<std::mutex> l(lock);
+			rest_seen = text;
+		}
+		worker.rest_saved();
+	}
+
+	json state(bool with_points)
 	{
 		std::lock_guard<std::mutex> l(state_lock);
+		const Face &face = state_now.face;
+		const Shown::Out &o = shown_now;
+		auto r = [](float v, float steps) {
+			return std::round(v * steps) / steps;
+		};
 		json parts = json::array();
-		for (int i = 0; i < PARTS; i++)
-			parts.push_back({face_now.x[i], face_now.y[i]});
+		for (const Part &p : o.layout.parts)
+			parts.push_back(
+				{{"x", r(p.x, 1e4f)}, {"y", r(p.y, 1e4f)}, {"w", r(p.w, 1e4f)}, {"h", r(p.h, 1e4f)}});
+		json moves = json::object();
+		for (int i = 1; i < EXPRESSIONS; i++)
+			moves[EXPRESSION_NAMES[i]] = r(o.moves[i], 100);
 		json camera_name_now;
 		{
 			std::lock_guard<std::mutex> l2(lock);
 			camera_name_now = camera_name;
 		}
-		return {{"ok", true},
+		json answer = {
+			{"ok", true},
 			{"camera", camera_name_now},
-			{"ready", ready_now},
+			{"ready", state_now.ready},
 			{"showing", showing_now},
-			{"found", face_now.found},
-			{"sure", face_now.found && face_now.confidence >= SURE},
-			{"confidence", std::round(face_now.confidence * 100) / 100},
+			{"found", face.found},
+			{"presence", r(face.presence, 100)},
+			{"set", state_now.rest.set},
+			{"setting", state_now.setting},
+			{"turn",
+			 {{"yaw", r(o.turn.yaw, 10)}, {"pitch", r(o.turn.pitch, 10)}, {"roll", r(o.turn.roll, 10)}}},
+			{"turned", o.turned},
+			{"moves", moves},
 			{"parts", parts},
-			{"scale", std::round(face_now.scale * 100) / 100},
-			{"angle", std::round(face_now.angle * 100) / 100},
-			{"turned", face_now.turned},
-			{"shown", std::round(shown_now.shown * 100) / 100},
-			{"looks_per_second", std::round(worker.looks_per_second() * 10) / 10}};
+			{"shown", r(o.shown, 100)},
+			{"holding", o.holding},
+			{"looks_per_second", r(state_now.rate, 10)},
+			{"ms", r(state_now.ms, 10)}};
+		if (!state_now.problem.empty())
+			answer["problem"] = state_now.problem;
+		if (with_points && face.found && face.w > 0 && face.h > 0) {
+			json points = json::array();
+			for (const Point &p : face.points)
+				points.push_back(
+					{{"x", r((p.x + 0.5f) / face.w, 1e4f)}, {"y", r((p.y + 0.5f) / face.h, 1e4f)}});
+			answer["points"] = points;
+		}
+		return answer;
 	}
 
 	static void on_rename(void *data, calldata_t *cd)
@@ -839,6 +949,22 @@ struct FaceAvatar {
 	}
 };
 
+void save_rest_task(void *param)
+{
+	std::unique_ptr<std::pair<obs_weak_source_t *, std::string>> job(
+		static_cast<std::pair<obs_weak_source_t *, std::string> *>(param));
+	obs_source_t *src = obs_weak_source_get_source(job->first);
+	obs_weak_source_release(job->first);
+	if (!src)
+		return;
+	obs_data_t *settings = obs_source_get_settings(src);
+	obs_data_set_string(settings, "rest", job->second.c_str());
+	obs_data_release(settings);
+	if (auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src)))
+		f->rest_saved(job->second);
+	obs_source_release(src);
+}
+
 const char *get_name(void *)
 {
 	return text("FaceAvatar.Name");
@@ -846,8 +972,7 @@ const char *get_name(void *)
 
 void *create(obs_data_t *settings, obs_source_t *source)
 {
-	auto *f = new FaceAvatar();
-	f->self = source;
+	auto *f = new FaceAvatar(source);
 	f->update(settings);
 	signal_handler_connect(obs_get_signal_handler(), "source_rename", FaceAvatar::on_rename, f);
 	return f;
@@ -881,8 +1006,9 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "follow_grow", 60);
 	obs_data_set_default_int(settings, "follow_tilt", 100);
 	obs_data_set_default_int(settings, "most_move", 25);
-	obs_data_set_default_string(settings, "speed", "normal");
-	obs_data_set_default_string(settings, "face", "");
+	obs_data_set_default_int(settings, "smoothing", 50);
+	obs_data_set_default_bool(settings, "easy", false);
+	obs_data_set_default_string(settings, "rest", "");
 	obs_data_set_default_string(settings, "spots", "");
 	obs_data_set_default_string(settings, "outfit", "[]");
 }
@@ -939,10 +1065,9 @@ obs_properties_t *get_properties(void *data)
 	obs_property_int_set_suffix(p, "%");
 	p = obs_properties_add_int_slider(props, "most_move", text("FaceAvatar.MostMove"), 0, 50, 1);
 	obs_property_int_set_suffix(p, "%");
-	obs_property_t *speed = obs_properties_add_list(props, "speed", text("FaceAvatar.Speed"), OBS_COMBO_TYPE_LIST,
-							OBS_COMBO_FORMAT_STRING);
-	for (const Speed &s : SPEEDS)
-		obs_property_list_add_string(speed, text(s.words), s.id);
+	p = obs_properties_add_int_slider(props, "smoothing", text("FaceAvatar.Smoothing"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_bool(props, "easy", text("FaceAvatar.Easy"));
 	obs_properties_add_int(props, "width", text("FaceAvatar.Width"), MIN_SIZE, MAX_SIZE, 2);
 	obs_properties_add_int(props, "height", text("FaceAvatar.Height"), MIN_SIZE, MAX_SIZE, 2);
 	return props;
@@ -985,126 +1110,7 @@ json fail(const char *words)
 	return {{"ok", false}, {"error", words}};
 }
 
-// The last set-up still: its small grey copy, kept for FaceSetUp.
-struct Still {
-	std::mutex lock;
-	uint64_t id = 0;
-	std::string camera;
-	std::vector<uint8_t> grey;
-	int w = 0, h = 0;
-};
-Still last_still;
 std::shared_ptr<std::atomic<bool>> alive = std::make_shared<std::atomic<bool>>(true);
-
-// Draws the camera once at w x h and reads it back (RGBA, row after row).
-bool grab(obs_source_t *cam, uint32_t cw, uint32_t ch, uint32_t w, uint32_t h, std::vector<uint8_t> &rgba)
-{
-	bool ok = false;
-	obs_enter_graphics();
-	gs_texrender_t *tex = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-	gs_stagesurf_t *stage = gs_stagesurface_create(w, h, GS_RGBA);
-	if (tex && stage && gs_texrender_begin(tex, w, h)) {
-		vec4 clear;
-		vec4_zero(&clear);
-		gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
-		gs_ortho(0.0f, (float)cw, 0.0f, (float)ch, -100.0f, 100.0f);
-		gs_blend_state_push();
-		gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
-		obs_source_video_render(cam);
-		gs_blend_state_pop();
-		gs_texrender_end(tex);
-		gs_stage_texture(stage, gs_texrender_get_texture(tex));
-		uint8_t *data = nullptr;
-		uint32_t line = 0;
-		if (gs_stagesurface_map(stage, &data, &line)) {
-			rgba.resize((size_t)w * h * 4);
-			for (uint32_t y = 0; y < h; y++)
-				std::memcpy(&rgba[(size_t)y * w * 4], data + (size_t)y * line, (size_t)w * 4);
-			gs_stagesurface_unmap(stage);
-			ok = true;
-		}
-	}
-	gs_stagesurface_destroy(stage);
-	gs_texrender_destroy(tex);
-	obs_leave_graphics();
-	return ok;
-}
-
-// A picture as a BMP file (24-bit, bottom row first): every browser shows
-// one, and it needs no code but this.
-std::string bmp(const std::vector<uint8_t> &rgba, uint32_t w, uint32_t h)
-{
-	const uint32_t row = (w * 3 + 3) & ~3u, size = 54 + row * h;
-	std::vector<uint8_t> out(size, 0);
-	auto put = [&](size_t at, uint32_t v, int bytes) {
-		for (int i = 0; i < bytes; i++)
-			out[at + i] = (uint8_t)(v >> (8 * i));
-	};
-	out[0] = 'B';
-	out[1] = 'M';
-	put(2, size, 4);
-	put(10, 54, 4);
-	put(14, 40, 4);
-	put(18, w, 4);
-	put(22, h, 4);
-	put(26, 1, 2);
-	put(28, 24, 2);
-	put(34, row * h, 4);
-	for (uint32_t y = 0; y < h; y++) {
-		const uint8_t *p = &rgba[(size_t)(h - 1 - y) * w * 4];
-		uint8_t *q = &out[54 + (size_t)y * row];
-		for (uint32_t x = 0; x < w; x++, p += 4, q += 3) {
-			q[0] = p[2];
-			q[1] = p[1];
-			q[2] = p[0];
-		}
-	}
-	return "data:image/bmp;base64," + encode(out);
-}
-
-json take_still(const json &data)
-{
-	const std::string name = data.value("camera", std::string());
-	if (name.empty())
-		return fail("Pick your camera first.");
-	obs_source_t *cam = obs_get_source_by_name(name.c_str());
-	if (!cam)
-		return fail("That camera isn't in OBS any more.");
-	const uint32_t cw = obs_source_get_width(cam), ch = obs_source_get_height(cam);
-	if (!cw || !ch) {
-		obs_source_release(cam);
-		return fail("The camera shows nothing right now - is it on, and in use by another app?");
-	}
-	// Shown for a moment, as OBS's own screenshots do, so a camera set to
-	// switch off when hidden gives a picture.
-	obs_source_inc_showing(cam);
-	const uint32_t sw = std::min<uint32_t>(STILL_WIDTH, cw);
-	const uint32_t sh = std::max<uint32_t>(2, (uint32_t)std::lround((double)sw * ch / cw));
-	const uint32_t gw = Tracker::WIDTH;
-	const uint32_t gh = std::clamp<uint32_t>((uint32_t)std::lround((double)gw * ch / cw) & ~1u, 32, gw * 4);
-	std::vector<uint8_t> big, small;
-	const bool ok = grab(cam, cw, ch, sw, sh, big) && grab(cam, cw, ch, gw, gh, small);
-	obs_source_dec_showing(cam);
-	obs_source_release(cam);
-	if (!ok)
-		return fail("Couldn't take a picture from the camera.");
-	std::lock_guard<std::mutex> l(last_still.lock);
-	last_still.id++;
-	last_still.camera = name;
-	last_still.w = (int)gw;
-	last_still.h = (int)gh;
-	last_still.grey.resize((size_t)gw * gh);
-	for (size_t i = 0; i < last_still.grey.size(); i++) {
-		const uint8_t *p = &small[i * 4];
-		last_still.grey[i] = (uint8_t)((p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8);
-	}
-	return {{"ok", true},
-		{"still", last_still.id},
-		{"camera", name},
-		{"width", sw},
-		{"height", sh},
-		{"image", bmp(big, sw, sh)}};
-}
 
 // The face avatar source by name, with a reference to release.
 obs_source_t *find_avatar(const json &data)
@@ -1118,45 +1124,43 @@ obs_source_t *find_avatar(const json &data)
 	return s;
 }
 
-json set_up(const json &data)
+// "Look straight at the camera and press Set" (or `clear`).
+json set_rest(const json &data)
 {
 	obs_source_t *src = find_avatar(data);
 	if (!src)
 		return fail("That face avatar isn't in OBS any more.");
-	Box boxes[PARTS];
-	json rows = data.value("boxes", json());
-	bool ok = rows.is_array() && rows.size() == PARTS;
-	for (int i = 0; ok && i < PARTS; i++) {
-		Rect r;
-		ok = rect_from(rows[i], r);
-		boxes[i] = {r.x, r.y, r.w, r.h};
-	}
-	if (!ok) {
-		obs_source_release(src);
-		return fail("Put a box over each eye and your mouth first.");
-	}
-	Tracker tracker;
-	std::string problem, camera;
-	{
-		std::lock_guard<std::mutex> l(last_still.lock);
-		if (!last_still.id || data.value("still", (uint64_t)0) != last_still.id) {
-			obs_source_release(src);
-			return fail("That picture is too old - take a new one.");
+	auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src));
+	json answer = {{"ok", true}};
+	if (!f) {
+		answer = fail("It isn't ready yet.");
+	} else if (data.value("clear", false)) {
+		obs_data_t *settings = obs_source_get_settings(src);
+		obs_data_set_string(settings, "rest", "");
+		obs_data_release(settings);
+		f->rest_saved("");
+		f->worker.load_rest("");
+		f->reset_shown = true;
+	} else {
+		Worker::State st;
+		f->worker.state(st);
+		bool showing;
+		{
+			std::lock_guard<std::mutex> l(f->state_lock);
+			showing = f->showing_now;
 		}
-		camera = last_still.camera;
-		if (!tracker.set_up(last_still.grey.data(), last_still.w, last_still.h, boxes, &problem)) {
-			obs_source_release(src);
-			return fail(problem.c_str());
-		}
+		if (!st.ready)
+			answer = fail(st.problem.empty()
+					      ? "The face models are still loading - try again in a moment."
+					      : "The face models couldn't be loaded - reinstall DireBot for OBS.");
+		else if (!showing)
+			answer = fail("Show the face avatar in OBS first - it only looks for you while it's shown.");
+		else
+			f->worker.start_rest();
+		answer["setting"] = answer["ok"].get<bool>();
 	}
-	json saved = {{"tracker", tracker.save()}, {"boxes", rows}};
-	obs_data_t *settings = obs_data_create();
-	obs_data_set_string(settings, "face", saved.dump().c_str());
-	obs_data_set_string(settings, "source", camera.c_str());
-	obs_source_update(src, settings);
-	obs_data_release(settings);
 	obs_source_release(src);
-	return {{"ok", true}};
+	return answer;
 }
 
 json get_state(const json &data)
@@ -1165,7 +1169,7 @@ json get_state(const json &data)
 	if (!src)
 		return fail("That face avatar isn't in OBS any more.");
 	auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src));
-	json answer = f ? f->state() : fail("It isn't ready yet.");
+	json answer = f ? f->state(data.value("points", false)) : fail("It isn't ready yet.");
 	obs_source_release(src);
 	return answer;
 }
@@ -1174,7 +1178,7 @@ json get_state(const json &data)
 
 const std::vector<std::string> &requests()
 {
-	static const std::vector<std::string> list = {"FaceStill", "FaceSetUp", "FaceGetState"};
+	static const std::vector<std::string> list = {"FaceSet", "FaceGetState"};
 	return list;
 }
 
@@ -1187,10 +1191,8 @@ bool handles(const std::string &type)
 json request(const std::string &type, const json &data)
 {
 	return obs::ui_call(alive, [type, data]() -> json {
-		if (type == "FaceStill")
-			return take_still(data);
-		if (type == "FaceSetUp")
-			return set_up(data);
+		if (type == "FaceSet")
+			return set_rest(data);
 		if (type == "FaceGetState")
 			return get_state(data);
 		return fail("DireBot for OBS doesn't know that request.");

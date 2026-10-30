@@ -19,830 +19,896 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "tracker.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 
 #include <nlohmann/json.hpp>
+
+#include "nn/net.hpp"
 
 namespace direbot::face {
 
 using json = nlohmann::json;
 
+const char *const EXPRESSION_NAMES[EXPRESSIONS] = {
+	"_neutral",         "browDownLeft",      "browDownRight",      "browInnerUp",
+	"browOuterUpLeft",  "browOuterUpRight",  "cheekPuff",          "cheekSquintLeft",
+	"cheekSquintRight", "eyeBlinkLeft",      "eyeBlinkRight",      "eyeLookDownLeft",
+	"eyeLookDownRight", "eyeLookInLeft",     "eyeLookInRight",     "eyeLookOutLeft",
+	"eyeLookOutRight",  "eyeLookUpLeft",     "eyeLookUpRight",     "eyeSquintLeft",
+	"eyeSquintRight",   "eyeWideLeft",       "eyeWideRight",       "jawForward",
+	"jawLeft",          "jawOpen",           "jawRight",           "mouthClose",
+	"mouthDimpleLeft",  "mouthDimpleRight",  "mouthFrownLeft",     "mouthFrownRight",
+	"mouthFunnel",      "mouthLeft",         "mouthLowerDownLeft", "mouthLowerDownRight",
+	"mouthPressLeft",   "mouthPressRight",   "mouthPucker",        "mouthRight",
+	"mouthRollLower",   "mouthRollUpper",    "mouthShrugLower",    "mouthShrugUpper",
+	"mouthSmileLeft",   "mouthSmileRight",   "mouthStretchLeft",   "mouthStretchRight",
+	"mouthUpperUpLeft", "mouthUpperUpRight", "noseSneerLeft",      "noseSneerRight"};
+
 namespace {
 
-// A part this alike (-1 to 1) might be it; the three have to agree too.
-constexpr float PART_Z = 0.5f;
-// Two parts alone (the third hidden by a hand or the mic) only count
-// this alike, and only close to where the face was.
-constexpr float PAIR_Z = 0.62f;
-// Found from nothing: all three this alike.
-constexpr float FIND_Z = 0.72f;
-// ...and fitting the set-up's shape this closely.
-constexpr float FIND_SHAPE = 0.15f;
-// How far a part may sit from where the other two put it, against the
-// eye gap.
-constexpr float SHAPE = 0.22f;
-// Bigger or smaller than at set-up, at most.
-constexpr float MIN_SCALE = 0.3f, MAX_SCALE = 3.5f;
-constexpr float MAX_ANGLE = 0.8f;
-// Lost: how many looks between looks over the whole picture.
-constexpr int FIND_EVERY = 8;
-// Templates bigger than this many pixels use every other one.
-constexpr int MOST_PIXELS = 500;
-// How much bigger than its box each part's look is kept (across, down).
-constexpr float GROW_ACROSS = 1.75f, GROW_DOWN = 2.1f;
+constexpr double PI = 3.14159265358979323846;
 
-float clampf(float v, float lo, float hi)
+// MediaPipe's Face Landmarker's settings (its defaults).
+constexpr float FIND_SCORE = 0.5f; // the face finder: this sure, at least
+constexpr float SAME_FACE = 0.3f;  // finds overlapping this much are one face
+constexpr float PRESENCE = 0.5f;   // the face model: there's a face there
+constexpr float GROW = 1.5f;       // the square: this much bigger than the face
+// The smoothing at 0.5 on the slider (MediaPipe's own): steady at rest,
+// quick to follow a move.
+constexpr double MIN_CUTOFF = 0.05, BETA = 80, D_CUTOFF = 1.0;
+// "Set" keeps this many looks.
+constexpr int REST_LOOKS = 10;
+
+// The 146 points the expressions model reads (MediaPipe's list).
+constexpr int SHAPE_POINTS[146] = {0,   1,   4,   5,   6,   7,   8,   10,  13,  14,  17,  21,  33,  37,  39,  40,  46,
+				   52,  53,  54,  55,  58,  61,  63,  65,  66,  67,  70,  78,  80,  81,  82,  84,  87,
+				   88,  91,  93,  95,  103, 105, 107, 109, 127, 132, 133, 136, 144, 145, 146, 148, 149,
+				   150, 152, 153, 154, 155, 157, 158, 159, 160, 161, 162, 163, 168, 172, 173, 176, 178,
+				   181, 185, 191, 195, 197, 234, 246, 249, 251, 263, 267, 269, 270, 276, 282, 283, 284,
+				   285, 288, 291, 293, 295, 296, 297, 300, 308, 310, 311, 312, 314, 317, 318, 321, 323,
+				   324, 332, 334, 336, 338, 356, 361, 362, 365, 373, 374, 375, 377, 378, 379, 380, 381,
+				   382, 384, 385, 386, 387, 388, 389, 390, 397, 398, 400, 402, 405, 409, 415, 454, 466,
+				   468, 469, 470, 471, 472, 473, 474, 475, 476, 477};
+
+uint16_t le16(const uint8_t *p)
 {
-	return std::min(hi, std::max(lo, v));
+	return (uint16_t)(p[0] | p[1] << 8);
 }
 
-float sample(const uint8_t *img, int w, int h, float x, float y)
+uint32_t le32(const uint8_t *p)
 {
-	x = clampf(x, 0, (float)w - 1.001f);
-	y = clampf(y, 0, (float)h - 1.001f);
-	const int x0 = (int)x, y0 = (int)y;
-	const float fx = x - x0, fy = y - y0;
-	const uint8_t *p = img + (size_t)y0 * w + x0;
-	const float top = p[0] + (p[1] - p[0]) * fx;
-	const float bottom = p[w] + (p[w + 1] - p[w]) * fx;
-	return top + (bottom - top) * fy;
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
-float sample(const Tracker::Patch &p, float x, float y)
-{
-	x = clampf(x, 0, (float)p.w - 1.001f);
-	y = clampf(y, 0, (float)p.h - 1.001f);
-	const int x0 = (int)x, y0 = (int)y;
-	const float fx = x - x0, fy = y - y0;
-	const float *q = &p.px[(size_t)y0 * p.w + x0];
-	const float top = q[0] + (q[1] - q[0]) * fx;
-	const float bottom = q[p.w] + (q[p.w + 1] - q[p.w]) * fx;
-	return top + (bottom - top) * fy;
-}
-
-// A template turned and sized for one look: offsets from its centre and
-// its zero-mean, unit-length values.
-struct Warped {
-	std::vector<int> dx, dy;
-	std::vector<float> t;
-	int left = 0, right = 0, top = 0, bottom = 0;
-	bool ok = false;
+// The files in a zip that are stored as they are (Google's .task file
+// keeps them that way, so nothing needs unpacking).
+struct Entry {
+	const uint8_t *data = nullptr;
+	size_t size = 0;
 };
 
-Warped warp(const Tracker::Patch &orig, const Tracker::Patch &learned, float scale, float angle)
+bool zip_entry(const uint8_t *zip, size_t size, const std::string &name, Entry &out)
 {
-	Warped out;
-	const float c = std::cos(angle), s = std::sin(angle);
-	const float hw = orig.w * 0.5f, hh = orig.h * 0.5f;
-	const int ex = (int)std::ceil((std::fabs(c) * hw + std::fabs(s) * hh) * scale);
-	const int ey = (int)std::ceil((std::fabs(s) * hw + std::fabs(c) * hh) * scale);
-	const int area = (2 * ex + 1) * (2 * ey + 1);
-	const int stride = area > MOST_PIXELS * 4 ? 3 : area > MOST_PIXELS ? 2 : 1;
-	double sum = 0;
-	for (int y = -ey; y <= ey; y += stride) {
-		for (int x = -ex; x <= ex; x += stride) {
-			// Back into the set-up patch.
-			const float u = (c * x + s * y) / scale + hw - 0.5f;
-			const float v = (-s * x + c * y) / scale + hh - 0.5f;
-			if (u < -0.5f || v < -0.5f || u > orig.w - 0.5f || v > orig.h - 0.5f)
-				continue;
-			const float value = 0.5f * (sample(orig, u, v) + sample(learned, u, v));
-			out.dx.push_back(x);
-			out.dy.push_back(y);
-			out.t.push_back(value);
-			sum += value;
-			out.left = std::min(out.left, x);
-			out.right = std::max(out.right, x);
-			out.top = std::min(out.top, y);
-			out.bottom = std::max(out.bottom, y);
+	if (size < 22)
+		return false;
+	// The end record, within the last 64 KB (it can carry a comment).
+	size_t end = size - 22;
+	const size_t stop = size > 22 + 65535 ? size - 22 - 65535 : 0;
+	while (le32(zip + end) != 0x06054b50) {
+		if (end == stop)
+			return false;
+		end--;
+	}
+	const uint16_t count = le16(zip + end + 10);
+	size_t at = le32(zip + end + 16);
+	for (uint16_t i = 0; i < count; i++) {
+		if (at + 46 > size || le32(zip + at) != 0x02014b50)
+			return false;
+		const uint16_t method = le16(zip + at + 10);
+		const uint32_t packed = le32(zip + at + 20), unpacked = le32(zip + at + 24);
+		const uint16_t name_len = le16(zip + at + 28), extra_len = le16(zip + at + 30),
+			       note_len = le16(zip + at + 32);
+		const uint32_t local = le32(zip + at + 42);
+		if (at + 46 + name_len > size)
+			return false;
+		if (name_len == name.size() && std::memcmp(zip + at + 46, name.data(), name_len) == 0) {
+			if (method != 0 || packed != unpacked)
+				return false;
+			if ((size_t)local + 30 > size || le32(zip + local) != 0x04034b50)
+				return false;
+			const size_t data = (size_t)local + 30 + le16(zip + local + 26) + le16(zip + local + 28);
+			if (data > size || packed > size - data)
+				return false;
+			out.data = zip + data;
+			out.size = packed;
+			return true;
+		}
+		at += 46 + (size_t)name_len + extra_len + note_len;
+	}
+	return false;
+}
+
+size_t elements(const std::vector<int> &shape)
+{
+	size_t n = 1;
+	for (int d : shape)
+		n *= (size_t)std::max(0, d);
+	return n;
+}
+
+float sigmoid(float x)
+{
+	return 1 / (1 + std::exp(-x));
+}
+
+float wrap_angle(float a)
+{
+	return (float)(a - 2 * PI * std::floor((a + PI) / (2 * PI)));
+}
+
+// A turned box in the picture: middle, size (pixels) and turn (radians,
+// clockwise as the picture shows it).
+using Square = Tracker::Square;
+
+// Cuts `sq` out of the picture at out_w x out_h, the way MediaPipe does
+// it (OpenCV's warp with bilinear sampling: 1/32 pixel steps, weights in
+// 15 bits, rounded to whole 0-255 values), then each value * scale +
+// offset as floats, red, green, blue. Outside the picture: black, or
+// the nearest edge pixel.
+void cut(const Frame &pic, const Square &sq, int out_w, int out_h, bool black_edges, float scale, float offset,
+	 float *out)
+{
+	const double c = std::cos((double)sq.angle), s = std::sin((double)sq.angle);
+	const double sx = sq.w / out_w, sy = sq.h / out_h;
+	// out (u, v) -> picture: middle + turn * (u * sx - w/2, v * sy - h/2).
+	const double m0 = c * sx, m1 = -s * sy, m2 = sq.cx - c * sq.w / 2 + s * sq.h / 2;
+	const double m3 = s * sx, m4 = c * sy, m5 = sq.cy - s * sq.w / 2 - c * sq.h / 2;
+	const int r = pic.bgra ? 2 : 0, b = pic.bgra ? 0 : 2;
+	const int w = pic.w, h = pic.h;
+	for (int v = 0; v < out_h; v++) {
+		const double x0 = m1 * v + m2, y0 = m4 * v + m5;
+		float *o = out + (size_t)v * out_w * 3;
+		for (int u = 0; u < out_w; u++, o += 3) {
+			const long X = std::lrint((x0 + m0 * u) * 32), Y = std::lrint((y0 + m3 * u) * 32);
+			const long ix = X >> 5, iy = Y >> 5;
+			const int fx = (int)(X & 31), fy = (int)(Y & 31);
+			const int w00 = (32 - fx) * (32 - fy) * 32, w01 = fx * (32 - fy) * 32;
+			const int w10 = (32 - fx) * fy * 32, w11 = fx * fy * 32;
+			const uint8_t *p00, *p01, *p10, *p11;
+			static const uint8_t zero[4] = {0, 0, 0, 0};
+			if (ix >= 0 && ix < w - 1 && iy >= 0 && iy < h - 1) {
+				p00 = pic.px + (size_t)iy * pic.stride + (size_t)ix * 4;
+				p01 = p00 + 4;
+				p10 = p00 + pic.stride;
+				p11 = p10 + 4;
+			} else if (black_edges) {
+				if (ix >= w || ix + 1 < 0 || iy >= h || iy + 1 < 0) {
+					o[0] = o[1] = o[2] = offset;
+					continue;
+				}
+				auto at = [&](long x, long y) {
+					return x >= 0 && x < w && y >= 0 && y < h
+						       ? pic.px + (size_t)y * pic.stride + (size_t)x * 4
+						       : zero;
+				};
+				p00 = at(ix, iy);
+				p01 = at(ix + 1, iy);
+				p10 = at(ix, iy + 1);
+				p11 = at(ix + 1, iy + 1);
+			} else {
+				auto at = [&](long x, long y) {
+					x = std::min<long>(std::max<long>(x, 0), w - 1);
+					y = std::min<long>(std::max<long>(y, 0), h - 1);
+					return pic.px + (size_t)y * pic.stride + (size_t)x * 4;
+				};
+				p00 = at(ix, iy);
+				p01 = at(ix + 1, iy);
+				p10 = at(ix, iy + 1);
+				p11 = at(ix + 1, iy + 1);
+			}
+			const int ch[3] = {r, 1, b};
+			for (int k = 0; k < 3; k++) {
+				const int i = ch[k];
+				const int sum = p00[i] * w00 + p01[i] * w01 + p10[i] * w10 + p11[i] * w11;
+				const int value = std::min(255, std::max(0, (sum + (1 << 14)) >> 15));
+				o[k] = (float)value * scale + offset;
+			}
 		}
 	}
-	if (out.t.size() < 12)
-		return out;
-	const float mean = (float)(sum / out.t.size());
-	double norm = 0;
-	for (float &v : out.t) {
-		v -= mean;
-		norm += (double)v * v;
+}
+
+// MediaPipe's One Euro filter (G. Casiez et al., 2012): a low-pass filter
+// whose cut-off rises with how fast the value moves.
+struct LowPass {
+	bool started = false;
+	float raw = 0, kept = 0;
+	float apply(float value, double alpha)
+	{
+		const float result = started ? (float)(alpha * value + (1 - alpha) * kept) : value;
+		started = true;
+		raw = value;
+		kept = result;
+		return result;
 	}
-	if (norm < 1e-3)
-		return out;
-	const float k = (float)(1.0 / std::sqrt(norm));
-	for (float &v : out.t)
-		v *= k;
-	out.ok = true;
-	return out;
-}
+};
 
-// How alike (-1 to 1) the template is to the picture centred at (x, y).
-// Flat picture there: 0, it isn't a face part.
-float zncc(const Warped &t, const uint8_t *img, int w, int h, int x, int y)
-{
-	if (x + t.left < 0 || y + t.top < 0 || x + t.right >= w || y + t.bottom >= h)
-		return -1;
-	double si = 0, sii = 0, sit = 0;
-	const size_t n = t.t.size();
-	const uint8_t *base = img + (size_t)y * w + x;
-	for (size_t k = 0; k < n; k++) {
-		const float v = base[(ptrdiff_t)t.dy[k] * w + t.dx[k]];
-		si += v;
-		sii += (double)v * v;
-		sit += (double)v * t.t[k];
+struct OneEuro {
+	double hz = 30;
+	int64_t last = -1;
+	LowPass x, dx;
+
+	static double alpha(double hz, double cutoff)
+	{
+		const double te = 1 / hz, tau = 1 / (2 * PI * cutoff);
+		return 1 / (1 + tau / te);
 	}
-	const double var = sii - si * si / (double)n;
-	if (var < n * 4.0) // under ~2 grey levels of change: flat
-		return 0;
-	return (float)(sit / std::sqrt(var));
-}
-
-// The peak's fractional position from its neighbours.
-float peak(float before, float at, float after)
-{
-	const float d = before - 2 * at + after;
-	if (d >= -1e-6f)
-		return 0;
-	return clampf(0.5f * (before - after) / d, -0.5f, 0.5f);
-}
-
-const char *B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	float apply(int64_t ns, double scale, float value, double min_cutoff, double beta)
+	{
+		if (last >= ns)
+			return value;
+		if (last != 0 && ns != 0)
+			hz = 1e9 / (double)(ns - last);
+		last = ns;
+		const double speed = x.started ? (value - x.raw) * scale * hz : 0;
+		const double eased = dx.apply((float)speed, alpha(hz, D_CUTOFF));
+		const double cutoff = min_cutoff + beta * std::fabs(eased);
+		return x.apply(value, alpha(hz, cutoff));
+	}
+};
 
 } // namespace
 
-std::string encode(const std::vector<uint8_t> &bytes)
+struct Tracker::Impl {
+	nn::Net finder, mesh, shapes;
+	Geometry geometry;
+	bool ready = false;
+	int find_size = 128, mesh_size = 256;
+	std::vector<float> anchors; // x, y each (shares of the finder's square)
+
+	int pic_w = 0, pic_h = 0;
+	bool following = false;
+	Square square;
+	std::vector<Found> found;
+	Face face;
+	Point raw[POINTS];
+
+	float amount = 0.5f;
+	OneEuro filters[POINTS][3];
+	bool filtering = false;
+
+	// "Set"
+	Rest rest;
+	int setting = 0; // looks still to keep (0: not setting)
+	int kept = 0;
+	double sum_pose[16] = {};
+	double sum_rest[EXPRESSIONS] = {};
+	double sum_x = 0, sum_y = 0, sum_gap = 0, sum_angle = 0;
+
+	bool load(const uint8_t *bytes, size_t size, std::string *problem);
+	void make_anchors();
+	bool find(const Frame &pic);
+	bool points(const Frame &pic);
+	void smooth(double seconds);
+	void lost();
+	void keep_rest();
+};
+
+namespace {
+
+bool fail(std::string *problem, const std::string &why)
 {
-	std::string out;
-	out.reserve((bytes.size() + 2) / 3 * 4);
-	for (size_t i = 0; i < bytes.size(); i += 3) {
-		const uint32_t n = (uint32_t)bytes[i] << 16 | (i + 1 < bytes.size() ? (uint32_t)bytes[i + 1] << 8 : 0) |
-				   (i + 2 < bytes.size() ? bytes[i + 2] : 0);
-		out += B64[n >> 18 & 63];
-		out += B64[n >> 12 & 63];
-		out += i + 1 < bytes.size() ? B64[n >> 6 & 63] : '=';
-		out += i + 2 < bytes.size() ? B64[n & 63] : '=';
-	}
-	return out;
+	if (problem)
+		*problem = why;
+	return false;
 }
 
-bool decode(const std::string &text, std::vector<uint8_t> &bytes)
+} // namespace
+
+bool Tracker::Impl::load(const uint8_t *bytes, size_t size, std::string *problem)
 {
-	bytes.clear();
-	uint32_t n = 0;
-	int bits = 0;
-	for (char ch : text) {
-		if (ch == '=')
-			break;
-		const char *at = std::strchr(B64, ch);
-		if (!at || !ch)
-			return false;
-		n = n << 6 | (uint32_t)(at - B64);
-		bits += 6;
-		if (bits >= 8) {
-			bits -= 8;
-			bytes.push_back((uint8_t)(n >> bits & 255));
+	ready = false;
+	Entry f, m, s, g;
+	if (!zip_entry(bytes, size, "face_detector.tflite", f) ||
+	    !zip_entry(bytes, size, "face_landmarks_detector.tflite", m) ||
+	    !zip_entry(bytes, size, "face_blendshapes.tflite", s) ||
+	    !zip_entry(bytes, size, "geometry_pipeline_metadata_landmarks.binarypb", g))
+		return fail(problem, "the face models file isn't Google's face_landmarker.task");
+	std::string why;
+	if (!finder.load(f.data, f.size, &why))
+		return fail(problem, "the face finder model: " + why);
+	if (!mesh.load(m.data, m.size, &why))
+		return fail(problem, "the face mesh model: " + why);
+	if (!shapes.load(s.data, s.size, &why))
+		return fail(problem, "the expressions model: " + why);
+	if (!geometry.load(g.data, g.size, &why))
+		return fail(problem, why);
+	// The shapes this code expects.
+	const auto &fi = finder.input_shape(0), &mi = mesh.input_shape(0);
+	if (finder.inputs() != 1 || fi.size() != 4 || fi[1] != fi[2] || fi[3] != 3 || finder.outputs() != 2 ||
+	    mesh.inputs() != 1 || mi.size() != 4 || mi[1] != mi[2] || mi[3] != 3 || mesh.outputs() < 2 ||
+	    elements(mesh.output_shape(0)) != (size_t)POINTS * 3 || elements(mesh.output_shape(1)) != 1 ||
+	    shapes.inputs() != 1 || elements(shapes.input_shape(0)) != 146 * 2 || shapes.outputs() != 1 ||
+	    elements(shapes.output_shape(0)) != EXPRESSIONS)
+		return fail(problem, "the face models aren't the ones expected");
+	find_size = fi[1];
+	mesh_size = mi[1];
+	make_anchors();
+	const size_t boxes = anchors.size() / 2;
+	const auto &o0 = finder.output_shape(0), &o1 = finder.output_shape(1);
+	if (!((elements(o0) == boxes * 16 && elements(o1) == boxes) ||
+	      (elements(o1) == boxes * 16 && elements(o0) == boxes)))
+		return fail(problem, "the face finder model isn't the one expected");
+	ready = true;
+	return true;
+}
+
+// The face finder's boxes start from these (MediaPipe's SSD anchors for
+// the short-range finder): 2 per spot on a 16 x 16 grid, then 6 per spot
+// on an 8 x 8 one.
+void Tracker::Impl::make_anchors()
+{
+	anchors.clear();
+	const int strides[4] = {8, 16, 16, 16};
+	int layer = 0;
+	while (layer < 4) {
+		int same = layer, per_spot = 0;
+		while (same < 4 && strides[same] == strides[layer]) {
+			per_spot += 2; // aspect ratio 1, and the one between sizes
+			same++;
 		}
+		const int grid = (int)std::ceil((double)find_size / strides[layer]);
+		for (int y = 0; y < grid; y++)
+			for (int x = 0; x < grid; x++)
+				for (int k = 0; k < per_spot; k++) {
+					anchors.push_back((x + 0.5f) / grid);
+					anchors.push_back((y + 0.5f) / grid);
+				}
+		layer = same;
 	}
-	return true;
 }
 
-bool Tracker::set_up(const uint8_t *grey, int w, int h, const Box parts[PARTS], std::string *problem)
+// Step 1: the whole picture, fitted into the finder's square with black
+// bars, then its boxes: the sure ones, overlapping ones merged (weighted
+// by how sure), and the biggest one followed.
+bool Tracker::Impl::find(const Frame &pic)
 {
-	auto say = [&](const char *words) {
-		if (problem)
-			*problem = words;
-		return false;
-	};
-	if (!grey || w < 32 || h < 32)
-		return say("The still is too small.");
-	Box grown[PARTS];
-	float cx[PARTS], cy[PARTS], bw[PARTS];
-	for (int i = 0; i < PARTS; i++) {
-		const Box &b = parts[i];
-		const float x0 = clampf(b.x, 0, 1) * w, y0 = clampf(b.y, 0, 1) * h;
-		const float x1 = clampf(b.x + b.w, 0, 1) * w, y1 = clampf(b.y + b.h, 0, 1) * h;
-		if (x1 - x0 < 5 || y1 - y0 < 4)
-			return say(i == MOUTH ? "The mouth box is too small - make it bigger, or come closer to the camera."
-					      : "An eye box is too small - make it bigger, or come closer to the camera.");
-		cx[i] = (x0 + x1) * 0.5f;
-		cy[i] = (y0 + y1) * 0.5f;
-		bw[i] = x1 - x0;
-		// What's found again is more than the box: the brow and the skin
-		// around an eye, the beard around a mouth. An eye alone changes
-		// too much as you look about; with what's around it, it's yours.
-		// Kept centred on the box, so less where it meets the picture's
-		// edge.
-		const float hw = std::min({(x1 - x0) * GROW_ACROSS * 0.5f, cx[i], w - cx[i]});
-		const float hh = std::min({(y1 - y0) * GROW_DOWN * 0.5f, cy[i], h - cy[i]});
-		grown[i] = {(cx[i] - hw) / w, (cy[i] - hh) / h, hw * 2 / w, hh * 2 / h};
-	}
-	const float gap = std::hypot(cx[1] - cx[0], cy[1] - cy[0]);
-	const float drop = std::hypot(cx[MOUTH] - (cx[0] + cx[1]) * 0.5f, cy[MOUTH] - (cy[0] + cy[1]) * 0.5f);
-	if (gap < std::max(bw[0], bw[1]) * 0.6f)
-		return say("The two eye boxes are on top of each other.");
-	if (drop < gap * 0.3f)
-		return say("The mouth box should be below the eyes.");
-	return take(grey, w, h, grown, problem);
-}
+	found.clear();
+	const float side = (float)std::max(pic.w, pic.h);
+	const Square whole{pic.w / 2.0f, pic.h / 2.0f, side, side, 0};
+	cut(pic, whole, find_size, find_size, true, 2.0f / 255, -1, finder.input(0));
+	finder.run();
+	const size_t boxes = anchors.size() / 2;
+	const bool first_is_boxes = elements(finder.output_shape(0)) == boxes * 16;
+	const float *raw = finder.output(first_is_boxes ? 0 : 1), *scores = finder.output(first_is_boxes ? 1 : 0);
 
-bool Tracker::take(const uint8_t *grey, int w, int h, const Box parts[PARTS], std::string *problem)
-{
-	auto say = [&](const char *words) {
-		if (problem)
-			*problem = words;
-		return false;
+	struct Box {
+		float x0, y0, x1, y1, score;
+		float keys[12];
 	};
-	Ref refs[PARTS];
-	for (int i = 0; i < PARTS; i++) {
-		const Box &b = parts[i];
-		const int x0 = (int)std::lround(clampf(b.x, 0, 1) * w), y0 = (int)std::lround(clampf(b.y, 0, 1) * h);
-		const int x1 = (int)std::lround(clampf(b.x + b.w, 0, 1) * w),
-			  y1 = (int)std::lround(clampf(b.y + b.h, 0, 1) * h);
-		if (x1 - x0 < 5 || y1 - y0 < 4)
-			return say("A box is too small.");
-		Patch p;
-		p.w = x1 - x0;
-		p.h = y1 - y0;
-		p.px.resize((size_t)p.w * p.h);
-		double sum = 0, sq = 0;
-		for (int y = 0; y < p.h; y++)
-			for (int x = 0; x < p.w; x++) {
-				const float v = grey[(size_t)(y0 + y) * w + x0 + x];
-				p.px[(size_t)y * p.w + x] = v;
-				sum += v;
-				sq += (double)v * v;
+	std::vector<Box> sure;
+	const float size = (float)find_size;
+	for (size_t i = 0; i < boxes; i++) {
+		const float score = sigmoid(std::min(100.0f, std::max(-100.0f, scores[i])));
+		if (score < FIND_SCORE)
+			continue;
+		const float *r = raw + i * 16;
+		const float ax = anchors[i * 2], ay = anchors[i * 2 + 1];
+		const float cx = r[0] / size + ax, cy = r[1] / size + ay, w = r[2] / size, h = r[3] / size;
+		if (w < 0 || h < 0)
+			continue;
+		Box b{cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2, score, {}};
+		for (int k = 0; k < 6; k++) {
+			b.keys[k * 2] = r[4 + k * 2] / size + ax;
+			b.keys[k * 2 + 1] = r[4 + k * 2 + 1] / size + ay;
+		}
+		sure.push_back(b);
+	}
+	std::stable_sort(sure.begin(), sure.end(), [](const Box &a, const Box &b) { return a.score > b.score; });
+	auto overlap = [](const Box &a, const Box &b) {
+		const float ix = std::min(a.x1, b.x1) - std::max(a.x0, b.x0),
+			    iy = std::min(a.y1, b.y1) - std::max(a.y0, b.y0);
+		if (ix <= 0 || iy <= 0)
+			return 0.0f;
+		const float both = ix * iy, all = (a.x1 - a.x0) * (a.y1 - a.y0) + (b.x1 - b.x0) * (b.y1 - b.y0) - both;
+		return all > 0 ? both / all : 0.0f;
+	};
+	std::vector<Box> faces;
+	while (!sure.empty()) {
+		const Box top = sure[0];
+		std::vector<Box> rest;
+		Box merged = top;
+		float total = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0, keys[12] = {};
+		for (const Box &b : sure) {
+			if (overlap(b, top) > SAME_FACE) {
+				total += b.score;
+				x0 += b.x0 * b.score;
+				y0 += b.y0 * b.score;
+				x1 += b.x1 * b.score;
+				y1 += b.y1 * b.score;
+				for (int k = 0; k < 12; k++)
+					keys[k] += b.keys[k] * b.score;
+			} else {
+				rest.push_back(b);
 			}
-		const double n = (double)p.px.size();
-		const double sd = std::sqrt(std::max(0.0, sq / n - (sum / n) * (sum / n)));
-		if (sd < 5)
-			return say(i == MOUTH ? "The mouth box is too plain to find again - is the camera on, and the room lit?"
-					      : "An eye box is too plain to find again - is the camera on, and the room lit?");
-		refs[i].original = p;
-		refs[i].learned = p;
-		// Pixel coordinates: pixel x's middle is at x.
-		refs[i].cx = x0 + (p.w - 1) * 0.5f;
-		refs[i].cy = y0 + (p.h - 1) * 0.5f;
+		}
+		if (total > 0) {
+			merged.x0 = x0 / total;
+			merged.y0 = y0 / total;
+			merged.x1 = x1 / total;
+			merged.y1 = y1 / total;
+			for (int k = 0; k < 12; k++)
+				merged.keys[k] = keys[k] / total;
+		}
+		faces.push_back(merged);
+		if (rest.size() == sure.size())
+			break;
+		sure.swap(rest);
 	}
-	const float gap = std::hypot(refs[1].cx - refs[0].cx, refs[1].cy - refs[0].cy);
-	const float mx = (refs[0].cx + refs[1].cx) * 0.5f, my = (refs[0].cy + refs[1].cy) * 0.5f;
-	const float drop = std::hypot(refs[MOUTH].cx - mx, refs[MOUTH].cy - my);
-	if (gap < 6)
-		return say("The two eye boxes are on top of each other.");
-	if (drop < gap * 0.3f)
-		return say("The mouth box should be below the eyes.");
-	for (int i = 0; i < PARTS; i++)
-		ref_[i] = refs[i];
-	setup_w_ = w;
-	setup_h_ = h;
-	eye_gap_ = gap;
-	ref_ratio_ = gap / drop;
-	ready_ = true;
-	forget();
-	// The next look starts where the still had it.
-	have_last_ = true;
-	for (int i = 0; i < PARTS; i++) {
-		last_x_[i] = ref_[i].cx;
-		last_y_[i] = ref_[i].cy;
+	// Back to the picture's pixels.
+	const float left = whole.cx - side / 2, top = whole.cy - side / 2;
+	for (const Box &b : faces) {
+		Found f;
+		f.x = left + b.x0 * side;
+		f.y = top + b.y0 * side;
+		f.w = (b.x1 - b.x0) * side;
+		f.h = (b.y1 - b.y0) * side;
+		f.score = b.score;
+		for (int k = 0; k < 6; k++) {
+			f.keys[k * 2] = left + b.keys[k * 2] * side;
+			f.keys[k * 2 + 1] = top + b.keys[k * 2 + 1] * side;
+		}
+		found.push_back(f);
 	}
-	last_scale_ = 1;
-	last_angle_ = 0;
-	last_w_ = w;
-	last_h_ = h;
+	if (found.empty())
+		return false;
+	const Found *best = &found[0];
+	for (const Found &f : found)
+		if (f.w * f.h > best->w * best->h)
+			best = &f;
+	// The square: the box, turned so the eyes (its first two points) are
+	// level, half as big again.
+	square.cx = best->x + best->w / 2;
+	square.cy = best->y + best->h / 2;
+	square.angle = wrap_angle(-std::atan2(-(best->keys[3] - best->keys[1]), best->keys[2] - best->keys[0]));
+	square.w = best->w * GROW;
+	square.h = best->h * GROW;
 	return true;
 }
 
-std::string Tracker::save() const
+// Step 2: the 478 points in the square, and whether there's a face there.
+// Then the square for the next look, from the points: around them all,
+// turned by the eyes' outer corners, made square, half as big again.
+bool Tracker::Impl::points(const Frame &pic)
 {
-	if (!ready_)
-		return "";
-	json parts = json::array();
-	for (const Ref &r : ref_) {
-		std::vector<uint8_t> bytes(r.original.px.size());
-		for (size_t i = 0; i < bytes.size(); i++)
-			bytes[i] = (uint8_t)clampf(std::round(r.original.px[i]), 0, 255);
-		parts.push_back({{"x", r.cx - (r.original.w - 1) * 0.5f},
-				 {"y", r.cy - (r.original.h - 1) * 0.5f},
-				 {"w", r.original.w},
-				 {"h", r.original.h},
-				 {"px", encode(bytes)}});
+	cut(pic, square, mesh_size, mesh_size, false, 1.0f / 255, 0, mesh.input(0));
+	mesh.run();
+	face.presence = sigmoid(mesh.output(1)[0]);
+	if (!(face.presence >= PRESENCE))
+		return false;
+	const float *out = mesh.output(0);
+	const float c = std::cos(square.angle), s = std::sin(square.angle);
+	// z on x's scale, as MediaPipe has it.
+	const float zs = pic.w * std::sqrt(std::pow(square.w * c / pic.w, 2.0f) + std::pow(square.w * s / pic.h, 2.0f));
+	const float size = (float)mesh_size;
+	float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+	for (int i = 0; i < POINTS; i++) {
+		const float x = (out[i * 3] / size - 0.5f) * square.w, y = (out[i * 3 + 1] / size - 0.5f) * square.h;
+		Point &p = raw[i];
+		p.x = c * x - s * y + square.cx;
+		p.y = s * x + c * y + square.cy;
+		p.z = out[i * 3 + 2] / size * zs;
+		x0 = std::min(x0, p.x);
+		y0 = std::min(y0, p.y);
+		x1 = std::max(x1, p.x);
+		y1 = std::max(y1, p.y);
 	}
-	return json{{"v", 1}, {"w", setup_w_}, {"h", setup_h_}, {"parts", parts}}.dump();
+	const Point &a = raw[RIGHT_EYE_OUTER], &b = raw[LEFT_EYE_OUTER];
+	square.cx = (x0 + x1) / 2;
+	square.cy = (y0 + y1) / 2;
+	square.angle = wrap_angle(-std::atan2(-(b.y - a.y), b.x - a.x));
+	square.w = square.h = std::max(x1 - x0, y1 - y0) * GROW;
+	return true;
 }
 
-bool Tracker::load(const std::string &text)
+// Step 4: each point's x, y and z through a One Euro filter, its speed
+// measured in face sizes a second.
+void Tracker::Impl::smooth(double seconds)
 {
-	const json j = json::parse(text, nullptr, false);
-	if (j.is_discarded() || !j.is_object() || j.value("v", 0) != 1 || !j.contains("parts") ||
-	    !j["parts"].is_array() || j["parts"].size() != PARTS)
-		return false;
-	const int w = j.value("w", 0), h = j.value("h", 0);
-	if (w < 32 || h < 32 || w > 4096 || h > 4096)
-		return false;
-	// Rebuilt as a picture with just the three patches in it, and set up
-	// from that: the same checks as a new set-up.
-	std::vector<uint8_t> canvas((size_t)w * h, 0);
-	Box boxes[PARTS];
-	for (int i = 0; i < PARTS; i++) {
-		const json &p = j["parts"][i];
-		if (!p.is_object())
-			return false;
-		const int pw = p.value("w", 0), ph = p.value("h", 0);
-		const int x0 = (int)std::lround(p.value("x", -1.0)), y0 = (int)std::lround(p.value("y", -1.0));
-		std::vector<uint8_t> bytes;
-		if (pw < 1 || ph < 1 || x0 < 0 || y0 < 0 || x0 + pw > w || y0 + ph > h ||
-		    !decode(p.value("px", std::string()), bytes) || bytes.size() != (size_t)pw * ph)
-			return false;
-		for (int y = 0; y < ph; y++)
-			std::copy_n(&bytes[(size_t)y * pw], pw, &canvas[(size_t)(y0 + y) * w + x0]);
-		boxes[i] = {x0 / (float)w, y0 / (float)h, pw / (float)w, ph / (float)h};
+	if (amount < 0) {
+		std::copy(std::begin(raw), std::end(raw), face.points);
+		return;
 	}
-	return take(canvas.data(), w, h, boxes);
+	if (!filtering) {
+		for (auto &f : filters)
+			for (auto &k : f)
+				k = OneEuro();
+		filtering = true;
+	}
+	float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+	for (const Point &p : raw) {
+		x0 = std::min(x0, p.x);
+		y0 = std::min(y0, p.y);
+		x1 = std::max(x1, p.x);
+		y1 = std::max(y1, p.y);
+	}
+	const float size = ((x1 - x0) + (y1 - y0)) / 2;
+	if (!(size >= 1e-6f)) {
+		std::copy(std::begin(raw), std::end(raw), face.points);
+		return;
+	}
+	// The slider: steadier at rest and slower to follow one way, the
+	// other way snappier; 0.5 is MediaPipe's.
+	const double t = std::min(1.0f, std::max(0.0f, amount)) * 2 - 1;
+	const double min_cutoff = MIN_CUTOFF * std::pow(5.0, t), beta = BETA * std::pow(3.0, t);
+	const int64_t ns = (int64_t)std::llround(seconds * 1e9);
+	const double scale = 1 / size;
+	for (int i = 0; i < POINTS; i++) {
+		face.points[i].x = filters[i][0].apply(ns, scale, raw[i].x, min_cutoff, beta);
+		face.points[i].y = filters[i][1].apply(ns, scale, raw[i].y, min_cutoff, beta);
+		face.points[i].z = filters[i][2].apply(ns, scale, raw[i].z, min_cutoff, beta);
+	}
+}
+
+void Tracker::Impl::lost()
+{
+	following = false;
+	filtering = false;
+	face.found = false;
+}
+
+void Tracker::Impl::keep_rest()
+{
+	for (int i = 0; i < 16; i++)
+		sum_pose[i] += face.pose[i];
+	for (int i = 0; i < EXPRESSIONS; i++)
+		sum_rest[i] += face.expressions[i];
+	const Layout l = layout_of(face);
+	sum_x += l.cx;
+	sum_y += l.cy;
+	sum_gap += l.gap;
+	sum_angle += l.angle;
+	kept++;
+	if (--setting > 0)
+		return;
+	float *rest_pose = rest.pose;
+	// The average turn, made a turn again (Gram-Schmidt on its columns).
+	double col[3][3];
+	for (int c = 0; c < 3; c++)
+		for (int r = 0; r < 3; r++)
+			col[c][r] = sum_pose[r * 4 + c];
+	auto dot = [](const double *a, const double *b) {
+		return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+	};
+	auto unit = [&](double *a) {
+		const double n = std::sqrt(dot(a, a));
+		for (int k = 0; k < 3; k++)
+			a[k] = n > 0 ? a[k] / n : 0;
+	};
+	unit(col[0]);
+	const double d01 = dot(col[0], col[1]);
+	for (int k = 0; k < 3; k++)
+		col[1][k] -= d01 * col[0][k];
+	unit(col[1]);
+	col[2][0] = col[0][1] * col[1][2] - col[0][2] * col[1][1];
+	col[2][1] = col[0][2] * col[1][0] - col[0][0] * col[1][2];
+	col[2][2] = col[0][0] * col[1][1] - col[0][1] * col[1][0];
+	for (int c = 0; c < 3; c++)
+		for (int r = 0; r < 3; r++)
+			rest_pose[r * 4 + c] = (float)col[c][r];
+	for (int r = 0; r < 3; r++)
+		rest_pose[r * 4 + 3] = (float)(sum_pose[r * 4 + 3] / kept);
+	rest_pose[12] = rest_pose[13] = rest_pose[14] = 0;
+	rest_pose[15] = 1;
+	for (int i = 0; i < EXPRESSIONS; i++)
+		rest.expressions[i] = (float)(sum_rest[i] / kept);
+	rest.x = (float)(sum_x / kept);
+	rest.y = (float)(sum_y / kept);
+	rest.gap = (float)(sum_gap / kept);
+	rest.angle = (float)(sum_angle / kept);
+	rest.set = true;
+}
+
+Tracker::Tracker() : impl_(std::make_unique<Impl>()) {}
+Tracker::~Tracker() = default;
+
+bool Tracker::load(const uint8_t *bytes, size_t size, std::string *problem)
+{
+	forget();
+	return impl_->load(bytes, size, problem);
+}
+
+bool Tracker::load_file(const std::string &path, std::string *problem)
+{
+	std::ifstream in(path, std::ios::binary);
+	if (!in)
+		return fail(problem, "the face models file is missing (" + path + ")");
+	std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+	return load(bytes.data(), bytes.size(), problem);
+}
+
+bool Tracker::ready() const
+{
+	return impl_->ready;
+}
+
+const Face &Tracker::look(const Frame &pic, double seconds)
+{
+	Impl &m = *impl_;
+	const auto start = std::chrono::steady_clock::now();
+	Face &face = m.face;
+	face.searched = false;
+	if (!m.ready || !pic.px || pic.w < 2 || pic.h < 2 || pic.stride < pic.w * 4) {
+		m.lost();
+		face.presence = 0;
+		return face;
+	}
+	if (pic.w != m.pic_w || pic.h != m.pic_h) {
+		m.pic_w = pic.w;
+		m.pic_h = pic.h;
+		m.lost();
+	}
+	if (!m.following) {
+		face.searched = true;
+		face.presence = 0;
+		m.following = m.find(pic);
+	}
+	if (m.following && m.points(pic)) {
+		m.smooth(seconds);
+		// Step 5: the expressions, from the smoothed points.
+		float *in = m.shapes.input(0);
+		for (int i = 0; i < 146; i++) {
+			in[i * 2] = face.points[SHAPE_POINTS[i]].x;
+			in[i * 2 + 1] = face.points[SHAPE_POINTS[i]].y;
+		}
+		m.shapes.run();
+		std::copy(m.shapes.output(0), m.shapes.output(0) + EXPRESSIONS, face.expressions);
+		// Step 6: the head in 3D.
+		m.geometry.pose(&face.points[0].x, pic.w, pic.h, face.pose);
+		face.found = true;
+		face.w = pic.w;
+		face.h = pic.h;
+		if (m.setting > 0)
+			m.keep_rest();
+		face.turn = m.rest.set ? turn_since(face.pose, m.rest.pose) : turn_of(face.pose);
+		for (int i = 0; i < EXPRESSIONS; i++) {
+			const float r = m.rest.set ? m.rest.expressions[i] : 0;
+			face.moves[i] = r < 0.98f ? std::min(1.0f, std::max(0.0f, (face.expressions[i] - r) / (1 - r)))
+						  : 0;
+		}
+	} else {
+		m.lost();
+	}
+	face.ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+	return face;
+}
+
+const Face &Tracker::face() const
+{
+	return impl_->face;
 }
 
 void Tracker::forget()
 {
-	have_last_ = false;
-	misses_ = 0;
-	looks_lost_ = 0;
-	turned_for_ = 0;
-	turned_seen_ = 0;
-	face_ = Face();
+	impl_->lost();
 }
 
-Tracker::Hit Tracker::search(int part, const uint8_t *grey, int w, int h, float px, float py, float radius,
-			     float scale, float angle, int step) const
+void Tracker::set_smoothing(float amount)
 {
-	Hit best;
-	const Warped t = warp(ref_[part].original, ref_[part].learned, scale, angle);
-	if (!t.ok)
-		return best;
-	const int r = std::max(1, (int)std::ceil(radius));
-	const int cx = (int)std::lround(px), cy = (int)std::lround(py);
-	int bx = cx, by = cy;
-	for (int y = cy - r; y <= cy + r; y += step)
-		for (int x = cx - r; x <= cx + r; x += step) {
-			const float z = zncc(t, grey, w, h, x, y);
-			if (z > best.z) {
-				best.z = z;
-				bx = x;
-				by = y;
-			}
-		}
-	if (best.z <= -1)
-		return best;
-	if (step > 1) {
-		const int ox = bx, oy = by;
-		for (int y = oy - step + 1; y < oy + step; y++)
-			for (int x = ox - step + 1; x < ox + step; x++) {
-				if (x == ox && y == oy)
-					continue;
-				const float z = zncc(t, grey, w, h, x, y);
-				if (z > best.z) {
-					best.z = z;
-					bx = x;
-					by = y;
-				}
-			}
-	}
-	best.x = bx + peak(zncc(t, grey, w, h, bx - 1, by), best.z, zncc(t, grey, w, h, bx + 1, by));
-	best.y = by + peak(zncc(t, grey, w, h, bx, by - 1), best.z, zncc(t, grey, w, h, bx, by + 1));
-	return best;
+	impl_->amount = amount;
 }
 
-bool Tracker::fit(const Hit hits[PARTS], const bool use[PARTS], float &s, float &a, float &tx, float &ty) const
+void Tracker::set_rest()
 {
-	double sw = 0, qx = 0, qy = 0, px = 0, py = 0;
-	for (int i = 0; i < PARTS; i++) {
-		if (!use[i])
-			continue;
-		const double wt = std::max(0.1f, hits[i].z);
-		sw += wt;
-		qx += wt * ref_[i].cx;
-		qy += wt * ref_[i].cy;
-		px += wt * hits[i].x;
-		py += wt * hits[i].y;
-	}
-	if (sw <= 0)
-		return false;
-	qx /= sw;
-	qy /= sw;
-	px /= sw;
-	py /= sw;
-	double A = 0, B = 0, D = 0;
-	for (int i = 0; i < PARTS; i++) {
-		if (!use[i])
-			continue;
-		const double wt = std::max(0.1f, hits[i].z);
-		const double Qx = ref_[i].cx - qx, Qy = ref_[i].cy - qy;
-		const double Px = hits[i].x - px, Py = hits[i].y - py;
-		A += wt * (Qx * Px + Qy * Py);
-		B += wt * (Qx * Py - Qy * Px);
-		D += wt * (Qx * Qx + Qy * Qy);
-	}
-	if (D < 1e-6)
-		return false;
-	s = (float)(std::sqrt(A * A + B * B) / D);
-	a = (float)std::atan2(B, A);
-	const float c = std::cos(a), sn = std::sin(a);
-	tx = (float)(px - s * (c * qx - sn * qy));
-	ty = (float)(py - s * (sn * qx + c * qy));
-	return std::isfinite(s) && s > 0;
+	Impl &m = *impl_;
+	m.setting = REST_LOOKS;
+	m.kept = 0;
+	std::fill(std::begin(m.sum_pose), std::end(m.sum_pose), 0.0);
+	std::fill(std::begin(m.sum_rest), std::end(m.sum_rest), 0.0);
+	m.sum_x = m.sum_y = m.sum_gap = m.sum_angle = 0;
 }
 
-bool Tracker::stretch(const Hit hits[PARTS], Shape &out) const
+bool Tracker::setting() const
 {
-	// The set-up's own two ways: eye to eye, and at right angles down.
-	const float ux = (ref_[1].cx - ref_[0].cx) / eye_gap_, uy = (ref_[1].cy - ref_[0].cy) / eye_gap_;
-	const float vx = -uy, vy = ux;
-	float qcx = 0, qcy = 0, pcx = 0, pcy = 0;
-	for (int i = 0; i < PARTS; i++) {
-		qcx += ref_[i].cx / PARTS;
-		qcy += ref_[i].cy / PARTS;
-		pcx += hits[i].x / PARTS;
-		pcy += hits[i].y / PARTS;
-	}
-	// The straight-line map M from the set-up's (across, down) to the
-	// picture: M = (sum P Q^T)(sum Q Q^T)^-1.
-	double qq[4] = {0, 0, 0, 0}, pq[4] = {0, 0, 0, 0};
-	for (int i = 0; i < PARTS; i++) {
-		const double dx = ref_[i].cx - qcx, dy = ref_[i].cy - qcy;
-		const double qa = dx * ux + dy * uy, qd = dx * vx + dy * vy;
-		const double px = hits[i].x - pcx, py = hits[i].y - pcy;
-		qq[0] += qa * qa;
-		qq[1] += qa * qd;
-		qq[3] += qd * qd;
-		pq[0] += px * qa;
-		pq[1] += px * qd;
-		pq[2] += py * qa;
-		pq[3] += py * qd;
-	}
-	qq[2] = qq[1];
-	const double det = qq[0] * qq[3] - qq[1] * qq[2];
-	if (std::fabs(det) < 1e-6)
-		return false;
-	const double i0 = qq[3] / det, i1 = -qq[1] / det, i3 = qq[0] / det;
-	const double m11 = pq[0] * i0 + pq[1] * i1, m12 = pq[0] * i1 + pq[1] * i3;
-	const double m21 = pq[2] * i0 + pq[3] * i1, m22 = pq[2] * i1 + pq[3] * i3;
-	// Split into a turn, a size each way and a lean.
-	const double across = std::hypot(m11, m21);
-	if (across < 1e-6)
-		return false;
-	const double c = m11 / across, sn = m21 / across;
-	const double lean = c * m12 + sn * m22, down = -sn * m12 + c * m22;
-	if (down <= 1e-6)
-		return false; // flipped over: not a face
-	out.across = (float)across;
-	out.down = (float)down;
-	out.lean = (float)(lean / across);
-	out.angle = (float)(std::atan2(sn, c) - std::atan2(uy, ux));
-	return std::isfinite(out.angle);
+	return impl_->setting > 0;
 }
 
-bool Tracker::accept(const Hit hits[PARTS], const uint8_t *grey, int w, int h, float strict, float shape)
+bool Tracker::has_rest() const
 {
-	const float k = (float)w / setup_w_;
-	struct Try {
-		bool use[PARTS];
-		bool pair;
+	return impl_->rest.set;
+}
+
+void Tracker::clear_rest()
+{
+	impl_->rest = Rest();
+	impl_->setting = 0;
+}
+
+const Rest &Tracker::rest() const
+{
+	return impl_->rest;
+}
+
+namespace {
+
+float rounded(float v, float steps)
+{
+	return std::round(v * steps) / steps;
+}
+
+} // namespace
+
+std::string Tracker::save_rest() const
+{
+	const Rest &r = impl_->rest;
+	if (!r.set)
+		return std::string();
+	json pose = json::array(), rest = json::object();
+	for (int i = 0; i < 12; i++)
+		pose.push_back(rounded(r.pose[i], 1e5f));
+	for (int i = 0; i < EXPRESSIONS; i++)
+		rest[EXPRESSION_NAMES[i]] = rounded(r.expressions[i], 1e4f);
+	return json{{"v", 1},
+		    {"pose", pose},
+		    {"rest", rest},
+		    {"x", rounded(r.x, 1e5f)},
+		    {"y", rounded(r.y, 1e5f)},
+		    {"gap", rounded(r.gap, 1e5f)},
+		    {"angle", rounded(r.angle, 1e5f)}}
+		.dump();
+}
+
+bool Tracker::load_rest(const std::string &text)
+{
+	const json j = json::parse(text, nullptr, false);
+	if (!j.is_object() || !j.contains("pose") || !j["pose"].is_array() || j["pose"].size() != 12 ||
+	    !j.contains("rest") || !j["rest"].is_object())
+		return false;
+	Rest r;
+	for (int i = 0; i < 12; i++) {
+		if (!j["pose"][i].is_number())
+			return false;
+		r.pose[i] = j["pose"][i].get<float>();
+	}
+	r.pose[12] = r.pose[13] = r.pose[14] = 0;
+	r.pose[15] = 1;
+	for (int i = 0; i < EXPRESSIONS; i++) {
+		const auto it = j["rest"].find(EXPRESSION_NAMES[i]);
+		if (it != j["rest"].end() && it->is_number())
+			r.expressions[i] = std::min(1.0f, std::max(0.0f, it->get<float>()));
+	}
+	auto number = [&](const char *key, float fallback, float lo, float hi) {
+		const auto it = j.find(key);
+		return it != j.end() && it->is_number() ? std::min(hi, std::max(lo, it->get<float>())) : fallback;
 	};
-	const Try tries[] = {{{true, true, true}, false},
-			     {{true, true, false}, true},
-			     {{true, false, true}, true},
-			     {{false, true, true}, true}};
-	// Each way of reading it that holds up; the surest one wins (a wrong
-	// mouth that still just fits loses to the two eyes alone).
-	bool any = false;
-	float best_conf = -1, best_s = 1, best_a = 0, best_x[PARTS], best_y[PARTS];
-	int best_turned = 0;
-	for (const Try &t : tries) {
-		// Pairs only near where it was: two parts can fit anywhere.
-		if (t.pair && !have_last_)
-			continue;
-		float zmin = 1;
-		bool ok = true;
-		for (int i = 0; i < PARTS; i++)
-			if (t.use[i]) {
-				zmin = std::min(zmin, hits[i].z);
-				if (hits[i].z < (t.pair ? PAIR_Z : strict))
-					ok = false;
-			}
-		if (!ok)
-			continue;
-		float s, a, tx, ty;
-		if (!fit(hits, t.use, s, a, tx, ty))
-			continue;
-		float fx[PARTS], fy[PARTS], worst = 0;
-		int turned = 0;
-		if (t.pair) {
-			// Two parts: the set-up's shape, moved, sized and tilted.
-			const float c = std::cos(a), sn = std::sin(a);
-			const float gap = eye_gap_ * s;
-			for (int i = 0; i < PARTS; i++) {
-				fx[i] = s * (c * ref_[i].cx - sn * ref_[i].cy) + tx;
-				fy[i] = s * (sn * ref_[i].cx + c * ref_[i].cy) + ty;
-				if (t.use[i])
-					worst = std::max(worst, std::hypot(fx[i] - hits[i].x, fy[i] - hits[i].y) / gap / shape);
-			}
-		} else {
-			// All three: a real head also nods and turns, which squashes
-			// the face up and down or across. So the shape may stretch
-			// along the face's own two ways (eye to eye, and down to the
-			// mouth) within limits, and lean a little - more than that
-			// isn't a face.
-			Shape f;
-			if (!stretch(hits, f))
-				continue;
-			s = std::sqrt(f.across * f.down);
-			a = f.angle;
-			const float limit = shape / SHAPE;
-			worst = std::max(std::fabs(std::log(f.down / f.across)) / (std::log(1.45f) * limit),
-					 std::fabs(f.lean) / (0.3f * limit));
-			for (int i = 0; i < PARTS; i++) {
-				fx[i] = hits[i].x;
-				fy[i] = hits[i].y;
-			}
-			// Turned: narrower across than down, and the mouth leaning
-			// towards the side it turned to (along the line from the first
-			// eye to the second: with the eyes the camera's way round,
-			// that's the picture's right).
-			if (f.across / f.down < 0.88f && std::fabs(f.lean) > 0.06f)
-				turned = f.lean > 0 ? 1 : -1;
-		}
-		const float scale = s / k;
-		if (scale < MIN_SCALE || scale > MAX_SCALE || std::fabs(a) > MAX_ANGLE)
-			continue;
-		if (have_last_ && (s / last_scale_ < 0.8f || s / last_scale_ > 1.25f ||
-				   std::fabs(a - last_angle_) > (t.pair ? 0.2f : 0.35f)))
-			continue;
-		bool inside = true;
-		for (int i = 0; i < PARTS; i++)
-			if (fx[i] < 0 || fy[i] < 0 || fx[i] >= w || fy[i] >= h)
-				inside = false;
-		if (worst > 1 || !inside)
-			continue;
-		const float conf = clampf((zmin - PART_Z) / 0.35f, 0, 1) * (1 - 0.5f * worst) * (t.pair ? 0.6f : 1);
-		if (conf <= best_conf)
-			continue;
-		any = true;
-		best_conf = conf;
-		best_s = s;
-		best_a = a;
-		best_turned = turned;
-		for (int i = 0; i < PARTS; i++) {
-			best_x[i] = fx[i];
-			best_y[i] = fy[i];
-		}
-	}
-	if (!any)
-		return false;
-
-	face_.found = true;
-	face_.confidence = best_conf;
-	float sx = 0, sy = 0;
-	for (int i = 0; i < PARTS; i++) {
-		face_.x[i] = best_x[i] / w;
-		face_.y[i] = best_y[i] / h;
-		sx += best_x[i];
-		sy += best_y[i];
-		last_x_[i] = best_x[i];
-		last_y_[i] = best_y[i];
-	}
-	face_.cx = sx / PARTS / w;
-	face_.cy = sy / PARTS / h;
-	face_.scale = best_s / k;
-	face_.angle = best_a;
-
-	const int turned = best_turned;
-	if (turned == turned_seen_)
-		turned_for_++;
-	else {
-		turned_seen_ = turned;
-		turned_for_ = 1;
-	}
-	if (turned_for_ >= 3)
-		face_.turned = turned_seen_;
-
-	have_last_ = true;
-	last_scale_ = best_s;
-	last_angle_ = best_a;
-	last_w_ = w;
-	last_h_ = h;
-	misses_ = 0;
-	looks_lost_ = 0;
-	if (face_.confidence > 0.75f)
-		learn(grey, w, h);
+	r.x = number("x", 0.5f, -1, 2);
+	r.y = number("y", 0.5f, -1, 2);
+	r.gap = number("gap", 0, 0, 2);
+	r.angle = number("angle", 0, -4, 4);
+	r.set = true;
+	impl_->rest = r;
+	impl_->setting = 0;
 	return true;
 }
 
-void Tracker::learn(const uint8_t *grey, int w, int h)
+const Geometry &Tracker::geometry() const
 {
-	const float s = last_scale_, c = std::cos(last_angle_), sn = std::sin(last_angle_);
-	for (int i = 0; i < PARTS; i++) {
-		Patch &l = ref_[i].learned;
-		const float hw = l.w * 0.5f, hh = l.h * 0.5f;
-		for (int y = 0; y < l.h; y++)
-			for (int x = 0; x < l.w; x++) {
-				const float qx = x + 0.5f - hw, qy = y + 0.5f - hh;
-				const float px = last_x_[i] + s * (c * qx - sn * qy);
-				const float py = last_y_[i] + s * (sn * qx + c * qy);
-				float &v = l.px[(size_t)y * l.w + x];
-				v = v * 0.95f + sample(grey, w, h, px, py) * 0.05f;
-			}
-	}
+	return impl_->geometry;
 }
 
-void Tracker::find_anywhere(const uint8_t *grey, int w, int h)
+void Tracker::set_plain(bool plain)
 {
-	const float k = (float)w / setup_w_;
-	struct Seed {
-		float x, y, z, s;
-		int part;
+	impl_->finder.set_plain(plain);
+	impl_->mesh.set_plain(plain);
+	impl_->shapes.set_plain(plain);
+}
+
+const std::vector<Tracker::Found> &Tracker::found() const
+{
+	return impl_->found;
+}
+
+bool Tracker::following(Square *square) const
+{
+	if (square)
+		*square = impl_->square;
+	return impl_->following;
+}
+
+Layout layout_of(const Face &face)
+{
+	Layout l;
+	if (!face.found || face.w <= 0 || face.h <= 0)
+		return l;
+	const float w = (float)face.w, h = (float)face.h;
+	auto at = [&](int i) {
+		return face.points[i];
 	};
-	// Looked over at half size (a quarter of the work), then each likely
-	// spot checked properly.
-	const int hw = w / 2, hh = h / 2;
-	half_.resize((size_t)hw * hh);
-	for (int y = 0; y < hh; y++)
-		for (int x = 0; x < hw; x++) {
-			const uint8_t *p = grey + (size_t)(y * 2) * w + x * 2;
-			half_[(size_t)y * hw + x] = (uint8_t)((p[0] + p[1] + p[w] + p[w + 1] + 2) >> 2);
-		}
-	std::vector<Seed> seeds;
-	for (int part = FIRST_EYE; part <= SECOND_EYE; part++) {
-		for (float scale : {0.55f, 0.72f, 0.92f, 1.18f, 1.5f}) {
-			const float s = scale * k;
-			const Warped t = warp(ref_[part].original, ref_[part].learned, s * 0.5f, 0);
-			if (!t.ok)
-				continue;
-			// The best spot in each cell, so one strong patch can't fill
-			// the list.
-			const int cell = std::max(4, (int)(eye_gap_ * s * 0.25f));
-			for (int cy = 0; cy < hh; cy += cell)
-				for (int cx = 0; cx < hw; cx += cell) {
-					Seed best{0, 0, FIND_Z - 0.1f, s, part};
-					bool any = false;
-					for (int y = cy; y < std::min(hh, cy + cell); y++)
-						for (int x = cx; x < std::min(hw, cx + cell); x++) {
-							const float z = zncc(t, half_.data(), hw, hh, x, y);
-							if (z > best.z) {
-								best.x = x * 2.0f + 0.5f;
-								best.y = y * 2.0f + 0.5f;
-								best.z = z;
-								any = true;
-							}
-						}
-					if (any)
-						seeds.push_back(best);
-				}
-		}
-	}
-	std::sort(seeds.begin(), seeds.end(), [](const Seed &a, const Seed &b) { return a.z > b.z; });
-	if (seeds.size() > 24)
-		seeds.resize(24);
-	const bool all[PARTS] = {true, true, true};
-	for (const Seed &seed : seeds) {
-		// The other two where the set-up says they'd be from this one...
-		Hit hits[PARTS];
-		const float gap = eye_gap_ * seed.s;
-		bool likely = true;
-		for (int i = 0; i < PARTS && likely; i++) {
-			const float px = seed.x + seed.s * (ref_[i].cx - ref_[seed.part].cx);
-			const float py = seed.y + seed.s * (ref_[i].cy - ref_[seed.part].cy);
-			hits[i] = search(i, grey, w, h, px, py, i == seed.part ? 3 : 0.35f * gap, seed.s, 0, 2);
-			likely = hits[i].z >= PART_Z;
-		}
-		float s, a, tx, ty;
-		if (!likely || !fit(hits, all, s, a, tx, ty))
-			continue;
-		// ...then each looked for again at the size and tilt all three
-		// say, so a seed from a rough size still lands.
-		const float c = std::cos(a), sn = std::sin(a);
-		for (int i = 0; i < PARTS; i++) {
-			const float px = s * (c * ref_[i].cx - sn * ref_[i].cy) + tx;
-			const float py = s * (sn * ref_[i].cx + c * ref_[i].cy) + ty;
-			Hit best;
-			for (float ds : {0.93f, 1.0f, 1.07f}) {
-				const Hit hit = search(i, grey, w, h, px, py, std::max(2.0f, 0.12f * eye_gap_ * s), s * ds, a, 1);
-				if (hit.z > best.z)
-					best = hit;
-			}
-			hits[i] = best;
-		}
-		if (accept(hits, grey, w, h, FIND_Z, FIND_SHAPE))
-			return;
-	}
+	auto mid = [](const Point &a, const Point &b) {
+		return Point{(a.x + b.x) / 2, (a.y + b.y) / 2, 0};
+	};
+	auto dist = [](const Point &a, const Point &b) {
+		return std::hypot(a.x - b.x, a.y - b.y);
+	};
+	// Each eye from its corners (they hold still while the eye moves and
+	// blinks), with room for its lids; the mouth from its corners and
+	// lips, taller as it opens.
+	const Point right = mid(at(RIGHT_EYE_OUTER), at(RIGHT_EYE_INNER)),
+		    left = mid(at(LEFT_EYE_OUTER), at(LEFT_EYE_INNER));
+	const float right_w = dist(at(RIGHT_EYE_OUTER), at(RIGHT_EYE_INNER)),
+		    left_w = dist(at(LEFT_EYE_OUTER), at(LEFT_EYE_INNER));
+	const bool right_first = right.x <= left.x;
+	const Point &first = right_first ? right : left, &second = right_first ? left : right;
+	const float first_w = right_first ? right_w : left_w, second_w = right_first ? left_w : right_w;
+	const Point corners = mid(at(MOUTH_RIGHT), at(MOUTH_LEFT)), lips = mid(at(UPPER_LIP_TOP), at(LOWER_LIP_BOTTOM));
+	const float mouth_w = dist(at(MOUTH_RIGHT), at(MOUTH_LEFT)),
+		    mouth_h = dist(at(UPPER_LIP_TOP), at(LOWER_LIP_BOTTOM));
+	auto part = [&](float x, float y, float pw, float ph) {
+		return Part{(x + 0.5f) / w, (y + 0.5f) / h, pw / w, ph / h};
+	};
+	l.parts[FIRST_EYE] = part(first.x, first.y, first_w * 1.9f, first_w * 1.25f);
+	l.parts[SECOND_EYE] = part(second.x, second.y, second_w * 1.9f, second_w * 1.25f);
+	l.parts[MOUTH] = part(corners.x, lips.y, mouth_w * 1.5f, std::max(mouth_w * 0.7f, mouth_h * 1.5f));
+	l.cx = (l.parts[0].x + l.parts[1].x + l.parts[2].x) / 3;
+	l.cy = (l.parts[0].y + l.parts[1].y + l.parts[2].y) / 3;
+	l.gap = dist(first, second) / w;
+	l.angle = std::atan2(second.y - first.y, second.x - first.x);
+	return l;
 }
 
-const Face &Tracker::update(const uint8_t *grey, int w, int h)
+Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_look)
 {
-	face_.found = false;
-	face_.confidence = 0;
-	if (!ready_ || !grey || w < 32 || h < 32)
-		return face_;
-	if (have_last_ && (w != last_w_ || h != last_h_))
-		forget();
-	bool found = false;
-	if (have_last_) {
-		const float gap = eye_gap_ * last_scale_;
-		const float radius = std::max(4.0f, 0.45f * gap);
-		Hit hits[PARTS];
-		for (int i = 0; i < PARTS; i++) {
-			const Hit coarse = search(i, grey, w, h, last_x_[i], last_y_[i], radius, last_scale_, last_angle_, 2);
-			Hit best = coarse;
-			if (coarse.z > -1) {
-				for (float ds : {0.93f, 1.0f, 1.07f})
-					for (float da : {-0.1f, 0.0f, 0.1f}) {
-						if (ds == 1.0f && da == 0.0f)
-							continue;
-						const Hit hit = search(i, grey, w, h, coarse.x, coarse.y, 1.5f, last_scale_ * ds,
-								       last_angle_ + da, 1);
-						if (hit.z > best.z)
-							best = hit;
-					}
-			}
-			hits[i] = best;
+	dt = std::max(0.0f, dt);
+	Out &o = out_;
+	o.home_x = rest.set ? rest.x : 0.5f;
+	o.home_y = rest.set ? rest.y : 0.5f;
+	if (face.found) {
+		if (new_look || !seen_) {
+			o.layout = layout_of(face);
+			o.scale = rest.set && rest.gap > 0 ? o.layout.gap / rest.gap : 1;
+			o.angle = wrap_angle(o.layout.angle - (rest.set ? rest.angle : 0));
+			o.turn = face.turn;
+			std::copy(std::begin(face.moves), std::end(face.moves), o.moves);
+			const float yaw = face.turn.yaw;
+			if (o.turned == 0 && std::fabs(yaw) > TURN_ON)
+				o.turned = yaw < 0 ? -1 : 1;
+			else if (o.turned != 0 && (std::fabs(yaw) < TURN_OFF || (yaw < 0) != (o.turned < 0)))
+				o.turned = std::fabs(yaw) > TURN_ON ? (yaw < 0 ? -1 : 1) : 0;
 		}
-		found = accept(hits, grey, w, h, PART_Z, SHAPE);
-		if (!found) {
-			misses_++;
-			// Not found for a moment: start from nothing.
-			if (misses_ > 6)
-				have_last_ = false;
-		} else if (face_.confidence < SURE) {
-			// Following something only a bit like the face for a while:
-			// it may not be the face at all. Start again, strictly.
-			if (++unsure_ > 10) {
-				have_last_ = false;
-				unsure_ = 0;
-			}
-		} else {
-			unsure_ = 0;
-		}
-	} else {
-		misses_++;
+		seen_ = true;
+		lost_for_ = 0;
+		o.found = true;
+		o.holding = false;
+		o.shown = std::min(1.0f, o.shown + dt / BACK);
+		return o;
 	}
-	if (!found && !have_last_) {
-		if (looks_lost_++ % FIND_EVERY == 0)
-			find_anywhere(grey, w, h);
+	o.found = false;
+	if (!seen_) {
+		o.shown = 0;
+		return o;
 	}
-	return face_;
+	// Lost: held as it was, then faded.
+	lost_for_ += dt;
+	o.holding = o.shown > 0;
+	if (lost_for_ > HOLD)
+		o.shown = std::max(0.0f, o.shown - dt / FADE);
+	if (o.shown <= 0) {
+		o.holding = false;
+		o.turned = 0;
+		o.turn = Turn();
+		std::fill(std::begin(o.moves), std::end(o.moves), 0.0f);
+	}
+	return o;
 }
 
-void Smoother::reset()
+void Shown::reset()
 {
-	started_ = false;
-	unsure_for_ = 0;
-	sure_looks_ = 0;
 	out_ = Out();
-}
-
-Smoother::Out Smoother::step(const Face &face, float dt, float seconds, bool new_look)
-{
-	dt = clampf(dt, 0, 0.5f);
-	const bool sure = face.found && face.confidence >= SURE;
-	if (new_look)
-		sure_looks_ = sure ? sure_looks_ + 1 : 0;
-	if (sure && !started_) {
-		started_ = true;
-		out_.cx = face.cx;
-		out_.cy = face.cy;
-		out_.scale = face.scale;
-		out_.angle = face.angle;
-		for (int i = 0; i < PARTS; i++) {
-			out_.x[i] = face.x[i];
-			out_.y[i] = face.y[i];
-		}
-	}
-	// Only a sure look moves anything: an unsure one may be a piece of
-	// the room, so everything holds where it was.
-	if (sure) {
-		// The pose follows gently; the cut-outs stay on the face.
-		const float slow = 1 - std::exp(-dt / std::max(0.05f, seconds / 3));
-		const float quick = 1 - std::exp(-dt / 0.04f);
-		out_.cx += (face.cx - out_.cx) * slow;
-		out_.cy += (face.cy - out_.cy) * slow;
-		out_.scale += (face.scale - out_.scale) * slow;
-		out_.angle += (face.angle - out_.angle) * slow;
-		for (int i = 0; i < PARTS; i++) {
-			out_.x[i] += (face.x[i] - out_.x[i]) * quick;
-			out_.y[i] += (face.y[i] - out_.y[i]) * quick;
-		}
-		out_.turned = face.turned;
-	}
-	if (sure && (out_.shown > 0 || sure_looks_ >= SURE_LOOKS)) {
-		unsure_for_ = 0;
-		out_.shown = std::min(1.0f, out_.shown + dt / 0.15f);
-	} else {
-		unsure_for_ += dt;
-		// Held still for a moment, then the avatar's own face.
-		if (unsure_for_ > 0.4f)
-			out_.shown = std::max(0.0f, out_.shown - dt / 0.3f);
-		if (unsure_for_ > 2.0f) {
-			const float back = 1 - std::exp(-dt / 1.5f);
-			out_.angle -= out_.angle * back;
-			out_.turned = 0;
-		}
-	}
-	return out_;
+	lost_for_ = 0;
+	seen_ = false;
 }
 
 } // namespace direbot::face

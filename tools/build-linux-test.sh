@@ -20,11 +20,15 @@ libs=()
 flags=(-O1 -g -fPIC -fvisibility=hidden -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 	-I"$prefix/include/obs" -I"$here/src" -I"$here/deps" ${EXTRA_FLAGS:-})
 gcc -std=c17 "${flags[@]}" -c "$out/gen/plugin-support.c" -o "$out/plugin-support.o"
+# The face engine's AVX2 convolutions, with their own flags (only called on
+# a CPU that has AVX2).
+g++ -std=c++17 "${flags[@]}" -O2 -mavx2 -mfma -c "$here/src/face/nn/kernels-avx2.cpp" -o "$out/kernels-avx2.o"
 g++ -std=c++17 "${flags[@]}" -shared -o "$out/$name.so" \
 	"$here/src/plugin-main.cpp" "$here"/src/link/{crypto,ws,protocol,server}.cpp \
 	"$here"/src/obs/{websocket,meters,usage,link-file,address,keystore,settings-window,recording}.cpp \
 	"$here"/src/multistream/{multistream,places}.cpp "$here"/src/follow/{tracker,follow-cam}.cpp "$here"/src/record/{rules,record}.cpp \
-	"$here"/src/moves/{plan,move-transition}.cpp "$here"/src/filters/blur-filter.cpp "$here"/src/face/{tracker,face-avatar}.cpp \
+	"$here"/src/moves/{plan,move-transition}.cpp "$here"/src/filters/blur-filter.cpp \
+	"$here"/src/face/{tracker,pose,face-avatar}.cpp "$here"/src/face/nn/{net,kernels,kernels-sse2}.cpp "$out/kernels-avx2.o" \
 	"$here"/src/vertical/{rules,options,canvas,outputs,settings,vertical}.cpp "$out/plugin-support.o" \
 	"${libs[@]}" -lobs -lobs-frontend-api -pthread -Wl,--no-undefined
 echo "Built $out/$name.so"

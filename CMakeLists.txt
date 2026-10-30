@@ -80,7 +80,30 @@ target_sources(
     src/filters/blur-filter.cpp
 )
 
-# 0.4.0: the face avatar - your real eyes and mouth on a character.
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/face/tracker.cpp src/face/face-avatar.cpp)
+# 0.4.0: the face avatar - your real eyes and mouth on a character, your
+# face followed by Google's MediaPipe face models (data/face) on our own
+# engine (src/face/nn).
+target_sources(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE
+    src/face/tracker.cpp
+    src/face/pose.cpp
+    src/face/face-avatar.cpp
+    src/face/nn/net.cpp
+    src/face/nn/kernels.cpp
+    src/face/nn/kernels-sse2.cpp
+    src/face/nn/kernels-avx2.cpp
+)
+# The AVX2 convolutions are built for AVX2 and FMA (kernels.cpp only calls
+# them on a CPU that has both), on their own: no whole-program
+# optimisation, so none of their code ends up anywhere else.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|x64" AND NOT APPLE)
+  if(MSVC)
+    set_source_files_properties(src/face/nn/kernels-avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/GL-")
+    set_source_files_properties(src/face/nn/kernels-sse2.cpp PROPERTIES COMPILE_OPTIONS "/GL-")
+  else()
+    set_source_files_properties(src/face/nn/kernels-avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+  endif()
+endif()
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

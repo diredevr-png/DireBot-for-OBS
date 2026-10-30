@@ -16,168 +16,227 @@ You should have received a copy of the GNU General Public License along
 with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
-// Where your eyes and mouth are in the camera's picture, for the face
-// avatar - all of it worked out here, with no one else's code or model.
+// Your face in the camera's picture, for the face avatar: 478 points on
+// it, 52 expressions (how open your mouth is, each eye's blink, a smile,
+// a raised brow...) and which way your head is turned.
 //
-// Set up once: on a still from the camera you put a box over each eye
-// and your mouth, and how those three look is kept. After that, on a
-// small grey copy of each picture, it looks for each one again near
-// where it was (how alike two patches are, whatever the light: zero-mean
-// normalised cross-correlation), then fits one move, size and tilt to
-// all three so they stay in shape as one face. A part that doesn't agree
-// with the other two isn't believed. It learns slowly while it's sure
-// (the light changes over a stream), and when it's lost it looks over
-// the whole picture every few looks until the three agree again.
+// Google's MediaPipe face models do the seeing (data/face, Apache 2.0),
+// run by our own engine (nn/net.hpp), with the steps around them done
+// as MediaPipe's Face Landmarker does them, so the answers are theirs:
 //
-// It would rather say "not sure" than be wrong: the avatar then shows
-// its own drawn eyes and mouth, never a piece of your room.
+//   1. Find a face: the whole picture, shrunk to 128 x 128, through the
+//      face finder. It follows the biggest face it finds.
+//   2. The 478 points: a square around the face, turned so the eyes are
+//      level, cut out at 256 x 256, through the face mesh model - which
+//      also says how sure it is there's a face there at all.
+//   3. Next look: the square comes from where the points were, so the
+//      finder only runs again once the face is lost.
+//   4. Smoothing (a One Euro filter on each point): steady while you're
+//      still, straight there when you move. How much is a slider.
+//   5. The 52 expressions: 146 of the points through the expressions
+//      model.
+//   6. The head's turn and place in 3D (pose.hpp).
+//
+// "Set": look straight at the camera with a resting face, and that look
+// is kept, so the head's turn and the expressions after it are against
+// how you sit and how your face rests (a beard, a camera off to one side).
 //
 // Plain code over plain numbers, so it's tested without OBS
 // (tests/unit_face.cpp).
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "pose.hpp"
+
 namespace direbot::face {
 
-// The parts, in the picture as the camera sees it (not mirrored).
-enum PartId { FIRST_EYE = 0, SECOND_EYE = 1, MOUTH = 2, PARTS = 3 };
+constexpr int POINTS = 478;
+constexpr int EXPRESSIONS = 52;
+// MediaPipe's names for the expressions (Apple's ARKit ones, and
+// "_neutral" first).
+extern const char *const EXPRESSION_NAMES[EXPRESSIONS];
 
-// A box: left, top, width, height as shares of the picture (0 to 1).
-struct Box {
-	float x = 0, y = 0, w = 0, h = 0;
+// Some points by number: the eyes' middles (the irises) and the lips.
+// "Right" and "left" are the person's own: the right eye is on the
+// picture's left in a camera that doesn't mirror.
+enum PointId {
+	RIGHT_IRIS = 468,
+	LEFT_IRIS = 473,
+	RIGHT_EYE_OUTER = 33,
+	RIGHT_EYE_INNER = 133,
+	LEFT_EYE_INNER = 362,
+	LEFT_EYE_OUTER = 263,
+	MOUTH_RIGHT = 61,
+	MOUTH_LEFT = 291,
+	UPPER_LIP_TOP = 0,
+	LOWER_LIP_BOTTOM = 17,
+	NOSE_TIP = 1,
 };
 
-// Sure enough to show your real eyes and mouth.
-constexpr float SURE = 0.45f;
+// A picture from the camera: 4 bytes a pixel, row after row.
+struct Frame {
+	const uint8_t *px = nullptr;
+	int w = 0, h = 0;
+	int stride = 0;    // bytes from one row to the next
+	bool bgra = false; // blue, green, red (else red first); the 4th is unused
+};
 
-// What it sees now.
+struct Point {
+	float x = 0, y = 0, z = 0;
+};
+
+// What one look saw.
 struct Face {
 	bool found = false;
-	// 0 (a guess) to 1 (sure). Only meaningful while found.
-	float confidence = 0;
-	// Each part's centre, shares of the picture.
-	float x[PARTS] = {0, 0, 0}, y[PARTS] = {0, 0, 0};
-	// The face as a whole, against the set-up still: the three parts'
-	// middle (shares of the picture), how much bigger (1: the same), and
-	// its tilt in radians (positive: clockwise on screen).
-	float cx = 0.5f, cy = 0.5f, scale = 1, angle = 0;
-	// Head turned: -1 towards the picture's left, 1 its right, 0 facing.
-	int turned = 0;
+	// The picture's size (the points are in its pixels).
+	int w = 0, h = 0;
+	// How sure the face model is (0 to 1); found means at least half.
+	float presence = 0;
+	// In the picture's pixels (0, 0 the top left pixel's middle); z: how
+	// far from the camera, against the face's middle, on x's scale.
+	Point points[POINTS];
+	// 0 to 1, as the model says...
+	float expressions[EXPRESSIONS] = {};
+	// ...and against your resting face from "Set" (the same until then):
+	// 0 at rest, 1 all the way.
+	float moves[EXPRESSIONS] = {};
+	// The head in 3D (pose.hpp), and its turn since "Set" (or since
+	// looking straight at the camera, until then).
+	float pose[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+	Turn turn;
+	// This look ran the face finder (no face was being followed).
+	bool searched = false;
+	// How long the look took, in milliseconds.
+	float ms = 0;
 };
+
+// "Set": your face at rest, looking at the camera.
+struct Rest {
+	bool set = false;
+	float pose[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+	float expressions[EXPRESSIONS] = {};
+	// Where the face was (the middle of the eyes and mouth, shares of the
+	// picture), from eye to eye (a share of its width) and the eyes' tilt
+	// (radians, clockwise as the picture shows it).
+	float x = 0.5f, y = 0.5f, gap = 0, angle = 0;
+};
+
+// The eyes and mouth as boxes in the picture, for the 2D avatar's
+// cut-outs: middles and sizes as shares of the picture (w of its width,
+// h of its height), turned with the eyes' tilt.
+enum PartId { FIRST_EYE = 0, SECOND_EYE = 1, MOUTH = 2, PARTS = 3 };
+struct Part {
+	float x = 0, y = 0, w = 0, h = 0;
+};
+struct Layout {
+	// The first eye is the one on the picture's left.
+	Part parts[PARTS];
+	float cx = 0.5f, cy = 0.5f; // the three parts' middle
+	float gap = 0;              // eye to eye, a share of the width
+	float angle = 0;            // radians, clockwise as the picture shows it
+};
+Layout layout_of(const Face &face);
 
 class Tracker {
 public:
-	// Wide enough for an eye at a normal distance to be ~20 pixels.
-	static constexpr int WIDTH = 400;
+	Tracker();
+	~Tracker();
+	Tracker(const Tracker &) = delete;
+	Tracker &operator=(const Tracker &) = delete;
 
-	// Keeps how the three parts look, from a grey picture (w x h, row
-	// after row). False (and nothing changes) for boxes that are too
-	// small, too plain to find again, or off the picture.
-	bool set_up(const uint8_t *grey, int w, int h, const Box parts[PARTS], std::string *problem = nullptr);
-	bool ready() const { return ready_; }
-	// Where the face was in the set-up still (the middle of the three
-	// parts, shares of the picture): the avatar's "home".
-	float home_x() const { return ready_ ? (ref_[0].cx + ref_[1].cx + ref_[2].cx) / 3 / setup_w_ : 0.5f; }
-	float home_y() const { return ready_ ? (ref_[0].cy + ref_[1].cy + ref_[2].cy) / 3 / setup_h_ : 0.5f; }
+	// Google's face_landmarker.task (a zip of the three models and the
+	// face at rest), from memory or a file. False, with why, if it can't.
+	bool load(const uint8_t *bytes, size_t size, std::string *problem = nullptr);
+	bool load_file(const std::string &path, std::string *problem = nullptr);
+	bool ready() const;
 
-	// The set-up as text, to keep in the source's settings, and back.
-	std::string save() const;
-	bool load(const std::string &text);
+	// Looks at a new picture. `seconds`: when the camera took it (any
+	// clock that only goes forward), for the smoothing.
+	const Face &look(const Frame &picture, double seconds);
+	const Face &face() const;
 
-	// Looks for the face in a new picture.
-	const Face &update(const uint8_t *grey, int w, int h);
-	const Face &face() const { return face_; }
-
-	// Lost: the next look starts from nothing (a new camera size, or a
-	// while without looking). The set-up is kept.
+	// The next look starts with the face finder (a new camera, a while
+	// without looking). "Set" is kept.
 	void forget();
 
-	// For tests and the state: looks since it was last found.
-	int misses() const { return misses_; }
+	// Smoothing: 0 the steadiest to 1 the snappiest; 0.5 is MediaPipe's
+	// own. Below 0: none at all (for tests).
+	void set_smoothing(float amount);
 
-	struct Patch {
-		int w = 0, h = 0;
-		std::vector<float> px;
+	// "Set": the next few looks that find the face are your resting face,
+	// looking at the camera. setting() is true until it has them.
+	void set_rest();
+	bool setting() const;
+	bool has_rest() const;
+	void clear_rest();
+	const Rest &rest() const;
+	// "Set" as text, to keep in the source's settings, and back.
+	std::string save_rest() const;
+	bool load_rest(const std::string &text);
+
+	// The face at rest in 3D and its triangles (for later).
+	const Geometry &geometry() const;
+
+	// For tests: the models step by step on the plain C++ code (net.hpp;
+	// set before load), and the face finder's answers on the last look
+	// that ran it (picture pixels).
+	void set_plain(bool plain);
+	struct Found {
+		float x = 0, y = 0, w = 0, h = 0; // its box
+		float score = 0;
+		float keys[12] = {}; // 6 points: eyes, nose, mouth, ears (x, y)
 	};
+	const std::vector<Found> &found() const;
+	// The square the next look will cut out (picture pixels, radians).
+	struct Square {
+		float cx = 0, cy = 0, w = 0, h = 0, angle = 0;
+	};
+	bool following(Square *square = nullptr) const;
 
 private:
-	struct Ref {
-		Patch original, learned;
-		float cx = 0, cy = 0; // centre, set-up pixels
-	};
-	struct Hit {
-		float x = 0, y = 0, z = -1;
-	};
-
-	// set_up's boxes, already grown (and load's).
-	bool take(const uint8_t *grey, int w, int h, const Box parts[PARTS], std::string *problem = nullptr);
-	Hit search(int part, const uint8_t *grey, int w, int h, float px, float py, float radius, float scale,
-		   float angle, int step) const;
-	bool fit(const Hit hits[PARTS], const bool use[PARTS], float &s, float &a, float &tx, float &ty) const;
-	// The three parts against the set-up's shape: how much bigger across
-	// (eye to eye) and down (to the mouth), the tilt, and the lean (the
-	// mouth off to one side, against the size across).
-	struct Shape {
-		float across = 1, down = 1, angle = 0, lean = 0;
-	};
-	bool stretch(const Hit hits[PARTS], Shape &out) const;
-	bool accept(const Hit hits[PARTS], const uint8_t *grey, int w, int h, float strict, float shape);
-	void learn(const uint8_t *grey, int w, int h);
-	void find_anywhere(const uint8_t *grey, int w, int h);
-
-	bool ready_ = false;
-	int setup_w_ = 0, setup_h_ = 0;
-	Ref ref_[PARTS];
-	float eye_gap_ = 0; // set-up pixels
-	float ref_ratio_ = 0; // eye gap against eyes-to-mouth, set up
-	Face face_;
-	int misses_ = 0;
-	int looks_lost_ = 0;
-	int unsure_ = 0; // looks in a row found, but not surely
-	int turned_for_ = 0; // looks in a row the turn reading has held
-	int turned_seen_ = 0;
-	// Where it was last (picture pixels of the current size), for the
-	// next look to start from.
-	bool have_last_ = false;
-	float last_x_[PARTS] = {0, 0, 0}, last_y_[PARTS] = {0, 0, 0};
-	float last_scale_ = 1, last_angle_ = 0;
-	int last_w_ = 0, last_h_ = 0;
-	std::vector<uint8_t> half_; // kept, so a look over everything doesn't allocate
+	struct Impl;
+	std::unique_ptr<Impl> impl_;
 };
 
-// The pose eased over time, so the avatar doesn't shake, and how much the
-// cut-outs show: held still a moment when tracking goes unsure, then
-// faded to the avatar's own drawn face.
-class Smoother {
+// What the 2D avatar shows, look by look: the eyes and mouth, the face's
+// move, size and tilt against "Set", which way you're turned, and how much
+// your real eyes and mouth show. When the face is lost they're held as
+// they were for a moment (the avatar keeps the last picture of them, so
+// it never shows your room), then faded to the avatar's own drawn face;
+// once it's found again they're back quickly.
+class Shown {
 public:
+	static constexpr float HOLD = 0.3f, FADE = 0.25f, BACK = 0.15f;
+	// Turned pictures: past this many degrees, and back under the other.
+	static constexpr float TURN_ON = 20, TURN_OFF = 12;
+
 	struct Out {
-		float cx = 0.5f, cy = 0.5f, scale = 1, angle = 0;
-		float x[PARTS] = {0, 0, 0}, y[PARTS] = {0, 0, 0};
-		float shown = 0; // the cut-outs: 0 hidden to 1 shown
-		int turned = 0;
+		Layout layout;
+		float scale = 1;                               // eye to eye, against "Set"
+		float home_x = 0.5f, home_y = 0.5f, angle = 0; // tilt against "Set"
+		float shown = 0;                               // the real eyes and mouth: 0 hidden to 1 shown
+		bool holding = false;                          // shown, but from the last picture they were seen in
+		bool found = false;
+		int turned = 0; // -1 towards the picture's left, 1 its right
+		Turn turn;
+		float moves[EXPRESSIONS] = {};
 	};
-	// `seconds`: about how long it takes to catch up. Once faded out, the
-	// cut-outs only come back after a few sure looks in a row: one lucky
-	// match on the wallpaper never shows.
-	static constexpr int SURE_LOOKS = 3;
-	// `new_look`: the face is from a new look, not the last one again.
-	Out step(const Face &face, float dt, float seconds, bool new_look = true);
+	// `face`: the newest look; `new_look`: it's a new one, not the last
+	// one again; `dt`: seconds since the last step.
+	Out step(const Face &face, const Rest &rest, float dt, bool new_look = true);
 	Out now() const { return out_; }
 	void reset();
 
 private:
 	Out out_;
-	bool started_ = false;
-	float unsure_for_ = 0;
-	int sure_looks_ = 0; // in a row
+	float lost_for_ = 0;
+	bool seen_ = false;
 };
-
-// The patch's pixels as text and back (for save/load).
-std::string encode(const std::vector<uint8_t> &bytes);
-bool decode(const std::string &text, std::vector<uint8_t> &bytes);
 
 } // namespace direbot::face

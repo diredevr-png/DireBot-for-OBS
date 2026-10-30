@@ -81,14 +81,20 @@ DireBot's **Smooth** transition uses it.
 
 **DireBot Face Avatar (0.4.0).** A source that puts a character on screen
 wearing your real eyes and mouth, cut out of your camera, and moves,
-tilts and turns it with your head. The face tracking is our own (no
-libraries, nothing sent anywhere): it learns your eyes and mouth from one
-picture with boxes drawn round them, follows them by matching pictures of
-them frame by frame on a thread of its own, and finds you
-again by searching the whole picture when you've gone. When it isn't sure
-the character shows its own drawn eyes and mouth, or none. Optional
-pictures for turned left and turned right, and outfit layers in front of
-or behind the character. DireBot sets it up (Avatar → Face avatar).
+tilts and turns it with your head. Your face is followed by Google's
+MediaPipe face models (in `data/face`, Apache 2.0) run by our own small
+engine (`src/face/nn`: no MediaPipe, TensorFlow or other library, nothing
+sent anywhere): 478 points on your face, 52 expressions (blinks, mouth
+open, smile...) and which way your head is turned, 30 times a second (15
+with **Easy on my PC**) on a thread of its own. The steps around the
+models are MediaPipe's own, so the answers are theirs (the tests check
+that). **Steady or snappy** sets the smoothing; **Set** (look straight at
+the camera with a resting face) makes your turn and expressions count
+from how you sit. When your face is lost the eyes and mouth are held for
+a moment, from the last picture they were seen in (never your room), then
+the character shows its own drawn eyes and mouth. Optional pictures for
+turned left and turned right, and outfit layers in front of or behind the
+character. DireBot sets it up (Avatar → Face avatar).
 
 The link never hands out your stream key: `GetStreamServiceSettings`
 through it shows the key (and a custom server's password or token) as
@@ -148,9 +154,8 @@ The add-on's own requests go through `CallVendorRequest` with
 | `RecordGetState` | clean recordings: `options` (`when`: `recording`/`stream`/`hand`, `encoder`, `picks`: `source`, `uuid`, `height` (0: the source's own), `quality`, `audio_track`, `enabled`), `running` (`source`, `file` name, `recording`, `seconds`), `problems`, `sources` (what can be picked), `encoders` (`id`, `name`), `auto_encoder` |
 | `RecordSetOptions` `{options}` | saves them (the same shape as `options` above); answers the state |
 | `RecordStart` / `RecordStop` | the state, plus `note` when some couldn't start, or `error` in words when none could. The `RecordChanged` vendor event sends the state whenever it changes |
-| `FaceStill` `{camera}` | `still` (an id), `camera`, `width`, `height` and `image`: a still from the camera as a BMP data URL, to draw the boxes on |
-| `FaceSetUp` `{source, still, boxes}` | learns the face from that still: `boxes` are the left eye, right eye and mouth as `[x, y, w, h]` shares of it; `ok`, or `error` in words (for one, a still that is too old) |
-| `FaceGetState` `{source}` | `camera`, `ready`, `showing`, `found`, `sure`, `confidence`, `parts`, `scale`, `angle`, `turned`, `shown`, `looks_per_second` |
+| `FaceSet` `{source, clear?}` | "Set": the next looks that find the face are its rest, kept in the source's `rest` setting (`setting` while it's taking them); `clear` forgets it. `ok`, or `error` in words (for one, the face avatar isn't shown) |
+| `FaceGetState` `{source, points?}` | `camera`, `ready`, `showing`, `found`, `presence` (0-1), `set`, `setting`, `turn` (`yaw`, `pitch`, `roll` in degrees, since "Set"), `turned` (-1, 0, 1), `moves` (the 51 expressions, 0-1 since "Set", ARKit's names), `parts` (first eye, second eye, mouth: `x`, `y`, `w`, `h` shares of the camera's picture), `shown`, `holding`, `looks_per_second`, `ms`, `problem`; with `points`, the 478 `points` (`x`, `y` shares) |
 | `GetUsage` | `measuring` (first 3 seconds), `fps`, `fps_now`, `frame_ms`, `frame_budget_ms`, `frames`, `frames_lagged`, `encoded`, `encoded_skipped`, `cpu`, `memory_mb`, `stream_frames`, `stream_dropped`, and `sources`: per input and filter `name`, `uuid`, `kind`, `type`, `active`, `showing`, `measured`, `tick_ms`, `render_ms`, `gpu_ms` (+ `_max_ms`), `fps_in`/`fps_shown` for cameras and media, `parent`/`enabled` for filters (and `own_ms`/`own_gpu_ms`: a filter's time takes in what it draws on, so this is its own part), and `hints` (browser size/fps/"shut down when hidden", whether it shows a page on this PC and its port, a short fingerprint of a camera to spot the same one added twice) |
 
 ## Building
@@ -165,9 +170,9 @@ A quick test build from Linux with MinGW, against OBS's headers only:
 
 Tests (Linux):
 
-    tools/test-link.sh                       # protocol, WebSocket, network
+    tools/test-link.sh                       # protocol, WebSocket, network, the face tracker
     BUILD_DIR=/tmp/b tools/build-linux-test.sh
-    DIREBOT_OBS_PLUGIN=/tmp/b/direbot-for-obs.so pytest tests/test_real_obs.py
+    DIREBOT_OBS_PLUGIN=/tmp/b/direbot-for-obs.so pytest tests/test_real_obs.py tests/test_real_face.py
 
 `test_real_obs.py` runs a real OBS 31.1 or newer (`ppa:obsproject/obs-studio`, then `apt install obs-studio xvfb`)
 with its own empty settings on a pretend screen, and checks the link with
@@ -176,6 +181,11 @@ obsws-python, the client DireBot uses. `test_real_obs_multistream.py` and
 picture needs OBS 31.1 or newer, newer than some Linux PCs have: build
 OBS from source and point the build at it with `OBS_PREFIX=/path/to/obs`
 (and `DIREBOT_OBS_PRELOAD` for libraries of its own that must load first).
+
+The face tracker's tests (`tests/unit_face.cpp`) check it against
+MediaPipe's own answers on a photo (`tests/data/face`), mirrored, turned
+and half size. `tools/face-expected.py` makes those answers again (it
+needs `pip install mediapipe`, for the test only).
 
 ## Releasing
 
@@ -204,8 +214,10 @@ OBS from source and point the build at it with `OBS_PREFIX=/path/to/obs`
     src/record/           clean recordings: a private picture and file per source
     src/moves/            the DireBot Move transition and its plan
     src/filters/          the DireBot Blur filter
-    src/face/             the DireBot Face Avatar source and our own face tracker
+    src/face/             the DireBot Face Avatar source and its face tracker
+    src/face/nn/          our own engine for the face models
     data/effects/         the shaders the transition, the filter and the face avatar draw with
+    data/face/            Google's MediaPipe face models (Apache 2.0, see its NOTICE)
     deps/                 nlohmann/json (MIT), obs-websocket's API header (GPL-2.0)
 
 Later parts each get their own folder under `src/`, their own `direbot`
@@ -214,3 +226,7 @@ requests and a line in `features`.
 ## Licence
 
 GPL-2.0-or-later, like OBS. See LICENSE.
+
+`data/face/face_landmarker.task` is Google's MediaPipe Face Landmarker,
+unchanged: Copyright The MediaPipe Authors, under the Apache License 2.0
+(`data/face/LICENSE`, `data/face/NOTICE`).

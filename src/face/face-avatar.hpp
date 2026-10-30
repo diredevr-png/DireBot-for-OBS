@@ -25,22 +25,26 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // like, pictures of it turned left and right), its own drawn eyes and
 // mouth for when the camera can't see you, and outfit layers in front of
 // or behind it. Where your eyes and mouth go on it is set by dragging
-// boxes in DireBot (Avatar -> Face avatar), which also takes the set-up
-// still: a box over each eye and your mouth (tracker.hpp).
+// boxes in DireBot (Avatar -> Face avatar).
+//
+// Your face is followed by Google's MediaPipe face models (data/face) on
+// our own code (tracker.hpp): 478 points, 52 expressions and your head's
+// turn. "Set" (look straight at the camera with a resting face) makes
+// the moves, tilt and turn count from how you sit.
 //
 // Like Follow Cam it only works while it's shown. Thirty times a second
-// it reads a small grey copy of the camera's picture (a look later, so
-// OBS never waits), and the tracker works on its own thread, so a slow
-// look never holds up OBS's picture.
+// (fifteen with "Easy on my PC") it reads a copy of the camera's picture
+// (a look later, so OBS never waits), and the tracker works on its own
+// thread, so a slow look never holds up OBS's picture.
 //
 // Vendor requests (DireBot):
-//   FaceStill {camera}            a picture from the camera to set up on:
-//                                 `image` (a BMP as a data: address),
-//                                 `width`, `height`, `still` (its id)
-//   FaceSetUp {source, still, boxes: [[x, y, w, h] x 3]}
-//                                 keeps how your eyes and mouth look (in
-//                                 the source's settings), or `error`
-//   FaceGetState {source}         what it sees now
+//   FaceSet {source, clear?}      "Set": the next looks that find your
+//                                 face are its rest (kept in the source's
+//                                 settings); `clear` forgets it
+//   FaceGetState {source, points?}
+//                                 what it sees now; `points`: the 478
+//                                 points too ({x, y}: shares of the picture), for
+//                                 DireBot's preview
 // Everything else (pictures, spots, outfit, looks) is the source's own
 // settings, set with obs-websocket's SetInputSettings.
 

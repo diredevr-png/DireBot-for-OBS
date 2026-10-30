@@ -28,7 +28,17 @@ link_src=("$here/src/link/crypto.cpp" "$here/src/link/ws.cpp" "$here/src/link/pr
 	"$here/src/moves/plan.cpp"
 "$out/unit-record"
 
-"$cxx" "${flags[@]}" -o "$out/unit-face" "$here/tests/unit_face.cpp" "$here/src/face/tracker.cpp"
+# The face tracker: its engine built as the add-on builds it (-O2, the AVX2
+# part with its own flags), the tests against the files in the repo.
+face_obj=()
+for src in net kernels kernels-sse2 kernels-avx2; do
+	extra=()
+	[ "$src" = kernels-avx2 ] && extra=(-mavx2 -mfma)
+	"$cxx" "${flags[@]}" -O2 ${extra[@]+"${extra[@]}"} -c "$here/src/face/nn/$src.cpp" -o "$out/face-$src.o"
+	face_obj+=("$out/face-$src.o")
+done
+"$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-face" "$here/tests/unit_face.cpp" \
+	"$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
 "$out/unit-face"
 
 "$cxx" "${flags[@]}" -o "$out/harness" "$here/tests/harness.cpp" "$here/src/link/server.cpp" "${link_src[@]}"

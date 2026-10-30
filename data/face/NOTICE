@@ -1,0 +1,27 @@
+face_landmarker.task - Google MediaPipe Face Landmarker
+Copyright The MediaPipe Authors (Google LLC)
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may
+not use this file except in compliance with the License. A copy of the
+License is in this folder (LICENSE), or see
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations
+under the License.
+
+It holds Google's three face models and the face at rest they come with:
+  face_detector.tflite             - finds faces (BlazeFace, short range)
+  face_landmarks_detector.tflite   - Face Mesh V2: 478 points on a face
+  face_blendshapes.tflite          - Blendshape V2: 52 face expressions
+  geometry_pipeline_metadata_landmarks.binarypb - the face at rest in 3D
+Model cards: https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker
+
+The file is Google's, unchanged, as downloaded from
+https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+sha256 64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff
+
+DireBot for OBS runs the models with its own code (src/face/nn); no
+MediaPipe or TensorFlow code is part of it.

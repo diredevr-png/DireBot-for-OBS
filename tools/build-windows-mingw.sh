@@ -51,14 +51,18 @@ sources=(
 	src/multistream/multistream.cpp src/multistream/places.cpp
 	src/follow/tracker.cpp src/follow/follow-cam.cpp
 	src/record/rules.cpp src/record/record.cpp src/moves/plan.cpp src/moves/move-transition.cpp
-	src/filters/blur-filter.cpp src/face/tracker.cpp src/face/face-avatar.cpp
+	src/filters/blur-filter.cpp src/face/tracker.cpp src/face/pose.cpp src/face/face-avatar.cpp
+	src/face/nn/net.cpp src/face/nn/kernels.cpp src/face/nn/kernels-sse2.cpp src/face/nn/kernels-avx2.cpp
 	src/vertical/rules.cpp src/vertical/options.cpp src/vertical/canvas.cpp src/vertical/outputs.cpp
 	src/vertical/settings.cpp src/vertical/vertical.cpp
 )
 objects=()
 for src in "${sources[@]}"; do
 	obj="$out/obj/$(echo "$src" | tr '/' '_').o"
-	"${prefix}g++" "${cxxflags[@]}" -c "$here/$src" -o "$obj"
+	extra=()
+	# The face engine's AVX2 convolutions (only called on a CPU with AVX2).
+	[ "$src" = src/face/nn/kernels-avx2.cpp ] && extra=(-mavx2 -mfma)
+	"${prefix}g++" "${cxxflags[@]}" ${extra[@]+"${extra[@]}"} -c "$here/$src" -o "$obj"
 	objects+=("$obj")
 done
 "${prefix}gcc" "${cflags[@]}" -c "$out/gen/plugin-support.c" -o "$out/obj/plugin-support.o"
