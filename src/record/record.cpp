@@ -140,6 +140,7 @@ void CleanRecordings::start(Emit emit)
 		return;
 	emit_ = std::move(emit);
 	obs_frontend_add_event_callback(&CleanRecordings::on_frontend, this);
+	frontend_ = true;
 	started_ = true;
 }
 
@@ -156,7 +157,11 @@ void CleanRecordings::unload()
 		release(r);
 	}
 	running_.clear();
-	obs_frontend_remove_event_callback(&CleanRecordings::on_frontend, this);
+	// Usually already done at OBS_FRONTEND_EVENT_EXIT: by unload OBS's
+	// window has let go of its list.
+	if (frontend_)
+		obs_frontend_remove_event_callback(&CleanRecordings::on_frontend, this);
+	frontend_ = false;
 }
 
 json CleanRecordings::request(const std::string &type, const json &data)
@@ -468,8 +473,13 @@ void CleanRecordings::on_frontend(enum obs_frontend_event event, void *self)
 			c->stop_all();
 		break;
 	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING:
+		c->stop_all();
+		break;
 	case OBS_FRONTEND_EVENT_EXIT:
 		c->stop_all();
+		// Now, while OBS's window still has its list.
+		obs_frontend_remove_event_callback(&CleanRecordings::on_frontend, c);
+		c->frontend_ = false;
 		break;
 	default:
 		break;
