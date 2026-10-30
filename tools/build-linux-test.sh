@@ -24,7 +24,7 @@ g++ -std=c++17 "${flags[@]}" -shared -o "$out/$name.so" \
 	"$here/src/plugin-main.cpp" "$here"/src/link/{crypto,ws,protocol,server}.cpp \
 	"$here"/src/obs/{websocket,meters,usage,link-file,address,keystore,settings-window,recording}.cpp \
 	"$here"/src/multistream/{multistream,places}.cpp "$here"/src/follow/{tracker,follow-cam}.cpp "$here"/src/record/{rules,record}.cpp \
-	"$here"/src/moves/{plan,move-transition}.cpp "$here"/src/filters/blur-filter.cpp \
+	"$here"/src/moves/{plan,move-transition}.cpp "$here"/src/filters/blur-filter.cpp "$here"/src/face/{tracker,face-avatar}.cpp \
 	"$here"/src/vertical/{rules,options,canvas,outputs,settings,vertical}.cpp "$out/plugin-support.o" \
 	"${libs[@]}" -lobs -lobs-frontend-api -pthread -Wl,--no-undefined
 echo "Built $out/$name.so"

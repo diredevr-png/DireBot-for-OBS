@@ -80,4 +80,7 @@ target_sources(
     src/filters/blur-filter.cpp
 )
 
+# 0.4.0: the face avatar - your real eyes and mouth on a character.
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/face/tracker.cpp src/face/face-avatar.cpp)
+
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

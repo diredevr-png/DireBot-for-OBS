@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds and runs the tests for DireBot for OBS that don't need OBS:
-# the unit tests (the link's, the vertical picture's, Follow me's), then the link's
+# the unit tests (the link's, the vertical picture's, Follow me's, clean recordings', the face tracker's), then the link's
 # network tests through obsws-python.
 # (tests/test_real_obs.py runs it inside a real OBS - see its top.)
 #   pip install pytest obsws-python websocket-client
@@ -27,6 +27,9 @@ link_src=("$here/src/link/crypto.cpp" "$here/src/link/ws.cpp" "$here/src/link/pr
 "$cxx" "${flags[@]}" -o "$out/unit-record" "$here/tests/unit_record.cpp" "$here/src/record/rules.cpp" \
 	"$here/src/moves/plan.cpp"
 "$out/unit-record"
+
+"$cxx" "${flags[@]}" -o "$out/unit-face" "$here/tests/unit_face.cpp" "$here/src/face/tracker.cpp"
+"$out/unit-face"
 
 "$cxx" "${flags[@]}" -o "$out/harness" "$here/tests/harness.cpp" "$here/src/link/server.cpp" "${link_src[@]}"
 DIREBOT_LINK_HARNESS="$out/harness" python3 -m pytest -q "$here/tests/test_link.py" "$@"

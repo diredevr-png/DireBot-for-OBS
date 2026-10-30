@@ -51,7 +51,7 @@ sources=(
 	src/multistream/multistream.cpp src/multistream/places.cpp
 	src/follow/tracker.cpp src/follow/follow-cam.cpp
 	src/record/rules.cpp src/record/record.cpp src/moves/plan.cpp src/moves/move-transition.cpp
-	src/filters/blur-filter.cpp
+	src/filters/blur-filter.cpp src/face/tracker.cpp src/face/face-avatar.cpp
 	src/vertical/rules.cpp src/vertical/options.cpp src/vertical/canvas.cpp src/vertical/outputs.cpp
 	src/vertical/settings.cpp src/vertical/vertical.cpp
 )

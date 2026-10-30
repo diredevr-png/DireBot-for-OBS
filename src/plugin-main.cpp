@@ -50,6 +50,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // scenes into its new place; and "DireBot Blur" (filters/), which
 // DireBot's stream tricks use for Blur and Pixelate.
 //
+// 0.4.0: "DireBot Face Avatar" (face/), your character with your real
+// eyes and mouth cut out of your camera, set up through "Face..." vendor
+// requests.
+//
 // Later parts plug in beside these: each gets its own folder under src/,
 // its own vendor requests, and a line in features().
 
@@ -68,6 +72,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "link/crypto.hpp"
 #include "link/server.hpp"
+#include "face/face-avatar.hpp"
 #include "filters/blur-filter.hpp"
 #include "follow/follow-cam.hpp"
 #include "moves/move-transition.hpp"
@@ -136,6 +141,8 @@ public:
 			for (const std::string &r : multistream::Multistream::requests())
 				requests.push_back(r);
 			for (const std::string &r : record::CleanRecordings::requests())
+				requests.push_back(r);
+			for (const std::string &r : face::requests())
 				requests.push_back(r);
 			ws_.connect([this](const std::string &type, const json &data,
 					   bool &found) { return vendor_request(type, data, found); },
@@ -283,6 +290,8 @@ private:
 			return vertical_.request(type, data);
 		if (record::CleanRecordings::handles(type))
 			return record_.request(type, data);
+		if (face::handles(type))
+			return face::request(type, data);
 		json answer;
 		if (multistream_.request(type, data, answer))
 			return answer;
@@ -299,7 +308,7 @@ private:
 			{"link_port", server_.port()},
 			{"features",
 			 {{"link", true}, {"meters", true}, {"usage", true}, {"vertical", true}, {"multistream", true},
-			  {"follow_cam", true}, {"record", true}, {"moves", true}, {"blur", true}}}};
+			  {"follow_cam", true}, {"record", true}, {"moves", true}, {"blur", true}, {"face_avatar", true}}}};
 	}
 
 	// One small thread for everything that runs on a clock: opening the
@@ -438,6 +447,7 @@ bool obs_module_load(void)
 	direbot::follow::register_source();
 	direbot::filters::register_blur();
 	direbot::moves::register_transition();
+	direbot::face::register_source();
 	obs_log(LOG_INFO, "version %s loaded", PLUGIN_VERSION);
 	return true;
 }

@@ -79,6 +79,17 @@ DireBot's **Smooth** transition uses it.
 **DireBot Blur (0.3.0).** A filter that blurs or pixelates a source
 (right-click it → Filters → **+** → DireBot Blur).
 
+**DireBot Face Avatar (0.4.0).** A source that puts a character on screen
+wearing your real eyes and mouth, cut out of your camera, and moves,
+tilts and turns it with your head. The face tracking is our own (no
+libraries, nothing sent anywhere): it learns your eyes and mouth from one
+picture with boxes drawn round them, follows them by matching pictures of
+them frame by frame on a thread of its own, and finds you
+again by searching the whole picture when you've gone. When it isn't sure
+the character shows its own drawn eyes and mouth, or none. Optional
+pictures for turned left and turned right, and outfit layers in front of
+or behind the character. DireBot sets it up (Avatar → Face avatar).
+
 The link never hands out your stream key: `GetStreamServiceSettings`
 through it shows the key (and a custom server's password or token) as
 `********`, and settings sent back as they were read keep the real one.
@@ -137,6 +148,9 @@ The add-on's own requests go through `CallVendorRequest` with
 | `RecordGetState` | clean recordings: `options` (`when`: `recording`/`stream`/`hand`, `encoder`, `picks`: `source`, `uuid`, `height` (0: the source's own), `quality`, `audio_track`, `enabled`), `running` (`source`, `file` name, `recording`, `seconds`), `problems`, `sources` (what can be picked), `encoders` (`id`, `name`), `auto_encoder` |
 | `RecordSetOptions` `{options}` | saves them (the same shape as `options` above); answers the state |
 | `RecordStart` / `RecordStop` | the state, plus `note` when some couldn't start, or `error` in words when none could. The `RecordChanged` vendor event sends the state whenever it changes |
+| `FaceStill` `{camera}` | `still` (an id), `camera`, `width`, `height` and `image`: a still from the camera as a BMP data URL, to draw the boxes on |
+| `FaceSetUp` `{source, still, boxes}` | learns the face from that still: `boxes` are the left eye, right eye and mouth as `[x, y, w, h]` shares of it; `ok`, or `error` in words (for one, a still that is too old) |
+| `FaceGetState` `{source}` | `camera`, `ready`, `showing`, `found`, `sure`, `confidence`, `parts`, `scale`, `angle`, `turned`, `shown`, `looks_per_second` |
 | `GetUsage` | `measuring` (first 3 seconds), `fps`, `fps_now`, `frame_ms`, `frame_budget_ms`, `frames`, `frames_lagged`, `encoded`, `encoded_skipped`, `cpu`, `memory_mb`, `stream_frames`, `stream_dropped`, and `sources`: per input and filter `name`, `uuid`, `kind`, `type`, `active`, `showing`, `measured`, `tick_ms`, `render_ms`, `gpu_ms` (+ `_max_ms`), `fps_in`/`fps_shown` for cameras and media, `parent`/`enabled` for filters (and `own_ms`/`own_gpu_ms`: a filter's time takes in what it draws on, so this is its own part), and `hints` (browser size/fps/"shut down when hidden", whether it shows a page on this PC and its port, a short fingerprint of a camera to spot the same one added twice) |
 
 ## Building
@@ -190,7 +204,8 @@ OBS from source and point the build at it with `OBS_PREFIX=/path/to/obs`
     src/record/           clean recordings: a private picture and file per source
     src/moves/            the DireBot Move transition and its plan
     src/filters/          the DireBot Blur filter
-    data/effects/         the shaders the transition and the filter draw with
+    src/face/             the DireBot Face Avatar source and our own face tracker
+    data/effects/         the shaders the transition, the filter and the face avatar draw with
     deps/                 nlohmann/json (MIT), obs-websocket's API header (GPL-2.0)
 
 Later parts each get their own folder under `src/`, their own `direbot`
