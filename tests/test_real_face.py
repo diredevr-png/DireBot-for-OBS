@@ -14,6 +14,7 @@ Skipped unless OBS, Xvfb and the test build are there:
 
 import base64
 import json
+import math
 import os
 import shutil
 import struct
@@ -68,13 +69,42 @@ def camera_picture(path, with_face=True):
     write_png(path, W, H, rows)
 
 
-def character_picture(path, size=400):
+# Where its eyes and mouth are on the character (shares of it).
+SPOTS = {"left_eye": [0.27, 0.36, 0.18, 0.12],
+         "right_eye": [0.55, 0.36, 0.18, 0.12],
+         "mouth": [0.37, 0.62, 0.26, 0.13]}
+
+
+def character_picture(path, size=400, eye_holes=False):
+    """An orange ball - with see-through eyes, if asked."""
+    def hole(u, v):
+        for b in (SPOTS["left_eye"], SPOTS["right_eye"]):
+            cx, cy = b[0] + b[2] / 2, b[1] + b[3] / 2
+            if ((u - cx) / (b[2] * 0.42)) ** 2 + ((v - cy) / (b[3] * 0.42)) ** 2 < 1:
+                return True
+        return False
     rows = []
     for y in range(size):
         row = bytearray(size * 4)
         for x in range(size):
-            if (x - size / 2) ** 2 + (y - size / 2) ** 2 < (size * 0.45) ** 2:
+            if (x - size / 2) ** 2 + (y - size / 2) ** 2 < (size * 0.45) ** 2 and \
+                    not (eye_holes and hole(x / size, y / size)):
                 row[x * 4:x * 4 + 4] = b"\xe0\x80\x30\xff"
+        rows.append(row)
+    write_png(path, size, size, rows, alpha=True)
+
+
+def drawn_picture(path, ovals, size=400):
+    """A see-through picture with dark ovals (middle x, y and half sizes as
+    shares): a drawn eye or mouth."""
+    rows = []
+    for y in range(size):
+        row = bytearray(size * 4)
+        for x in range(size):
+            u, v = x / size, y / size
+            if any(((u - cx) / rx) ** 2 + ((v - cy) / ry) ** 2 < 1
+                   for cx, cy, rx, ry in ovals):
+                row[x * 4:x * 4 + 4] = b"\x10\x08\x08\xff"
         rows.append(row)
     write_png(path, size, size, rows, alpha=True)
 
@@ -306,6 +336,207 @@ def test_cutouts_sit_still_while_you_move(run):
         # The face jumps 30 px (the eye spot shows it about 1.4 times
         # bigger): a newer picture's eye would wander up to ~40 px.
         assert spread < 6, moving
+    finally:
+        c.disconnect()
+
+
+def screenshot(c, name, width=None):
+    """What a source shows, as rows of (r, g, b) - kept as a PNG too, in
+    the folder DIREBOT_FACE_SHOTS names, for looking at."""
+    data = {"sourceName": name, "imageFormat": "bmp"}
+    if width:
+        data["imageWidth"] = width
+    shot = send(c, "GetSourceScreenshot", data)["imageData"]
+    rows = read_bmp(base64.b64decode(shot.split(",", 1)[1]))
+    keep = os.environ.get("DIREBOT_FACE_SHOTS")
+    if keep:
+        write_png(os.path.join(keep, name + ".png"), len(rows[0]), len(rows),
+                  [bytes(v for px in row for v in px) for row in rows])
+    return rows
+
+
+def middle_of(rows, test, box=None):
+    """The middle (x, y) of the pixels `test` picks, and how many."""
+    x0, y0, x1, y1 = box or (0, 0, len(rows[0]), len(rows))
+    xs, ys = [], []
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            if test(rows[y][x]):
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return None, None, 0
+    return sum(xs) / len(xs), sum(ys) / len(ys), len(xs)
+
+
+def turned_rest(rest_text, yaw_degrees):
+    """A "Set" that's turned: the same face then reads as turned by
+    -yaw_degrees (towards the picture's left)."""
+    r = json.loads(rest_text)
+    p = r["pose"]
+    a = math.radians(yaw_degrees)
+    turn = [[math.cos(a), 0, math.sin(a)], [0, 1, 0],
+            [-math.sin(a), 0, math.cos(a)]]
+    m = [[p[0], p[1], p[2]], [p[4], p[5], p[6]], [p[8], p[9], p[10]]]
+    for i in range(3):
+        for j in range(3):
+            p[i * 4 + j] = round(sum(turn[i][k] * m[k][j] for k in range(3)), 5)
+    return json.dumps(r)
+
+
+ORANGE = (0xe0, 0x80, 0x30)
+
+
+def near_colour(px, want, by):
+    return all(abs(a - b) <= by for a, b in zip(px, want))
+
+
+def test_it_turns_blends_draws_and_wears(run):
+    face_png = os.path.join(run.home, "camera.png")
+    body_png = os.path.join(run.home, "character.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+        character_picture(body_png)
+    holes_png = os.path.join(run.home, "character-holes.png")
+    character_picture(holes_png, eye_holes=True)
+    eyes_png = os.path.join(run.home, "eyes-open.png")
+    mouth_png = os.path.join(run.home, "mouth-closed.png")
+    drawn_picture(eyes_png, [(0.36, 0.42, 0.05, 0.05), (0.64, 0.42, 0.05, 0.05)])
+    drawn_picture(mouth_png, [(0.5, 0.685, 0.08, 0.015)])
+    size = 400
+    # Held still where it is (only "Turned" turns), so where things are
+    # can be checked.
+    common = {"source": "Looks camera", "width": size, "height": size, "size": 100,
+              "mirror": False, "smoothing": 100, "spots": json.dumps(SPOTS),
+              "follow_move": 0, "follow_grow": 0, "follow_tilt": 0, "bend": 0}
+    avatars = {
+        "Plain": {"character": body_png},
+        "Turned": {"character": body_png, "bend": 85},
+        "Own skin": {"character": body_png, "skin": 0},
+        "See-through": {"character": holes_png},
+        "Drawn": {"character": body_png, "style": "drawn",
+                  "eyes_open": eyes_png, "mouth_closed": mouth_png},
+        "Worn": {"character": body_png, "worn": True},
+        "Worn bare": {"character": body_png, "worn": True,
+                      "show_camera": False},
+    }
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="",
+                        timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "Looks"})
+        send(c, "CreateInput", {
+            "sceneName": "Looks", "inputName": "Looks camera",
+            "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        for name, extra in avatars.items():
+            send(c, "CreateInput", {
+                "sceneName": "Looks", "inputName": name,
+                "inputKind": "direbot_face_avatar",
+                "inputSettings": {**common, **extra}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Looks"})
+
+        def st(name):
+            return vendor(c, "FaceGetState", {"source": name})
+        for name in avatars:
+            assert wait_for(lambda: st(name)["found"] and st(name)["shown"] == 1,
+                            30, 0.2), st(name)
+        s = st("Plain")
+        assert s["style"] == "real" and not s["worn"] and s["shaped"]
+        assert s["placed"]["shown"] and s["placed"]["picture"] == "main"
+        assert not any(s["see_through"].values())
+        assert st("See-through")["see_through"] == {
+            "left_eye": True, "right_eye": True, "mouth": False}
+
+        # Turned: "Set", then that "Set" turned 25 degrees the other way,
+        # so you read as turned 25 degrees to the picture's left. The
+        # character turns ("Turn and nod with me": 85%), its mouth sliding
+        # over to that side.
+        assert vendor(c, "FaceSet", {"source": "Turned"})["ok"]
+        assert wait_for(lambda: st("Turned")["set"] and not st("Turned")["setting"],
+                        10, 0.1)
+        rest = send(c, "GetInputSettings", {"inputName": "Turned"})[
+            "inputSettings"]["rest"]
+        send(c, "SetInputSettings", {"inputName": "Turned", "inputSettings": {
+            "rest": turned_rest(rest, 25)}})
+        assert wait_for(lambda: st("Turned")["turn"]["yaw"] < -20, 5, 0.1)
+        time.sleep(0.3)
+        s = st("Turned")
+        assert abs(s["placed"]["yaw"] - 0.85 * s["turn"]["yaw"]) < 0.5, s
+        teeth = lambda px: sum(px) > 3 * 205  # noqa: E731
+        lower = (0, size // 2, size, size)
+        plain_x, _, n1 = middle_of(screenshot(c, "Plain"), teeth, lower)
+        turned_x, _, n2 = middle_of(screenshot(c, "Turned"), teeth, lower)
+        print(f"teeth: {plain_x:.1f} straight, {turned_x:.1f} turned")
+        assert n1 > 100 and n2 > 100
+        assert turned_x < plain_x - 10
+        # Bending off: it stays flat.
+        send(c, "SetInputSettings", {"inputName": "Turned",
+                                     "inputSettings": {"bend": 0}})
+        assert wait_for(lambda: st("Turned")["placed"]["yaw"] == 0, 5, 0.1)
+
+        # Your skin round your eyes takes the character's colour; with
+        # "skin" at 0 it keeps yours: how far from its orange the eye's
+        # spot is, on average. (Your eye itself keeps its colours in both.)
+        def off_orange(name):
+            rows = screenshot(c, name)
+            b = SPOTS["left_eye"]
+            px = [rows[y][x]
+                  for y in range(int(b[1] * size), int((b[1] + b[3]) * size))
+                  for x in range(int(b[0] * size), int((b[0] + b[2]) * size))]
+            return sum(sum(abs(a - o) for a, o in zip(p, ORANGE)) for p in px) / len(px)
+        blended, own = off_orange("Plain"), off_orange("Own skin")
+        print(f"eye spot off the character's orange: {blended:.1f} blended,"
+              f" {own:.1f} your own skin")
+        assert blended < own - 15
+
+        # See-through eyes: yours show from behind it, inside the holes.
+        rows = screenshot(c, "See-through")
+        b = SPOTS["left_eye"]
+        middle = rows[int((b[1] + b[3] / 2) * size)][int((b[0] + b[2] / 2) * size)]
+        assert not near_colour(middle, ORANGE, 40) and sum(middle) > 0
+
+        # Its own drawn face: no smile picture, so the closed mouth.
+        s = st("Drawn")
+        assert s["style"] == "drawn"
+        assert set(s["drawn"]) == {"left_eye", "right_eye", "mouth"}
+        rows = screenshot(c, "Drawn")
+        assert sum(rows[int(0.42 * size)][int(0.36 * size)]) < 3 * 50
+        assert sum(rows[int(0.685 * size)][int(0.5 * size)]) < 3 * 50
+        _, _, light = middle_of(rows, teeth, lower)
+        assert light == 0  # none of your teeth
+
+        # Worn on your head: the camera's size, the character's eyes on
+        # yours, the camera round it (or nothing).
+        item = send(c, "GetSceneItemId", {
+            "sceneName": "Looks", "sourceName": "Worn"})["sceneItemId"]
+        t = send(c, "GetSceneItemTransform", {
+            "sceneName": "Looks", "sceneItemId": item})["sceneItemTransform"]
+        assert (t["sourceWidth"], t["sourceHeight"]) == (W, H)
+        s = st("Worn")
+        assert s["worn"] and s["placed"]["shown"]
+        first, second = s["parts"][0], s["parts"][1]
+        ex, ey = (first["x"] + second["x"]) / 2 * W, (first["y"] + second["y"]) / 2 * H
+        assert abs(s["placed"]["x"] - ex) < 8 and abs(s["placed"]["y"] - ey) < 8
+        rows = screenshot(c, "Worn")
+        assert len(rows) == H and len(rows[0]) == W
+        assert near_colour(rows[int(ey)][int(ex)], ORANGE, 40)
+        assert near_colour(rows[10][10], (96, 96, 96), 4)  # the room
+        bare = screenshot(c, "Worn bare")
+        assert near_colour(bare[int(ey)][int(ex)], ORANGE, 40)
+        assert bare[10][10] == (0, 0, 0)  # nothing (see-through)
+        # The face gone: held a moment, then gone.
+        empty_png = os.path.join(run.home, "empty-room.png")
+        if not os.path.exists(empty_png):
+            camera_picture(empty_png, with_face=False)
+        send(c, "SetInputSettings", {"inputName": "Looks camera",
+                                     "inputSettings": {"file": empty_png}})
+        assert wait_for(lambda: not st("Worn")["placed"]["shown"], 5, 0.1)
+        rows = screenshot(c, "Worn")
+        assert near_colour(rows[int(ey)][int(ex)], (96, 96, 96), 4)
+        send(c, "SetInputSettings", {"inputName": "Looks camera",
+                                     "inputSettings": {"file": face_png}})
+        assert wait_for(lambda: st("Worn")["placed"]["shown"], 10, 0.1)
+        for name in avatars:
+            send(c, "RemoveInput", {"inputName": name})
     finally:
         c.disconnect()
 

@@ -40,6 +40,9 @@ done
 "$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-face" "$here/tests/unit_face.cpp" \
 	"$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
 "$out/unit-face"
+"$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-avatar" "$here/tests/unit_avatar.cpp" \
+	"$here/src/face/avatar2d.cpp" "$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
+"$out/unit-avatar"
 
 "$cxx" "${flags[@]}" -o "$out/harness" "$here/tests/harness.cpp" "$here/src/link/server.cpp" "${link_src[@]}"
 DIREBOT_LINK_HARNESS="$out/harness" python3 -m pytest -q "$here/tests/test_link.py" "$@"

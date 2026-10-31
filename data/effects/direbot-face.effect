@@ -1,20 +1,50 @@
-// DireBot Face Avatar (src/face/face-avatar.cpp): the character's
-// pictures, and your eyes and mouth cut out of the camera with soft edges.
-// Straight (not premultiplied) colour out; the avatar's blend takes care
-// of the rest.
+// DireBot Face Avatar (src/face/face-avatar.cpp, sums in src/face/avatar2d.cpp):
+//   Picture  the character's pictures (straight colour), cut to `clip`
+//   Cutout   one of your eyes or your mouth, from the camera: along its
+//            soft outline (`mask_map`), its skin taking the character's
+//            colour
+//   Turn     the drawn character (premultiplied) turned and nodded: each
+//            point slides by how far it stands out (`depth_map`)
+//   Camera   the camera's picture, mirrored or not (worn on your head)
 
 uniform float4x4 ViewProj;
 uniform texture2d image;
 uniform float opacity;
-// The cut-out: where its corner is in the camera's picture (0 to 1), and
-// how far its whole width and height go there - turned with your head.
+// Picture: the part of it to show (left, top, right, bottom, 0 to 1).
+uniform float4 clip;
+// Cutout: where its corner is in the camera's picture (0 to 1), and how
+// far its whole width and height go there - turned with your head.
 uniform float2 origin;
 uniform float2 across;
 uniform float2 down;
-// How much of the edge fades (0 to 1), and a colour it's tinted towards.
-uniform float feather;
-uniform float4 tint;
-uniform float tint_amount;
+// Cutout: its soft outline (mask_map's top half) and how much is inside
+// the outline (its bottom half) - which part of it (from, width), whether
+// it's mirrored (1), and its rows (from, height) - and the skin: the
+// colour round it, the colour it takes (both L*a*b*), and how much.
+uniform texture2d mask_map;
+uniform float4 mask_place;
+uniform float2 mask_rows;
+uniform float3 skin_lab;
+uniform float3 target_lab;
+uniform float skin_amount;
+// Cutout: kept inside the character's outline (`inside` 1), where its
+// picture is solid - `body_place`: the piece's corner and size on it (0 to
+// 1).
+uniform texture2d body_map;
+uniform float4 body_place;
+uniform float inside;
+// Turn: the character's size (with its outfit) and what it turns round
+// (its pixels), the
+// turn (narrowing across, narrowing down, sideways and up per depth), one
+// depth point's size, and the room round it (a share each side).
+uniform texture2d depth_map;
+uniform float2 char_px;
+uniform float2 pivot;
+uniform float4 turn_k;
+uniform float2 cell;
+uniform float pad;
+// Camera: 1 to mirror it.
+uniform float flip;
 
 sampler_state textureSampler {
 	Filter    = Linear;
@@ -35,22 +65,175 @@ VertData VSDefault(VertData v_in)
 	return vert_out;
 }
 
+// ---- Picture ----
+
 float4 PSPicture(VertData v_in) : TARGET
 {
 	float4 c = image.Sample(textureSampler, v_in.uv);
-	return float4(c.rgb, c.a * opacity);
+	float inside = 1.0;
+	if (v_in.uv.x < clip.x || v_in.uv.y < clip.y || v_in.uv.x >= clip.z || v_in.uv.y >= clip.w)
+		inside = 0.0;
+	return float4(c.rgb, c.a * opacity * inside);
 }
+
+// ---- Colour (avatar2d.cpp's lab_of and rgb_of) ----
+
+float linear_of(float c)
+{
+	return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+float srgb_of(float c)
+{
+	c = max(c, 0.0);
+	return saturate(c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055);
+}
+
+float f_of(float t)
+{
+	return t > 0.008856452 ? pow(t, 1.0 / 3.0) : t / 0.12841855 + 0.137931034;
+}
+
+float f_back(float t)
+{
+	return t > 0.206896552 ? t * t * t : 0.12841855 * (t - 0.137931034);
+}
+
+float3 lab_of(float3 c)
+{
+	float r = linear_of(c.r);
+	float g = linear_of(c.g);
+	float b = linear_of(c.b);
+	float X = (0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047;
+	float Y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
+	float Z = (0.0193339 * r + 0.1191920 * g + 0.9503041 * b) / 1.08883;
+	float fx = f_of(X);
+	float fy = f_of(Y);
+	float fz = f_of(Z);
+	return float3(116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz));
+}
+
+float3 rgb_of(float3 lab)
+{
+	float fy = (lab.x + 16.0) / 116.0;
+	float fx = fy + lab.y / 500.0;
+	float fz = fy - lab.z / 200.0;
+	float X = 0.95047 * f_back(fx);
+	float Y = f_back(fy);
+	float Z = 1.08883 * f_back(fz);
+	return float3(srgb_of(3.2404542 * X - 1.5371385 * Y - 0.4985314 * Z),
+		      srgb_of(-0.9692660 * X + 1.8760108 * Y + 0.0415560 * Z),
+		      srgb_of(0.0556434 * X - 0.2040259 * Y + 1.0572252 * Z));
+}
+
+// ---- Cutout ----
 
 float4 PSCutout(VertData v_in) : TARGET
 {
 	float2 uv = origin + across * v_in.uv.x + down * v_in.uv.y;
 	float4 c = image.Sample(textureSampler, uv);
-	// An oval that fades out towards its edge.
-	float r = length((v_in.uv - 0.5) * 2.0);
-	float edge = max(feather, 0.001);
-	float a = 1.0 - smoothstep(1.0 - edge, 1.0, r);
-	float3 rgb = lerp(c.rgb, c.rgb * tint.rgb, tint_amount);
-	return float4(rgb, a * opacity);
+	float mu = mask_place.z > 0.5 ? 1.0 - v_in.uv.x : v_in.uv.x;
+	float mx = mask_place.x + mu * mask_place.y;
+	float my = mask_rows.x + v_in.uv.y * mask_rows.y;
+	float m = mask_map.Sample(textureSampler, float2(mx, my)).r;
+	if (inside > 0.5)
+		m = m * body_map.Sample(textureSampler, body_place.xy + v_in.uv * body_place.zw).a;
+	float3 rgb = c.rgb;
+	if (skin_amount > 0.0) {
+		float in_line = mask_map.Sample(textureSampler, float2(mx, my + 0.5)).r;
+		float w = saturate(skin_amount) * (1.0 - in_line);
+		float3 lab = lab_of(rgb);
+		float3 turned = rgb_of(float3(target_lab.x + (lab.x - skin_lab.x) * 0.9, target_lab.y, target_lab.z));
+		rgb = lerp(rgb, turned, w);
+	}
+	return float4(rgb, m * opacity);
+}
+
+// ---- Turn (avatar2d.cpp's turned_from, step for step) ----
+// (SampleLevel: these samples are taken or skipped point by point.)
+
+struct Guess {
+	float2 at;
+	float2 best_at;
+	float best;
+	float done;
+};
+
+float depth_of(float2 p)
+{
+	float2 q = p / char_px;
+	if (q.x < 0.0 || q.y < 0.0 || q.x > 1.0 || q.y > 1.0)
+		return 0.0;
+	return depth_map.SampleLevel(textureSampler, q, 0.0).r * char_px.x;
+}
+
+Guess turn_step(Guess g, float2 P)
+{
+	if (g.done > 0.5)
+		return g;
+	float Z = depth_of(g.at + pivot);
+	float2 f = float2(g.at.x * turn_k.x + Z * turn_k.z, g.at.y * turn_k.y - Z * turn_k.w) - P;
+	float off = dot(f, f);
+	if (off < g.best) {
+		g.best = off;
+		g.best_at = g.at;
+	}
+	// There (within a hundredth of a pixel): the rest is skipped.
+	if (off < 0.0001) {
+		g.done = 1.0;
+		return g;
+	}
+	float zx = (depth_of(g.at + pivot + float2(cell.x, 0.0)) - Z) / cell.x;
+	float zy = (depth_of(g.at + pivot + float2(0.0, cell.y)) - Z) / cell.y;
+	float a = turn_k.x + turn_k.z * zx;
+	float b = turn_k.z * zy;
+	float c = -turn_k.w * zx;
+	float d = turn_k.y - turn_k.w * zy;
+	float det = a * d - b * c;
+	if (abs(det) < 0.15)
+		det = det < 0.0 ? -0.15 : 0.15;
+	float2 move = float2(d * f.x - b * f.y, a * f.y - c * f.x) / det;
+	float len = length(move);
+	float most = 0.08 * char_px.x;
+	if (len > most)
+		move = move * (most / len);
+	g.at = g.at - move;
+	return g;
+}
+
+float4 PSTurn(VertData v_in) : TARGET
+{
+	float2 uv = v_in.uv * (1.0 + 2.0 * pad) - float2(pad, pad);
+	float2 P = uv * char_px - pivot;
+	Guess g;
+	g.at = P;
+	g.best_at = P;
+	g.best = 1.0e30;
+	g.done = 0.0;
+	g = turn_step(g, P);
+	g = turn_step(g, P);
+	g = turn_step(g, P);
+	g = turn_step(g, P);
+	g = turn_step(g, P);
+	if (g.done < 0.5) {
+		float Z = depth_of(g.at + pivot);
+		float2 f = float2(g.at.x * turn_k.x + Z * turn_k.z, g.at.y * turn_k.y - Z * turn_k.w) - P;
+		if (dot(f, f) < g.best)
+			g.best_at = g.at;
+	}
+	float2 src = (g.best_at + pivot) / char_px;
+	if (src.x < 0.0 || src.y < 0.0 || src.x > 1.0 || src.y > 1.0)
+		return float4(0.0, 0.0, 0.0, 0.0);
+	return image.SampleLevel(textureSampler, src, 0.0) * opacity;
+}
+
+// ---- Camera ----
+
+float4 PSCamera(VertData v_in) : TARGET
+{
+	float2 uv = float2(flip > 0.5 ? 1.0 - v_in.uv.x : v_in.uv.x, v_in.uv.y);
+	float4 c = image.Sample(textureSampler, uv);
+	return float4(c.rgb, 1.0);
 }
 
 technique Picture
@@ -68,5 +251,23 @@ technique Cutout
 	{
 		vertex_shader = VSDefault(v_in);
 		pixel_shader  = PSCutout(v_in);
+	}
+}
+
+technique Turn
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSTurn(v_in);
+	}
+}
+
+technique Camera
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSCamera(v_in);
 	}
 }

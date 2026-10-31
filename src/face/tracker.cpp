@@ -880,7 +880,7 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 				o.turned = std::fabs(yaw) > TURN_ON ? (yaw < 0 ? -1 : 1) : 0;
 			// Glide there from where it is - or jump, coming back after the
 			// face was lost and faded (nothing to glide from).
-			const Glide target{o.layout.cx, o.layout.cy, o.scale, o.angle};
+			const Glide target{o.layout.cx, o.layout.cy, o.scale, o.angle, face.turn.yaw, face.turn.pitch};
 			if (!seen_ || o.shown <= 0) {
 				from_ = to_ = o.glide = target;
 				glided_ = 1;
@@ -894,6 +894,7 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 		}
 		seen_ = true;
 		lost_for_ = 0;
+		o.lost_for = 0;
 		o.found = true;
 		o.holding = false;
 		o.shown = std::min(1.0f, o.shown + dt / BACK);
@@ -908,6 +909,7 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 	// Lost: held as it was (the glide finishes), then faded.
 	glide(dt);
 	lost_for_ += dt;
+	o.lost_for = lost_for_;
 	o.holding = o.shown > 0;
 	if (lost_for_ > HOLD)
 		o.shown = std::max(0.0f, o.shown - dt / FADE);
@@ -916,6 +918,14 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 		o.turned = 0;
 		o.turn = Turn();
 		std::fill(std::begin(o.moves), std::end(o.moves), 0.0f);
+		// Its own face faces you again, easing back.
+		const float back = std::exp(-dt / BACK);
+		o.glide.yaw *= back;
+		o.glide.pitch *= back;
+		to_.yaw *= back;
+		to_.pitch *= back;
+		from_.yaw *= back;
+		from_.pitch *= back;
 	}
 	return o;
 }
@@ -931,6 +941,8 @@ void Shown::glide(float dt)
 	g.cy = from_.cy + (to_.cy - from_.cy) * t;
 	g.scale = from_.scale + (to_.scale - from_.scale) * t;
 	g.angle = wrap_angle(from_.angle + wrap_angle(to_.angle - from_.angle) * t);
+	g.yaw = from_.yaw + (to_.yaw - from_.yaw) * t;
+	g.pitch = from_.pitch + (to_.pitch - from_.pitch) * t;
 }
 
 void Shown::reset()

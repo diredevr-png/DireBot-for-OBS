@@ -1056,6 +1056,30 @@ static void test_shown()
 	CHECK(jumps.now().shown == 0);
 	o = jumps.step(far, rest, frame, true);
 	CHECK(near(o.glide.cx, layout_of(far).cx, 1e-6));
+
+	// The head's turn and nod glide too, for the character's bending; lost
+	// and faded, it eases back to facing you. lost_for counts up.
+	Shown bends;
+	Face turned = face;
+	turned.turn.yaw = 0;
+	turned.turn.pitch = 0;
+	bends.step(turned, rest, frame);
+	bends.step(turned, rest, frame, false);
+	turned.turn.yaw = 20;
+	turned.turn.pitch = -10;
+	o = bends.step(turned, rest, frame, true);
+	CHECK(near(o.glide.yaw, 10, 1e-3) && near(o.glide.pitch, -5, 1e-3));
+	CHECK(o.lost_for == 0);
+	o = bends.step(turned, rest, frame, false);
+	CHECK(near(o.glide.yaw, 20, 1e-3) && near(o.glide.pitch, -10, 1e-3));
+	o = bends.step(lost, rest, 0.2f);
+	CHECK(near(o.lost_for, 0.2, 1e-5) && o.holding && near(o.glide.yaw, 20, 1e-3));
+	for (int i = 0; i < 40; i++)
+		o = bends.step(lost, rest, 0.05f);
+	CHECK(near(o.lost_for, 2.2, 1e-3) && o.shown == 0 && std::fabs(o.glide.yaw) < 0.1f &&
+	      std::fabs(o.glide.pitch) < 0.1f);
+	o = bends.step(turned, rest, frame, true);
+	CHECK(o.lost_for == 0 && near(o.glide.yaw, 20, 1e-3)); // found again: straight there
 }
 
 // --- Speed --------------------------------------------------------------------------

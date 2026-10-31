@@ -88,6 +88,7 @@ target_sources(
   PRIVATE
     src/face/tracker.cpp
     src/face/pose.cpp
+    src/face/avatar2d.cpp
     src/face/face-avatar.cpp
     src/face/nn/net.cpp
     src/face/nn/kernels.cpp

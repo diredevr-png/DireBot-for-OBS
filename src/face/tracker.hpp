@@ -217,12 +217,13 @@ public:
 	static constexpr float TURN_ON = 20, TURN_OFF = 12;
 
 	// What the character follows - the face's middle (shares of the
-	// picture), its size and tilt against "Set" - eased from one look to
-	// the next over the frames between them, so it glides at any frame
-	// rate instead of stepping each look (OBS often draws 60 frames a
-	// second; it looks 30 times).
+	// picture), its size and tilt against "Set", and the head's turn and
+	// nod (degrees, as Turn) - eased from one look to the next over the
+	// frames between them, so it glides at any frame rate instead of
+	// stepping each look (OBS often draws 60 frames a second; it looks 30
+	// times).
 	struct Glide {
-		float cx = 0.5f, cy = 0.5f, scale = 1, angle = 0;
+		float cx = 0.5f, cy = 0.5f, scale = 1, angle = 0, yaw = 0, pitch = 0;
 	};
 	struct Out {
 		Layout layout;                                 // the newest look's, as it was
@@ -232,7 +233,8 @@ public:
 		float shown = 0;      // the real eyes and mouth: 0 hidden to 1 shown
 		bool holding = false; // shown, but from the last picture they were seen in
 		bool found = false;
-		int turned = 0; // -1 towards the picture's left, 1 its right
+		float lost_for = 0; // seconds since the face was last found
+		int turned = 0;     // -1 towards the picture's left, 1 its right
 		Turn turn;
 		float moves[EXPRESSIONS] = {};
 	};
