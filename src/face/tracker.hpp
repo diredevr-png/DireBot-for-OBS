@@ -216,12 +216,21 @@ public:
 	// Turned pictures: past this many degrees, and back under the other.
 	static constexpr float TURN_ON = 20, TURN_OFF = 12;
 
+	// What the character follows - the face's middle (shares of the
+	// picture), its size and tilt against "Set" - eased from one look to
+	// the next over the frames between them, so it glides at any frame
+	// rate instead of stepping each look (OBS often draws 60 frames a
+	// second; it looks 30 times).
+	struct Glide {
+		float cx = 0.5f, cy = 0.5f, scale = 1, angle = 0;
+	};
 	struct Out {
-		Layout layout;
+		Layout layout;                                 // the newest look's, as it was
 		float scale = 1;                               // eye to eye, against "Set"
 		float home_x = 0.5f, home_y = 0.5f, angle = 0; // tilt against "Set"
-		float shown = 0;                               // the real eyes and mouth: 0 hidden to 1 shown
-		bool holding = false;                          // shown, but from the last picture they were seen in
+		Glide glide;
+		float shown = 0;      // the real eyes and mouth: 0 hidden to 1 shown
+		bool holding = false; // shown, but from the last picture they were seen in
 		bool found = false;
 		int turned = 0; // -1 towards the picture's left, 1 its right
 		Turn turn;
@@ -234,9 +243,16 @@ public:
 	void reset();
 
 private:
+	void glide(float dt);
+
 	Out out_;
 	float lost_for_ = 0;
 	bool seen_ = false;
+	// The glide: from where it was to the newest look, `glided_` of the
+	// way there, over `between_` seconds (the time between the last two
+	// looks).
+	Glide from_, to_;
+	float glided_ = 1, between_ = 1.0f / 30, since_look_ = 0;
 };
 
 } // namespace direbot::face

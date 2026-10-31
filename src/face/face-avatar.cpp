@@ -56,6 +56,9 @@ constexpr int MIN_SIZE = 64, MAX_SIZE = 4096;
 // The picture the tracker gets: the camera, at most this big on its
 // longest side (the face models work on 256 x 256 of it at most).
 constexpr uint32_t LOOK_SIZE = 960;
+// Camera pictures kept for the cut-outs: the one in use, the one the
+// tracker is looking at, the newest, and one to spare (see look).
+constexpr int SHOTS = 4;
 // Outfit layers at most.
 constexpr size_t MOST_LAYERS = 12;
 
@@ -227,6 +230,7 @@ public:
 
 	struct State {
 		Face face;
+		uint64_t ns = 0; // when the picture `face` is from was taken (give's `ns`)
 		Rest rest;
 		bool ready = false, setting = false;
 		std::string problem;
@@ -237,6 +241,7 @@ public:
 	{
 		std::lock_guard<std::mutex> l(lock_);
 		out.face = face_;
+		out.ns = face_ns_;
 		out.rest = rest_;
 		out.ready = ready_;
 		out.setting = setting_ || start_rest_;
@@ -321,6 +326,8 @@ private:
 				std::lock_guard<std::mutex> l(lock_);
 				if (look || load || forget)
 					face_ = tracker.face();
+				if (look)
+					face_ns_ = ns;
 				rest_ = tracker.rest();
 				setting_ = tracker.setting();
 				if (look)
@@ -353,6 +360,7 @@ private:
 	uint64_t in_ns_ = 0;
 	std::string rest_text_;
 	Face face_;
+	uint64_t face_ns_ = 0;
 	Rest rest_;
 	uint64_t looks_ = 0;
 	bool ready_ = false;
@@ -401,9 +409,20 @@ struct FaceAvatar {
 	std::atomic<bool> reset_shown{false};
 	uint64_t seen_looks = 0;
 	Worker::State seen;
-	gs_texrender_t *cam_tex = nullptr; // the camera, as it is (held while the face is lost)
-	gs_texrender_t *small = nullptr;   // the camera, small, for a look
-	gs_texrender_t *out = nullptr;     // the avatar, drawn once a frame
+	// The camera as it was at each look. The cut-outs come from the very
+	// picture the newest look found your face in, so your eyes and mouth
+	// sit still in them however fast you move - a newer picture's would
+	// already have moved on from where the tracker saw them. The one in
+	// use is kept while the face is lost, so they never show anything else.
+	struct Shot {
+		gs_texrender_t *tex = nullptr;
+		uint64_t ns = 0; // when it was taken; 0: nothing in it
+	};
+	Shot shots[SHOTS];
+	int used_shot = -1;
+	std::atomic<bool> new_camera{false};
+	gs_texrender_t *small = nullptr; // the camera, small, for a look
+	gs_texrender_t *out = nullptr;   // the avatar, drawn once a frame
 	gs_stagesurf_t *stage = nullptr;
 	uint32_t stage_w = 0, stage_h = 0;
 	bool staged = false;
@@ -457,7 +476,8 @@ struct FaceAvatar {
 	{
 		worker.stop();
 		obs_enter_graphics();
-		gs_texrender_destroy(cam_tex);
+		for (Shot &shot : shots)
+			gs_texrender_destroy(shot.tex);
 		gs_texrender_destroy(small);
 		gs_texrender_destroy(out);
 		gs_stagesurface_destroy(stage);
@@ -499,13 +519,15 @@ struct FaceAvatar {
 			std::lock_guard<std::mutex> l(lock);
 			obs_weak_source_release(camera);
 			camera = found ? obs_source_get_weak_source(found) : nullptr;
+			new_camera = true;
 		}
 		obs_source_release(old);
 		obs_source_release(found);
 	}
 
 	// A copy of the camera for the tracker: the one read back last time
-	// goes to it, and a new one is asked for.
+	// goes to it, and a new one is asked for - the camera at full size
+	// into a shot (kept for the cut-outs), then shrunk from that.
 	void look(obs_source_t *cam, uint32_t cw, uint32_t ch)
 	{
 		if (staged && stage) {
@@ -531,22 +553,59 @@ struct FaceAvatar {
 			stage_h = sh;
 			worker.forget();
 		}
+		// The oldest shot that isn't in use.
+		int slot = -1;
+		for (int i = 0; i < SHOTS; i++)
+			if (i != used_shot && (slot < 0 || shots[i].ns < shots[slot].ns))
+				slot = i;
+		Shot &shot = shots[slot];
+		if (!shot.tex)
+			shot.tex = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 		if (!small)
 			small = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-		if (!stage || !small)
+		if (!stage || !small || !shot.tex)
 			return;
+		vec4 clear;
+		vec4_zero(&clear);
+		gs_texrender_reset(shot.tex);
+		if (!gs_texrender_begin(shot.tex, cw, ch))
+			return;
+		gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+		gs_ortho(0.0f, (float)cw, 0.0f, (float)ch, -100.0f, 100.0f);
+		obs_source_video_render(cam);
+		gs_texrender_end(shot.tex);
+		const uint64_t ns = os_gettime_ns();
+		shot.ns = ns;
+		gs_texture_t *full = gs_texrender_get_texture(shot.tex);
 		gs_texrender_reset(small);
-		if (gs_texrender_begin(small, sw, sh)) {
-			vec4 clear;
-			vec4_zero(&clear);
+		if (full && gs_texrender_begin(small, sw, sh)) {
 			gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
-			gs_ortho(0.0f, (float)cw, 0.0f, (float)ch, -100.0f, 100.0f);
-			obs_source_video_render(cam);
+			gs_ortho(0.0f, (float)sw, 0.0f, (float)sh, -100.0f, 100.0f);
+			gs_effect_t *base = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+			gs_effect_set_texture(gs_effect_get_param_by_name(base, "image"), full);
+			while (gs_effect_loop(base, "Draw"))
+				gs_draw_sprite(full, 0, sw, sh);
 			gs_texrender_end(small);
 			gs_stage_texture(stage, gs_texrender_get_texture(small));
 			staged = true;
-			staged_ns = os_gettime_ns();
+			staged_ns = ns;
 		}
+	}
+
+	// The shot the cut-outs come from: the newest look's, if it found the
+	// face (else the one in use is kept).
+	gs_texture_t *cutout_picture()
+	{
+		if (new_camera.exchange(false)) {
+			used_shot = -1;
+			for (Shot &shot : shots)
+				shot.ns = 0;
+		}
+		if (seen.face.found && seen.ns)
+			for (int i = 0; i < SHOTS; i++)
+				if (shots[i].tex && shots[i].ns == seen.ns)
+					used_shot = i;
+		return used_shot >= 0 ? gs_texrender_get_texture(shots[used_shot].tex) : nullptr;
 	}
 
 	void draw_picture(gs_texture_t *tex, float x, float y, float w, float h, float opacity)
@@ -630,23 +689,8 @@ struct FaceAvatar {
 				gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 				look(cam, cw, ch);
 			}
-			// The camera as it is, for the cut-outs - kept as it was while
-			// the face is lost, so they never show anything else.
-			if (!cam_tex)
-				cam_tex = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-			if (!drawn && cam_tex && !shown.now().holding) {
-				gs_texrender_reset(cam_tex);
-				gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
-				if (gs_texrender_begin(cam_tex, cw, ch)) {
-					vec4 clear;
-					vec4_zero(&clear);
-					gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
-					gs_ortho(0.0f, (float)cw, 0.0f, (float)ch, -100.0f, 100.0f);
-					obs_source_video_render(cam);
-					gs_texrender_end(cam_tex);
-				}
-			}
 		}
+		gs_texture_t *picture = cam && cw && ch ? cutout_picture() : nullptr;
 		if (!out)
 			out = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 		// A texrender draws once until it's reset: without this only the
@@ -661,7 +705,7 @@ struct FaceAvatar {
 			// Straight colour in, premultiplied out.
 			gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE,
 						   GS_BLEND_INVSRCALPHA);
-			draw_avatar(cam && cw && ch ? gs_texrender_get_texture(cam_tex) : nullptr, cw, ch, w, h);
+			draw_avatar(picture, cw, ch, w, h);
 			gs_texrender_end(out);
 			drawn = true;
 		}
@@ -696,15 +740,16 @@ struct FaceAvatar {
 			return;
 		const float char_w = pic->width(), char_h = pic->height();
 		// Sized to fit, then following you: moved, grown and tilted as
-		// you are against "Set", within limits.
+		// you are against "Set", within limits - gliding between looks.
+		const Shown::Glide &g = o.glide;
 		const float fit = std::min(w / char_w, h / char_h) * size;
-		float dx = (o.layout.cx - o.home_x) * follow_move, dy = (o.layout.cy - o.home_y) * follow_move;
+		float dx = (g.cx - o.home_x) * follow_move, dy = (g.cy - o.home_y) * follow_move;
 		if (mirror)
 			dx = -dx;
 		dx = clampf(dx, -most_move, most_move);
 		dy = clampf(dy, -most_move, most_move);
-		const float grow = clampf(std::pow(std::max(0.05f, o.scale), follow_grow), 0.6f, 1.6f);
-		const float tilt = clampf(o.angle * follow_tilt * (mirror ? -1 : 1), -0.6f, 0.6f);
+		const float grow = clampf(std::pow(std::max(0.05f, g.scale), follow_grow), 0.6f, 1.6f);
+		const float tilt = clampf(g.angle * follow_tilt * (mirror ? -1 : 1), -0.6f, 0.6f);
 		gs_matrix_push();
 		gs_matrix_translate3f(w * (0.5f + dx), h * (0.5f + dy), 0);
 		gs_matrix_rotaa4f(0, 0, 1, tilt);

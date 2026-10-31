@@ -12,10 +12,12 @@ Skipped unless OBS, Xvfb and the test build are there:
         python3 -m pytest tests/test_real_face.py
 """
 
+import base64
 import json
 import os
 import shutil
 import struct
+import threading
 import time
 import zlib
 
@@ -199,6 +201,111 @@ def test_it_finds_the_face_and_sets_it(run):
         shot = send(c, "GetSourceScreenshot", {
             "sourceName": "Avatar", "imageFormat": "png", "imageWidth": 200})
         assert shot["imageData"].startswith("data:image/png;base64,")
+    finally:
+        c.disconnect()
+
+
+def read_bmp(data):
+    """A screenshot as rows of (r, g, b): 24 or 32 bits a pixel."""
+    start, = struct.unpack_from("<I", data, 10)
+    w, h, _, bits = struct.unpack_from("<iiHH", data, 18)
+    step = bits // 8
+    line = (w * step + 3) & ~3
+    rows = []
+    for y in range(abs(h)):
+        at = start + (abs(h) - 1 - y if h > 0 else y) * line
+        rows.append([(data[at + x * step + 2], data[at + x * step + 1],
+                      data[at + x * step]) for x in range(w)])
+    return rows
+
+
+def test_cutouts_sit_still_while_you_move(run):
+    # The face jumps back and forth in the camera's picture, out of step
+    # with OBS's frames. Your eye has to stay put in the character's eye:
+    # it's cut from the very picture the tracker found it in, not a newer
+    # one where it has already moved on.
+    face_png = os.path.join(run.home, "camera.png")
+    body_png = os.path.join(run.home, "character.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+        character_picture(body_png)
+    size = 400
+    spot = [0.25, 0.3, 0.2, 0.14]  # its left eye, as shares of the character
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="",
+                        timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "Moving"})
+        send(c, "CreateInput", {
+            "sceneName": "Moving", "inputName": "Moving photo",
+            "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        item = send(c, "GetSceneItemId", {
+            "sceneName": "Moving", "sourceName": "Moving photo"})["sceneItemId"]
+        send(c, "CreateScene", {"sceneName": "Still"})
+        send(c, "CreateInput", {
+            "sceneName": "Still", "inputName": "Steady avatar",
+            "inputKind": "direbot_face_avatar",
+            "inputSettings": {
+                "source": "Moving", "character": body_png, "width": size,
+                "height": size, "size": 100, "mirror": False,
+                "follow_move": 0, "follow_grow": 0, "follow_tilt": 0,
+                "turn_pictures": False, "smoothing": 100,
+                "spots": json.dumps({"left_eye": spot,
+                                     "right_eye": [0.55, 0.3, 0.2, 0.14],
+                                     "mouth": [0.38, 0.6, 0.24, 0.14]})}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Still"})
+
+        def steady():
+            return vendor(c, "FaceGetState", {"source": "Steady avatar"})
+        assert wait_for(lambda: steady()["found"] and steady()["shown"] == 1,
+                        30, 0.2), steady()
+
+        def eye_x():
+            # Where the dark of the eye is inside the character's eye.
+            shot = send(c, "GetSourceScreenshot", {
+                "sourceName": "Steady avatar", "imageFormat": "bmp",
+                "imageWidth": size})["imageData"]
+            rows = read_bmp(base64.b64decode(shot.split(",", 1)[1]))
+            x0, y0 = int(spot[0] * size), int(spot[1] * size)
+            x1, y1 = int((spot[0] + spot[2]) * size), int((spot[1] + spot[3]) * size)
+            dark = [x for y in range(y0, y1) for x in range(x0, x1)
+                    if sum(rows[y][x]) < 3 * 90]
+            return sum(dark) / len(dark) if len(dark) > 20 else None
+
+        still = [eye_x() for _ in range(6)]
+        moving = []
+        stop = threading.Event()
+
+        def jiggle():
+            # Its own connection: 30 pixels right and back, 23 times a second.
+            j = obsws.ReqClient(host="127.0.0.1", port=run.ws_port,
+                                password="", timeout=10)
+            right = False
+            while not stop.is_set():
+                right = not right
+                j.send("SetSceneItemTransform", {
+                    "sceneName": "Moving", "sceneItemId": item,
+                    "sceneItemTransform": {"positionX": 30 if right else 0}},
+                    raw=True)
+                time.sleep(0.043)
+            j.disconnect()
+        mover = threading.Thread(target=jiggle)
+        mover.start()
+        try:
+            time.sleep(0.5)
+            for _ in range(24):
+                moving.append(eye_x())
+                time.sleep(0.017)
+        finally:
+            stop.set()
+            mover.join()
+        assert None not in still and None not in moving, (still, moving)
+        spread = max(moving) - min(moving)
+        print(f"eye in the cut-out: still {min(still):.1f}..{max(still):.1f},"
+              f" moving {min(moving):.1f}..{max(moving):.1f} px")
+        assert max(still) - min(still) < 1.5
+        # The face jumps 30 px (the eye spot shows it about 1.4 times
+        # bigger): a newer picture's eye would wander up to ~40 px.
+        assert spread < 6, moving
     finally:
         c.disconnect()
 

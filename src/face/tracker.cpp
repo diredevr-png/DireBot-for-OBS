@@ -865,6 +865,7 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 	Out &o = out_;
 	o.home_x = rest.set ? rest.x : 0.5f;
 	o.home_y = rest.set ? rest.y : 0.5f;
+	since_look_ += dt;
 	if (face.found) {
 		if (new_look || !seen_) {
 			o.layout = layout_of(face);
@@ -877,12 +878,26 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 				o.turned = yaw < 0 ? -1 : 1;
 			else if (o.turned != 0 && (std::fabs(yaw) < TURN_OFF || (yaw < 0) != (o.turned < 0)))
 				o.turned = std::fabs(yaw) > TURN_ON ? (yaw < 0 ? -1 : 1) : 0;
+			// Glide there from where it is - or jump, coming back after the
+			// face was lost and faded (nothing to glide from).
+			const Glide target{o.layout.cx, o.layout.cy, o.scale, o.angle};
+			if (!seen_ || o.shown <= 0) {
+				from_ = to_ = o.glide = target;
+				glided_ = 1;
+			} else {
+				from_ = o.glide;
+				to_ = target;
+				glided_ = 0;
+				between_ = std::min(0.25f, std::max(1.0f / 240, since_look_));
+			}
+			since_look_ = 0;
 		}
 		seen_ = true;
 		lost_for_ = 0;
 		o.found = true;
 		o.holding = false;
 		o.shown = std::min(1.0f, o.shown + dt / BACK);
+		glide(dt);
 		return o;
 	}
 	o.found = false;
@@ -890,7 +905,8 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 		o.shown = 0;
 		return o;
 	}
-	// Lost: held as it was, then faded.
+	// Lost: held as it was (the glide finishes), then faded.
+	glide(dt);
 	lost_for_ += dt;
 	o.holding = o.shown > 0;
 	if (lost_for_ > HOLD)
@@ -904,11 +920,28 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 	return o;
 }
 
+void Shown::glide(float dt)
+{
+	if (glided_ >= 1)
+		return;
+	glided_ = std::min(1.0f, glided_ + dt / between_);
+	const float t = glided_;
+	Glide &g = out_.glide;
+	g.cx = from_.cx + (to_.cx - from_.cx) * t;
+	g.cy = from_.cy + (to_.cy - from_.cy) * t;
+	g.scale = from_.scale + (to_.scale - from_.scale) * t;
+	g.angle = wrap_angle(from_.angle + wrap_angle(to_.angle - from_.angle) * t);
+}
+
 void Shown::reset()
 {
 	out_ = Out();
 	lost_for_ = 0;
 	seen_ = false;
+	from_ = to_ = Glide();
+	glided_ = 1;
+	between_ = 1.0f / 30;
+	since_look_ = 0;
 }
 
 } // namespace direbot::face

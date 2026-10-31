@@ -1002,6 +1002,60 @@ static void test_shown()
 	CHECK(near(o.angle, 0.1, 1e-4));
 	since.reset();
 	CHECK(since.now().shown == 0 && !since.now().found);
+
+	// The glide: OBS at 60 frames a second, a look every other frame. The
+	// character moves a little on every frame, not a step every other one,
+	// and is where the newest look says by the time the next one comes.
+	Shown glides;
+	const float frame = 1.0f / 60;
+	o = glides.step(face, rest, frame);
+	CHECK(near(o.glide.cx, l.cx, 1e-6) && near(o.glide.scale, 1, 1e-6)); // the first look: straight there
+	o = glides.step(face, rest, frame, false);
+	std::vector<float> xs;
+	for (int i = 1; i <= 8; i++) {
+		Face step_face = face;
+		for (auto &p : step_face.points)
+			p.x += 6.0f * i; // moving right, 6 pixels a look
+		o = glides.step(step_face, rest, frame, true);
+		xs.push_back(o.glide.cx);
+		o = glides.step(step_face, rest, frame, false);
+		xs.push_back(o.glide.cx);
+		CHECK(near(o.glide.cx, o.layout.cx, 1e-5)); // there before the next look
+	}
+	bool every_frame = true, even = true;
+	for (size_t i = 1; i < xs.size(); i++) {
+		const float move = xs[i] - xs[i - 1];
+		every_frame = every_frame && move > 0;
+		even = even && near(move, 3.0f / face.w, 2e-4);
+	}
+	CHECK(every_frame && even);
+	// Tilt and size (against "Set") glide too.
+	Face tipped = face;
+	for (auto &p : tipped.points) {
+		const float x = p.x - face.w / 2.0f, y = p.y - face.h / 2.0f;
+		p.x = face.w / 2.0f + x * 1.2f * std::cos(0.2f) - y * 1.2f * std::sin(0.2f);
+		p.y = face.h / 2.0f + x * 1.2f * std::sin(0.2f) + y * 1.2f * std::cos(0.2f);
+	}
+	Shown tilts;
+	tilts.step(face, set, frame);
+	tilts.step(face, set, frame, false);
+	const float angle0 = tilts.now().glide.angle;
+	CHECK(near(angle0, 0.1, 1e-4) && near(tilts.now().glide.scale, 2, 1e-4));
+	o = tilts.step(tipped, set, frame, true);
+	CHECK(near(o.glide.angle - angle0, 0.1, 2e-3) && near(o.glide.scale, 2.2, 2e-3));
+	o = tilts.step(tipped, set, frame, false);
+	CHECK(near(o.glide.angle - angle0, 0.2, 2e-3) && near(o.glide.scale, 2.4, 2e-3));
+	// Lost and faded, then found somewhere else: straight there, not a
+	// slide across from where it was lost.
+	Face far = face;
+	for (auto &p : far.points)
+		p.x += 60;
+	Shown jumps;
+	jumps.step(face, rest, 0.2f);
+	jumps.step(lost, rest, 1.0f);
+	CHECK(jumps.now().shown == 0);
+	o = jumps.step(far, rest, frame, true);
+	CHECK(near(o.glide.cx, layout_of(far).cx, 1e-6));
 }
 
 // --- Speed --------------------------------------------------------------------------
