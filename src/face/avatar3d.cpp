@@ -594,13 +594,11 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 	vec4_zero(&clear_colour);
 	gs_clear(GS_CLEAR_COLOR | GS_CLEAR_DEPTH, &clear_colour, 1.0f, 0);
 	gs_perspective(v.fov * 180 / 3.14159265f, (float)v.w / v.h, v.near, v.far);
-	// The camera's view as OBS's 3D wants it: y down, and on Direct3D
-	// looking along +z (OpenGL along -z).
-	M4 fix;
-	fix.m[5] = -1;
-	if (gs_get_device_type() == GS_DEVICE_DIRECT3D_11)
-		fix.m[10] = -1;
-	const matrix4 view = obs_matrix(fix * v.view);
+	// The camera's view as OBS's 3D wants it: y down, looking along -z.
+	// The same on Direct3D and OpenGL: OBS's Direct3D turns z round
+	// itself, so turning it here too would put the model behind the
+	// camera.
+	const matrix4 view = obs_matrix(obs_view(v.view));
 	gs_matrix_set(&view);
 	// Handed over turned rows-for-columns, as OBS hands over ViewProj.
 	matrix4 cam = obs_matrix(v.view);

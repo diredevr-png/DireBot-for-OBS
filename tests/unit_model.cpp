@@ -520,7 +520,8 @@ static void test_spots_on_a_vrm()
 		mesh["extras"]["targetNames"] = {"One", "Fcl_EYE_Close", "Three", "jawOpen"};
 		json &preset = p.b.doc["extensions"]["VRMC_vrm"]["expressions"]["preset"];
 		for (const char *viseme : {"aa", "ih", "ou", "ee", "oh"})
-			preset[viseme] = {{"morphTargetBinds", {{{"node", p.face_node}, {"index", 3}, {"weight", 1.0}}}}};
+			preset[viseme] = {
+				{"morphTargetBinds", {{{"node", p.face_node}, {"index", 3}, {"weight", 1.0}}}}};
 		auto m = std::make_shared<Model>();
 		CHECK(load(p.b.glb(), *m));
 		FaceSpots fs = face_spots(m, Quat(), CharacterSetup());
@@ -1107,6 +1108,107 @@ static void test_facing_arms_and_wearing()
 	CHECK(near(fb.height, 24, 1e-3) && near(ft.height, 24, 1e-3));
 }
 
+// OBS's own sums for its 3D, as libobs 30-32 does them: gs_perspective's
+// frustum on each graphics card's way (Direct3D 11, OpenGL), and what each
+// does to the view before drawing: Direct3D turns its z round, OpenGL
+// turns y round drawing into a picture. `d3d_turns_z_too`: the old mistake,
+// turning z round in the add-on as well.
+struct Seen {
+	float w, across, down, depth; // down: a share of the picture from its top
+};
+static Seen obs_sees(bool d3d, const Framing &f, float aspect, V3 world, bool d3d_turns_z_too = false)
+{
+	M4 view = obs_view(f.view);
+	if (d3d_turns_z_too) {
+		M4 turn;
+		turn.m[10] = -1;
+		view = turn * view;
+	}
+	if (d3d)
+		for (int c = 0; c < 4; c++)
+			view.at(2, c) = -view.at(2, c);
+	const float n = f.near, fa = f.far;
+	const float ymax = n * std::tan(f.fov * 0.5f), ymin = -ymax;
+	const float left = ymin * aspect, right = ymax * aspect, top = ymin, bottom = ymax;
+	M4 p;
+	p.m[0] = p.m[5] = p.m[10] = p.m[15] = 0;
+	const float rml = right - left;
+	p.at(0, 0) = 2 * n / rml;
+	if (d3d) {
+		const float bmt = bottom - top, fmn = fa - n;
+		p.at(0, 2) = (left + right) / -rml;
+		p.at(1, 1) = 2 * n / -bmt;
+		p.at(1, 2) = (bottom + top) / bmt;
+		p.at(2, 2) = fa / fmn;
+		p.at(2, 3) = n * fa / -fmn;
+		p.at(3, 2) = 1;
+	} else {
+		const float tmb = top - bottom, nmf = n - fa;
+		p.at(0, 2) = (left + right) / rml;
+		p.at(1, 1) = 2 * n / tmb;
+		p.at(1, 2) = (bottom + top) / tmb;
+		p.at(2, 2) = (fa + n) / nmf;
+		p.at(2, 3) = 2 * n * fa / nmf;
+		p.at(3, 2) = -1;
+		for (int c = 0; c < 4; c++)
+			p.at(1, c) = -p.at(1, c);
+	}
+	const M4 all = p * view;
+	float clip[4];
+	const float in[4] = {world.x, world.y, world.z, 1};
+	for (int r = 0; r < 4; r++) {
+		clip[r] = 0;
+		for (int k = 0; k < 4; k++)
+			clip[r] += all.at(r, k) * in[k];
+	}
+	Seen s;
+	s.w = clip[3];
+	const float x = clip[0] / clip[3], y = clip[1] / clip[3], z = clip[2] / clip[3];
+	s.across = (x + 1) / 2;
+	// Direct3D's picture starts at its top (y +1); OpenGL's at y -1, which
+	// OBS shows as the top too.
+	s.down = d3d ? (1 - y) / 2 : (1 + y) / 2;
+	s.depth = d3d ? z : (z + 1) / 2;
+	return s;
+}
+
+static void test_obs_camera()
+{
+	// A character 1.6 tall, in its own spot and worn on a head: on both
+	// graphics cards it's in front of the camera, in the picture, the
+	// right way up, near before far, and in the same place on each.
+	Model m;
+	m.low = {-0.3f, 0, -0.1f};
+	m.high = {0.3f, 1.6f, 0.1f};
+	const float aspect = 16 / 9.0f;
+	M4 pose = moved({0, 0, -60}); // your face 60 cm in front of the camera
+	const Framing frames[2] = {frame_own_spot(m, Quat{}, 1280, 720, 0.8f, false, 0, 0, 1),
+				   frame_worn(m, Quat{}, WornPlace(), pose, aspect)};
+	for (const Framing &f : frames) {
+		const V3 top = point(f.place, {0, 1.6f, 0}), feet = point(f.place, {0, 0, 0});
+		const V3 front = point(f.place, {0, 0.8f, 0.1f}), back = point(f.place, {0, 0.8f, -0.1f});
+		const V3 left_side = point(f.place, {-0.3f, 0.8f, 0});
+		for (int d3d = 0; d3d < 2; d3d++) {
+			for (V3 at : {top, feet, front, back, left_side}) {
+				const Seen s = obs_sees(d3d, f, aspect, at);
+				CHECK(s.w > 0);
+				CHECK(s.across > -0.01f && s.across < 1.01f && s.down > -0.01f && s.down < 1.01f);
+				CHECK(s.depth > 0 && s.depth < 1);
+				// The same spot in the picture whichever card draws it.
+				const Seen o = obs_sees(!d3d, f, aspect, at);
+				CHECK(near(s.across, o.across, 1e-4) && near(s.down, o.down, 1e-4));
+			}
+			CHECK(obs_sees(d3d, f, aspect, top).down < obs_sees(d3d, f, aspect, feet).down);
+			CHECK(obs_sees(d3d, f, aspect, front).depth < obs_sees(d3d, f, aspect, back).depth);
+			// Its -x side on the picture's left: x runs right on both.
+			CHECK(obs_sees(d3d, f, aspect, left_side).across < 0.5f);
+		}
+		// Turning z round in the add-on as well as in OBS's Direct3D put
+		// it all behind the camera: nothing drawn.
+		CHECK(obs_sees(true, f, aspect, top, true).w < 0);
+	}
+}
+
 static void test_set_up()
 {
 	// Reading it: what can't be used is left out.
@@ -1312,6 +1414,7 @@ int main()
 	test_dangly_parts();
 	test_facing_arms_and_wearing();
 	test_set_up();
+	test_obs_camera();
 	std::printf("unit_model: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;
 }

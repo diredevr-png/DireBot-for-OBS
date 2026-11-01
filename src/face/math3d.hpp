@@ -141,6 +141,17 @@ inline M4 operator*(const M4 &a, const M4 &b)
 		}
 	return r;
 }
+// The camera's view (x right, y up, looking along -z) as OBS's 3D wants
+// it, for gs_matrix_set with gs_perspective: y turned round (OBS's y runs
+// down), still looking along -z. The same on Direct3D and OpenGL: OBS's
+// Direct3D turns z round itself, so turning it here as well would put the
+// character behind the camera.
+inline M4 obs_view(const M4 &view)
+{
+	M4 flip;
+	flip.m[5] = -1;
+	return flip * view;
+}
 inline V3 point(const M4 &a, V3 p)
 {
 	return {a.m[0] * p.x + a.m[4] * p.y + a.m[8] * p.z + a.m[12],
