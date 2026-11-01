@@ -508,6 +508,52 @@ static Person make_person(bool vrm0)
 	return p;
 }
 
+// Where your eyes and mouth go on a VRM: a shape counts by every name it
+// goes by, and with nothing to go on the guess is at its head.
+static void test_spots_on_a_vrm()
+{
+	// Every mouth expression on the one "jawOpen" shape, as a simple VRM
+	// made in Blender has it: the mouth is where that shape moves.
+	{
+		Person p = make_person(false);
+		json &mesh = p.b.doc["meshes"][0];
+		mesh["extras"]["targetNames"] = {"One", "Fcl_EYE_Close", "Three", "jawOpen"};
+		json &preset = p.b.doc["extensions"]["VRMC_vrm"]["expressions"]["preset"];
+		for (const char *viseme : {"aa", "ih", "ou", "ee", "oh"})
+			preset[viseme] = {{"morphTargetBinds", {{{"node", p.face_node}, {"index", 3}, {"weight", 1.0}}}}};
+		auto m = std::make_shared<Model>();
+		CHECK(load(p.b.glb(), *m));
+		FaceSpots fs = face_spots(m, Quat(), CharacterSetup());
+		CHECK(std::strcmp(fs.from[2], "expressions") == 0);
+		CHECK(std::strcmp(fs.from[0], "expressions") == 0 && std::strcmp(fs.from[1], "expressions") == 0);
+	}
+	// No eye bones, no expressions, a body far below its head: the guess
+	// is on its head, not its chest.
+	{
+		Person p = make_person(false);
+		Builder &b = p.b;
+		json &bones = b.doc["extensions"]["VRMC_vrm"]["humanoid"]["humanBones"];
+		bones.erase("leftEye");
+		bones.erase("rightEye");
+		b.doc["extensions"]["VRMC_vrm"].erase("expressions");
+		b.doc["meshes"][0]["extras"]["targetNames"] = {"One", "Two", "Three", "Four"};
+		std::vector<V3> pos;
+		std::vector<uint16_t> ix;
+		cube(pos, ix, {0, 0.6f, 0}, 0.4f);
+		b.doc["meshes"].push_back(
+			{{"primitives", {{{"attributes", {{"POSITION", b.vec3s(pos)}}}, {"indices", b.indices(ix)}}}}});
+		const int body = b.node({{"name", "body"}, {"mesh", 1}});
+		b.doc["scenes"][0]["nodes"].push_back(body);
+		auto m = std::make_shared<Model>();
+		CHECK(load(b.glb(), *m));
+		FaceSpots fs = face_spots(m, Quat(), CharacterSetup());
+		CHECK(std::strcmp(fs.from[0], "guessed") == 0 && std::strcmp(fs.from[2], "guessed") == 0);
+		CHECK(fs.spot[0].at.y > 1.6f && fs.spot[0].at.y < 1.8f && near(fs.spot[0].at.x, 0.036, 2e-3) &&
+		      near(fs.spot[1].at.x, -0.036, 2e-3));
+		CHECK(fs.spot[2].at.y < fs.spot[0].at.y && fs.spot[2].at.y > 1.5f);
+	}
+}
+
 static void test_vrm1_reading()
 {
 	Person p = make_person(false);
@@ -1262,6 +1308,7 @@ int main()
 	test_names_and_sides();
 	test_springs();
 	test_link_chain();
+	test_spots_on_a_vrm();
 	test_dangly_parts();
 	test_facing_arms_and_wearing();
 	test_set_up();

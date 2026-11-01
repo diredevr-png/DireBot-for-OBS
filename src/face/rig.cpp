@@ -1195,13 +1195,36 @@ FaceSpots face_spots(const std::shared_ptr<const Model> &mp, Quat facing, const 
 	bool have[3] = {};
 	V3 at[3];
 
-	// Its blink and mouth expressions: the middle of what they move.
-	std::map<std::pair<int, int>, std::string> vrm_names;
+	// Its blink and mouth expressions: the middle of what they move. A
+	// shape counts by every name it goes by - its own and each VRM
+	// expression it's in (one "jawOpen" shape can be all of aa, ih, ou,
+	// ee and oh).
+	std::map<std::pair<int, int>, std::vector<std::string>> vrm_names;
 	for (const Expression &e : m.expressions)
 		for (const Expression::Bind &b : e.binds)
-			vrm_names[{b.mesh, b.morph}] = e.name;
-	// What each moves (the facing model's points) and how far.
-	std::vector<std::pair<V3, float>> moved_by[3];
+			vrm_names[{b.mesh, b.morph}].push_back(e.name);
+	auto kind_of = [&](int mi, size_t k, const Mesh &mesh) {
+		int eye = 0, mouth = 0;
+		auto take = [&](const std::string &name) {
+			const int kind = face_part_of(name);
+			if (kind > 10)
+				mouth = std::max(mouth, kind);
+			else if (kind == 1 || kind == 2)
+				eye = kind;
+			else if (kind == 3 && eye == 0)
+				eye = 3;
+		};
+		if (k < mesh.morph_names.size())
+			take(mesh.morph_names[k]);
+		auto named = vrm_names.find({mi, (int)k});
+		if (named != vrm_names.end())
+			for (const std::string &name : named->second)
+				take(name);
+		return eye ? eye : mouth;
+	};
+	// What each moves (the facing model's points) and how far; a blink of
+	// both eyes, split between them afterwards.
+	std::vector<std::pair<V3, float>> moved_by[3], both;
 	int mouth_kind = 0;
 	for (int pass = 0; pass < 2; pass++)
 		for (size_t pi = 0; pi < parts.size(); pi++) {
@@ -1211,11 +1234,7 @@ FaceSpots face_spots(const std::shared_ptr<const Model> &mp, Quat facing, const 
 				continue;
 			const Mesh &mesh = m.meshes[mi];
 			for (size_t k = 0; k < prim.morphs.size(); k++) {
-				auto named = vrm_names.find({mi, (int)k});
-				const std::string name = named != vrm_names.end()      ? named->second
-							 : k < mesh.morph_names.size() ? mesh.morph_names[k]
-										       : std::string();
-				const int kind = face_part_of(name);
+				const int kind = kind_of(mi, k, mesh);
 				// First pass: which mouth expression says most surely where it is.
 				if (pass == 0) {
 					if (kind > 10)
@@ -1230,13 +1249,30 @@ FaceSpots face_spots(const std::shared_ptr<const Model> &mp, Quat facing, const 
 					if (w < 1e-7f)
 						continue;
 					const V3 p = points[pi][v];
-					const int which = kind > 10   ? 2
-							  : kind == 3 ? (p.x >= middle.x ? 0 : 1)
-								      : kind - 1;
-					moved_by[which].push_back({p, w});
+					if (kind == 3)
+						both.push_back({p, w});
+					else
+						moved_by[kind > 10 ? 2 : kind - 1].push_back({p, w});
 				}
 			}
 		}
+	// Both eyes' blink: each side of the middle of what it moves (not the
+	// model's middle - two characters in one file), its own left eye on
+	// the right.
+	if (!both.empty() && (moved_by[0].empty() || moved_by[1].empty())) {
+		float lo = 1e30f, hi = -1e30f;
+		for (const auto &pw : both) {
+			lo = std::min(lo, pw.first.x);
+			hi = std::max(hi, pw.first.x);
+		}
+		const float split = (lo + hi) / 2;
+		const bool need[2] = {moved_by[0].empty(), moved_by[1].empty()};
+		for (const auto &pw : both) {
+			const int which = pw.first.x >= split ? 0 : 1;
+			if (need[which])
+				moved_by[which].push_back(pw);
+		}
+	}
 	// Each one's middle and size: the box round what it moves most (a
 	// blink's lids, "aa"'s lips).
 	V3 box_size[3];
@@ -1274,12 +1310,32 @@ FaceSpots face_spots(const std::shared_ptr<const Model> &mp, Quat facing, const 
 			out.from[i] = "eye bones";
 		}
 	}
-	// A guess: the front of its top half.
+	// A guess: the front of its top half - or, with a head bone, of its
+	// head (what's above that bone, about as wide as it's tall).
 	const float top = middle.y + size.y / 2;
 	if (!have[0] || !have[1]) {
-		const float gap = 0.3f * size.x, y = top - 0.35f * size.y;
+		float cx = middle.x, gap = 0.3f * size.x, y = top - 0.35f * size.y;
+		const int head_bone = m.bone("head");
+		if (head_bone >= 0) {
+			const V3 h = rotate(facing, move_of(rest_world(m)[head_bone]));
+			const float reach = std::max(0.0f, top - h.y);
+			V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+			size_t found = 0;
+			for (const auto &part : points)
+				for (const V3 &p : part)
+					if (p.y >= h.y - 1e-3f * size.y && std::fabs(p.x - h.x) <= 0.6f * reach) {
+						lo = {std::min(lo.x, p.x), std::min(lo.y, p.y), lo.z};
+						hi = {std::max(hi.x, p.x), std::max(hi.y, p.y), hi.z};
+						found++;
+					}
+			if (found >= 3 && hi.x > lo.x && hi.y > lo.y) {
+				cx = (lo.x + hi.x) / 2;
+				gap = 0.36f * (hi.x - lo.x);
+				y = hi.y - 0.55f * (hi.y - lo.y);
+			}
+		}
 		for (int i = 0; i < 2; i++) {
-			const float x = middle.x + (i == 0 ? gap : -gap) / 2;
+			const float x = cx + (i == 0 ? gap : -gap) / 2;
 			at[i] = {x, y, surface(x, y, middle.z + size.z / 2)};
 			out.from[i] = "guessed";
 		}
