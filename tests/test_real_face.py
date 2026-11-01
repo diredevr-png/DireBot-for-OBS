@@ -109,6 +109,78 @@ def drawn_picture(path, ovals, size=400):
     write_png(path, size, size, rows, alpha=True)
 
 
+def ball_points(cx, cy, cz, rx, ry, rz, n=24):
+    """A ball's points, their facings and its triangles."""
+    pos, nrm, ix = [], [], []
+    for i in range(n + 1):
+        th = math.pi * i / n
+        for j in range(n + 1):
+            ph = 2 * math.pi * j / n
+            u = (math.sin(th) * math.cos(ph), math.cos(th), math.sin(th) * math.sin(ph))
+            pos.append((cx + u[0] * rx, cy + u[1] * ry, cz + u[2] * rz))
+            f = (u[0] / rx, u[1] / ry, u[2] / rz)
+            k = math.sqrt(sum(c * c for c in f)) or 1
+            nrm.append(tuple(c / k for c in f))
+    for i in range(n):
+        for j in range(n):
+            a = i * (n + 1) + j
+            b = a + n + 1
+            ix += [a, b, a + 1, a + 1, b, b + 1]
+    return pos, nrm, ix
+
+
+def write_glb(path, parts):
+    """A plain .glb: one node a part, each (points, facings, triangles,
+    colour as linear red/green/blue, roughness)."""
+    blob = bytearray()
+    views, accessors, meshes, nodes, materials = [], [], [], [], []
+
+    def add(data, target):
+        while len(blob) % 4:
+            blob.append(0)
+        views.append({"buffer": 0, "byteOffset": len(blob),
+                      "byteLength": len(data), "target": target})
+        blob.extend(data)
+        return len(views) - 1
+
+    for i, (pos, nrm, ix, colour, rough) in enumerate(parts):
+        p = add(struct.pack("<%df" % (len(pos) * 3), *[c for v in pos for c in v]), 34962)
+        lo = [min(v[k] for v in pos) for k in range(3)]
+        hi = [max(v[k] for v in pos) for k in range(3)]
+        accessors.append({"bufferView": p, "componentType": 5126, "count": len(pos),
+                          "type": "VEC3", "min": lo, "max": hi})
+        n = add(struct.pack("<%df" % (len(nrm) * 3), *[c for v in nrm for c in v]), 34962)
+        accessors.append({"bufferView": n, "componentType": 5126, "count": len(nrm), "type": "VEC3"})
+        t = add(struct.pack("<%dI" % len(ix), *ix), 34963)
+        accessors.append({"bufferView": t, "componentType": 5125, "count": len(ix), "type": "SCALAR"})
+        materials.append({"pbrMetallicRoughness": {"baseColorFactor": list(colour) + [1],
+                                                   "metallicFactor": 0, "roughnessFactor": rough}})
+        meshes.append({"primitives": [{"attributes": {"POSITION": 3 * i, "NORMAL": 3 * i + 1},
+                                       "indices": 3 * i + 2, "material": i}]})
+        nodes.append({"name": "part%d" % i, "mesh": i})
+    doc = {"asset": {"version": "2.0"}, "scene": 0,
+           "scenes": [{"nodes": list(range(len(nodes)))}], "nodes": nodes,
+           "meshes": meshes, "materials": materials, "accessors": accessors,
+           "bufferViews": views, "buffers": [{"byteLength": len(blob)}]}
+    text = json.dumps(doc).encode()
+    text += b" " * (-len(text) % 4)
+    while len(blob) % 4:
+        blob.append(0)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(text) + 8 + len(blob)))
+        f.write(struct.pack("<II", len(text), 0x4E4F534A) + text)
+        f.write(struct.pack("<II", len(blob), 0x004E4942) + bytes(blob))
+
+
+def ball_character(path):
+    """A 3D orange ball head 20 cm across, two black eyes on its front."""
+    write_glb(path, [
+        ball_points(0, 0, 0, 0.1, 0.1, 0.1) + ((0.8, 0.25, 0.04), 0.4),
+        ball_points(-0.035, 0.025, 0.088, 0.018, 0.022, 0.012) + ((0.01, 0.01, 0.01), 0.3),
+        ball_points(0.035, 0.025, 0.088, 0.018, 0.022, 0.012) + ((0.01, 0.01, 0.01), 0.3),
+    ])
+
+
 def send(c, request, data=None):
     return c.send(request, data or {}, raw=True)
 
@@ -535,6 +607,96 @@ def test_it_turns_blends_draws_and_wears(run):
         send(c, "SetInputSettings", {"inputName": "Looks camera",
                                      "inputSettings": {"file": face_png}})
         assert wait_for(lambda: st("Worn")["placed"]["shown"], 10, 0.1)
+        for name in avatars:
+            send(c, "RemoveInput", {"inputName": name})
+    finally:
+        c.disconnect()
+
+
+def test_3d_characters(run):
+    """A .glb character: loaded on its own, drawn lit with depth (its eyes
+    in front of its head), turning with you, worn on your head; a broken
+    file says why and draws nothing."""
+    face_png = os.path.join(run.home, "camera.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+    ball = os.path.join(run.home, "ball.glb")
+    ball_character(ball)
+    broken = os.path.join(run.home, "broken.glb")
+    with open(broken, "wb") as f:
+        f.write(b"glTF not really")
+    size = 300
+    common = {"source": "3D camera", "width": size, "height": size, "size": 100,
+              "mirror": False, "smoothing": 100, "follow_move": 0, "follow_grow": 0,
+              "follow_tilt": 0, "bend": 100}
+    avatars = {
+        "3D": {"model": ball},
+        "3D turned": {"model": ball},
+        "3D worn": {"model": ball, "worn": True},
+        "3D broken": {"model": broken},
+    }
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "3D characters"})
+        send(c, "CreateInput", {"sceneName": "3D characters", "inputName": "3D camera",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        for name, extra in avatars.items():
+            send(c, "CreateInput", {"sceneName": "3D characters", "inputName": name,
+                                    "inputKind": "direbot_face_avatar",
+                                    "inputSettings": {**common, **extra}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "3D characters"})
+
+        def st(name):
+            return vendor(c, "FaceGetState", {"source": name})
+        for name in ("3D", "3D turned", "3D worn"):
+            assert wait_for(lambda: st(name)["found"] and st(name)["model"]["shown"], 30, 0.2), st(name)
+        m = st("3D")["model"]
+        assert m["loaded"] and not m["loading"] and m["kind"] == "gltf"
+        assert m["points"] == 3 * 25 * 25 and m["triangles"] == 3 * 24 * 24 * 2
+        assert m["springs"] == 0 and "problem" not in m
+        # The broken one: why, in plain words, and nothing drawn.
+        assert wait_for(lambda: st("3D broken")["model"].get("problem"), 10, 0.1)
+        b = st("3D broken")["model"]
+        assert not b["loaded"] and not b["shown"]
+
+        # In its own spot: an orange ball, lit (brighter up and to the
+        # left, where the light is), its eyes dark in front of it.
+        time.sleep(0.5)
+        rows = screenshot(c, "3D")
+        mid = rows[size // 2 + 30][size // 2]
+        assert mid[0] > 150 and mid[0] > mid[1] > mid[2], mid
+        lit, dim = rows[size // 2 - 60][size // 2 - 60], rows[size // 2 + 60][size // 2 + 60]
+        assert sum(lit) > sum(dim) + 30, (lit, dim)
+        dark = lambda px: sum(px) < 3 * 60 and px != (0, 0, 0)  # noqa: E731
+        ex, ey, n = middle_of(rows, dark, (0, 0, size, size // 2 + 20))
+        assert n > 50 and abs(ex - size / 2) < 5, (ex, ey, n)
+        assert rows[5][5] == (0, 0, 0)   # see-through round it
+
+        # Turned 25 degrees to the picture's left: it turns with you, its
+        # eyes going left.
+        assert vendor(c, "FaceSet", {"source": "3D turned"})["ok"]
+        assert wait_for(lambda: st("3D turned")["set"] and not st("3D turned")["setting"], 10, 0.1)
+        rest = send(c, "GetInputSettings", {"inputName": "3D turned"})["inputSettings"]["rest"]
+        send(c, "SetInputSettings", {"inputName": "3D turned", "inputSettings": {
+            "rest": turned_rest(rest, 25)}})
+        assert wait_for(lambda: st("3D turned")["model"]["yaw"] < -20, 5, 0.1)
+        time.sleep(0.3)
+        tx, _, n = middle_of(screenshot(c, "3D turned"), dark, (0, 0, size, size // 2 + 20))
+        print(f"3D eyes: {ex:.1f} straight, {tx:.1f} turned")
+        assert n > 30 and tx < ex - 20
+
+        # Worn on your head: the camera's size, the ball over your face,
+        # the room round it.
+        rows = screenshot(c, "3D worn")
+        assert len(rows) == H and len(rows[0]) == W
+        s = st("3D worn")
+        first, second = s["parts"][0], s["parts"][1]
+        fx, fy = (first["x"] + second["x"]) / 2 * W, (first["y"] + second["y"]) / 2 * H
+        px = rows[int(fy) + 25][int(fx)]
+        assert px[0] > 150 and px[0] > px[1] > px[2], px
+        assert near_colour(rows[10][10], (96, 96, 96), 4)
+        mx, my = s["model"]["x"], s["model"]["y"]
+        assert abs(mx - fx) < 40 and abs(my - fy) < 60, (mx, my, fx, fy)
         for name in avatars:
             send(c, "RemoveInput", {"inputName": name})
     finally:

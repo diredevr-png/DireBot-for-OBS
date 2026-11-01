@@ -94,7 +94,19 @@ from how you sit. When your face is lost the eyes and mouth are held for
 a moment, from the last picture they were seen in (never your room), then
 the character shows its own drawn eyes and mouth. Optional pictures for
 turned left and turned right, and outfit layers in front of or behind the
-character. DireBot sets it up (Avatar → Face avatar).
+character. Or a **3D character** instead of the pictures: a `.glb`/`.gltf`
+(Blender and most 3D tools) or `.vrm` (VRoid Studio, VRM 0.x and 1.0),
+read by our own code (`src/face/model.cpp`) and drawn with OBS's own
+graphics: lit glossy, as a cartoon (VRM's MToon, with its outlines) or
+flat, see-through round it. It turns and nods with you (a VRM's neck and
+head bones, or the whole of it round its head), makes your 52 expressions
+(parts named as Apple's ARKit names them, or VRM's expressions worked out
+from yours), looks where you look, and its swinging parts swing: VRM's
+spring bones, or any bones that hang free (a string of sausages, a doll's
+ears and legs). Characters standing in a T get their arms down. In its own
+spot, or worn on your head over the camera (a VRM's eyes on yours), with
+a hidden head shape so what's behind your head stays behind it.
+DireBot sets it up (Avatar → Face avatar).
 
 The link never hands out your stream key: `GetStreamServiceSettings`
 through it shows the key (and a custom server's password or token) as
@@ -155,7 +167,7 @@ The add-on's own requests go through `CallVendorRequest` with
 | `RecordSetOptions` `{options}` | saves them (the same shape as `options` above); answers the state |
 | `RecordStart` / `RecordStop` | the state, plus `note` when some couldn't start, or `error` in words when none could. The `RecordChanged` vendor event sends the state whenever it changes |
 | `FaceSet` `{source, clear?}` | "Set": the next looks that find the face are its rest, kept in the source's `rest` setting (`setting` while it's taking them); `clear` forgets it. `ok`, or `error` in words (for one, the face avatar isn't shown) |
-| `FaceGetState` `{source, points?}` | `camera`, `ready`, `showing`, `found`, `presence` (0-1), `set`, `setting`, `turn` (`yaw`, `pitch`, `roll` in degrees, since "Set"), `turned` (-1, 0, 1), `moves` (the 51 expressions, 0-1 since "Set", ARKit's names), `parts` (first eye, second eye, mouth: `x`, `y`, `w`, `h` shares of the camera's picture), `shown`, `holding`, `looks_per_second`, `ms`, `problem`; with `points`, the 478 `points` (`x`, `y` shares) |
+| `FaceGetState` `{source, points?}` | `camera`, `ready`, `showing`, `found`, `presence` (0-1), `set`, `setting`, `turn` (`yaw`, `pitch`, `roll` in degrees, since "Set"), `turned` (-1, 0, 1), `moves` (the 51 expressions, 0-1 since "Set", ARKit's names), `parts` (first eye, second eye, mouth: `x`, `y`, `w`, `h` shares of the camera's picture), `shown`, `holding`, `looks_per_second`, `ms`, `problem`; with `points`, the 478 `points` (`x`, `y` shares); with a 3D character, `model`: `file`, `loaded`, `loading`, `shown`, `kind` (`gltf`, `vrm0`, `vrm1`), `title`, `author`, `points`, `triangles`, `springs`, `swinging_chain`, `arkit_parts`, `expressions` (VRM's, 0-1), `yaw`, `pitch`, `x`, `y` (its middle in the picture, pixels), `problem` in words when it couldn't be read |
 | `GetUsage` | `measuring` (first 3 seconds), `fps`, `fps_now`, `frame_ms`, `frame_budget_ms`, `frames`, `frames_lagged`, `encoded`, `encoded_skipped`, `cpu`, `memory_mb`, `stream_frames`, `stream_dropped`, and `sources`: per input and filter `name`, `uuid`, `kind`, `type`, `active`, `showing`, `measured`, `tick_ms`, `render_ms`, `gpu_ms` (+ `_max_ms`), `fps_in`/`fps_shown` for cameras and media, `parent`/`enabled` for filters (and `own_ms`/`own_gpu_ms`: a filter's time takes in what it draws on, so this is its own part), and `hints` (browser size/fps/"shut down when hidden", whether it shows a page on this PC and its port, a short fingerprint of a camera to spot the same one added twice) |
 
 ## Building

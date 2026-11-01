@@ -24,6 +24,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -41,6 +42,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "../obs/ui-call.hpp"
 #include "avatar2d.hpp"
+#include "avatar3d.hpp"
+#include "model.hpp"
+#include "rig.hpp"
 #include "tracker.hpp"
 
 namespace direbot::face {
@@ -69,6 +73,8 @@ constexpr size_t MOST_LAYERS = 12;
 constexpr float PIECE_ROOM = 1.25f;
 // Turning and nodding at most (degrees): in its own spot; worn, nodding.
 constexpr float MOST_YAW = 40, MOST_PITCH = 20, WORN_PITCH = 25;
+// A 3D character turns and nods more (it's really turned).
+constexpr float MOST_YAW_3D = 60, MOST_PITCH_3D = 40;
 constexpr float RAD = 3.14159265f / 180;
 // Room round the character as it turns (a share each side), and the
 // most pixels across it's drawn at before it turns.
@@ -575,6 +581,19 @@ struct FaceAvatar {
 	std::atomic<bool> worn{false};
 	bool show_camera = true;
 	float worn_size = 1.3f;
+	// A 3D character (.glb, .gltf, .vrm) instead of the pictures, when
+	// there is one: loaded on its own thread, drawn by Avatar3D.
+	struct Look3D {
+		int turn = 0; // degrees round from the way it most likely faces (guess_turn)
+		int look = 0; // 0 its own, 1 glossy, 2 cartoon, 3 flat
+		float outline = 0, floppy = 0.5f;
+		bool swing = true;
+		int framing = 0; // 0 head and shoulders for a VRM, 1 all of it, 2 head
+		bool hide = true, smooth = true;
+		WornPlace place;
+	};
+	Look3D look3d; // under pictures_lock
+	ModelLoader loader;
 
 	Worker worker;
 	// Only on OBS's graphics thread (video_tick and video_render).
@@ -645,6 +664,23 @@ struct FaceAvatar {
 	Placed placed_now;
 	bool showing_now = false;
 	uint64_t last_render = 0;
+	// The 3D character (OBS's graphics thread only)...
+	std::unique_ptr<Avatar3D> avatar3d;
+	std::unique_ptr<Rig> rig;
+	std::shared_ptr<const Model> model_now;
+	std::string rig_key;
+	M4 worn_pose;
+	bool have_worn_pose = false;
+	// ...and what it showed, for FaceGetState (under state_lock).
+	struct State3D {
+		std::string file, problem, kind, title, author;
+		bool loaded = false, shown = false, chain = false;
+		size_t points = 0, triangles = 0;
+		int springs = 0, arkit = 0;
+		float yaw = 0, pitch = 0, x = 0, y = 0;
+		std::map<std::string, float> values;
+	};
+	State3D state3d;
 
 	explicit FaceAvatar(obs_source_t *source)
 		: self(source),
@@ -702,6 +738,7 @@ struct FaceAvatar {
 	{
 		worker.stop();
 		obs_enter_graphics();
+		avatar3d.reset();
 		for (Shot &shot : shots)
 			gs_texrender_destroy(shot.tex);
 		gs_texrender_destroy(small);
@@ -1206,6 +1243,173 @@ struct FaceAvatar {
 		gs_matrix_pop();
 	}
 
+	// Which way the 3D character faces: as set, or as it is (a VRM 0.x
+	// faces away, so it's turned round).
+	Quat facing_of(const Model &m) const
+	{
+		// Turned from the way it most likely faces, if asked.
+		const int turn = guess_turn(m) + std::max(0, look3d.turn);
+		return axis_angle({0, 1, 0}, turn * RAD);
+	}
+
+	// A newly loaded 3D character onto the graphics card, and its rig
+	// (made anew when how it swings or faces changes).
+	void pick_model()
+	{
+		if (std::shared_ptr<ModelPack> pack = loader.take()) {
+			if (!avatar3d)
+				avatar3d = std::make_unique<Avatar3D>();
+			avatar3d->set(pack->model, std::move(pack->pictures));
+			model_now = pack->model;
+			rig.reset();
+			rig_key.clear();
+			have_worn_pose = false;
+			State3D st;
+			st.file = pack->path;
+			st.problem = pack->problem;
+			if (model_now) {
+				const Model &m = *model_now;
+				st.loaded = true;
+				st.kind = m.vrm == 1 ? "vrm1" : m.vrm == -1 ? "vrm0" : "gltf";
+				st.title = m.meta.title;
+				st.author = m.meta.author;
+				st.points = m.points;
+				st.triangles = m.triangles;
+			}
+			std::lock_guard<std::mutex> l(state_lock);
+			state3d = st;
+		}
+		if (!model_now || !avatar3d || !avatar3d->ready()) {
+			rig.reset();
+			return;
+		}
+		RigOptions ro;
+		ro.facing = facing_of(*model_now);
+		ro.floppy = look3d.floppy;
+		ro.springs = look3d.swing;
+		const std::string key = std::to_string(ro.facing.y) + "/" + std::to_string(ro.facing.w) + "/" +
+					std::to_string(ro.floppy) + "/" + (ro.springs ? "1" : "0");
+		if (!rig || key != rig_key) {
+			rig = std::make_unique<Rig>(model_now, ro);
+			rig_key = key;
+			std::lock_guard<std::mutex> l(state_lock);
+			state3d.springs = rig->springs();
+			state3d.chain = rig->auto_chain();
+			state3d.arkit = rig->arkit_parts();
+		}
+	}
+
+	// The 3D character into `out`: posed by your face and drawn - in its
+	// own spot, following you as the pictures do; or worn on your head,
+	// sat on it as your face's pose puts it, over the camera.
+	void draw_3d(obs_source_t *cam, uint32_t cw, uint32_t ch, uint32_t w, uint32_t h, const Shown::Out &o,
+		     bool wear)
+	{
+		const Model &m = *model_now;
+		const Quat facing = facing_of(m);
+		Drive d;
+		d.dt = frame_dt;
+		std::copy(o.moves, o.moves + EXPRESSIONS, d.moves);
+		Framing f;
+		View3D v;
+		bool show = true;
+		float opacity = 1;
+		if (!wear) {
+			// Mirrored: it moves as your reflection does (not mirrored itself).
+			if (mirror)
+				swap_sides(d.moves);
+			const Shown::Glide &g = o.glide;
+			const float flip = mirror ? -1.0f : 1.0f;
+			const float dx = clampf((g.cx - o.home_x) * follow_move * flip, -most_move, most_move);
+			const float dy = clampf((g.cy - o.home_y) * follow_move, -most_move, most_move);
+			const float grow = clampf(std::pow(std::max(0.05f, g.scale), follow_grow), 0.6f, 1.6f);
+			const bool head = look3d.framing == 2 || (look3d.framing == 0 && m.is_vrm());
+			f = frame_own_spot(m, facing, w, h, size, head, dx, dy, grow);
+			d.head = head_turn(clampf(g.yaw * bend, -MOST_YAW_3D, MOST_YAW_3D),
+					   clampf(g.pitch * bend, -MOST_PITCH_3D, MOST_PITCH_3D),
+					   clampf(g.angle * follow_tilt, -0.6f, 0.6f), mirror);
+			v.w = w;
+			v.h = h;
+		} else {
+			// Your face's pose in the very picture shown (held a moment
+			// when it's lost, then faded).
+			if (looked_shot >= 0 && seen.face.found) {
+				worn_pose = matrix_of_rows(seen.face.pose);
+				have_worn_pose = true;
+			}
+			const float t = clampf((o.lost_for - WORN_HOLD) / WORN_FADE, 0, 1);
+			opacity = 1 - t * t * (3 - 2 * t);
+			show = have_worn_pose && opacity > 0.001f;
+			f = frame_worn(m, facing, look3d.place, worn_pose, (float)cw / std::max(1u, ch));
+			v.w = cw;
+			v.h = ch;
+			v.hide_behind_head = look3d.hide;
+			v.head = worn_pose;
+		}
+		d.place = f.place;
+		if (rig->turns_whole())
+			rig->set_pivot(look3d.place.automatic ? f.pivot : head_in_model(m, facing, look3d.place));
+		rig->pose(d);
+		v.fov = f.fov;
+		v.near = f.near;
+		v.far = f.far;
+		v.view = f.view;
+		v.world_scale = f.world_scale;
+		v.height = f.height;
+		v.look = look3d.look;
+		v.outline = look3d.outline;
+		v.smooth = look3d.smooth && !easy;
+		v.opacity = opacity;
+		gs_texture_t *tex = show ? avatar3d->draw(*rig, v) : nullptr;
+		{
+			std::lock_guard<std::mutex> l(state_lock);
+			state3d.shown = tex != nullptr;
+			state3d.values = rig->expression_values();
+			const V3 front = rotate(d.head, {0, 0, 1});
+			state3d.yaw = std::atan2(front.x, front.z) / RAD;
+			state3d.pitch = std::asin(clampf(front.y, -1, 1)) / RAD;
+			// Where its middle is in the picture (pixels).
+			const V3 mid = point(f.place, (m.low + m.high) * 0.5f);
+			const V3 c = point(f.view, mid);
+			const float k = 1 / std::tan(f.fov / 2);
+			const float aspect = (float)v.w / std::max(1u, v.h);
+			if (c.z < -1e-4f) {
+				const float sx = (c.x * k / aspect) / -c.z, sy = (c.y * k) / -c.z;
+				state3d.x = (wear && mirror ? -sx : sx) * 0.5f * v.w + 0.5f * v.w;
+				state3d.y = -sy * 0.5f * v.h + 0.5f * v.h;
+			}
+		}
+		{
+			std::lock_guard<std::mutex> l(state_lock);
+			placed_now = Placed();
+			placed_now.shown = tex != nullptr;
+			placed_now.opacity = opacity;
+		}
+		if (!out)
+			out = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+		if (!out)
+			return;
+		gs_texrender_reset(out);
+		if (!gs_texrender_begin(out, w, h))
+			return;
+		vec4 clear;
+		vec4_zero(&clear);
+		gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+		gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
+		if (wear && show_camera)
+			draw_camera(cam, cw, ch);
+		if (tex) {
+			// Worn, it's drawn as the camera sees you: mirrored with it.
+			gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+			gs_effect_t *base = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+			gs_effect_set_texture(gs_effect_get_param_by_name(base, "image"), tex);
+			while (gs_effect_loop(base, "Draw"))
+				gs_draw_sprite(tex, wear && mirror ? GS_FLIP_U : 0, w, h);
+		}
+		gs_texrender_end(out);
+		have_out = true;
+	}
+
 	void render()
 	{
 		if (drawing || !effect)
@@ -1264,6 +1468,11 @@ struct FaceAvatar {
 		std::lock_guard<std::mutex> l(pictures_lock);
 		const Shown::Out o = shown.now();
 		const bool wear = worn && cw && ch;
+		pick_model();
+		if (rig && model_now) {
+			draw_3d(cam, cw, ch, w, h, o, wear);
+			return;
+		}
 		gs_texture_t *cut = cam && used_shot >= 0 ? gs_texrender_get_texture(shots[used_shot].tex) : nullptr;
 		upload_masks();
 		// Which way it faces: turned pictures if there are any.
@@ -1494,6 +1703,49 @@ struct FaceAvatar {
 			worn_size = clampf((float)obs_data_get_int(settings, "worn_size") / 100.0f, 0.5f, 3.0f);
 		}
 		next_layers.clear();
+		// The 3D character.
+		Look3D l3;
+		l3.turn = (int)obs_data_get_int(settings, "model_turn");
+		if (l3.turn != -1)
+			l3.turn = ((l3.turn % 360) + 360) % 360;
+		const char *look_name = obs_data_get_string(settings, "look");
+		l3.look = !look_name                               ? 0
+			  : std::strcmp(look_name, "glossy") == 0  ? 1
+			  : std::strcmp(look_name, "cartoon") == 0 ? 2
+			  : std::strcmp(look_name, "flat") == 0    ? 3
+								   : 0;
+		l3.outline = clampf((float)obs_data_get_int(settings, "outline") / 100.0f, 0, 1) * 0.02f;
+		l3.floppy = clampf((float)obs_data_get_int(settings, "floppy") / 100.0f, 0, 1);
+		l3.swing = obs_data_get_bool(settings, "swing");
+		const char *framing = obs_data_get_string(settings, "framing");
+		l3.framing = framing && std::strcmp(framing, "whole") == 0  ? 1
+			     : framing && std::strcmp(framing, "head") == 0 ? 2
+									    : 0;
+		l3.hide = obs_data_get_bool(settings, "hide_behind_head");
+		l3.smooth = obs_data_get_bool(settings, "smooth_edges");
+		const json model_place = json::parse(obs_data_get_string(settings, "model_place"), nullptr, false);
+		if (model_place.is_object()) {
+			auto number = [&model_place](const char *key, float def) {
+				auto it = model_place.find(key);
+				return it != model_place.end() && it->is_number() && std::isfinite(it->get<double>())
+					       ? (float)it->get<double>()
+					       : def;
+			};
+			const float units = number("units", 0);
+			if (units > 0) {
+				l3.place.automatic = false;
+				l3.place.units = clampf(units, 1e-4f, 1e6f);
+				l3.place.at = {clampf(number("x", 0), -200, 200), clampf(number("y", 0), -200, 200),
+					       clampf(number("z", 0), -200, 200)};
+			}
+			l3.place.size = clampf(number("size", 1), 0.1f, 10);
+		}
+		{
+			std::lock_guard<std::mutex> l(pictures_lock);
+			look3d = l3;
+		}
+		const char *model_file = obs_data_get_string(settings, "model");
+		loader.want(model_file ? model_file : "");
 		mirror = obs_data_get_bool(settings, "mirror");
 		easy = obs_data_get_bool(settings, "easy");
 		const char *style = obs_data_get_string(settings, "style");
@@ -1598,6 +1850,32 @@ struct FaceAvatar {
 				    {"opacity", r(at.opacity, 100)}};
 		answer["see_through"] = holes;
 		answer["shaped"] = shaped;
+		{
+			const State3D &st = state3d;
+			json values = json::object();
+			for (const auto &kv : st.values)
+				values[kv.first] = r(kv.second, 100);
+			json model = {{"file", st.file},
+				      {"loaded", st.loaded},
+				      {"loading", loader.busy()},
+				      {"shown", st.shown},
+				      {"kind", st.kind},
+				      {"title", st.title},
+				      {"author", st.author},
+				      {"points", st.points},
+				      {"triangles", st.triangles},
+				      {"springs", st.springs},
+				      {"swinging_chain", st.chain},
+				      {"arkit_parts", st.arkit},
+				      {"expressions", values},
+				      {"yaw", r(st.yaw, 10)},
+				      {"pitch", r(st.pitch, 10)},
+				      {"x", r(st.x, 10)},
+				      {"y", r(st.y, 10)}};
+			if (!st.problem.empty())
+				model["problem"] = st.problem;
+			answer["model"] = model;
+		}
 		if (with_points && face.found && face.w > 0 && face.h > 0) {
 			json points = json::array();
 			for (const Point &p : face.points)
@@ -1704,6 +1982,16 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "rest", "");
 	obs_data_set_default_string(settings, "spots", "");
 	obs_data_set_default_string(settings, "outfit", "[]");
+	obs_data_set_default_string(settings, "model", "");
+	obs_data_set_default_int(settings, "model_turn", 0);
+	obs_data_set_default_string(settings, "look", "auto");
+	obs_data_set_default_int(settings, "outline", 0);
+	obs_data_set_default_int(settings, "floppy", 50);
+	obs_data_set_default_bool(settings, "swing", true);
+	obs_data_set_default_string(settings, "framing", "auto");
+	obs_data_set_default_bool(settings, "hide_behind_head", true);
+	obs_data_set_default_bool(settings, "smooth_edges", true);
+	obs_data_set_default_string(settings, "model_place", "");
 }
 
 bool add_camera(void *param, obs_source_t *source)
@@ -1784,6 +2072,36 @@ obs_properties_t *get_properties(void *data)
 	for (int i = 0; i < MOUTH_LOOKS; i++)
 		obs_properties_add_path(drawn, MOUTH_KEYS[i], text(mouth_text[i]), OBS_PATH_FILE, pictures, nullptr);
 	obs_properties_add_group(props, "drawn_face", text("FaceAvatar.DrawnFace"), OBS_GROUP_NORMAL, drawn);
+
+	obs_properties_t *m3 = obs_properties_create();
+	obs_properties_add_text(m3, "model_about", text("FaceAvatar.ModelAbout"), OBS_TEXT_INFO);
+	obs_properties_add_path(m3, "model", text("FaceAvatar.Model"), OBS_PATH_FILE,
+				"3D characters (*.glb *.vrm *.gltf);;All files (*.*)", nullptr);
+	obs_property_t *turn = obs_properties_add_list(m3, "model_turn", text("FaceAvatar.ModelTurn"),
+						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(turn, text("FaceAvatar.TurnAuto"), 0);
+	obs_property_list_add_int(turn, text("FaceAvatar.TurnLeft"), 90);
+	obs_property_list_add_int(turn, text("FaceAvatar.TurnBack"), 180);
+	obs_property_list_add_int(turn, text("FaceAvatar.TurnRight"), 270);
+	obs_property_t *look = obs_properties_add_list(m3, "look", text("FaceAvatar.Look"), OBS_COMBO_TYPE_LIST,
+						       OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(look, text("FaceAvatar.LookAuto"), "auto");
+	obs_property_list_add_string(look, text("FaceAvatar.LookGlossy"), "glossy");
+	obs_property_list_add_string(look, text("FaceAvatar.LookCartoon"), "cartoon");
+	obs_property_list_add_string(look, text("FaceAvatar.LookFlat"), "flat");
+	p = obs_properties_add_int_slider(m3, "outline", text("FaceAvatar.Outline"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_bool(m3, "swing", text("FaceAvatar.Swing"));
+	p = obs_properties_add_int_slider(m3, "floppy", text("FaceAvatar.Floppy"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
+	obs_property_t *framing = obs_properties_add_list(m3, "framing", text("FaceAvatar.Framing"),
+							  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(framing, text("FaceAvatar.FramingAuto"), "auto");
+	obs_property_list_add_string(framing, text("FaceAvatar.FramingWhole"), "whole");
+	obs_property_list_add_string(framing, text("FaceAvatar.FramingHead"), "head");
+	obs_properties_add_bool(m3, "hide_behind_head", text("FaceAvatar.HideBehindHead"));
+	obs_properties_add_bool(m3, "smooth_edges", text("FaceAvatar.SmoothEdges"));
+	obs_properties_add_group(props, "model3d", text("FaceAvatar.Model3D"), OBS_GROUP_NORMAL, m3);
 	return props;
 }
 

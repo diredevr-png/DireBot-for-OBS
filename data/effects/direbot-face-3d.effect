@@ -1,0 +1,259 @@
+// DireBot Face Avatar, 3D characters (src/face/avatar3d.cpp):
+//   Draw     a part of the character: its colour and pictures, lit glossy
+//            (shine and reflections), as a cartoon (VRM's MToon: a shadow
+//            colour, a rim of light) or flat
+//   Outline  a cartoon outline: the part pushed out along its facing, only
+//            its far side drawn, so it shows round the edge
+//   Hidden   the hidden head shape: only depth, so what's behind your
+//            head is hidden
+//   Down     the picture drawn twice the size, halved: smooth edges
+// Points come already moved by the bones and expressions, in the world;
+// `cam` takes them to the camera's view (x right, y up, looking along -z)
+// for the light. Colours are worked in linear light and written as sRGB,
+// premultiplied.
+
+uniform float4x4 ViewProj;
+uniform float4x4 cam;
+uniform texture2d base_map;
+uniform texture2d shade_map;
+uniform texture2d emissive_map;
+uniform texture2d matcap_map;
+uniform texture2d metal_map;
+uniform texture2d image;
+// Base colour (linear, with its see-through), emissive glow.
+uniform float4 base_colour;
+uniform float3 emissive;
+// metal, rough, cutoff (0: none), see-through (1: blended)
+uniform float4 surface;
+// shadow shift, toony, rim power, rim lift
+uniform float4 toon;
+uniform float3 shade_colour;
+uniform float3 rim_colour;
+uniform float3 matcap_colour;
+// look (0 glossy, 1 cartoon, 2 flat), rim mix, has a matcap picture (1), opacity
+uniform float4 look;
+// where the pictures land: move xy, size zw
+uniform float4 uv_place;
+// Outline: how far out (world units), its colour, how much it's lit.
+uniform float outline_width;
+uniform float4 outline_colour;
+// Down: one texel of the big picture.
+uniform float2 texel;
+
+sampler_state wrapSampler {
+	Filter    = Linear;
+	AddressU  = Wrap;
+	AddressV  = Wrap;
+};
+
+sampler_state clampSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertIn {
+	float4 pos  : POSITION;
+	float4 norm : NORMAL;
+	float4 col  : COLOR;
+	float2 uv   : TEXCOORD0;
+};
+
+struct VertOut {
+	float4 pos  : POSITION;
+	float4 col  : COLOR;
+	float2 uv   : TEXCOORD0;
+	float3 vpos : TEXCOORD1;
+	float3 vnrm : TEXCOORD2;
+};
+
+VertOut VSDraw(VertIn v)
+{
+	VertOut o;
+	o.pos = mul(float4(v.pos.xyz, 1.0), ViewProj);
+	o.col = v.col;
+	o.uv = v.uv * uv_place.zw + uv_place.xy;
+	o.vpos = mul(float4(v.pos.xyz, 1.0), cam).xyz;
+	o.vnrm = mul(float4(v.norm.xyz, 0.0), cam).xyz;
+	return o;
+}
+
+VertOut VSOutline(VertIn v)
+{
+	VertOut o;
+	float3 p = v.pos.xyz + v.norm.xyz * outline_width;
+	o.pos = mul(float4(p, 1.0), ViewProj);
+	o.col = v.col;
+	o.uv = v.uv * uv_place.zw + uv_place.xy;
+	o.vpos = mul(float4(p, 1.0), cam).xyz;
+	o.vnrm = mul(float4(v.norm.xyz, 0.0), cam).xyz;
+	return o;
+}
+
+float3 lin(float3 c)
+{
+	return pow(max(c, float3(0.0, 0.0, 0.0)), float3(2.2, 2.2, 2.2));
+}
+
+float3 srgb(float3 c)
+{
+	return pow(saturate(c), float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
+}
+
+// A soft studio round it: bright above, a bright window up and to the
+// left, darker below - what shiny parts reflect.
+float3 studio(float3 r)
+{
+	float up = saturate(r.y * 0.5 + 0.5);
+	float3 c = lerp(float3(0.10, 0.10, 0.11), float3(0.95, 0.96, 1.0), up * up);
+	float window = saturate((dot(r, normalize(float3(-0.45, 0.55, 0.7))) - 0.82) * 8.0);
+	return c + float3(1.6, 1.6, 1.6) * window;
+}
+
+float4 PSDraw(VertOut v) : TARGET
+{
+	// Every picture is read first, the same way at every point.
+	float4 tex = base_map.Sample(wrapSampler, v.uv);
+	float4 shade_tex = shade_map.Sample(wrapSampler, v.uv);
+	float4 glow_tex = emissive_map.Sample(wrapSampler, v.uv);
+	float4 mr = metal_map.Sample(wrapSampler, v.uv);
+	float3 N = normalize(v.vnrm);
+	float3 V = normalize(-v.vpos);
+	if (dot(N, V) < 0.0)
+		N = -N;
+	float2 cap_uv = float2(N.x * 0.5 + 0.5, 0.5 - N.y * 0.5);
+	float4 cap = matcap_map.Sample(clampSampler, cap_uv);
+
+	float4 base = base_colour * float4(lin(tex.rgb), tex.a) * float4(lin(v.col.rgb), v.col.a);
+	float alpha = base.a * look.w;
+	if (surface.z > 0.0 && base.a < surface.z)
+		discard;
+	if (surface.w < 0.5)
+		alpha = look.w;
+	float3 glow = emissive * lin(glow_tex.rgb);
+
+	float3 L = normalize(float3(-0.45, 0.6, 0.66));
+	float3 L2 = normalize(float3(0.7, 0.15, 0.7));
+	float nl = dot(N, L);
+	float nv = saturate(dot(N, V));
+	float3 col;
+	if (look.x > 1.5) {
+		col = base.rgb + glow;
+	} else if (look.x > 0.5) {
+		// Cartoon: lit or in shadow, with a sharp or soft line between.
+		float s = nl + toon.x;
+		float t = saturate((s - (-1.0 + toon.y)) / max(0.0001, 2.0 - 2.0 * toon.y));
+		float3 shade = shade_colour * lin(shade_tex.rgb);
+		col = lerp(shade, base.rgb, t);
+		col = col + base.rgb * 0.12;
+		float rim = pow(saturate(1.0 - nv + toon.w), max(toon.z, 0.001));
+		col = col + rim_colour * rim * lerp(1.0, saturate(t + 0.3), look.y);
+		col = col + matcap_colour * lin(cap.rgb) * look.z;
+		col = col + glow;
+	} else {
+		// Glossy: light from two lamps, shine, and the studio reflected.
+		float metal = saturate(surface.x * mr.b);
+		float rough = saturate(surface.y * mr.g);
+		float a = max(rough * rough, 0.003);
+		float3 f0 = lerp(float3(0.04, 0.04, 0.04), base.rgb, metal);
+		float3 diffuse = base.rgb * (1.0 - metal);
+		float3 ambient = lerp(float3(0.16, 0.15, 0.15), float3(0.42, 0.43, 0.46), N.y * 0.5 + 0.5);
+		col = diffuse * (ambient + float3(1.0, 0.98, 0.95) * saturate(nl) * 1.05 +
+				 float3(0.55, 0.58, 0.65) * saturate(dot(N, L2)) * 0.45);
+		float3 H = normalize(L + V);
+		float nh = saturate(dot(N, H));
+		float d = nh * nh * (a * a - 1.0) + 1.0;
+		float D = a * a / (3.14159 * d * d);
+		float k = (rough + 1.0) * (rough + 1.0) / 8.0;
+		float G = 1.0 / ((nv * (1.0 - k) + k) * (saturate(nl) * (1.0 - k) + k));
+		float3 F = f0 + (float3(1.0, 1.0, 1.0) - f0) * pow(1.0 - saturate(dot(H, V)), 5.0);
+		col = col + D * G * F * saturate(nl) * 0.25;
+		float3 R = reflect(-V, N);
+		float3 env = lerp(studio(R), float3(0.5, 0.5, 0.52), rough);
+		float3 fe = f0 + (max(float3(1.0 - rough, 1.0 - rough, 1.0 - rough), f0) - f0) * pow(1.0 - nv, 5.0);
+		col = col + env * fe * (1.0 - rough * 0.7);
+		col = col + glow;
+	}
+	return float4(srgb(col) * alpha, alpha);
+}
+
+float4 PSOutline(VertOut v) : TARGET
+{
+	float4 tex = base_map.Sample(wrapSampler, v.uv);
+	float3 N = normalize(v.vnrm);
+	float3 V = normalize(-v.vpos);
+	// Only the far side: the near side would cover the part itself.
+	if (dot(N, V) > 0.0)
+		discard;
+	if (surface.z > 0.0 && base_colour.a * tex.a < surface.z)
+		discard;
+	float3 c = outline_colour.rgb;
+	float3 lit = c * lerp(1.0, 0.85, outline_colour.a);
+	return float4(srgb(lit) * look.w, look.w);
+}
+
+float4 PSHidden(VertOut v) : TARGET
+{
+	return float4(0.0, 0.0, 0.0, 0.0);
+}
+
+struct DownData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+DownData VSDown(DownData v)
+{
+	DownData o;
+	o.pos = mul(float4(v.pos.xyz, 1.0), ViewProj);
+	o.uv = v.uv;
+	return o;
+}
+
+float4 PSDown(DownData v) : TARGET
+{
+	// Each pixel is the middle of 2 x 2 of the big picture's, so one
+	// smooth read is their average; two more either side soften it.
+	float4 c = image.Sample(clampSampler, v.uv) * 0.5;
+	c = c + image.Sample(clampSampler, v.uv + float2(texel.x, 0.0)) * 0.125;
+	c = c + image.Sample(clampSampler, v.uv - float2(texel.x, 0.0)) * 0.125;
+	c = c + image.Sample(clampSampler, v.uv + float2(0.0, texel.y)) * 0.125;
+	c = c + image.Sample(clampSampler, v.uv - float2(0.0, texel.y)) * 0.125;
+	return c;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDraw(v);
+		pixel_shader  = PSDraw(v);
+	}
+}
+
+technique Outline
+{
+	pass
+	{
+		vertex_shader = VSOutline(v);
+		pixel_shader  = PSOutline(v);
+	}
+}
+
+technique Hidden
+{
+	pass
+	{
+		vertex_shader = VSDraw(v);
+		pixel_shader  = PSHidden(v);
+	}
+}
+
+technique Down
+{
+	pass
+	{
+		vertex_shader = VSDown(v);
+		pixel_shader  = PSDown(v);
+	}
+}
