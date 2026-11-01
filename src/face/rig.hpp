@@ -27,8 +27,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //     tools give them ("Blink", "A", "Smile", "まばたき"...) are worked
 //     out from yours. Your eyes' looks turn a VRM's eyes.
 //   - Swinging parts: VRM's spring bones as VRM says they move, bumping
-//     into its colliders; a character whose bones are one chain (the
-//     Sausage's string of sausages) swings on it, hanging from its first.
+//     into its colliders; a character's dangly parts (the Sausage's
+//     string of sausages, a doll's ears and legs) swing, each hanging from
+//     its first bone - or, set up (an imported Lens Studio project), the
+//     chains it names, pulled as it says, and parts that stay upright and
+//     trail after your head (a doll's body).
+//   - Where your real eyes and mouth go on it (face_spots).
 //
 // Then its points are moved by its bones and expressions ("skinned"),
 // ready to draw. Plain code over plain numbers (tests/unit_model.cpp).
@@ -42,6 +46,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "math3d.hpp"
 #include "model.hpp"
+#include "setup.hpp"
 #include "tracker.hpp"
 
 namespace direbot::face {
@@ -57,6 +62,9 @@ struct RigOptions {
 	float neck_share = 0.4f;
 	// A character made standing in a T: its arms down by its sides.
 	bool arms_down = true;
+	// Its set-up (setup.hpp): the chains that swing and the parts that
+	// stay upright, if it names any.
+	std::shared_ptr<const CharacterSetup> setup;
 };
 
 struct Drive {
@@ -72,6 +80,10 @@ struct Drive {
 	float dt = 0;     // seconds since the last frame
 	bool look = true; // turn its eyes with yours
 	bool expressions = true;
+	// The model -> the world with your head held straight, for parts that
+	// stay upright (`place` if not given).
+	M4 upright;
+	bool has_upright = false;
 };
 
 class Rig {
@@ -103,6 +115,10 @@ public:
 	const std::vector<std::vector<float>> &weights() const { return weights_; }
 	int springs() const { return (int)springs_.size(); }
 	bool auto_chain() const { return auto_chain_; }
+	int upright_parts() const { return (int)upright_.size(); }
+	// What your eyes and mouth ride on: the model -> the world as its head
+	// is now (its head bone's, or all of it turned).
+	M4 head_frame() const;
 
 private:
 	struct Joint {
@@ -111,6 +127,16 @@ private:
 		V3 tail;   // in its own space
 		V3 axis;   // the tail's way, in its own space
 		V3 now, before;
+		// A set-up chain (as Lens Studio's swing): pulled by `pull` (the
+		// model's units a second, each second; turned with the head, or
+		// not), never back to how it was made.
+		bool pulled = false, with_head = true;
+		V3 pull;
+	};
+	struct Upright {
+		int node = -1;
+		float follow = 5;
+		V3 at;
 	};
 	struct Chain {
 		std::vector<Joint> joints;
@@ -132,6 +158,8 @@ private:
 	void drive_head(const Drive &d);
 	void drive_eyes(const Drive &d);
 	void step_springs(float dt, float scale);
+	void stand_upright(const Drive &d);
+	Quat head_turn_now() const;
 	void skin();
 
 	std::shared_ptr<const Model> model_;
@@ -151,6 +179,8 @@ private:
 	};
 	std::vector<Arm> arms_;
 	std::vector<Chain> springs_;
+	std::vector<Upright> upright_;
+	std::vector<char> held_; // a node standing upright this frame
 	bool auto_chain_ = false;
 	bool settled_ = true;
 	float spring_time_ = 0;
@@ -174,6 +204,7 @@ struct Framing {
 	float height = 1;      // its height in the world
 	V3 pivot;              // what it turns round, whole (model space)
 	bool has_pivot = false;
+	M4 upright; // the model -> the world, your head held straight (Drive::upright)
 };
 
 // In its own spot: the picture `w` x `h`, the character `size` of it
@@ -207,6 +238,26 @@ M4 matrix_of_rows(const float rows[16]);
 // Your head's turn from the glide (degrees; tilt in radians, clockwise as
 // the picture shows it), mirrored or not.
 Quat head_turn(float yaw, float pitch, float tilt, bool mirror);
+
+// Where your eyes and mouth go on it: the character's own left eye,
+// right eye and mouth, each its middle in the model at rest and its size
+// (the model's units) on a card facing its front. As its set-up says;
+// else found from its blink and mouth expressions, its eye bones, or (if
+// none) a guess at the front of its top half - each worked out again only
+// when something changes.
+struct FaceSpot {
+	V3 at;
+	float w = 0, h = 0;
+};
+struct FaceSpots {
+	FaceSpot spot[3];
+	// How each was found: "set up", "expressions", "eye bones", "guessed".
+	const char *from[3] = {"guessed", "guessed", "guessed"};
+	// Its front picture's box (the facing model's left, top, width,
+	// height), for spots given as shares of it.
+	float box[4] = {0, 0, 1, 1};
+};
+FaceSpots face_spots(const std::shared_ptr<const Model> &m, Quat facing, const CharacterSetup &setup);
 
 // Which way it most likely faces, as a turn (degrees about y) to face
 // the camera: a VRM as its version says; any other the way glTF says

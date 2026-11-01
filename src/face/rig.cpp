@@ -36,6 +36,8 @@ constexpr float RAD = PI_F / 180;
 // frame rate, so they swing the same at 30 and 60 frames a second.
 constexpr float SPRING_STEP = 1.0f / 60;
 constexpr int MOST_STEPS = 4;
+// A set-up chain slows only a little (Lens Studio's swing doesn't at all).
+constexpr float PULLED_DRAG = 0.02f;
 // How far your eyes turn at their most (degrees), for a full look.
 constexpr float EYE_SIDEWAYS = 30, EYE_UPDOWN = 25;
 
@@ -229,6 +231,30 @@ float scale_of(const M4 &m)
 {
 	return length(V3{m.m[0], m.m[1], m.m[2]});
 }
+// A node by its name: a bone of a skin first, as a set-up names them.
+int node_named(const Model &m, const std::string &name)
+{
+	int any = -1;
+	for (const Skin &skin : m.skins)
+		for (int j : skin.joints)
+			if (j >= 0 && j < (int)m.nodes.size() && m.nodes[j].name == name)
+				return j;
+	for (size_t i = 0; i < m.nodes.size() && any < 0; i++)
+		if (m.nodes[i].name == name)
+			any = (int)i;
+	return any;
+}
+
+int depth_of(const Model &m, int node)
+{
+	int d = 0;
+	while (node >= 0 && d < 1000) {
+		node = m.nodes[node].parent;
+		d++;
+	}
+	return d;
+}
+
 // Where on a line from a to b is nearest p.
 V3 nearest_on(V3 a, V3 b, V3 p)
 {
@@ -303,6 +329,7 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 	}
 	rest_world_ = rest_world(m);
 	world_ = rest_world_;
+	held_.assign(n, 0);
 	head_ = m.bone("head");
 	neck_ = m.bone("neck");
 	left_eye_ = m.bone("leftEye");
@@ -391,6 +418,17 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 		drivers_.clear();
 	drivers_.insert(drivers_.end(), arkit.begin(), arkit.end());
 
+	// Parts that stay upright (a doll's body), as its set-up names them.
+	const CharacterSetup *setup = options_.setup.get();
+	if (setup)
+		for (const UprightSetup &u : setup->upright) {
+			Upright up;
+			up.node = node_named(m, u.bone);
+			up.follow = u.follow;
+			if (up.node >= 0)
+				upright_.push_back(up);
+		}
+
 	// Swinging parts.
 	if (!options_.springs)
 		return;
@@ -415,7 +453,46 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 		if (!c.joints.empty())
 			springs_.push_back(c);
 	}
-	if (!m.is_vrm() && springs_.empty()) {
+	if (setup && setup->chains_given) {
+		// The chains its set-up names (an imported Lens Studio project's):
+		// each hangs from its first bone and swings, pulled as it says.
+		std::vector<std::pair<int, Chain>> given;
+		for (const ChainSetup &cs : setup->chains) {
+			std::vector<int> nodes;
+			for (const std::string &b : cs.bones)
+				nodes.push_back(node_named(m, b));
+			if (std::find(nodes.begin(), nodes.end(), -1) != nodes.end())
+				continue;
+			// Both ends held: the last link stays as it is.
+			const size_t links = nodes.size() - 1 - (cs.both_ends && nodes.size() > 2 ? 1 : 0);
+			Chain c;
+			for (size_t i = 0; i < links; i++) {
+				Joint j;
+				j.s.node = nodes[i];
+				j.s.tail_node = nodes[i + 1];
+				j.tail = local_tail(nodes[i], nodes[i + 1], {});
+				if (length(j.tail) < 1e-6f)
+					continue;
+				j.axis = normalized(j.tail);
+				j.rest = m.nodes[nodes[i]].r;
+				j.pulled = true;
+				j.with_head = cs.with_head;
+				j.pull = cs.pull;
+				j.s.stiffness = 0;
+				j.s.gravity = 0;
+				j.s.drag = PULLED_DRAG;
+				j.s.radius = 0;
+				c.joints.push_back(j);
+			}
+			if (!c.joints.empty())
+				given.push_back({depth_of(m, nodes[0]), c});
+		}
+		// A chain hanging off another swings after it.
+		std::stable_sort(given.begin(), given.end(),
+				 [](const auto &a, const auto &b) { return a.first < b.first; });
+		for (auto &g : given)
+			springs_.push_back(g.second);
+	} else if (!m.is_vrm() && springs_.empty()) {
 		// Its dangly parts (the Sausage's string of sausages, a doll's ears
 		// and legs): each hangs from its first bone and swings, sized to the
 		// character. A person's skeleton: only hair, tails and the like.
@@ -475,7 +552,9 @@ void Rig::world_from(int start)
 		const int n = stack.back();
 		stack.pop_back();
 		const int p = m.nodes[n].parent;
-		world_[n] = (p >= 0 ? world_[p] : root_) * matrix_of(t_[n], r_[n], s_[n]);
+		// A part standing upright keeps the place it was given.
+		if (!held_[n])
+			world_[n] = (p >= 0 ? world_[p] : root_) * matrix_of(t_[n], r_[n], s_[n]);
 		for (int c : m.nodes[n].children)
 			stack.push_back(c);
 	}
@@ -611,6 +690,7 @@ void Rig::step_springs(float dt, float scale)
 	// Dangly parts found by us: the character as made is how they hang
 	// upright, so gravity pulls only as far as it's tipped from that.
 	const V3 upright_down = auto_chain_ ? normalized(direction(root_, {0, -1, 0}), {0, -1, 0}) : V3{0, 0, 0};
+	const Quat head_turn = head_turn_now();
 	for (Chain &c : springs_) {
 		for (Joint &j : c.joints) {
 			const int n = j.s.node;
@@ -623,9 +703,17 @@ void Rig::step_springs(float dt, float scale)
 				continue;
 			const V3 rest_dir = rotate(parent_rot * j.rest, j.axis);
 			const float k = scale * auto_k;
-			V3 next = j.now + (j.now - j.before) * (1 - j.s.drag) +
-				  rest_dir * (j.s.stiffness * stiff_k * dt * k) +
-				  (j.s.gravity_dir - upright_down) * (j.s.gravity * dt * k);
+			V3 next;
+			if (j.pulled) {
+				// Swung and pulled, never back to how it was made: it hangs
+				// the way it's pulled (with the head, or down).
+				const V3 pull = j.with_head ? rotate(head_turn, j.pull) : j.pull;
+				next = j.now + (j.now - j.before) * (1 - j.s.drag) + pull * (dt * dt * scale);
+			} else {
+				next = j.now + (j.now - j.before) * (1 - j.s.drag) +
+				       rest_dir * (j.s.stiffness * stiff_k * dt * k) +
+				       (j.s.gravity_dir - upright_down) * (j.s.gravity * dt * k);
+			}
 			next = head + normalized(next - head, rest_dir) * len;
 			for (int ci : c.colliders) {
 				if (ci < 0 || ci >= (int)m.colliders.size())
@@ -652,11 +740,54 @@ void Rig::step_springs(float dt, float scale)
 	}
 }
 
+Quat Rig::head_turn_now() const
+{
+	// The facing model's directions (x right, y up, z out of its face)
+	// as its head has them now.
+	const Quat F = options_.facing;
+	if (head_ >= 0)
+		return rot_of(world_[head_]) * conj(rot_of(rest_world_[head_])) * conj(F);
+	return rot_of(root_) * conj(F);
+}
+
+M4 Rig::head_frame() const
+{
+	if (head_ >= 0)
+		return world_[head_] * inverse(rest_world_[head_]);
+	return root_;
+}
+
+void Rig::stand_upright(const Drive &d)
+{
+	if (upright_.empty())
+		return;
+	const Model &m = *model_;
+	const M4 &up = d.has_upright ? d.upright : d.place;
+	for (Upright &u : upright_) {
+		// It trails after where it would be, turned with your head...
+		const V3 target = move_of(world_[u.node]);
+		if (settled_ || u.follow <= 0)
+			u.at = target;
+		else
+			u.at = u.at + (target - u.at) * (1 - std::exp(-u.follow * std::max(0.0f, d.dt)));
+		// ...standing as it was made.
+		M4 w = up * rest_world_[u.node];
+		w.m[12] = u.at.x;
+		w.m[13] = u.at.y;
+		w.m[14] = u.at.z;
+		world_[u.node] = w;
+		held_[u.node] = 1;
+		for (int c : m.nodes[u.node].children)
+			world_from(c);
+	}
+}
+
 void Rig::pose(const Drive &d)
 {
 	const Model &m = *model_;
 	for (size_t i = 0; i < m.nodes.size(); i++)
 		r_[i] = m.nodes[i].r;
+	std::fill(held_.begin(), held_.end(), 0);
 	// No head bone: it all turns round its head.
 	if (head_ < 0) {
 		const Quat F = options_.facing;
@@ -681,6 +812,7 @@ void Rig::pose(const Drive &d)
 	if (!settled_ && (d.dt > 0.25f || length(root_at - last_root_) > height_ * scale * 0.75f))
 		settled_ = true;
 	last_root_ = root_at;
+	stand_upright(d);
 	if (settled_) {
 		for (Chain &c : springs_)
 			for (Joint &j : c.joints) {
@@ -907,6 +1039,7 @@ Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, floa
 	f.world_scale = s * grow;
 	f.height = extent.y * s * grow;
 	f.pivot = rotate(conj(facing), middle);
+	f.upright = f.place;
 	return f;
 }
 
@@ -922,6 +1055,8 @@ Framing frame_worn(const Model &m, Quat facing, const WornPlace &place, const M4
 	(void)aspect;
 	const float pose_scale = length(V3{pose.m[0], pose.m[1], pose.m[2]});
 	f.world_scale = units * pose_scale;
+	// Your head held straight: where it is, facing the camera.
+	f.upright = moved(move_of(pose)) * scaled(pose_scale) * worn;
 	V3 middle, extent;
 	facing_bounds(m, facing, middle, extent);
 	f.height = extent.y * f.world_scale;
@@ -932,6 +1067,244 @@ V3 head_in_model(const Model &m, Quat facing, const WornPlace &place)
 {
 	float units = 1;
 	return point(inverse(worn_matrix(m, facing, place, units)), V3{});
+}
+
+namespace {
+
+// The surface nearest you at (x, y), the model facing +z: its z, or false.
+bool front_z(const std::vector<std::vector<V3>> &points, const std::vector<Rig::Part> &parts, float x, float y,
+	     float &z)
+{
+	bool found = false;
+	for (size_t pi = 0; pi < parts.size(); pi++) {
+		const std::vector<uint32_t> &index = parts[pi].prim->index;
+		const std::vector<V3> &p = points[pi];
+		for (size_t t = 0; t + 2 < index.size(); t += 3) {
+			if (index[t] >= p.size() || index[t + 1] >= p.size() || index[t + 2] >= p.size())
+				continue;
+			const V3 a = p[index[t]], b = p[index[t + 1]], c = p[index[t + 2]];
+			const float d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+			if (std::fabs(d) < 1e-12f)
+				continue;
+			const float u = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / d;
+			const float v = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / d;
+			const float w = 1 - u - v;
+			if (u < 0 || v < 0 || w < 0)
+				continue;
+			const float hit = a.z * u + b.z * v + c.z * w;
+			if (!found || hit > z) {
+				z = hit;
+				found = true;
+			}
+		}
+	}
+	return found;
+}
+
+// What an expression does, for finding the eyes and mouth: 1 its left eye
+// shuts, 2 its right, 3 both; 10 + how surely it opens the mouth.
+int face_part_of(const std::string &name)
+{
+	static const int blink_l = move_id("eyeBlinkLeft"), blink_r = move_id("eyeBlinkRight"),
+			 funnel = move_id("mouthFunnel"), pucker = move_id("mouthPucker"), jaw = move_id("jawOpen");
+	const int move = arkit_move(name);
+	if (move > 0) {
+		if (move == blink_l)
+			return 1;
+		if (move == blink_r)
+			return 2;
+		if (move == funnel || move == pucker)
+			return 12;
+		if (move == jaw)
+			return 11;
+		return 0;
+	}
+	const std::string e = name == "blink" || name == "blinkLeft" || name == "blinkRight" || name == "aa"
+				      ? name
+				      : usual_expression(name);
+	if (e == "blink")
+		return 3;
+	if (e == "blinkLeft")
+		return 1;
+	if (e == "blinkRight")
+		return 2;
+	if (e == "aa")
+		return 13;
+	return 0;
+}
+
+} // namespace
+
+FaceSpots face_spots(const std::shared_ptr<const Model> &mp, Quat facing, const CharacterSetup &setup)
+{
+	const Model &m = *mp;
+	FaceSpots out;
+	V3 middle, size;
+	facing_bounds(m, facing, middle, size);
+	out.box[0] = middle.x - size.x / 2;
+	out.box[1] = middle.y + size.y / 2;
+	out.box[2] = size.x;
+	out.box[3] = size.y;
+	const Quat back = conj(facing);
+
+	// The model at rest (as it stands, its own expressions only), facing +z.
+	RigOptions ro;
+	ro.facing = facing;
+	ro.springs = false;
+	ro.arms_down = false;
+	Rig rig(mp, ro);
+	Drive d;
+	d.expressions = false;
+	d.look = false;
+	rig.pose(d);
+	const std::vector<Rig::Part> &parts = rig.parts();
+	std::vector<std::vector<V3>> points(parts.size());
+	for (size_t pi = 0; pi < parts.size(); pi++) {
+		points[pi].resize(parts[pi].pos.size());
+		for (size_t v = 0; v < parts[pi].pos.size(); v++)
+			points[pi][v] = rotate(facing, parts[pi].pos[v]);
+	}
+	auto surface = [&](float x, float y, float fallback) {
+		float z = fallback;
+		front_z(points, parts, x, y, z);
+		return z;
+	};
+	bool have[3] = {};
+	V3 at[3];
+
+	// Its blink and mouth expressions: the middle of what they move.
+	std::map<std::pair<int, int>, std::string> vrm_names;
+	for (const Expression &e : m.expressions)
+		for (const Expression::Bind &b : e.binds)
+			vrm_names[{b.mesh, b.morph}] = e.name;
+	// What each moves (the facing model's points) and how far.
+	std::vector<std::pair<V3, float>> moved_by[3];
+	int mouth_kind = 0;
+	for (int pass = 0; pass < 2; pass++)
+		for (size_t pi = 0; pi < parts.size(); pi++) {
+			const int mi = m.nodes[parts[pi].node].mesh;
+			const Primitive &prim = *parts[pi].prim;
+			if (mi < 0)
+				continue;
+			const Mesh &mesh = m.meshes[mi];
+			for (size_t k = 0; k < prim.morphs.size(); k++) {
+				auto named = vrm_names.find({mi, (int)k});
+				const std::string name = named != vrm_names.end()      ? named->second
+							 : k < mesh.morph_names.size() ? mesh.morph_names[k]
+										       : std::string();
+				const int kind = face_part_of(name);
+				// First pass: which mouth expression says most surely where it is.
+				if (pass == 0) {
+					if (kind > 10)
+						mouth_kind = std::max(mouth_kind, kind);
+					continue;
+				}
+				if (kind == 0 || (kind > 10 && kind != mouth_kind))
+					continue;
+				const std::vector<V3> &moved = prim.morphs[k].pos;
+				for (size_t v = 0; v < moved.size() && v < points[pi].size(); v++) {
+					const float w = length(moved[v]);
+					if (w < 1e-7f)
+						continue;
+					const V3 p = points[pi][v];
+					const int which = kind > 10   ? 2
+							  : kind == 3 ? (p.x >= middle.x ? 0 : 1)
+								      : kind - 1;
+					moved_by[which].push_back({p, w});
+				}
+			}
+		}
+	// Each one's middle and size: the box round what it moves most (a
+	// blink's lids, "aa"'s lips).
+	V3 box_size[3];
+	for (int i = 0; i < 3; i++) {
+		float most = 0;
+		for (const auto &pw : moved_by[i])
+			most = std::max(most, pw.second);
+		if (most <= 0)
+			continue;
+		V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f}, sum;
+		float weight = 0;
+		for (const auto &pw : moved_by[i]) {
+			if (pw.second < 0.25f * most)
+				continue;
+			const V3 p = pw.first;
+			lo = {std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
+			hi = {std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
+			sum = sum + p * pw.second;
+			weight += pw.second;
+		}
+		at[i] = {(lo.x + hi.x) / 2, (lo.y + hi.y) / 2, sum.z / weight};
+		box_size[i] = hi - lo;
+		have[i] = true;
+		out.from[i] = "expressions";
+	}
+
+	// Its eye bones (a VRM's), on the surface in front of them.
+	const int eye_bone[2] = {m.bone("leftEye"), m.bone("rightEye")};
+	if ((!have[0] || !have[1]) && eye_bone[0] >= 0 && eye_bone[1] >= 0) {
+		const std::vector<M4> rest = rest_world(m);
+		for (int i = 0; i < 2; i++) {
+			const V3 b = rotate(facing, move_of(rest[eye_bone[i]]));
+			at[i] = {b.x, b.y, surface(b.x, b.y, b.z)};
+			have[i] = true;
+			out.from[i] = "eye bones";
+		}
+	}
+	// A guess: the front of its top half.
+	const float top = middle.y + size.y / 2;
+	if (!have[0] || !have[1]) {
+		const float gap = 0.3f * size.x, y = top - 0.35f * size.y;
+		for (int i = 0; i < 2; i++) {
+			const float x = middle.x + (i == 0 ? gap : -gap) / 2;
+			at[i] = {x, y, surface(x, y, middle.z + size.z / 2)};
+			out.from[i] = "guessed";
+		}
+	}
+	const float gap = std::max(1e-4f, std::fabs(at[0].x - at[1].x));
+	if (!have[2]) {
+		const float x = (at[0].x + at[1].x) / 2;
+		const float y = std::max(middle.y - size.y / 2, (at[0].y + at[1].y) / 2 - 0.8f * gap);
+		at[2] = {x, y, surface(x, y, middle.z + size.z / 2)};
+		out.from[2] = "guessed";
+	}
+	for (int i = 0; i < 3; i++) {
+		FaceSpot &s = out.spot[i];
+		// As big as what its expression moves (a drawn character's big eyes
+		// covered), within reason; else as a person's are, for the gap.
+		const V3 b = box_size[i];
+		const bool eye = i < 2;
+		float w = eye ? 0.55f * gap : 0.9f * gap;
+		if (b.x > 0)
+			w = std::min(eye ? 0.85f : 1.3f, std::max(eye ? 0.35f : 0.5f, b.x * 1.1f / gap)) * gap;
+		float h = w * (eye ? 0.65f : 0.55f);
+		if (b.y > 0)
+			h = std::min(eye ? 0.95f : 0.7f, std::max(eye ? 0.5f : 0.4f, b.y * 1.1f / w)) * w;
+		s.w = w;
+		s.h = h;
+		// Just in front of the surface, in the model.
+		s.at = rotate(back, at[i] + V3{0, 0, 0.02f * gap});
+	}
+
+	// As its set-up says.
+	for (int i = 0; i < 3; i++) {
+		const SpotSetup &g = setup.spots[i];
+		if (!g.given)
+			continue;
+		FaceSpot &s = out.spot[i];
+		if (g.has_at) {
+			s.at = g.at;
+			s.w = g.w;
+			s.h = g.h;
+		} else {
+			const float x = out.box[0] + g.x * out.box[2], y = out.box[1] - g.y * out.box[3];
+			s.at = rotate(back, V3{x, y, surface(x, y, middle.z + size.z / 2) + 0.01f * size.x});
+			s.w = g.w * out.box[2];
+			s.h = g.h * out.box[2];
+		}
+		out.from[i] = "set up";
+	}
+	return out;
 }
 
 } // namespace direbot::face

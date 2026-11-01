@@ -1061,6 +1061,165 @@ static void test_facing_arms_and_wearing()
 	CHECK(near(fb.height, 24, 1e-3) && near(ft.height, 24, 1e-3));
 }
 
+static void test_set_up()
+{
+	// Reading it: what can't be used is left out.
+	CHECK(setup_from("").empty() && setup_from("not json").empty() && setup_from("[1, 2]").empty());
+	const CharacterSetup su = setup_from(R"({
+		"facing": [0, 2, 0, 2], "pivot": [0, -0.1, 0],
+		"spots": {"left_eye": {"at": [0.1, 0.2, 0.3], "w": 0.05, "h": 0.03},
+			  "right_eye": {"x": 0.4, "y": 0.3, "w": 0.1, "h": 0.06},
+			  "mouth": {"at": [0, 0, 0], "w": -1, "h": 1}},
+		"chains": [{"bones": ["A", "B", "C"], "pull": [1, -1, 0], "with_head": false},
+			   {"bones": ["Only one"]}, "junk"],
+		"upright": [{"bone": "Body", "follow": 4.5}, {"follow": 2}]})");
+	CHECK(!su.empty() && su.has_facing && near(su.facing.y, 0.70710678, 1e-5) &&
+	      near(su.facing.w, 0.70710678, 1e-5));
+	CHECK(su.has_pivot && near3(su.pivot, {0, -0.1f, 0}, 1e-6f));
+	CHECK(su.spots[0].given && su.spots[0].has_at && near3(su.spots[0].at, {0.1f, 0.2f, 0.3f}, 1e-6f));
+	CHECK(su.spots[1].given && !su.spots[1].has_at && near(su.spots[1].x, 0.4, 1e-6) &&
+	      near(su.spots[1].w, 0.1, 1e-6));
+	CHECK(!su.spots[2].given);
+	CHECK(su.chains_given && su.chains.size() == 1 && su.chains[0].bones.size() == 3 && !su.chains[0].with_head &&
+	      near3(su.chains[0].pull, {1, -1, 0}, 1e-6f));
+	CHECK(su.upright.size() == 1 && su.upright[0].bone == "Body" && near(su.upright[0].follow, 4.5, 1e-6));
+	CHECK(setup_from(R"({"chains": []})").chains_given);
+
+	// A doll as an imported Lens has it: its ear a chain pulled out to
+	// its side (turning with its head), its leg pulled straight down the
+	// picture, its body standing upright and trailing after its head.
+	Bones d;
+	const int root = d.add("Bone", -1, {0, 0, 0});
+	const int body = d.add("Bone.001", root, {0, -0.1f, 0});
+	const int e0 = d.add("Bone.002", root, {0.1f, 0.1f, 0});
+	const int e1 = d.add("Bone.003", e0, {0, 0.15f, 0});
+	const int e2 = d.add("Bone.004", e1, {0.03f, 0.15f, 0});
+	const int l0 = d.add("Bone.005", body, {0.05f, -0.2f, 0});
+	const int l1 = d.add("Bone.006", l0, {0, -0.12f, 0});
+	const int l2 = d.add("Bone.007", l1, {0, -0.12f, 0});
+	auto m = d.load_it();
+	auto setup = std::make_shared<CharacterSetup>(setup_from(R"({
+		"chains": [{"bones": ["Bone.005", "Bone.006", "Bone.007"], "pull": [0, -20, 0], "with_head": false},
+			   {"bones": ["Bone.002", "Bone.003", "Bone.004"], "pull": [20, 0, 0]},
+			   {"bones": ["Bone.002", "No such bone"]}],
+		"upright": [{"bone": "Bone.001", "follow": 5}]})"));
+	RigOptions o;
+	o.setup = setup;
+	Rig rig(m, o);
+	// Only the chains it names swing, the one hanging off another after it.
+	CHECK(!rig.auto_chain() && rig.springs() == 2 && rig.upright_parts() == 1);
+	auto pt = [&](const Rig &r, int i) {
+		return r.parts()[0].pos[i];
+	};
+	auto way = [](V3 a, V3 b) {
+		return normalized(b - a);
+	};
+	Drive s = still();
+	for (int i = 0; i < 240; i++)
+		rig.pose(s);
+	// Pulled as it says - not the shape it was made: the ear lies out to
+	// its side, the leg hangs straight down.
+	CHECK(dot(way(pt(rig, e0), pt(rig, e2)), {1, 0, 0}) > 0.95f);
+	CHECK(dot(way(pt(rig, l0), pt(rig, l2)), {0, -1, 0}) > 0.99f);
+	CHECK(near(length(pt(rig, e2) - pt(rig, e0)), length(d.at[e2] - d.at[e0]), 0.03));
+	// The head turned a quarter (your head tipped right over): the ear's
+	// pull turns with it; the leg still hangs straight down the picture,
+	// and the body stays standing as it was made.
+	Drive t = still();
+	const Quat tip = axis_angle({0, 0, 1}, 1.2f);
+	t.head = tip;
+	rig.set_pivot({0, 0, 0});
+	for (int i = 0; i < 600; i++)
+		rig.pose(t);
+	CHECK(dot(way(pt(rig, e0), pt(rig, e2)), rotate(tip, {1, 0, 0})) > 0.95f);
+	CHECK(dot(way(pt(rig, l0), pt(rig, l2)), {0, -1, 0}) > 0.99f);
+	CHECK(near3(pt(rig, body), d.at[body] + (rotate(tip, d.at[body]) - d.at[body]), 1e-3f));
+	CHECK(near3(pt(rig, l0) - pt(rig, body), d.at[l0] - d.at[body], 1e-3f));
+	// Moved suddenly (but not far enough to start again): the head jumps,
+	// the body trails after it and catches up.
+	for (int i = 0; i < 240; i++)
+		rig.pose(s);
+	Drive mv = still();
+	mv.place = moved({0.05f, 0, 0});
+	rig.pose(mv);
+	const float behind = pt(rig, root).x - pt(rig, body).x;
+	CHECK(behind > 0.03f);
+	for (int i = 0; i < 120; i++)
+		rig.pose(mv);
+	CHECK(std::fabs(pt(rig, root).x - pt(rig, body).x) < 0.002f);
+	// Upright: as `upright` puts it, not as the head is turned.
+	Drive u = mv;
+	u.head = tip;
+	u.upright = moved({0.05f, 0, 0});
+	u.has_upright = true;
+	for (int i = 0; i < 120; i++)
+		rig.pose(u);
+	CHECK(near3(pt(rig, l0) - pt(rig, body), d.at[l0] - d.at[body], 1e-3f));
+
+	// Where your eyes and mouth go: a face with ARKit's expressions on it.
+	GlbPart face;
+	face.name = "face";
+	const int N = 8;
+	for (int y = 0; y <= N; y++)
+		for (int x = 0; x <= N; x++)
+			face.pos.push_back({-0.5f + (float)x / N, -0.5f + (float)y / N, 0.5f});
+	for (int y = 0; y < N; y++)
+		for (int x = 0; x < N; x++) {
+			const uint32_t a = y * (N + 1) + x;
+			face.index.insert(face.index.end(), {a, a + 1, a + N + 1, a + 1, a + N + 2, a + N + 1});
+		}
+	auto at_point = [&](float x, float y) {
+		return (uint32_t)(std::lround((y + 0.5f) * N) * (N + 1) + std::lround((x + 0.5f) * N));
+	};
+	auto moving = [&](std::initializer_list<std::pair<float, float>> where, V3 by) {
+		std::vector<V3> mv(face.pos.size());
+		for (auto w : where)
+			mv[at_point(w.first, w.second)] = by;
+		return mv;
+	};
+	face.morph_names = {"eyeBlinkLeft", "eyeBlinkRight", "jawOpen", "mouthFunnel", "browInnerUp"};
+	face.morphs.push_back(moving({{0.25f, 0.25f}, {0.375f, 0.25f}}, {0, -0.05f, 0}));
+	face.morphs.push_back(moving({{-0.25f, 0.25f}, {-0.375f, 0.25f}}, {0, -0.05f, 0}));
+	face.morphs.push_back(moving({{0, -0.5f}}, {0, -0.1f, 0}));
+	face.morphs.push_back(moving({{-0.125f, -0.25f}, {0.125f, -0.25f}}, {0, 0, 0.05f}));
+	face.morphs.push_back(moving({{0, 0.5f}}, {0, 0.05f, 0}));
+	auto fm = std::make_shared<Model>();
+	CHECK(load(write_glb({face}), *fm));
+	FaceSpots fs = face_spots(fm, Quat(), CharacterSetup());
+	// Its own left eye is on the viewer's right (+x); the mouth where
+	// "mouthFunnel" moves it (surer than the jaw).
+	CHECK(std::strcmp(fs.from[0], "expressions") == 0 && std::strcmp(fs.from[2], "expressions") == 0);
+	CHECK(near(fs.spot[0].at.x, 0.3125, 1e-3) && near(fs.spot[0].at.y, 0.25, 1e-3) && fs.spot[0].at.z >= 0.5f);
+	CHECK(near(fs.spot[1].at.x, -0.3125, 1e-3) && near(fs.spot[1].at.y, 0.25, 1e-3));
+	CHECK(near(fs.spot[2].at.x, 0, 1e-3) && near(fs.spot[2].at.y, -0.25, 1e-3));
+	CHECK(fs.spot[0].w > 0.2f && fs.spot[0].w < 0.6f && fs.spot[0].h > 0 && fs.spot[0].h < fs.spot[0].w);
+	CHECK(fs.spot[2].w > fs.spot[0].w);
+	CHECK(near(fs.box[0], -0.5, 1e-4) && near(fs.box[1], 0.5, 1e-4) && near(fs.box[2], 1, 1e-4));
+	// Facing the other way, its eyes are still the ones its expressions
+	// name, each pushed out of its face the way it now faces.
+	FaceSpots turned = face_spots(fm, axis_angle({0, 1, 0}, 3.14159265f), CharacterSetup());
+	CHECK(near(turned.spot[0].at.x, 0.3125, 1e-3) && turned.spot[0].at.z < 0.5f);
+	// As its set-up says: in the model, or dragged on its front picture
+	// (onto whatever's in front there).
+	CharacterSetup given = setup_from(R"({"spots": {"left_eye": {"at": [0.1, 0.1, 0.6], "w": 0.2, "h": 0.1},
+		"mouth": {"x": 0.5, "y": 0.75, "w": 0.4, "h": 0.2}}})");
+	FaceSpots gs = face_spots(fm, Quat(), given);
+	CHECK(std::strcmp(gs.from[0], "set up") == 0 && near3(gs.spot[0].at, {0.1f, 0.1f, 0.6f}, 1e-6f) &&
+	      near(gs.spot[0].w, 0.2, 1e-6));
+	CHECK(std::strcmp(gs.from[1], "expressions") == 0);
+	CHECK(near(gs.spot[2].at.x, 0, 1e-4) && near(gs.spot[2].at.y, -0.25, 1e-4) && gs.spot[2].at.z > 0.5f &&
+	      gs.spot[2].at.z < 0.52f && near(gs.spot[2].w, 0.4, 1e-4));
+	// Nothing to go on: a guess at the front of its top half.
+	GlbPart plain = face;
+	plain.morph_names.clear();
+	plain.morphs.clear();
+	auto pm = std::make_shared<Model>();
+	CHECK(load(write_glb({plain}), *pm));
+	FaceSpots ps = face_spots(pm, Quat(), CharacterSetup());
+	CHECK(std::strcmp(ps.from[0], "guessed") == 0 && ps.spot[0].at.x > 0 && ps.spot[1].at.x < 0 &&
+	      ps.spot[0].at.y > 0 && ps.spot[2].at.y < ps.spot[0].at.y && near(ps.spot[0].at.z, 0.5, 0.02));
+}
+
 int main()
 {
 	test_write_and_read();
@@ -1075,6 +1234,7 @@ int main()
 	test_sausage_chain();
 	test_dangly_parts();
 	test_facing_arms_and_wearing();
+	test_set_up();
 	std::printf("unit_model: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;
 }

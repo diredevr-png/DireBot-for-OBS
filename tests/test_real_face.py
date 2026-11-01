@@ -129,9 +129,11 @@ def ball_points(cx, cy, cz, rx, ry, rz, n=24):
     return pos, nrm, ix
 
 
-def write_glb(path, parts):
+def write_glb(path, parts, tree=None):
     """A plain .glb: one node a part, each (points, facings, triangles,
-    colour as linear red/green/blue, roughness)."""
+    colour as linear red/green/blue, roughness) - or, given `tree` (glTF
+    nodes, the first the top one, "mesh" naming a part), its parts hung on
+    those."""
     blob = bytearray()
     views, accessors, meshes, nodes, materials = [], [], [], [], []
 
@@ -158,8 +160,11 @@ def write_glb(path, parts):
         meshes.append({"primitives": [{"attributes": {"POSITION": 3 * i, "NORMAL": 3 * i + 1},
                                        "indices": 3 * i + 2, "material": i}]})
         nodes.append({"name": "part%d" % i, "mesh": i})
+    if tree is not None:
+        nodes = tree
     doc = {"asset": {"version": "2.0"}, "scene": 0,
-           "scenes": [{"nodes": list(range(len(nodes)))}], "nodes": nodes,
+           "scenes": [{"nodes": [0] if tree is not None else list(range(len(nodes)))}],
+           "nodes": nodes,
            "meshes": meshes, "materials": materials, "accessors": accessors,
            "bufferViews": views, "buffers": [{"byteLength": len(blob)}]}
     text = json.dumps(doc).encode()
@@ -179,6 +184,34 @@ def ball_character(path):
         ball_points(-0.035, 0.025, 0.088, 0.018, 0.022, 0.012) + ((0.01, 0.01, 0.01), 0.3),
         ball_points(0.035, 0.025, 0.088, 0.018, 0.022, 0.012) + ((0.01, 0.01, 0.01), 0.3),
     ])
+
+
+def set_up_character(path):
+    """An orange ball head with a blue body under it (a red badge on its
+    front, right) and a green ear sticking out to its right: two links,
+    a bead and a tip. Its nodes are named, as a set-up names them."""
+    write_glb(path, [
+        ball_points(0, 0, 0, 0.1, 0.1, 0.1) + ((0.8, 0.25, 0.04), 0.4),
+        ball_points(0, 0, 0, 0.07, 0.06, 0.05) + ((0.05, 0.1, 0.7), 0.5),
+        ball_points(0, 0, 0, 0.016, 0.016, 0.016) + ((0.8, 0.01, 0.01), 0.5),
+        ball_points(0, 0, 0, 0.012, 0.012, 0.012) + ((0.05, 0.6, 0.05), 0.5),
+        ball_points(0, 0, 0, 0.022, 0.022, 0.022) + ((0.05, 0.6, 0.05), 0.5),
+    ], tree=[
+        {"name": "Character", "children": [1, 2, 4]},
+        {"name": "Ball", "mesh": 0},
+        {"name": "Body", "translation": [0, -0.16, 0], "mesh": 1, "children": [3]},
+        {"name": "Badge", "translation": [0.04, 0, 0.045], "mesh": 2},
+        {"name": "Ear0", "translation": [0.09, 0.04, 0], "children": [5]},
+        {"name": "Ear1", "translation": [0.06, 0, 0], "mesh": 3, "children": [6]},
+        {"name": "Ear2", "translation": [0.06, 0, 0], "mesh": 4},
+    ])
+
+
+# Its eyes and mouth, as DireBot sends them (in the model, its own left
+# eye on its left).
+SET_UP_SPOTS = {"left_eye": {"at": [0.035, 0.025, 0.1], "w": 0.045, "h": 0.03},
+                "right_eye": {"at": [-0.035, 0.025, 0.1], "w": 0.045, "h": 0.03},
+                "mouth": {"at": [0, -0.045, 0.09], "w": 0.06, "h": 0.03}}
 
 
 def send(c, request, data=None):
@@ -654,6 +687,9 @@ def test_3d_characters(run):
         assert m["loaded"] and not m["loading"] and m["kind"] == "gltf"
         assert m["points"] == 3 * 25 * 25 and m["triangles"] == 3 * 24 * 24 * 2
         assert m["springs"] == 0 and "problem" not in m
+        assert not m["set_up"] and m["upright_parts"] == 0
+        assert {v["from"] for v in m["spots"].values()} == {"guessed"}
+        assert wait_for(lambda: st("3D")["model"]["cards"] == 3, 10, 0.1)
         # The broken one: why, in plain words, and nothing drawn.
         assert wait_for(lambda: st("3D broken")["model"].get("problem"), 10, 0.1)
         b = st("3D broken")["model"]
@@ -698,6 +734,121 @@ def test_3d_characters(run):
         mx, my = s["model"]["x"], s["model"]["y"]
         assert abs(mx - fx) < 40 and abs(my - fy) < 60, (mx, my, fx, fy)
         for name in avatars:
+            send(c, "RemoveInput", {"inputName": name})
+    finally:
+        c.disconnect()
+
+
+def test_set_up_characters(run):
+    """A 3D character with its set-up (DireBot's "model_setup", as from an
+    imported Lens Studio project): your real eyes and mouth drawn on its
+    face where it says, only inside its outline; its ear swinging down,
+    pulled as it says; its body staying upright while its head turns with
+    you."""
+    face_png = os.path.join(run.home, "camera.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+    model = os.path.join(run.home, "set-up.glb")
+    set_up_character(model)
+    size = 300
+    still = json.dumps({"spots": SET_UP_SPOTS, "chains": []})
+    swinging = json.dumps({"spots": SET_UP_SPOTS,
+                           "chains": [{"bones": ["Ear0", "Ear1", "Ear2"],
+                                       "pull": [0, -9.8, 0], "with_head": False}],
+                           "upright": [{"bone": "Body", "follow": 6}]})
+    common = {"source": "Set-up camera", "width": size, "height": size, "size": 100,
+              "mirror": False, "smoothing": 100, "follow_move": 0, "follow_grow": 0,
+              "follow_tilt": 0, "bend": 100, "model": model}
+    avatars = {
+        "Real eyes": {"model_setup": still},
+        "Drawn": {"model_setup": still, "style": "drawn"},
+        "Swinging": {"model_setup": swinging, "style": "drawn"},
+        "Broken set-up": {"model_setup": "{not json"},
+    }
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "Set-up characters"})
+        send(c, "CreateInput", {"sceneName": "Set-up characters", "inputName": "Set-up camera",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        for name, extra in avatars.items():
+            send(c, "CreateInput", {"sceneName": "Set-up characters", "inputName": name,
+                                    "inputKind": "direbot_face_avatar",
+                                    "inputSettings": {**common, **extra}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Set-up characters"})
+
+        def st(name):
+            return vendor(c, "FaceGetState", {"source": name})
+        for name in avatars:
+            assert wait_for(lambda: st(name)["found"] and st(name)["model"]["shown"], 30, 0.2), st(name)
+        assert wait_for(lambda: st("Real eyes")["model"]["cards"] == 3, 10, 0.1), st("Real eyes")
+        m = st("Real eyes")["model"]
+        assert m["set_up"] and m["springs"] == 0 and m["upright_parts"] == 0
+        assert {k: v["from"] for k, v in m["spots"].items()} == {
+            "left_eye": "set up", "right_eye": "set up", "mouth": "set up"}
+        # Its own left eye is on the picture's right, facing you.
+        assert m["spots"]["left_eye"]["x"] > m["spots"]["right_eye"]["x"]
+        assert st("Drawn")["model"]["cards"] == 0
+        s = st("Swinging")["model"]
+        assert s["set_up"] and s["springs"] == 1 and s["upright_parts"] == 1, s
+        # Set-up text it can't read: as if there were none.
+        b = st("Broken set-up")["model"]
+        assert not b["set_up"] and "problem" not in b
+        assert {v["from"] for v in b["spots"].values()} == {"guessed"}
+
+        # Your eyes and mouth: on its face where its set-up says (two up
+        # top, one under them), nowhere else - and never outside it.
+        time.sleep(1.5)
+        real, drawn = screenshot(c, "Real eyes"), screenshot(c, "Drawn")
+        orange = lambda px: px[0] > 120 and px[0] > px[1] + 30 > px[2] + 30  # noqa: E731
+        ox, oy, n = middle_of(drawn, orange)
+        assert n > 2000, n
+        xs = [x for y in range(size) for x in range(size) if orange(drawn[y][x])]
+        ys = [y for y in range(size) for x in range(size) if orange(drawn[y][x])]
+        top, bottom, left, right = min(ys), max(ys), min(xs), max(xs)
+        changed = [(x, y) for y in range(size) for x in range(size)
+                   if sum(abs(a - b) for a, b in zip(real[y][x], drawn[y][x])) > 60]
+        assert len(changed) > 150, len(changed)
+        assert all(drawn[y][x] != (0, 0, 0) for x, y in changed)
+        # (Bar a stray pixel or two on an edge: each tracks you itself.)
+        outside = [(x, y) for x, y in changed
+                   if not (left - 2 <= x <= right + 2 and top - 2 <= y <= bottom + 2)]
+        assert len(outside) <= len(changed) // 100, outside
+        upper = [(x, y) for x, y in changed if y < oy]
+        lower = [(x, y) for x, y in changed if y > oy + (bottom - oy) * 0.15]
+        assert sum(1 for x, _ in upper if x < ox - 5) > 30 and sum(1 for x, _ in upper if x > ox + 5) > 30
+        assert len(lower) > 30 and abs(sum(x for x, _ in lower) / len(lower) - ox) < 15
+
+        # Its ear: sticking out, still - or hanging down, pulled.
+        green = lambda px: px[1] > 90 and px[1] > px[0] + 40 and px[1] > px[2] + 40  # noqa: E731
+        time.sleep(3)
+        rows = screenshot(c, "Swinging")
+        _, still_y, n1 = middle_of(drawn, green)
+        _, hang_y, n2 = middle_of(rows, green)
+        print(f"ear: {still_y:.1f} still, {hang_y:.1f} hanging")
+        assert n1 > 50 and n2 > 50 and hang_y > still_y + 30, (still_y, hang_y)
+        red = lambda px: px[0] > 120 and px[1] < 70 and px[2] < 70  # noqa: E731
+        drawn_badge, _, n1 = middle_of(drawn, red)
+        upright_badge, _, n2 = middle_of(rows, red)
+        assert n1 > 20 and n2 > 20 and abs(drawn_badge - upright_badge) < 3
+
+        # Turned 25 degrees: both turn with you, but the upright body
+        # stays as it was made - its badge where it was.
+        for name in ("Drawn", "Swinging"):
+            assert vendor(c, "FaceSet", {"source": name})["ok"]
+            assert wait_for(lambda: st(name)["set"] and not st(name)["setting"], 10, 0.1)
+            rest = send(c, "GetInputSettings", {"inputName": name})["inputSettings"]["rest"]
+            send(c, "SetInputSettings", {"inputName": name, "inputSettings": {
+                "rest": turned_rest(rest, 25)}})
+        for name in ("Drawn", "Swinging"):
+            assert wait_for(lambda: st(name)["model"]["yaw"] < -20, 5, 0.1), st(name)["model"]
+        time.sleep(2)
+        turned_badge, _, n1 = middle_of(screenshot(c, "Drawn"), red)
+        kept_badge, _, n2 = middle_of(screenshot(c, "Swinging"), red)
+        print(f"badge: {drawn_badge:.1f} straight, {turned_badge:.1f} turned, {kept_badge:.1f} upright")
+        assert n1 > 10 and n2 > 10
+        # (Moved a little, maybe, as your head tips a little too.)
+        assert abs(turned_badge - drawn_badge) > 12 and abs(kept_badge - upright_badge) < 6
+        for name in list(avatars) + ["Set-up camera"]:
             send(c, "RemoveInput", {"inputName": name})
     finally:
         c.disconnect()

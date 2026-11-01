@@ -6,6 +6,9 @@
 //   Turn     the drawn character (premultiplied) turned and nodded: each
 //            point slides by how far it stands out (`depth_map`)
 //   Camera   the camera's picture, mirrored or not (worn on your head)
+//   Card     one of your eyes or your mouth on a 3D character: on a card
+//            in its spot (drawn over it, kept inside its outline), its
+//            skin taking the colour round the card as it's drawn
 
 uniform float4x4 ViewProj;
 uniform texture2d image;
@@ -45,6 +48,15 @@ uniform float2 cell;
 uniform float pad;
 // Camera: 1 to mirror it.
 uniform float flip;
+// Card: where its corner is on the 3D character's picture and how far its
+// width and height go there (0 to 1) - the picture is `body_map` - and
+// where its colour is read: round `ring.xy`, `ring.zw` away. `ring_on` 0:
+// the skin takes `target_lab` instead.
+uniform float2 body_origin;
+uniform float2 body_across;
+uniform float2 body_down;
+uniform float4 ring;
+uniform float ring_on;
 
 sampler_state textureSampler {
 	Filter    = Linear;
@@ -144,6 +156,46 @@ float4 PSCutout(VertData v_in) : TARGET
 		float w = saturate(skin_amount) * (1.0 - in_line);
 		float3 lab = lab_of(rgb);
 		float3 turned = rgb_of(float3(target_lab.x + (lab.x - skin_lab.x) * 0.9, target_lab.y, target_lab.z));
+		rgb = lerp(rgb, turned, w);
+	}
+	return float4(rgb, m * opacity);
+}
+
+// ---- Card ----
+
+float4 ring_sample(float2 at)
+{
+	return body_map.SampleLevel(textureSampler, ring.xy + at * ring.zw, 0.0);
+}
+
+float4 PSCard(VertData v_in) : TARGET
+{
+	float2 uv = origin + across * v_in.uv.x + down * v_in.uv.y;
+	float4 c = image.Sample(textureSampler, uv);
+	float mu = mask_place.z > 0.5 ? 1.0 - v_in.uv.x : v_in.uv.x;
+	float mx = mask_place.x + mu * mask_place.y;
+	float my = mask_rows.x + v_in.uv.y * mask_rows.y;
+	float m = mask_map.Sample(textureSampler, float2(mx, my)).r;
+	float2 on_body = body_origin + body_across * v_in.uv.x + body_down * v_in.uv.y;
+	m = m * body_map.Sample(textureSampler, on_body).a;
+	float3 rgb = c.rgb;
+	if (skin_amount > 0.0) {
+		float3 target = target_lab;
+		float use = 1.0;
+		if (ring_on > 0.5) {
+			// The character round the card, as it's drawn (lit and shaded;
+			// premultiplied).
+			float4 sum = ring_sample(float2(1.0, 0.0)) + ring_sample(float2(-1.0, 0.0)) +
+				     ring_sample(float2(0.0, 1.0)) + ring_sample(float2(0.0, -1.0)) +
+				     ring_sample(float2(0.7071, 0.7071)) + ring_sample(float2(-0.7071, 0.7071)) +
+				     ring_sample(float2(0.7071, -0.7071)) + ring_sample(float2(-0.7071, -0.7071));
+			use = saturate(sum.a - 1.0);
+			target = lab_of(saturate(sum.rgb / max(sum.a, 0.001)));
+		}
+		float in_line = mask_map.Sample(textureSampler, float2(mx, my + 0.5)).r;
+		float w = saturate(skin_amount) * (1.0 - in_line) * use;
+		float3 lab = lab_of(rgb);
+		float3 turned = rgb_of(float3(target.x + (lab.x - skin_lab.x) * 0.9, target.y, target.z));
 		rgb = lerp(rgb, turned, w);
 	}
 	return float4(rgb, m * opacity);
@@ -260,6 +312,15 @@ technique Turn
 	{
 		vertex_shader = VSDefault(v_in);
 		pixel_shader  = PSTurn(v_in);
+	}
+}
+
+technique Card
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSCard(v_in);
 	}
 }
 

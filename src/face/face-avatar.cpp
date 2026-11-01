@@ -19,6 +19,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "face-avatar.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -591,6 +592,10 @@ struct FaceAvatar {
 		int framing = 0; // 0 head and shoulders for a VRM, 1 all of it, 2 head
 		bool hide = true, smooth = true;
 		WornPlace place;
+		// Its set-up (DireBot's "model_setup": an imported Lens Studio
+		// project, spots dragged into place), and as text, to see changes.
+		std::shared_ptr<const CharacterSetup> setup = std::make_shared<CharacterSetup>();
+		std::string setup_text;
 	};
 	Look3D look3d; // under pictures_lock
 	ModelLoader loader;
@@ -643,7 +648,8 @@ struct FaceAvatar {
 		    *p_skin_lab = nullptr, *p_target_lab = nullptr, *p_skin_amount = nullptr, *p_mask_rows = nullptr,
 		    *p_body_map = nullptr, *p_body_place = nullptr, *p_inside = nullptr, *p_depth_map = nullptr,
 		    *p_char_px = nullptr, *p_pivot = nullptr, *p_turn_k = nullptr, *p_cell = nullptr, *p_pad = nullptr,
-		    *p_flip = nullptr;
+		    *p_flip = nullptr, *p_body_origin = nullptr, *p_body_across = nullptr, *p_body_down = nullptr,
+		    *p_ring = nullptr, *p_ring_on = nullptr;
 	bool drawing = false, drawn = false, have_out = false;
 	std::vector<uint8_t> mask_bytes;
 	// What it showed last, for FaceGetState.
@@ -671,12 +677,20 @@ struct FaceAvatar {
 	std::string rig_key;
 	M4 worn_pose;
 	bool have_worn_pose = false;
+	// Where your eyes and mouth go on it (worked out with its rig), and
+	// the shape they're cut (under pictures_lock).
+	FaceSpots spots3d;
+	float aspect3d[PARTS] = {0.65f, 0.65f, 0.55f};
 	// ...and what it showed, for FaceGetState (under state_lock).
 	struct State3D {
 		std::string file, problem, kind, title, author;
-		bool loaded = false, shown = false, chain = false;
+		bool loaded = false, shown = false, chain = false, set_up = false;
 		size_t points = 0, triangles = 0;
-		int springs = 0, arkit = 0;
+		int springs = 0, arkit = 0, upright = 0, cards = 0;
+		// Each spot (its own left eye, right eye, mouth) on its front
+		// picture (shares of FaceSpots::box) and how it was found.
+		float spot[3][4] = {};
+		const char *spot_from[3] = {"", "", ""};
 		float yaw = 0, pitch = 0, x = 0, y = 0;
 		std::map<std::string, float> values;
 	};
@@ -723,6 +737,11 @@ struct FaceAvatar {
 			p_cell = param("cell");
 			p_pad = param("pad");
 			p_flip = param("flip");
+			p_body_origin = param("body_origin");
+			p_body_across = param("body_across");
+			p_body_down = param("body_down");
+			p_ring = param("ring");
+			p_ring_on = param("ring_on");
 			const float zero = 0;
 			const uint8_t *zero_data = reinterpret_cast<const uint8_t *>(&zero);
 			no_depth = gs_texture_create(1, 1, GS_R32F, 1, &zero_data, 0);
@@ -1247,7 +1266,10 @@ struct FaceAvatar {
 	// faces away, so it's turned round).
 	Quat facing_of(const Model &m) const
 	{
-		// Turned from the way it most likely faces, if asked.
+		// As its set-up says, or turned from the way it most likely faces
+		// - and turned further, if asked.
+		if (look3d.setup->has_facing)
+			return axis_angle({0, 1, 0}, std::max(0, look3d.turn) * RAD) * look3d.setup->facing;
 		const int turn = guess_turn(m) + std::max(0, look3d.turn);
 		return axis_angle({0, 1, 0}, turn * RAD);
 	}
@@ -1287,15 +1309,40 @@ struct FaceAvatar {
 		ro.facing = facing_of(*model_now);
 		ro.floppy = look3d.floppy;
 		ro.springs = look3d.swing;
-		const std::string key = std::to_string(ro.facing.y) + "/" + std::to_string(ro.facing.w) + "/" +
-					std::to_string(ro.floppy) + "/" + (ro.springs ? "1" : "0");
+		ro.setup = look3d.setup;
+		const std::string key = std::to_string(ro.facing.x) + "/" + std::to_string(ro.facing.y) + "/" +
+					std::to_string(ro.facing.z) + "/" + std::to_string(ro.facing.w) + "/" +
+					std::to_string(ro.floppy) + "/" + (ro.springs ? "1" : "0") + "/" +
+					look3d.setup_text;
 		if (!rig || key != rig_key) {
 			rig = std::make_unique<Rig>(model_now, ro);
 			rig_key = key;
+			spots3d = face_spots(model_now, ro.facing, *look3d.setup);
+			// Your eyes and mouth are cut the shape of its spots.
+			const float eye = (spots3d.spot[0].h / std::max(1e-6f, spots3d.spot[0].w) +
+					   spots3d.spot[1].h / std::max(1e-6f, spots3d.spot[1].w)) /
+					  2;
+			const float aspect[PARTS] = {clampf(eye, 0.1f, 4.0f), clampf(eye, 0.1f, 4.0f),
+						     clampf(spots3d.spot[2].h / std::max(1e-6f, spots3d.spot[2].w),
+							    0.1f, 4.0f)};
+			std::copy(aspect, aspect + PARTS, aspect3d);
+			worker.set_cut(aspect, feather);
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d.springs = rig->springs();
 			state3d.chain = rig->auto_chain();
 			state3d.arkit = rig->arkit_parts();
+			state3d.upright = rig->upright_parts();
+			state3d.set_up = !look3d.setup->empty();
+			const float *box = spots3d.box;
+			for (int i = 0; i < 3; i++) {
+				const FaceSpot &sp = spots3d.spot[i];
+				const V3 f = rotate(ro.facing, sp.at);
+				state3d.spot[i][0] = (f.x - box[0]) / std::max(1e-6f, box[2]);
+				state3d.spot[i][1] = (box[1] - f.y) / std::max(1e-6f, box[3]);
+				state3d.spot[i][2] = sp.w / std::max(1e-6f, box[2]);
+				state3d.spot[i][3] = sp.h / std::max(1e-6f, box[2]);
+				state3d.spot_from[i] = spots3d.from[i];
+			}
 		}
 	}
 
@@ -1347,8 +1394,15 @@ struct FaceAvatar {
 			v.head = worn_pose;
 		}
 		d.place = f.place;
+		d.upright = f.upright;
+		d.has_upright = true;
 		if (rig->turns_whole())
-			rig->set_pivot(look3d.place.automatic ? f.pivot : head_in_model(m, facing, look3d.place));
+			rig->set_pivot(turn_pivot(m, facing, f));
+		// Your real eyes and mouth on it: its own stay open and shut under them.
+		gs_texture_t *cut = cam && used_shot >= 0 ? gs_texrender_get_texture(shots[used_shot].tex) : nullptr;
+		const float showing = !drawn_style && seen.ready && cut && held.found ? o.shown : 0;
+		if (showing > 0.5f)
+			quiet_face(d.moves);
 		rig->pose(d);
 		v.fov = f.fov;
 		v.near = f.near;
@@ -1398,6 +1452,7 @@ struct FaceAvatar {
 		gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
 		if (wear && show_camera)
 			draw_camera(cam, cw, ch);
+		int cards = 0;
 		if (tex) {
 			// Worn, it's drawn as the camera sees you: mirrored with it.
 			gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
@@ -1405,9 +1460,198 @@ struct FaceAvatar {
 			gs_effect_set_texture(gs_effect_get_param_by_name(base, "image"), tex);
 			while (gs_effect_loop(base, "Draw"))
 				gs_draw_sprite(tex, wear && mirror ? GS_FLIP_U : 0, w, h);
+			if (showing * opacity > 0.001f)
+				cards = draw_cards(cut, cw, ch, tex, v, rig->head_frame(), f.upright, facing, wear,
+						   showing * opacity);
 		}
 		gs_texrender_end(out);
 		have_out = true;
+		std::lock_guard<std::mutex> l(state_lock);
+		state3d.cards = cards;
+	}
+
+	// What it turns round, whole, in its own spot: where it's put on your
+	// head, if that's set; else its set-up's (an imported Lens's head,
+	// if that's inside it) or round its own head, behind its eyes; else
+	// its middle.
+	V3 turn_pivot(const Model &m, Quat facing, const Framing &f) const
+	{
+		if (!look3d.place.automatic)
+			return head_in_model(m, facing, look3d.place);
+		const CharacterSetup &su = *look3d.setup;
+		if (su.empty())
+			return f.pivot;
+		const V3 room = (m.high - m.low) * 0.1f;
+		const V3 lo = m.low - room, hi = m.high + room;
+		const V3 p = su.pivot;
+		if (su.has_pivot && p.x >= lo.x && p.y >= lo.y && p.z >= lo.z && p.x <= hi.x && p.y <= hi.y &&
+		    p.z <= hi.z)
+			return p;
+		V3 eyes = rotate(facing, (spots3d.spot[0].at + spots3d.spot[1].at) * 0.5f);
+		eyes.z = rotate(facing, (m.low + m.high) * 0.5f).z;
+		return rotate(conj(facing), eyes);
+	}
+
+	// Its own eyes and mouth stay as they are (your real ones are on them).
+	static void quiet_face(float moves[EXPRESSIONS])
+	{
+		for (int i = 1; i < EXPRESSIONS; i++) {
+			const char *n = EXPRESSION_NAMES[i];
+			if (std::strncmp(n, "eyeBlink", 8) == 0 || std::strncmp(n, "eyeSquint", 9) == 0 ||
+			    std::strncmp(n, "jaw", 3) == 0 || std::strncmp(n, "mouth", 5) == 0)
+				moves[i] = 0;
+		}
+	}
+
+	// Your real eyes and mouth on the 3D character (`body`, as drawn into
+	// `out`): each piece of the camera on a card in its spot, riding on
+	// its head (`frame`, the model -> the world as its head is now) but
+	// turned only half as far as your head (the camera already shows the
+	// turn; `unturned`: the model -> the world, your head straight), kept
+	// inside its outline, its skin taking the colour round the card. Your
+	// far eye fades as you turn from the camera (from 30 degrees, gone by
+	// 50), your mouth from 40, and a card turned from the camera goes.
+	// How many it drew.
+	int draw_cards(gs_texture_t *cam, uint32_t cw, uint32_t ch, gs_texture_t *body, const View3D &v,
+		       const M4 &frame, const M4 &unturned, Quat facing, bool wear, float opacity)
+	{
+		if (!cam || !body || !v.w || !v.h)
+			return 0;
+		const float W = (float)v.w, H = (float)v.h;
+		const float k = 1 / std::tan(v.fov / 2), aspect = W / H;
+		bool behind = false;
+		auto project = [&](V3 p, float &depth) {
+			const V3 c = point(v.view, p);
+			depth = -c.z;
+			if (depth < v.near * 0.5f) {
+				behind = true;
+				depth = v.near * 0.5f;
+			}
+			return std::array<float, 2>{(c.x * k / aspect / depth + 1) * 0.5f * W,
+						    (1 - c.y * k / depth) * 0.5f * H};
+		};
+		const Quat back = conj(facing);
+		const Quat full = quat_of(frame), half = slerp(quat_of(unturned), full, 0.5f);
+		const float scale = length(V3{frame.m[0], frame.m[1], frame.m[2]});
+		const V3 eye_at = point(inverse(v.view), V3{});
+		struct Card {
+			std::array<float, 2> c, across, down;
+			float depth = 0, facing = 1;
+		} card[3];
+		for (int i = 0; i < 3; i++) {
+			const FaceSpot &sp = spots3d.spot[i];
+			const V3 centre = point(frame, sp.at);
+			const V3 a = rotate(half, rotate(back, V3{1, 0, 0})),
+				 dn = rotate(half, rotate(back, V3{0, -1, 0}));
+			const V3 normal = rotate(full, rotate(back, V3{0, 0, 1}));
+			Card &cd = card[i];
+			cd.c = project(centre, cd.depth);
+			cd.facing = dot(normal, normalized(eye_at - centre, {0, 0, 1}));
+			float d0, d1;
+			const float hw = sp.w * scale * 0.5f, hh = sp.h * scale * 0.5f;
+			const auto r = project(centre + a * hw, d0), l = project(centre - a * hw, d1);
+			const auto b = project(centre + dn * hh, d0), t = project(centre - dn * hh, d1);
+			cd.across = {r[0] - l[0], r[1] - l[1]};
+			cd.down = {b[0] - t[0], b[1] - t[1]};
+		}
+		if (behind)
+			return 0;
+		// Which piece goes on which card: the eye on the left of the picture
+		// on the card on the left. Worn, the picture is the camera's own
+		// (mirrored later, card and all); in its own spot it moves as your
+		// reflection does.
+		const bool flip_piece = !wear && mirror;
+		const int left_card = card[0].c[0] <= card[1].c[0] ? 0 : 1;
+		const int far_card = card[0].depth >= card[1].depth ? 0 : 1;
+		const float yaw = std::fabs(held_turn.yaw);
+		gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+		int drawn_cards = 0;
+		for (int i = 0; i < 3; i++) {
+			const int part = i == 2 ? MOUTH : (i == left_card) == !flip_piece ? FIRST_EYE : SECOND_EYE;
+			const Piece &p = held.part[part];
+			if (p.w <= 0 || p.h <= 0)
+				continue;
+			const Card &cd = card[i];
+			float fade = clampf((cd.facing - 0.15f) / 0.25f, 0, 1);
+			if (i == 2)
+				fade *= clampf(1 - (yaw - 40) / 20, 0, 1);
+			else if (i == far_card)
+				fade *= clampf(1 - (yaw - 30) / 20, 0, 1);
+			const float alpha = opacity * fade;
+			if (alpha <= 0.001f)
+				continue;
+			// The card: round its spot's middle, with room for the soft edge,
+			// grown by "Eye and mouth size" (and a wide-open mouth's more).
+			const float grow = part_size * PIECE_ROOM * std::max(1.0f, p.grown);
+			const std::array<float, 2> ax{cd.across[0] * grow, cd.across[1] * grow},
+				dy{cd.down[0] * grow, cd.down[1] * grow};
+			const float ox = cd.c[0] - ax[0] / 2 - dy[0] / 2, oy = cd.c[1] - ax[1] / 2 - dy[1] / 2;
+			// In the camera's picture: the piece, turned with your eyes.
+			const float pw = p.w * cw, ph = p.h * cw;
+			const float co = std::cos(p.angle), si = std::sin(p.angle);
+			float cax = co * pw, cay = si * pw, cdx = -si * ph, cdy = co * ph;
+			float cox = p.x * cw - cax / 2 - cdx / 2, coy = p.y * ch - cay / 2 - cdy / 2;
+			if (flip_piece) {
+				cox += cax;
+				coy += cay;
+				cax = -cax;
+				cay = -cay;
+			}
+			vec2 origin, across, down, b_origin, b_across, b_down, mask_rows;
+			vec4 mask_place, ring;
+			vec2_set(&origin, cox / cw, coy / ch);
+			vec2_set(&across, cax / cw, cay / ch);
+			vec2_set(&down, cdx / cw, cdy / ch);
+			vec2_set(&b_origin, ox / W, oy / H);
+			vec2_set(&b_across, ax[0] / W, ax[1] / H);
+			vec2_set(&b_down, dy[0] / W, dy[1] / H);
+			vec4_set(&mask_place, (part * MASK + 0.5f) / (MASK * PARTS), (MASK - 1.0f) / (MASK * PARTS),
+				 flip_piece ? 1.0f : 0.0f, 0);
+			vec2_set(&mask_rows, 0.5f / (2 * MASK), (MASK - 1.0f) / (2 * MASK));
+			const float ring_k = 0.62f * grow;
+			vec4_set(&ring, cd.c[0] / W, cd.c[1] / H, ring_k * std::hypot(cd.across[0], cd.across[1]) / W,
+				 ring_k * std::hypot(cd.down[0], cd.down[1]) / H);
+			vec3 skin_lab, target_lab;
+			vec3_set(&skin_lab, p.skin.l, p.skin.a, p.skin.b);
+			vec3_set(&target_lab, skin_colour.l, skin_colour.a, skin_colour.b);
+			gs_effect_set_texture(p_image, cam);
+			gs_effect_set_texture(p_mask_map, masks);
+			gs_effect_set_texture(p_body_map, body);
+			gs_effect_set_float(p_opacity, alpha);
+			gs_effect_set_vec2(p_origin, &origin);
+			gs_effect_set_vec2(p_across, &across);
+			gs_effect_set_vec2(p_down, &down);
+			gs_effect_set_vec4(p_mask_place, &mask_place);
+			gs_effect_set_vec2(p_mask_rows, &mask_rows);
+			gs_effect_set_vec2(p_body_origin, &b_origin);
+			gs_effect_set_vec2(p_body_across, &b_across);
+			gs_effect_set_vec2(p_body_down, &b_down);
+			gs_effect_set_vec4(p_ring, &ring);
+			gs_effect_set_float(p_ring_on, skin_auto ? 1.0f : 0.0f);
+			gs_effect_set_vec3(p_skin_lab, &skin_lab);
+			gs_effect_set_vec3(p_target_lab, &target_lab);
+			gs_effect_set_float(p_skin_amount, skin);
+			// The card as a slanted box: corner, then across and down
+			// (mirrored with the picture, worn).
+			matrix4 m;
+			if (wear && mirror) {
+				vec4_set(&m.x, -ax[0], ax[1], 0, 0);
+				vec4_set(&m.y, -dy[0], dy[1], 0, 0);
+				vec4_set(&m.t, W - ox, oy, 0, 1);
+			} else {
+				vec4_set(&m.x, ax[0], ax[1], 0, 0);
+				vec4_set(&m.y, dy[0], dy[1], 0, 0);
+				vec4_set(&m.t, ox, oy, 0, 1);
+			}
+			vec4_set(&m.z, 0, 0, 1, 0);
+			gs_matrix_push();
+			gs_matrix_mul(&m);
+			while (gs_effect_loop(effect, "Card"))
+				gs_draw_quadf(nullptr, 0, 1, 1);
+			gs_matrix_pop();
+			drawn_cards++;
+		}
+		return drawn_cards;
 	}
 
 	void render()
@@ -1469,12 +1713,12 @@ struct FaceAvatar {
 		const Shown::Out o = shown.now();
 		const bool wear = worn && cw && ch;
 		pick_model();
+		upload_masks();
 		if (rig && model_now) {
 			draw_3d(cam, cw, ch, w, h, o, wear);
 			return;
 		}
 		gs_texture_t *cut = cam && used_shot >= 0 ? gs_texrender_get_texture(shots[used_shot].tex) : nullptr;
-		upload_masks();
 		// Which way it faces: turned pictures if there are any.
 		const int turned = turn_pictures ? o.turned * (mirror ? -1 : 1) : 0;
 		int which = 0;
@@ -1740,6 +1984,15 @@ struct FaceAvatar {
 			}
 			l3.place.size = clampf(number("size", 1), 0.1f, 10);
 		}
+		const char *setup_text = obs_data_get_string(settings, "model_setup");
+		l3.setup_text = setup_text ? setup_text : "";
+		{
+			std::lock_guard<std::mutex> l(pictures_lock);
+			if (look3d.setup_text == l3.setup_text)
+				l3.setup = look3d.setup;
+			else
+				l3.setup = std::make_shared<CharacterSetup>(setup_from(l3.setup_text));
+		}
 		{
 			std::lock_guard<std::mutex> l(pictures_lock);
 			look3d = l3;
@@ -1754,9 +2007,13 @@ struct FaceAvatar {
 		worker.set_smoothing(clampf((float)obs_data_get_int(settings, "smoothing") / 100.0f, 0, 1));
 
 		// Each of your eyes and your mouth is cut the shape of the
-		// character's spot it goes into, so it's never stretched.
+		// character's spot it goes into, so it's never stretched (a 3D
+		// character's, once it's loaded: pick_model).
 		float aspect[PARTS] = {0.7f, 0.7f, 0.5f};
-		{
+		if (model_file && *model_file) {
+			std::lock_guard<std::mutex> l(pictures_lock);
+			worker.set_cut(aspect3d, feather);
+		} else {
 			std::lock_guard<std::mutex> l(pictures_lock);
 			const float char_w = loaded(body) ? body->width() : 1,
 				    char_h = loaded(body) ? body->height() : 1;
@@ -1867,6 +2124,9 @@ struct FaceAvatar {
 				      {"springs", st.springs},
 				      {"swinging_chain", st.chain},
 				      {"arkit_parts", st.arkit},
+				      {"set_up", st.set_up},
+				      {"upright_parts", st.upright},
+				      {"cards", st.cards},
 				      {"expressions", values},
 				      {"yaw", r(st.yaw, 10)},
 				      {"pitch", r(st.pitch, 10)},
@@ -1874,6 +2134,16 @@ struct FaceAvatar {
 				      {"y", r(st.y, 10)}};
 			if (!st.problem.empty())
 				model["problem"] = st.problem;
+			if (st.loaded) {
+				json spots = json::object();
+				for (int i = 0; i < PARTS; i++)
+					spots[spot_names[i]] = {{"x", r(st.spot[i][0], 1e4f)},
+								{"y", r(st.spot[i][1], 1e4f)},
+								{"w", r(st.spot[i][2], 1e4f)},
+								{"h", r(st.spot[i][3], 1e4f)},
+								{"from", st.spot_from[i]}};
+				model["spots"] = spots;
+			}
 			answer["model"] = model;
 		}
 		if (with_points && face.found && face.w > 0 && face.h > 0) {
@@ -1992,6 +2262,7 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "hide_behind_head", true);
 	obs_data_set_default_bool(settings, "smooth_edges", true);
 	obs_data_set_default_string(settings, "model_place", "");
+	obs_data_set_default_string(settings, "model_setup", "");
 }
 
 bool add_camera(void *param, obs_source_t *source)
