@@ -336,6 +336,7 @@ Avatar3D::Avatar3D()
 		p_outline_width = param("outline_width");
 		p_outline_colour = param("outline_colour");
 		p_texel = param("texel");
+		check_.load(effect_, "3D", face_3d_needs());
 	}
 	const uint32_t white = 0xFFFFFFFF, black = 0xFF000000;
 	const uint8_t *w = reinterpret_cast<const uint8_t *>(&white);
@@ -475,8 +476,19 @@ void Avatar3D::set(std::shared_ptr<const Model> model, std::vector<ModelPicture>
 	}
 }
 
+void Avatar3D::set_camera()
+{
+	// Handed over turned rows-for-columns, as OBS hands over ViewProj.
+	matrix4 cam = obs_matrix(cam_);
+	matrix4_transpose(&cam, &cam);
+	gs_effect_set_matrix4(p_cam, &cam);
+}
+
 void Avatar3D::set_material(const Material &m, const View3D &v, bool outline)
 {
+	// Everything a technique reads, every time: OBS empties them all
+	// when the technique before finishes (see effect-needs.hpp).
+	set_camera();
 	auto tex = [this](const TexRef &r, gs_texture_t *none) {
 		if (r.image >= 0 && r.image < (int)textures_.size() && textures_[r.image])
 			return textures_[r.image];
@@ -537,6 +549,7 @@ void Avatar3D::draw_part(size_t i, const Rig::Part &p, const char *technique)
 		return;
 	gs_load_vertexbuffer(part.vb);
 	gs_load_indexbuffer(part.ib);
+	check_(technique);
 	while (gs_effect_loop(effect_, technique))
 		gs_draw(GS_TRIS, 0, 0);
 	(void)p;
@@ -600,10 +613,7 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 	// camera.
 	const matrix4 view = obs_matrix(obs_view(v.view));
 	gs_matrix_set(&view);
-	// Handed over turned rows-for-columns, as OBS hands over ViewProj.
-	matrix4 cam = obs_matrix(v.view);
-	matrix4_transpose(&cam, &cam);
-	gs_effect_set_matrix4(p_cam, &cam);
+	cam_ = v.view;
 
 	const gs_cull_mode cull = gs_get_cull_mode();
 	gs_set_cull_mode(GS_NEITHER);
@@ -619,6 +629,9 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 		gs_enable_color(false, false, false, false);
 		gs_load_vertexbuffer(head_.vb);
 		gs_load_indexbuffer(head_.ib);
+		set_camera();
+		set_vec4(p_uv, 0, 0, 1, 1);
+		check_("Hidden");
 		while (gs_effect_loop(effect_, "Hidden"))
 			gs_draw(GS_TRIS, 0, 0);
 		gs_enable_color(true, true, true, true);
@@ -687,6 +700,7 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 	vec2_set(&texel, 1.0f / (v.w * k), 1.0f / (v.h * k));
 	gs_effect_set_texture(p_image, big);
 	gs_effect_set_vec2(p_texel, &texel);
+	check_("Down");
 	while (gs_effect_loop(effect_, "Down"))
 		gs_draw_sprite(big, 0, v.w, v.h);
 	gs_blend_state_pop();

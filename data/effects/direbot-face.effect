@@ -82,10 +82,12 @@ VertData VSDefault(VertData v_in)
 float4 PSPicture(VertData v_in) : TARGET
 {
 	float4 c = image.Sample(textureSampler, v_in.uv);
-	float inside = 1.0;
+	// (Not called `inside`: OBS takes any word that's a value's name as
+	// reading that value, and Windows won't draw with it unset.)
+	float kept = 1.0;
 	if (v_in.uv.x < clip.x || v_in.uv.y < clip.y || v_in.uv.x >= clip.z || v_in.uv.y >= clip.w)
-		inside = 0.0;
-	return float4(c.rgb, c.a * opacity * inside);
+		kept = 0.0;
+	return float4(c.rgb, c.a * opacity * kept);
 }
 
 // ---- Colour (avatar2d.cpp's lab_of and rgb_of) ----

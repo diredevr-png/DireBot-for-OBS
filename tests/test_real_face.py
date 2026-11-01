@@ -669,6 +669,9 @@ def test_3d_characters(run):
         "3D": {"model": ball},
         "3D turned": {"model": ball},
         "3D worn": {"model": ball, "worn": True},
+        # Every way of drawing at once (the hidden head, outlines, the
+        # parts, smoothing): the closing test checks each had its values.
+        "3D outlined": {"model": ball, "worn": True, "outline": 60},
         "3D broken": {"model": broken},
     }
     c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
@@ -684,7 +687,7 @@ def test_3d_characters(run):
 
         def st(name):
             return vendor(c, "FaceGetState", {"source": name})
-        for name in ("3D", "3D turned", "3D worn"):
+        for name in ("3D", "3D turned", "3D worn", "3D outlined"):
             assert wait_for(lambda: st(name)["found"] and st(name)["model"]["shown"], 30, 0.2), st(name)
         m = st("3D")["model"]
         assert m["loaded"] and not m["loading"] and m["kind"] == "gltf"
@@ -912,3 +915,6 @@ def test_closing_obs_leaves_nothing_behind(run):
     assert run.close() == 0
     log = run.log()
     assert "Number of memory leaks: 0" in log
+    # Every value a 3D technique reads was set just before it (Windows
+    # won't draw one with any missing).
+    assert "Windows won't draw it" not in log

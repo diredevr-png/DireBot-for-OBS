@@ -36,6 +36,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <graphics/graphics.h>
 
+#include "effect-check.hpp"
 #include "math3d.hpp"
 #include "model.hpp"
 #include "rig.hpp"
@@ -130,6 +131,7 @@ private:
 	};
 	void clear();
 	void make_head();
+	void set_camera();
 	void set_material(const Material &m, const View3D &v, bool outline);
 	void draw_part(size_t i, const Rig::Part &p, const char *technique);
 
@@ -139,6 +141,8 @@ private:
 		    *p_emissive = nullptr, *p_surface = nullptr, *p_toon = nullptr, *p_shade = nullptr,
 		    *p_rim = nullptr, *p_matcap = nullptr, *p_look = nullptr, *p_uv = nullptr,
 		    *p_outline_width = nullptr, *p_outline_colour = nullptr, *p_texel = nullptr;
+	EffectCheck check_;
+	M4 cam_;
 	gs_texture_t *white_ = nullptr, *black_ = nullptr;
 	std::shared_ptr<const Model> model_;
 	std::vector<gs_texture_t *> textures_;

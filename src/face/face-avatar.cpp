@@ -45,6 +45,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "../obs/ui-call.hpp"
 #include "avatar2d.hpp"
 #include "avatar3d.hpp"
+#include "effect-check.hpp"
 #include "model.hpp"
 #include "rig.hpp"
 #include "tracker.hpp"
@@ -651,6 +652,7 @@ struct FaceAvatar {
 		    *p_char_px = nullptr, *p_pivot = nullptr, *p_turn_k = nullptr, *p_cell = nullptr, *p_pad = nullptr,
 		    *p_flip = nullptr, *p_body_origin = nullptr, *p_body_across = nullptr, *p_body_down = nullptr,
 		    *p_ring = nullptr, *p_ring_on = nullptr;
+	EffectCheck check;
 	bool drawing = false, drawn = false, have_out = false;
 	std::vector<uint8_t> mask_bytes;
 	// What it showed last, for FaceGetState.
@@ -743,6 +745,7 @@ struct FaceAvatar {
 			p_body_down = param("body_down");
 			p_ring = param("ring");
 			p_ring_on = param("ring_on");
+			check.load(effect, "2D", face_2d_needs());
 			const float zero = 0;
 			const uint8_t *zero_data = reinterpret_cast<const uint8_t *>(&zero);
 			no_depth = gs_texture_create(1, 1, GS_R32F, 1, &zero_data, 0);
@@ -940,6 +943,7 @@ struct FaceAvatar {
 		gs_effect_set_vec4(p_clip, &clip);
 		gs_matrix_push();
 		gs_matrix_translate3f(x, y, 0);
+		check("Picture");
 		while (gs_effect_loop(effect, "Picture"))
 			gs_draw_quadf(tex, 0, w, h);
 		gs_matrix_pop();
@@ -1015,6 +1019,7 @@ struct FaceAvatar {
 		gs_effect_set_float(p_skin_amount, amount);
 		gs_matrix_push();
 		gs_matrix_translate3f(sx, sy, 0);
+		check("Cutout");
 		while (gs_effect_loop(effect, "Cutout"))
 			gs_draw_quadf(nullptr, 0, sw, sh);
 		gs_matrix_pop();
@@ -1234,6 +1239,7 @@ struct FaceAvatar {
 		gs_matrix_rotaa4f(0, 0, 1, at.angle);
 		gs_matrix_scale3f(at.scale, at.scale, 1);
 		gs_matrix_translate3f(-at.ax - TURN_PAD * CW, -at.ay - TURN_PAD * CH, 0);
+		check("Turn");
 		while (gs_effect_loop(effect, "Turn"))
 			gs_draw_quadf(nullptr, 0, CW * (1 + 2 * TURN_PAD), CH * (1 + 2 * TURN_PAD));
 		gs_matrix_pop();
@@ -1250,6 +1256,7 @@ struct FaceAvatar {
 		if (tex) {
 			gs_effect_set_texture(p_image, tex);
 			gs_effect_set_float(p_flip, mirror ? 1.0f : 0.0f);
+			check("Camera");
 			while (gs_effect_loop(effect, "Camera"))
 				gs_draw_quadf(tex, 0, (float)cw, (float)ch);
 			return;
@@ -1570,6 +1577,7 @@ struct FaceAvatar {
 			gs_effect_set_vec4(p_clip, &clip);
 			gs_matrix_push();
 			gs_matrix_mul(&m);
+			check("Picture");
 			while (gs_effect_loop(effect, "Picture"))
 				gs_draw_quadf(tex, 0, 1, 1);
 			gs_matrix_pop();
@@ -1834,6 +1842,7 @@ struct FaceAvatar {
 			vec4_set(&m.z, 0, 0, 1, 0);
 			gs_matrix_push();
 			gs_matrix_mul(&m);
+			check("Card");
 			while (gs_effect_loop(effect, "Card"))
 				gs_draw_quadf(nullptr, 0, 1, 1);
 			gs_matrix_pop();

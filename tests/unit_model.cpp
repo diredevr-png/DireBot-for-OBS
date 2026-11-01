@@ -6,6 +6,7 @@
 // bump into), and a chain of links swinging on one line of bones.
 // Build and run: tools/test-link.sh (Linux, any C++17 compiler).
 
+#include "../src/face/effect-needs.hpp"
 #include "../src/face/model.hpp"
 #include "../src/face/rig.hpp"
 
@@ -14,6 +15,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <functional>
+#include <map>
+#include <regex>
+#include <set>
+#include <sstream>
 #include <memory>
 #include <random>
 #include <string>
@@ -1441,6 +1448,101 @@ static void test_set_up()
 	CHECK(spread(er.parts()[1]) > 1);
 }
 
+#ifndef DIREBOT_SOURCE_DIR
+#define DIREBOT_SOURCE_DIR "."
+#endif
+
+// The values effect-needs.hpp says each technique reads are exactly the
+// ones its shaders read, as OBS works it out: by every word in each
+// function (and the functions it calls) that's a value's name. The
+// drawing sets those before every technique, and Windows won't draw one
+// with any value missing. And no function has its own variable named
+// like a value, which OBS would take as reading the value.
+static void check_effect_needs(const std::string &file, const std::vector<direbot::face::EffectNeeds> &needs)
+{
+	std::ifstream in(std::string(DIREBOT_SOURCE_DIR) + "/data/effects/" + file);
+	CHECK(in.good());
+	std::stringstream ss;
+	ss << in.rdbuf();
+	const std::string text = std::regex_replace(ss.str(), std::regex("//[^\n]*"), "");
+
+	std::set<std::string> uniforms;
+	const std::regex uniform_re("uniform\\s+\\w+\\s+(\\w+)\\s*[;=]");
+	for (std::sregex_iterator it(text.begin(), text.end(), uniform_re), end; it != end; ++it)
+		uniforms.insert((*it)[1]);
+	CHECK(uniforms.count("image"));
+
+	// Each function's body, by name.
+	std::map<std::string, std::string> bodies;
+	const std::regex func_re("(^|\\n)\\w+\\s+(\\w+)\\s*\\([^)]*\\)\\s*(:\\s*\\w+\\s*)?\\{");
+	for (std::sregex_iterator it(text.begin(), text.end(), func_re), end; it != end; ++it) {
+		size_t at = (size_t)(it->position() + it->length());
+		int depth = 1;
+		size_t i = at;
+		for (; i < text.size() && depth; i++)
+			depth += text[i] == '{' ? 1 : text[i] == '}' ? -1 : 0;
+		bodies[(*it)[2]] = text.substr(at, i - at);
+	}
+	CHECK(bodies.size() > 3);
+
+	const std::regex local_re("\\b(float[234]?(x[234])?|int[234]?|uint|bool|half[234]?)\\s+(\\w+)\\s*[=;,\\[]");
+	for (const auto &b : bodies)
+		for (std::sregex_iterator it(b.second.begin(), b.second.end(), local_re), end; it != end; ++it)
+			if (uniforms.count((*it)[3])) {
+				std::printf("  %s: %s has its own %s\n", file.c_str(), b.first.c_str(),
+					    (*it)[3].str().c_str());
+				CHECK(false);
+			}
+
+	std::function<void(const std::string &, std::set<std::string> &, std::set<std::string> &)> reads;
+	reads = [&](const std::string &fn, std::set<std::string> &got, std::set<std::string> &seen) {
+		if (!seen.insert(fn).second || !bodies.count(fn))
+			return;
+		const std::string &body = bodies[fn];
+		const std::regex word("[A-Za-z_]\\w*");
+		for (std::sregex_iterator it(body.begin(), body.end(), word), end; it != end; ++it) {
+			const std::string w = it->str();
+			if (uniforms.count(w) && w != "ViewProj")
+				got.insert(w);
+			if (bodies.count(w))
+				reads(w, got, seen);
+		}
+	};
+
+	const std::regex tech_re(
+		"technique\\s+(\\w+)\\s*\\{\\s*pass\\s*\\{\\s*vertex_shader\\s*=\\s*(\\w+)\\s*\\([^)]*\\)\\s*;"
+		"\\s*pixel_shader\\s*=\\s*(\\w+)");
+	size_t techniques = 0;
+	for (std::sregex_iterator it(text.begin(), text.end(), tech_re), end; it != end; ++it, techniques++) {
+		std::set<std::string> got, seen;
+		reads((*it)[2], got, seen);
+		reads((*it)[3], got, seen);
+		const direbot::face::EffectNeeds *listed = nullptr;
+		for (const auto &n : needs)
+			if ((*it)[1] == n.technique)
+				listed = &n;
+		CHECK(listed != nullptr);
+		if (!listed)
+			continue;
+		const std::set<std::string> want(listed->values.begin(), listed->values.end());
+		if (want != got) {
+			std::string have;
+			for (const auto &g : got)
+				have += g + " ";
+			std::printf("  %s %s reads: %s\n", file.c_str(), listed->technique, have.c_str());
+		}
+		CHECK(want == got);
+		CHECK(want.size() == listed->values.size());
+	}
+	CHECK(techniques == needs.size());
+}
+
+static void test_effect_needs()
+{
+	check_effect_needs("direbot-face-3d.effect", direbot::face::face_3d_needs());
+	check_effect_needs("direbot-face.effect", direbot::face::face_2d_needs());
+}
+
 int main()
 {
 	test_write_and_read();
@@ -1459,6 +1561,7 @@ int main()
 	test_facing_arms_and_wearing();
 	test_set_up();
 	test_obs_camera();
+	test_effect_needs();
 	std::printf("unit_model: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;
 }
