@@ -115,7 +115,9 @@ imported from a Lens Studio project: its set-up (the `model_setup`
 setting, JSON in the model's own units) says which way it faces, what
 it turns round, where its eyes and mouth are, which bone chains swing and
 which way they're pulled, and which parts stay upright as your head turns
-(trailing after it). Set-up it can't read counts as none.
+(trailing after it), and which parts are its own drawn eyes and mouth
+(hidden while your real ones are on it). DireBot's starter characters
+come with one. Set-up it can't read counts as none.
 
 The link never hands out your stream key: `GetStreamServiceSettings`
 through it shows the key (and a custom server's password or token) as

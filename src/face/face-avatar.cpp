@@ -1401,8 +1401,10 @@ struct FaceAvatar {
 		// Your real eyes and mouth on it: its own stay open and shut under them.
 		gs_texture_t *cut = cam && used_shot >= 0 ? gs_texrender_get_texture(shots[used_shot].tex) : nullptr;
 		const float showing = !drawn_style && seen.ready && cut && held.found ? o.shown : 0;
-		if (showing > 0.5f)
+		if (showing > 0.5f) {
 			quiet_face(d.moves);
+			d.hide_own_face = true;
+		}
 		rig->pose(d);
 		v.fov = f.fov;
 		v.near = f.near;

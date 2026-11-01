@@ -27,7 +27,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //              "right_eye": {"x": .., "y": .., "w": .., "h": ..}, "mouth": ...},
 //    "chains": [{"bones": [...], "pull": [x, y, z], "with_head": true,
 //                "both_ends": false}],
-//    "upright": [{"bone": "...", "follow": 5}]}
+//    "upright": [{"bone": "...", "follow": 5}],
+//    "own_face": ["...", ...]}
 //
 // A spot is the character's own left eye, right eye or mouth: its middle
 // ("at", in the model) or, dragged on its picture from the front, its
@@ -38,7 +39,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // swinging, pulled by "pull" (the model's units a second, each second -
 // turning with your head, or straight down the picture). "upright": parts
 // that stay as they are made, however your head turns, trailing after
-// your head ("follow": how quickly, a second).
+// your head ("follow": how quickly, a second). "own_face": its own drawn
+// eyes and mouth (parts, with all hanging off them), hidden while your
+// real ones are on it.
 
 #pragma once
 
@@ -78,6 +81,7 @@ struct CharacterSetup {
 	bool chains_given = false;
 	std::vector<ChainSetup> chains;
 	std::vector<UprightSetup> upright;
+	std::vector<std::string> own_face;
 	bool empty() const;
 };
 

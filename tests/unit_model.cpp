@@ -1218,6 +1218,36 @@ static void test_set_up()
 	FaceSpots ps = face_spots(pm, Quat(), CharacterSetup());
 	CHECK(std::strcmp(ps.from[0], "guessed") == 0 && ps.spot[0].at.x > 0 && ps.spot[1].at.x < 0 &&
 	      ps.spot[0].at.y > 0 && ps.spot[2].at.y < ps.spot[0].at.y && near(ps.spot[0].at.z, 0.5, 0.02));
+
+	// Its own drawn eyes ("own_face"): drawn as usual, but not while your
+	// real ones are on it (every point in one, covering nothing).
+	CHECK(setup_from(R"({"own_face": ["eyes", 3, "mouth"]})").own_face ==
+	      std::vector<std::string>({"eyes", "mouth"}));
+	GlbPart eyes = plain;
+	eyes.name = "eyes";
+	eyes.t = {0, 0, 0.1f};
+	auto em = std::make_shared<Model>();
+	CHECK(load(write_glb({plain, eyes}), *em));
+	RigOptions eo;
+	eo.setup = std::make_shared<CharacterSetup>(setup_from(R"({"own_face": ["eyes", "no such part"]})"));
+	Rig er(em, eo);
+	Drive shown = still();
+	er.pose(shown);
+	auto spread = [](const Rig::Part &p) {
+		V3 lo = p.pos[0], hi = p.pos[0];
+		for (const V3 &v : p.pos) {
+			lo = {std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+			hi = {std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
+		}
+		return length(hi - lo);
+	};
+	CHECK(er.parts().size() == 2 && spread(er.parts()[0]) > 1 && spread(er.parts()[1]) > 1);
+	shown.hide_own_face = true;
+	er.pose(shown);
+	CHECK(spread(er.parts()[0]) > 1 && spread(er.parts()[1]) == 0);
+	shown.hide_own_face = false;
+	er.pose(shown);
+	CHECK(spread(er.parts()[1]) > 1);
 }
 
 int main()

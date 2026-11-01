@@ -428,6 +428,22 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 			if (up.node >= 0)
 				upright_.push_back(up);
 		}
+	// Its own drawn face: the parts named, and all hanging off them.
+	own_face_.assign(m.nodes.size(), 0);
+	if (setup)
+		for (const std::string &name : setup->own_face) {
+			const int n = node_named(m, name);
+			if (n >= 0)
+				own_face_[n] = 1;
+		}
+	for (bool more = true; more;) {
+		more = false;
+		for (size_t i = 0; i < m.nodes.size(); i++) {
+			const int p = m.nodes[i].parent;
+			if (!own_face_[i] && p >= 0 && own_face_[p])
+				own_face_[i] = more = true;
+		}
+	}
 
 	// Swinging parts.
 	if (!options_.springs)
@@ -813,6 +829,7 @@ void Rig::pose(const Drive &d)
 		settled_ = true;
 	last_root_ = root_at;
 	stand_upright(d);
+	hide_face_ = d.hide_own_face;
 	if (settled_) {
 		for (Chain &c : springs_)
 			for (Joint &j : c.joints) {
@@ -923,6 +940,9 @@ void Rig::skin()
 					out.normal[i] = normalized(direction(mw, src_n[i]), {0, 0, 1});
 				}
 			}
+			// Not drawn: every point in one, so its triangles cover nothing.
+			if (hide_face_ && own_face_[ni] && n)
+				std::fill(out.pos.begin() + 1, out.pos.end(), out.pos[0]);
 		}
 	}
 }
@@ -1029,7 +1049,8 @@ Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, floa
 	size = std::min(1.0f, std::max(0.05f, size));
 	f.fov = 20 * RAD;
 	const float t = std::tan(f.fov / 2);
-	const float d = std::max(extent.y * s, extent.x * s / aspect) / (size * 2 * t);
+	// Far enough back that its front fits too (nearer, it looks bigger).
+	const float d = std::max(extent.y * s, extent.x * s / aspect) / (size * 2 * t) + extent.z * s / 2;
 	const float seen_h = 2 * d * t, seen_w = seen_h * aspect;
 	f.view = moved({0, 0, -d});
 	f.near = d * 0.05f;

@@ -84,6 +84,9 @@ struct Drive {
 	// stay upright (`place` if not given).
 	M4 upright;
 	bool has_upright = false;
+	// Your real eyes and mouth are on it: its own drawn ones (its set-up's
+	// "own_face") aren't drawn.
+	bool hide_own_face = false;
 };
 
 class Rig {
@@ -180,7 +183,9 @@ private:
 	std::vector<Arm> arms_;
 	std::vector<Chain> springs_;
 	std::vector<Upright> upright_;
-	std::vector<char> held_; // a node standing upright this frame
+	std::vector<char> held_;     // a node standing upright this frame
+	std::vector<char> own_face_; // a node of its own drawn face
+	bool hide_face_ = false;
 	bool auto_chain_ = false;
 	bool settled_ = true;
 	float spring_time_ = 0;

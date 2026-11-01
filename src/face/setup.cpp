@@ -29,7 +29,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr size_t MOST_CHAINS = 64, MOST_BONES = 64, MOST_UPRIGHT = 16;
+constexpr size_t MOST_CHAINS = 64, MOST_BONES = 64, MOST_UPRIGHT = 16, MOST_FACE = 32;
 constexpr float FAR = 1e6f;
 
 bool number(const json &j, float &out)
@@ -74,7 +74,7 @@ float number_or(const json &j, const char *key, float def)
 
 bool CharacterSetup::empty() const
 {
-	if (has_facing || has_pivot || chains_given || !upright.empty())
+	if (has_facing || has_pivot || chains_given || !upright.empty() || !own_face.empty())
 		return false;
 	for (const SpotSetup &s : spots)
 		if (s.given)
@@ -156,6 +156,10 @@ CharacterSetup setup_from(const std::string &text)
 			up.follow = std::min(1000.0f, std::max(0.0f, number_or(u, "follow", 5)));
 			out.upright.push_back(up);
 		}
+	if (j.contains("own_face") && j["own_face"].is_array())
+		for (const json &n : j["own_face"])
+			if (n.is_string() && out.own_face.size() < MOST_FACE)
+				out.own_face.push_back(n.get<std::string>());
 	return out;
 }
 
