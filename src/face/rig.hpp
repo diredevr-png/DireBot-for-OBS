@@ -230,6 +230,8 @@ struct Framing {
 	V3 pivot;              // what it turns round, whole (model space)
 	bool has_pivot = false;
 	M4 upright; // the model -> the world, your head held straight (Drive::upright)
+	// In its own spot: the picture's width and height in the world.
+	float seen_w = 1, seen_h = 1;
 };
 
 // In its own spot: the picture `w` x `h`, the character `size` of it
@@ -238,6 +240,8 @@ struct Framing {
 // shoulders (a VRM with a head bone), else all of it.
 Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, float size, bool head, float dx, float dy,
 		       float grow);
+// Moves it on in its spot by `dx`, `dy` more (shares of the picture).
+void move_own_spot(Framing &f, float dx, float dy);
 
 // Worn on your head: where it sits on it (centimetres from the middle of
 // your head - MediaPipe's face at rest - x right, y up, z out of your

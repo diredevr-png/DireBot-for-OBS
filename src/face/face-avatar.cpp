@@ -1109,11 +1109,22 @@ struct FaceAvatar {
 			// In its own spot: sized to fit, then following you - moved,
 			// grown, tilted, turned and nodded as you are against "Set",
 			// within limits, gliding between looks.
-			const Shown::Glide &g = o.glide;
+			const Shown::Glide &g = o.steady;
 			const float fit = std::min(w / char_w, h / char_h) * size;
-			const float dx = clampf((g.cx - o.home_x) * follow_move * flip, -most_move, most_move);
-			const float dy = clampf((g.cy - o.home_y) * follow_move, -most_move, most_move);
 			const float grow = clampf(std::pow(std::max(0.05f, g.scale), follow_grow), 0.6f, 1.6f);
+			// Moved in proportion to its size: its eye gap, as it's shown.
+			float its_gap = 0;
+			if (have_spots) {
+				const float lx = (spots[0].x + spots[0].w / 2) * char_w,
+					    ly = (spots[0].y + spots[0].h / 2) * char_h;
+				const float rx = (spots[1].x + spots[1].w / 2) * char_w,
+					    ry = (spots[1].y + spots[1].h / 2) * char_h;
+				its_gap = std::hypot(rx - lx, ry - ly) * fit * grow;
+			}
+			float dx = 0, dy = 0;
+			follow_of(o, g, follow_move, its_gap / std::max(1u, w), its_gap / std::max(1u, h), dx, dy);
+			dx = clampf(dx * flip, -most_move, most_move);
+			dy = clampf(dy, -most_move, most_move);
 			at.shown = true;
 			at.x = w * (0.5f + dx);
 			at.y = h * (0.5f + dy);
@@ -1412,13 +1423,17 @@ struct FaceAvatar {
 			// Mirrored: it moves as your reflection does (not mirrored itself).
 			if (mirror)
 				swap_sides(d.moves);
-			const Shown::Glide &g = o.glide;
+			const Shown::Glide &g = o.steady;
 			const float flip = mirror ? -1.0f : 1.0f;
-			const float dx = clampf((g.cx - o.home_x) * follow_move * flip, -most_move, most_move);
-			const float dy = clampf((g.cy - o.home_y) * follow_move, -most_move, most_move);
 			const float grow = clampf(std::pow(std::max(0.05f, g.scale), follow_grow), 0.6f, 1.6f);
 			const bool head = look3d.framing == 2 || (look3d.framing == 0 && m.is_vrm());
-			f = frame_own_spot(m, facing, w, h, size, head, dx, dy, grow);
+			// Moved in proportion to its size: its eye gap (its spots), as
+			// it's framed.
+			f = frame_own_spot(m, facing, w, h, size, head, 0, 0, grow);
+			const float its_gap = length(spots3d.spot[0].at - spots3d.spot[1].at) * f.world_scale;
+			float dx = 0, dy = 0;
+			follow_of(o, g, follow_move, its_gap / f.seen_w, its_gap / f.seen_h, dx, dy);
+			move_own_spot(f, clampf(dx * flip, -most_move, most_move), clampf(dy, -most_move, most_move));
 			d.head = head_turn(clampf(g.yaw * bend, -MOST_YAW_3D, MOST_YAW_3D),
 					   clampf(g.pitch * bend, -MOST_PITCH_3D, MOST_PITCH_3D),
 					   clampf(g.angle * follow_tilt, -0.6f, 0.6f), mirror);

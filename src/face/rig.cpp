@@ -1139,15 +1139,25 @@ Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, floa
 	const float d = std::max(extent.y * s, extent.x * s / aspect) / (size * 2 * t) + extent.z * s / 2;
 	const float seen_h = 2 * d * t, seen_w = seen_h * aspect;
 	f.view = moved({0, 0, -d});
+	f.seen_w = seen_w;
+	f.seen_h = seen_h;
 	f.near = d * 0.05f;
 	f.far = d * 20;
 	grow = std::max(0.05f, grow);
-	f.place = moved({dx * seen_w, -dy * seen_h, 0}) * scaled(s * grow) * moved(middle * -1) * matrix_of(facing);
+	f.place = scaled(s * grow) * moved(middle * -1) * matrix_of(facing);
 	f.world_scale = s * grow;
 	f.height = extent.y * s * grow;
 	f.pivot = rotate(conj(facing), middle);
 	f.upright = f.place;
+	move_own_spot(f, dx, dy);
 	return f;
+}
+
+void move_own_spot(Framing &f, float dx, float dy)
+{
+	const M4 by = moved({dx * f.seen_w, -dy * f.seen_h, 0});
+	f.place = by * f.place;
+	f.upright = by * f.upright;
 }
 
 Framing frame_worn(const Model &m, Quat facing, const WornPlace &place, const M4 &pose, float aspect)

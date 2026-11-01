@@ -225,11 +225,24 @@ public:
 	struct Glide {
 		float cx = 0.5f, cy = 0.5f, scale = 1, angle = 0, yaw = 0, pitch = 0;
 	};
+	// Sitting still, your head still sways a little (and the tracker's
+	// guess with it): the glide's middle and size held still against
+	// moves within STILL of your eye gap and STILL_GROW of its size, so
+	// the character doesn't wiggle; a bigger move takes it along
+	// straight away. Within them it settles on you slowly (STILL_SETTLE
+	// seconds).
+	static constexpr float STILL = 0.25f, STILL_GROW = 0.03f, STILL_SETTLE = 1.5f;
+	// Your eye gap is taken over about this long (seconds).
+	static constexpr float GAP_TIME = 0.5f;
 	struct Out {
 		Layout layout;                                 // the newest look's, as it was
 		float scale = 1;                               // eye to eye, against "Set"
 		float home_x = 0.5f, home_y = 0.5f, angle = 0; // tilt against "Set"
 		Glide glide;
+		Glide steady; // the glide held still against small moves: what the character follows
+		// Your eyes' gap lately (a share of the picture's width; 0 until
+		// seen) and the picture's width over its height.
+		float gap = 0, aspect = 16.0f / 9;
 		float shown = 0;      // the real eyes and mouth: 0 hidden to 1 shown
 		bool holding = false; // shown, but from the last picture they were seen in
 		bool found = false;
@@ -252,18 +265,33 @@ public:
 
 private:
 	void glide(float dt);
+	void hold_still(float dt);
 
 	Out out_;
 	float lost_for_ = 0;
 	bool seen_ = false;
 	// The glide: from where it was to the newest look, `glided_` of the
-	// way there, over `between_` seconds (the time between the last two
-	// looks).
+	// way there, over `between_` seconds - the time looks come apart,
+	// lately (`pace_`): a camera's pictures don't come quite evenly, and
+	// a look straight after the last one glided over just that would get
+	// there at once and then stand still until the next.
 	Glide from_, to_;
-	float glided_ = 1, between_ = 1.0f / 30, since_look_ = 0;
+	float glided_ = 1, between_ = 1.0f / 30, since_look_ = 0, pace_ = 1.0f / 30;
+	bool still_from_glide_ = true; // the steady glide jumps to the glide
 	Glide last_, before_; // the newest two looks', as they were (for the lead)
 	bool have_move_ = false;
 	float lead_ = 0;
 };
+
+// In its own spot, how far the character moves (`dx` across, `dy` down,
+// shares of its picture) as the glide `g` is from "Set"'s place: `follow`
+// of your move, counted in eye gaps - yours in the camera (`o`), its own
+// in its picture (`its_w`, `its_h`: eye to eye as shares of the picture's
+// width and height) - so a character shown small (all of it, say) moves
+// in proportion, a few of its own heads at most; but never further than
+// `follow` of the move as shares of the camera's picture. Its eye gap
+// unknown (0): the latter.
+void follow_of(const Shown::Out &o, const Shown::Glide &g, float follow, float its_w, float its_h, float &dx,
+	       float &dy);
 
 } // namespace direbot::face

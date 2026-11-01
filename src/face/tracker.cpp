@@ -884,6 +884,7 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 			if (!seen_ || o.shown <= 0) {
 				from_ = to_ = o.glide = target;
 				glided_ = 1;
+				still_from_glide_ = true;
 			} else {
 				from_ = o.glide;
 				to_ = target;
@@ -910,8 +911,17 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 						to_.angle = wrap_angle(target.angle +
 								       (std::fabs(a) < std::fabs(b) ? a : b) * lead_);
 				}
+				// Over the time looks come apart lately; after a gap (it
+				// lost you a moment), over the gap.
 				glided_ = 0;
-				between_ = std::min(0.25f, std::max(1.0f / 240, since_look_));
+				const float apart = std::min(0.25f, std::max(1.0f / 240, since_look_));
+				if (apart > pace_ * 3) {
+					between_ = apart;
+					pace_ += (apart - pace_) * 0.05f;
+				} else {
+					pace_ += (apart - pace_) * 0.25f;
+					between_ = pace_;
+				}
 			}
 			// The last two looks (one straight after the other) for the lead.
 			have_move_ = seen_ && o.shown > 0 && since_look_ <= LEAD_GAP;
@@ -925,7 +935,13 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 		o.found = true;
 		o.holding = false;
 		o.shown = std::min(1.0f, o.shown + dt / BACK);
+		if (face.w > 0 && face.h > 0)
+			o.aspect = (float)face.w / (float)face.h;
+		if (o.layout.gap > 0)
+			o.gap = o.gap > 0 ? o.gap + (o.layout.gap - o.gap) * std::min(1.0f, dt / GAP_TIME)
+					  : o.layout.gap;
 		glide(dt);
+		hold_still(dt);
 		return o;
 	}
 	o.found = false;
@@ -954,6 +970,7 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 		from_.yaw *= back;
 		from_.pitch *= back;
 	}
+	hold_still(dt);
 	return o;
 }
 
@@ -972,6 +989,38 @@ void Shown::glide(float dt)
 	g.pitch = from_.pitch + (to_.pitch - from_.pitch) * t;
 }
 
+void Shown::hold_still(float dt)
+{
+	Glide &s = out_.steady;
+	const Glide &g = out_.glide;
+	if (still_from_glide_ || out_.gap <= 0) {
+		s = g;
+		still_from_glide_ = out_.gap <= 0;
+		return;
+	}
+	s.angle = g.angle;
+	s.yaw = g.yaw;
+	s.pitch = g.pitch;
+	const float settle = std::min(1.0f, std::max(0.0f, dt) / STILL_SETTLE);
+	// Across and up and down: within STILL of your eye gap (a share of
+	// the picture's width; of its height, `aspect` times that).
+	const float rx = STILL * out_.gap, ry = rx * out_.aspect;
+	const float ex = (g.cx - s.cx) / rx, ey = (g.cy - s.cy) / ry;
+	const float past = std::sqrt(ex * ex + ey * ey);
+	if (past > 1) {
+		s.cx = g.cx - (g.cx - s.cx) / past;
+		s.cy = g.cy - (g.cy - s.cy) / past;
+	} else {
+		s.cx += (g.cx - s.cx) * settle;
+		s.cy += (g.cy - s.cy) * settle;
+	}
+	const float grown = std::log(std::max(1e-4f, g.scale) / std::max(1e-4f, s.scale));
+	if (std::fabs(grown) > STILL_GROW)
+		s.scale = g.scale * std::exp(grown > 0 ? -STILL_GROW : STILL_GROW);
+	else
+		s.scale *= std::exp(grown * settle);
+}
+
 void Shown::reset()
 {
 	out_ = Out();
@@ -980,8 +1029,20 @@ void Shown::reset()
 	from_ = to_ = last_ = before_ = Glide();
 	have_move_ = false;
 	glided_ = 1;
-	between_ = 1.0f / 30;
+	between_ = pace_ = 1.0f / 30;
 	since_look_ = 0;
+	still_from_glide_ = true;
+}
+
+void follow_of(const Shown::Out &o, const Shown::Glide &g, float follow, float its_w, float its_h, float &dx,
+	       float &dy)
+{
+	dx = (g.cx - o.home_x) * follow;
+	dy = (g.cy - o.home_y) * follow;
+	if (o.gap > 0 && its_w > 0 && its_h > 0) {
+		dx *= std::min(1.0f, its_w / o.gap);
+		dy *= std::min(1.0f, its_h / (o.gap * o.aspect));
+	}
 }
 
 } // namespace direbot::face

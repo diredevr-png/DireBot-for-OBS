@@ -1135,6 +1135,121 @@ static void test_shown()
 	o = gap.step(shifted(18), rest, look, true);
 	o = gap.step(shifted(18), rest, 1.0f, false);
 	CHECK(near(o.glide.cx, o.layout.cx, 1e-6));
+
+	// A camera's pictures coming unevenly (one straight after another,
+	// then a wait of three frames, 30 a second all the same) while you
+	// move steadily: the glide goes at the pace they come, so it never
+	// gets somewhere at once and stands still for frames (a stutter).
+	{
+		Shown uneven;
+		uneven.step(face, rest, frame);
+		const float px_frame = 3; // 180 pixels a second
+		int t = 0;
+		std::vector<float> xs2;
+		for (int i = 0; i < 30; i++) {
+			const int wait = i % 2 ? 1 : 3;
+			for (int k = 0; k < wait; k++) {
+				t++;
+				o = uneven.step(shifted(px_frame * t), rest, frame, k == wait - 1);
+				xs2.push_back(o.glide.cx);
+			}
+		}
+		int still = 0, most_still = 0;
+		float biggest = 0;
+		for (size_t i = 20; i < xs2.size(); i++) {
+			const float move = xs2[i] - xs2[i - 1];
+			still = move < 1e-6f ? still + 1 : 0;
+			most_still = std::max(most_still, still);
+			biggest = std::max(biggest, move);
+		}
+		CHECK(most_still <= 1);
+		CHECK(biggest < 2.2f * px_frame / face.w); // no jump of a whole look's move at once
+	}
+
+	// Sitting still: the character follows the steady glide, held still
+	// against a little sway; a real move takes it along at once (no
+	// further behind than STILL eye gaps), and it settles on you.
+	{
+		Shown sway;
+		o = sway.step(face, rest, look);
+		const float gap_px = o.gap * face.w;
+		CHECK(gap_px > 10 && near(o.aspect, (float)face.w / face.h, 1e-5));
+		const float x0 = o.steady.cx, y0 = o.steady.cy;
+		float most_off = 0;
+		for (int i = 1; i <= 90; i++) {
+			// Swaying 0.12 of an eye gap to and fro, up and down.
+			Face f = face;
+			const float dx = 0.12f * gap_px * std::sin(i * 1.3f), dy = 0.12f * gap_px * std::cos(i * 0.7f);
+			for (auto &p : f.points) {
+				p.x += dx;
+				p.y += dy;
+			}
+			o = sway.step(f, rest, look);
+			most_off = std::max(most_off, std::fabs(o.steady.cx - x0) * face.w);
+			most_off = std::max(most_off, std::fabs(o.steady.cy - y0) * face.h);
+		}
+		CHECK(most_off < 0.06f * gap_px); // it barely moves (the glide moved twice as far)
+		// A move of two eye gaps: along at once.
+		const Face moved_on = shifted(2 * gap_px);
+		o = sway.step(moved_on, rest, look);
+		o = sway.step(moved_on, rest, look, false);
+		CHECK(std::fabs(o.glide.cx - o.steady.cx) <= Shown::STILL * o.gap + 1e-5f);
+		CHECK((o.steady.cx - x0) * face.w > 1.6f * gap_px);
+		// Then still there: it settles on you.
+		for (int i = 0; i < 300; i++)
+			o = sway.step(moved_on, rest, look);
+		CHECK(std::fabs(o.glide.cx - o.steady.cx) < 0.01f * o.gap);
+		// Leaning in a little (against "Set"): held; a lot: along.
+		Shown leans;
+		o = leans.step(face, set, look);
+		const float scale0 = o.steady.scale;
+		CHECK(near(scale0, 2, 1e-4));
+		Face nearer = face;
+		const float mid_x = face.w * l.cx, mid_y = face.h * l.cy;
+		for (auto &p : nearer.points) {
+			p.x = mid_x + (p.x - mid_x) * 1.02f;
+			p.y = mid_y + (p.y - mid_y) * 1.02f;
+		}
+		o = leans.step(nearer, set, look);
+		o = leans.step(nearer, set, look, false);
+		CHECK(near(o.glide.scale / scale0, 1.02, 1e-3) && std::fabs(o.steady.scale / scale0 - 1) < 0.002f);
+		for (auto &p : nearer.points) {
+			p.x = mid_x + (p.x - mid_x) * 1.2f;
+			p.y = mid_y + (p.y - mid_y) * 1.2f;
+		}
+		o = leans.step(nearer, set, look);
+		o = leans.step(nearer, set, look, false);
+		CHECK(o.steady.scale / scale0 > 1.18f);
+		// Lost and faded, then found somewhere else: straight there.
+		for (int i = 0; i < 20; i++)
+			o = sway.step(lost, rest, 0.1f);
+		o = sway.step(face, rest, look);
+		CHECK(near(o.steady.cx, o.glide.cx, 1e-6) && near(o.steady.cx, layout_of(face).cx, 1e-6));
+	}
+
+	// How far the character moves in its own spot: counted in eye gaps,
+	// so one shown small (all of it) moves a little, never further than
+	// the same share of its picture as you moved in the camera's.
+	{
+		Shown::Out at;
+		at.home_x = 0.5f;
+		at.home_y = 0.5f;
+		at.gap = 0.05f;
+		at.aspect = 16.0f / 9;
+		Shown::Glide g;
+		g.cx = 0.8f; // 0.3 of the picture across: 6 of your eye gaps
+		g.cy = 0.6f; // 0.1 of its height: 0.1 * 9 / 16 / 0.05 = 1.125 eye gaps
+		float dx = 0, dy = 0;
+		follow_of(at, g, 0.6f, 0, 0, dx, dy); // its gap unknown: shares, as ever
+		CHECK(near(dx, 0.18, 1e-6) && near(dy, 0.06, 1e-6));
+		follow_of(at, g, 0.6f, 0.4f, 0.4f, dx, dy); // shown big: no further than that either
+		CHECK(near(dx, 0.18, 1e-6) && near(dy, 0.06, 1e-6));
+		// All of a character in a 16:9 picture: its eyes 0.017 of the
+		// width apart, 0.03 of the height.
+		follow_of(at, g, 0.6f, 0.017f, 0.03f, dx, dy);
+		CHECK(near(dx, 0.6 * 6 * 0.017, 1e-5) && near(dy, 0.6 * 1.125 * 0.03, 1e-5));
+		CHECK(dx < 0.07f && dy < 0.03f);
+	}
 }
 
 // When the camera's picture goes to the tracker (look-pace.hpp): OBS at

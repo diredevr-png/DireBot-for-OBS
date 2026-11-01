@@ -1367,6 +1367,20 @@ static void test_obs_camera()
 		// it all behind the camera: nothing drawn.
 		CHECK(obs_sees(true, f, aspect, top, true).w < 0);
 	}
+	// Moved on in its spot (shares of the picture): the same as framed
+	// there, and that far across and down the picture.
+	{
+		const Framing there = frame_own_spot(m, Quat{}, 1280, 720, 0.8f, false, 0.1f, 0.05f, 1.2f);
+		Framing moved_on = frame_own_spot(m, Quat{}, 1280, 720, 0.8f, false, 0, 0, 1.2f);
+		const Seen before = obs_sees(false, moved_on, aspect, point(moved_on.place, {0, 0.8f, 0}));
+		move_own_spot(moved_on, 0.1f, 0.05f);
+		CHECK(near(moved_on.seen_w / moved_on.seen_h, aspect, 1e-4));
+		for (int i = 0; i < 16; i++)
+			CHECK(near(moved_on.place.m[i], there.place.m[i], 1e-5) &&
+			      near(moved_on.upright.m[i], there.upright.m[i], 1e-5));
+		const Seen after = obs_sees(false, moved_on, aspect, point(moved_on.place, {0, 0.8f, 0}));
+		CHECK(near(after.across - before.across, 0.1, 1e-3) && near(after.down - before.down, 0.05, 1e-3));
+	}
 }
 
 static void test_set_up()
