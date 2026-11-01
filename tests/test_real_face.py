@@ -272,11 +272,13 @@ def test_it_finds_the_face_and_sets_it(run):
             x, y = want["points"][i][:2]
             assert abs(s["points"][i]["x"] - (AT_X + 2 * x + 1) / W) < 0.006
             assert abs(s["points"][i]["y"] - (AT_Y + 2 * y + 1) / H) < 0.01
-        # Thirty looks a second (OBS here runs at 30 frames a second), on
-        # its own thread. (Counted over 2 seconds.)
+        # A look at every frame OBS draws - thirty a second here, fewer when
+        # a busy machine makes OBS itself skip some - on its own thread.
+        # (Counted over 2 seconds.)
         time.sleep(4.5)
         s = state(c)
-        assert 24 <= s["looks_per_second"] <= 31, s
+        fps = send(c, "GetStats")["activeFps"]
+        assert max(5.0, 0.8 * min(fps, 30)) <= s["looks_per_second"] <= 31, (s, fps)
         assert 0 < s["ms"] < 40
 
         # "Set": kept in its settings, and the same face reads as at rest.
@@ -298,7 +300,8 @@ def test_it_finds_the_face_and_sets_it(run):
         send(c, "SetInputSettings", {"inputName": "Avatar",
                                      "inputSettings": {"easy": True}})
         time.sleep(4.5)
-        assert 12 <= state(c)["looks_per_second"] <= 16
+        fps = send(c, "GetStats")["activeFps"]
+        assert max(2.5, 0.4 * min(fps, 30)) <= state(c)["looks_per_second"] <= 16, fps
 
         # The face gone: held for a moment, then the character's own face.
         send(c, "SetInputSettings", {"inputName": "Camera",
