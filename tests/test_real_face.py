@@ -47,6 +47,41 @@ def write_png(path, w, h, rows, alpha=False):
                 chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
+def write_gif(path, w, h, frames, palette, delay_cs):
+    """An animated GIF, looping: each frame a list of palette numbers (up
+    to 4 colours), `delay_cs` hundredths of a second each."""
+    def pixels(indices):
+        # LZW kept to 3-bit codes: a clear code before every two pixels,
+        # so its table never grows a code size.
+        codes = []
+        for i in range(0, len(indices), 2):
+            codes.append(4)
+            codes.extend(indices[i:i + 2])
+        codes.append(5)
+        bits = n = 0
+        out = bytearray()
+        for code in codes:
+            bits |= code << n
+            n += 3
+            while n >= 8:
+                out.append(bits & 0xFF)
+                bits >>= 8
+                n -= 8
+        if n:
+            out.append(bits & 0xFF)
+        blocks = b"".join(bytes([len(out[i:i + 255])]) + bytes(out[i:i + 255])
+                          for i in range(0, len(out), 255))
+        return bytes([2]) + blocks + b"\0"
+    table = b"".join(bytes(c) for c in (palette + [(0, 0, 0)] * 4)[:4])
+    data = (b"GIF89a" + struct.pack("<HHBBB", w, h, 0x81, 0, 0) + table +
+            b"\x21\xff\x0bNETSCAPE2.0\x03\x01\0\0\0")
+    for frame in frames:
+        data += b"\x21\xf9\x04\x00" + struct.pack("<H", delay_cs) + b"\0\0"
+        data += b"\x2c" + struct.pack("<HHHHB", 0, 0, w, h, 0) + pixels(frame)
+    with open(path, "wb") as f:
+        f.write(data + b"\x3b")
+
+
 def read_ppm(path):
     data = open(path, "rb").read()
     magic, w, h, top, rest = data.split(maxsplit=4)
@@ -272,13 +307,14 @@ def test_it_finds_the_face_and_sets_it(run):
             x, y = want["points"][i][:2]
             assert abs(s["points"][i]["x"] - (AT_X + 2 * x + 1) / W) < 0.006
             assert abs(s["points"][i]["y"] - (AT_Y + 2 * y + 1) / H) < 0.01
-        # A look at every frame OBS draws - thirty a second here, fewer when
-        # a busy machine makes OBS itself skip some - on its own thread.
-        # (Counted over 2 seconds.)
+        # A look at each new picture (up to thirty a second, on its own
+        # thread: test_it_looks_at_each_new_picture); a picture that stays
+        # just the same, like this photo, ten a second. (Counted over 2
+        # seconds; fewer when a busy machine makes OBS skip frames.)
         time.sleep(4.5)
         s = state(c)
         fps = send(c, "GetStats")["activeFps"]
-        assert max(5.0, 0.8 * min(fps, 30)) <= s["looks_per_second"] <= 31, (s, fps)
+        assert max(3.0, 0.25 * min(fps, 30)) <= s["looks_per_second"] <= 16, (s, fps)
         assert 0 < s["ms"] < 40
 
         # "Set": kept in its settings, and the same face reads as at rest.
@@ -301,7 +337,7 @@ def test_it_finds_the_face_and_sets_it(run):
                                      "inputSettings": {"easy": True}})
         time.sleep(4.5)
         fps = send(c, "GetStats")["activeFps"]
-        assert max(2.5, 0.4 * min(fps, 30)) <= state(c)["looks_per_second"] <= 16, fps
+        assert max(1.5, 0.12 * min(fps, 30)) <= state(c)["looks_per_second"] <= 8.5, fps
 
         # The face gone: held for a moment, then the character's own face.
         send(c, "SetInputSettings", {"inputName": "Camera",
@@ -339,6 +375,66 @@ def test_it_finds_the_face_and_sets_it(run):
         shot = send(c, "GetSourceScreenshot", {
             "sourceName": "Avatar", "imageFormat": "png", "imageWidth": 200})
         assert shot["imageData"].startswith("data:image/png;base64,")
+    finally:
+        c.disconnect()
+
+
+def test_it_looks_at_each_new_picture(run):
+    """A camera's picture changes every time it sends one: each new one
+    is looked at (up to thirty a second), soon after it comes. A small
+    picture flickering in a corner of the scene stands in for a camera's
+    grain; the photo moving, for you."""
+    face_png = os.path.join(run.home, "camera.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+    flicker = os.path.join(run.home, "flicker.gif")
+    # Three frames 20 ms each: whatever the frame rate, each frame OBS
+    # draws shows a different one from the frame before.
+    write_gif(flicker, 8, 8, [[i] * 64 for i in range(3)],
+              [(10, 10, 10), (60, 60, 60), (120, 120, 120)], 2)
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="",
+                        timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "Flicker"})
+        send(c, "CreateInput", {"sceneName": "Flicker", "inputName": "Flicker photo",
+                                "inputKind": "image_source",
+                                "inputSettings": {"file": face_png}})
+        send(c, "CreateInput", {"sceneName": "Flicker", "inputName": "Grain",
+                                "inputKind": "image_source",
+                                "inputSettings": {"file": flicker}})
+        photo = send(c, "GetSceneItemId", {"sceneName": "Flicker",
+                                           "sourceName": "Flicker photo"})["sceneItemId"]
+        send(c, "CreateScene", {"sceneName": "Quick"})
+        send(c, "CreateInput", {"sceneName": "Quick", "inputName": "Quick avatar",
+                                "inputKind": "direbot_face_avatar",
+                                "inputSettings": {"source": "Flicker"}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Quick"})
+        quick = lambda: vendor(c, "FaceGetState", {"source": "Quick avatar"})
+        assert wait_for(lambda: quick()["found"], 30, 0.2), quick()
+        time.sleep(4.5)
+        s = quick()
+        fps = send(c, "GetStats")["activeFps"]
+        assert max(5.0, 0.8 * min(fps, 30)) <= s["looks_per_second"] <= 31, (s, fps)
+        # You move: it sees where you went within a few frames (two to read
+        # the picture back and look, one to pick it up; a frame is up to
+        # 1/30 s here, longer on a busy machine), not a look or two behind.
+        frame = 1 / max(1.0, min(fps, 60))
+        took = []
+        for step in (40, -40, 40, -40):
+            x0 = quick()["parts"][0]["x"]
+            at = send(c, "GetSceneItemTransform", {"sceneName": "Flicker",
+                                                   "sceneItemId": photo})["sceneItemTransform"]
+            t0 = time.perf_counter()
+            send(c, "SetSceneItemTransform", {"sceneName": "Flicker", "sceneItemId": photo,
+                                              "sceneItemTransform": {"positionX": at["positionX"] + step}})
+            assert wait_for(lambda: abs(quick()["parts"][0]["x"] - x0) > 0.01, 2, 0.002)
+            took.append(time.perf_counter() - t0)
+            time.sleep(0.3)
+        print("\nsees a move in %s ms (frames of %.0f ms, looks of %.0f ms)" % (
+            [round(1000 * t) for t in took], 1000 * frame, s["ms"]))
+        assert sorted(took)[1] < 5 * frame + 2 * s["ms"] / 1000 + 0.05, took
+        send(c, "RemoveScene", {"sceneName": "Quick"})
+        send(c, "RemoveScene", {"sceneName": "Flicker"})
     finally:
         c.disconnect()
 

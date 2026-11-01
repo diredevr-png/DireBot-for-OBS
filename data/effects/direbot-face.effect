@@ -170,6 +170,23 @@ float4 ring_sample(float2 at)
 	return body_map.SampleLevel(textureSampler, ring.xy + at * ring.zw, 0.0);
 }
 
+// One point of the character round the card, as Lab, weighted by how like
+// skin it looks (rgb: Lab times the weight; a: the weight): near your
+// own skin's colour and light counts most, so a beard, a mustache or a
+// shadow round the mouth hardly counts. (A character nothing like skin -
+// green, blue - counts all its points about the same.)
+float4 ring_skin(float2 at)
+{
+	float4 s = ring_sample(at);
+	if (s.a < 0.01)
+		return float4(0.0, 0.0, 0.0, 0.0);
+	float3 lab = lab_of(saturate(s.rgb / s.a));
+	float2 hue = lab.yz - skin_lab.yz;
+	float like = 0.05 + exp(-dot(hue, hue) / 200.0);
+	float w = s.a * like * (0.25 + saturate(lab.x / 80.0));
+	return float4(lab * w, w);
+}
+
 float4 PSCard(VertData v_in) : TARGET
 {
 	float2 uv = origin + across * v_in.uv.x + down * v_in.uv.y;
@@ -185,14 +202,18 @@ float4 PSCard(VertData v_in) : TARGET
 		float3 target = target_lab;
 		float use = 1.0;
 		if (ring_on > 0.5) {
-			// The character round the card, as it's drawn (lit and shaded;
-			// premultiplied).
+			// The character's skin round the card, as it's drawn (lit and
+			// shaded; premultiplied): only once it's there all round.
 			float4 sum = ring_sample(float2(1.0, 0.0)) + ring_sample(float2(-1.0, 0.0)) +
 				     ring_sample(float2(0.0, 1.0)) + ring_sample(float2(0.0, -1.0)) +
 				     ring_sample(float2(0.7071, 0.7071)) + ring_sample(float2(-0.7071, 0.7071)) +
 				     ring_sample(float2(0.7071, -0.7071)) + ring_sample(float2(-0.7071, -0.7071));
 			use = saturate(sum.a - 1.0);
-			target = lab_of(saturate(sum.rgb / max(sum.a, 0.001)));
+			float4 skin = ring_skin(float2(1.0, 0.0)) + ring_skin(float2(-1.0, 0.0)) +
+				      ring_skin(float2(0.0, 1.0)) + ring_skin(float2(0.0, -1.0)) +
+				      ring_skin(float2(0.7071, 0.7071)) + ring_skin(float2(-0.7071, 0.7071)) +
+				      ring_skin(float2(0.7071, -0.7071)) + ring_skin(float2(-0.7071, -0.7071));
+			target = skin.rgb / max(skin.a, 0.0001);
 		}
 		float in_line = mask_map.Sample(textureSampler, float2(mx, my + 0.5)).r;
 		float w = saturate(skin_amount) * (1.0 - in_line) * use;

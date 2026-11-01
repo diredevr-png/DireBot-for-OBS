@@ -243,6 +243,12 @@ public:
 	Out step(const Face &face, const Rest &rest, float dt, bool new_look = true);
 	Out now() const { return out_; }
 	void reset();
+	// How far past the newest look the glide aims, 0 to 1 of the move
+	// it's making (as far as both its last two moves went that way). 0:
+	// it trails a look behind a moving face; 1: it keeps up with a steady
+	// move. Only over looks straight after each other (LEAD_GAP).
+	static constexpr float LEAD_GAP = 0.1f;
+	void set_lead(float lead) { lead_ = lead < 0 ? 0 : lead > 1 ? 1 : lead; }
 
 private:
 	void glide(float dt);
@@ -255,6 +261,9 @@ private:
 	// looks).
 	Glide from_, to_;
 	float glided_ = 1, between_ = 1.0f / 30, since_look_ = 0;
+	Glide last_, before_; // the newest two looks', as they were (for the lead)
+	bool have_move_ = false;
+	float lead_ = 0;
 };
 
 } // namespace direbot::face

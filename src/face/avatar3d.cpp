@@ -646,10 +646,16 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 	};
 	// Outlines (only their far side, so they show round the edges), then
 	// the solid parts over them, then the see-through ones far to near.
+	// The outline setting draws one round every part - but a character
+	// with outlines of its own keeps them off the parts it has none on (a
+	// face, its eyes).
+	bool own_outlines = false;
+	for (const Material &mat : m.materials)
+		own_outlines = own_outlines || mat.outline != Outline::None;
 	std::vector<size_t> blended;
 	for (size_t i = 0; i < posed.size(); i++) {
 		const Material &mat = material_of(i);
-		if (mat.outline == Outline::None && v.outline <= 0)
+		if (mat.outline == Outline::None && (v.outline <= 0 || own_outlines))
 			continue;
 		part_distance_ = distance[i];
 		set_material(mat, v, true);

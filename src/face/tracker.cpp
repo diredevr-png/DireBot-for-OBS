@@ -887,9 +887,36 @@ Shown::Out Shown::step(const Face &face, const Rest &rest, float dt, bool new_lo
 			} else {
 				from_ = o.glide;
 				to_ = target;
+				// Aimed on past it by some of the move it's making, so it
+				// keeps up with you instead of always a look behind - only
+				// as far as both its last two moves went that way, so a
+				// sudden move or a stop doesn't overshoot.
+				const bool lead = lead_ > 0 && since_look_ <= LEAD_GAP && have_move_;
+				auto on = [&](float now, float last, float before) {
+					const float a = now - last, b = last - before;
+					if (!lead || a * b <= 0)
+						return now;
+					return now + (std::fabs(a) < std::fabs(b) ? a : b) * lead_;
+				};
+				to_.cx = on(target.cx, last_.cx, before_.cx);
+				to_.cy = on(target.cy, last_.cy, before_.cy);
+				to_.scale = on(target.scale, last_.scale, before_.scale);
+				to_.yaw = on(target.yaw, last_.yaw, before_.yaw);
+				to_.pitch = on(target.pitch, last_.pitch, before_.pitch);
+				{
+					const float a = wrap_angle(target.angle - last_.angle),
+						    b = wrap_angle(last_.angle - before_.angle);
+					if (lead && a * b > 0)
+						to_.angle = wrap_angle(target.angle +
+								       (std::fabs(a) < std::fabs(b) ? a : b) * lead_);
+				}
 				glided_ = 0;
 				between_ = std::min(0.25f, std::max(1.0f / 240, since_look_));
 			}
+			// The last two looks (one straight after the other) for the lead.
+			have_move_ = seen_ && o.shown > 0 && since_look_ <= LEAD_GAP;
+			before_ = last_;
+			last_ = target;
 			since_look_ = 0;
 		}
 		seen_ = true;
@@ -950,7 +977,8 @@ void Shown::reset()
 	out_ = Out();
 	lost_for_ = 0;
 	seen_ = false;
-	from_ = to_ = Glide();
+	from_ = to_ = last_ = before_ = Glide();
+	have_move_ = false;
 	glided_ = 1;
 	between_ = 1.0f / 30;
 	since_look_ = 0;

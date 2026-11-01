@@ -7,6 +7,7 @@
 // Build and run: tools/test-link.sh (Linux, any C++17 compiler).
 
 #include "../src/face/tracker.hpp"
+#include "../src/face/look-pace.hpp"
 #include "../src/face/pose.hpp"
 #include "../src/face/nn/kernels.hpp"
 #include "../src/face/nn/net.hpp"
@@ -1080,6 +1081,147 @@ static void test_shown()
 	      std::fabs(o.glide.pitch) < 0.1f);
 	o = bends.step(turned, rest, frame, true);
 	CHECK(o.lost_for == 0 && near(o.glide.yaw, 20, 1e-3)); // found again: straight there
+
+	// The lead: moving steadily, it aims on past each look by some of the
+	// move, so it keeps up instead of trailing a look behind; a sudden
+	// move or a stop never overshoots.
+	auto shifted = [&](float px) {
+		Face f = face;
+		for (auto &p : f.points)
+			p.x += px;
+		return f;
+	};
+	const float look = 1.0f / 30, step_px = 6, share = step_px / face.w;
+	for (const float lead : {0.0f, 0.5f, 1.0f}) {
+		Shown leads;
+		leads.set_lead(lead);
+		leads.step(face, rest, look);
+		float x = 0, behind = 0;
+		for (int i = 1; i <= 10; i++) {
+			// A look, then the frame before the next (60 a second).
+			const Face f = shifted(step_px * i);
+			leads.step(f, rest, look / 2, true);
+			o = leads.step(f, rest, look / 2, false);
+			x = o.glide.cx;
+			behind = o.layout.cx - x;
+		}
+		// Ten looks in: lead 0 is right on the newest look (a look behind
+		// you), 1 a whole look's move further on.
+		CHECK(near(behind, -lead * share, 1e-5));
+		// It stops: straight to where you stopped, no further.
+		const Face f = shifted(step_px * 10);
+		float most = x;
+		for (int i = 0; i < 6; i++) {
+			o = leads.step(f, rest, look / 2, true);
+			most = std::max(most, o.glide.cx);
+			o = leads.step(f, rest, look / 2, false);
+			most = std::max(most, o.glide.cx);
+		}
+		CHECK(near(o.glide.cx, o.layout.cx, 1e-6));
+		CHECK(most <= std::max(x, o.layout.cx) + 1e-6f);
+		// A sudden jump from still: no lead on it either.
+		const Face jump = shifted(step_px * 10 + 30);
+		o = leads.step(jump, rest, look / 2, true);
+		o = leads.step(jump, rest, look / 2, false);
+		CHECK(near(o.glide.cx, o.layout.cx, 1e-6));
+	}
+	// Not over a gap between looks (it lost you a moment): no lead.
+	Shown gap;
+	gap.set_lead(1);
+	gap.step(face, rest, look);
+	gap.step(shifted(6), rest, look);
+	gap.step(shifted(12), rest, look);
+	gap.step(lost, rest, 0.2f);
+	o = gap.step(shifted(18), rest, look, true);
+	o = gap.step(shifted(18), rest, 1.0f, false);
+	CHECK(near(o.glide.cx, o.layout.cx, 1e-6));
+}
+
+// When the camera's picture goes to the tracker (look-pace.hpp): OBS at
+// 60 frames a second, a camera at not quite 30 with a little wobble - each
+// of its pictures OBS shows is looked at once (not twice, none missed),
+// within two frames of coming; a 60 a second camera, every other picture,
+// evenly; a still picture now and then.
+static void test_look_pace()
+{
+	struct Run {
+		int looks = 0, twice = 0, missed = 0, uneven = 0;
+		double most_late = 0;
+		bool fast = false;
+	};
+	auto run = [](double obs_fps, double camera_fps, float every, double wobble, double seconds) {
+		Run r;
+		LookPace pace;
+		pace.every = every;
+		std::mt19937 rng(7);
+		std::uniform_real_distribution<double> jitter(-wobble, wobble);
+		// When each of the camera's pictures comes.
+		std::vector<double> comes;
+		for (int i = 0; i / camera_fps < seconds + 1; i++)
+			comes.push_back(0.0123 + i / camera_fps + jitter(rng));
+		size_t at = 0;
+		const double frame = 1 / obs_fps;
+		int staged = -2, last = -1, last_k = -1, gap = 0;
+		std::vector<bool> shown(comes.size(), false), looked(comes.size(), false);
+		for (int k = 0; k * frame < seconds; k++) {
+			const double t = k * frame;
+			while (at < comes.size() && comes[at] <= t)
+				at++;
+			const int showing = (int)at - 1; // the newest come so far
+			if (showing >= 0)
+				shown[showing] = true;
+			pace.frame((float)frame);
+			if (staged != -2) {
+				if (pace.give(staged == last)) {
+					if (staged >= 0 && looked[staged])
+						r.twice++;
+					if (staged >= 0 && !looked[staged]) {
+						looked[staged] = true;
+						r.most_late = std::max(r.most_late, t - comes[staged]);
+					}
+					if (k > obs_fps && last_k >= 0) {
+						// After the first second: the same gap every time?
+						if (gap && k - last_k != gap)
+							r.uneven++;
+						gap = k - last_k;
+					}
+					last = staged;
+					last_k = k;
+					r.looks++;
+				}
+			}
+			staged = showing;
+		}
+		// Of what OBS showed (not the one still showing at the end).
+		for (size_t i = 0; i + 1 < comes.size() && comes[i + 1] < seconds - 0.1; i++)
+			if (shown[i] && !looked[i])
+				r.missed++;
+		r.fast = pace.fast();
+		return r;
+	};
+	// A camera at 29.97 against OBS at 60 drifts all the way round in 33
+	// seconds: every one of its pictures, once, within two frames.
+	Run r = run(60, 29.97, 1.0f / 30, 0.004, 40);
+	CHECK(r.twice == 0 && r.missed == 0 && !r.fast);
+	CHECK(r.looks > 29 * 39 && r.most_late <= 2.0 / 60 + 1e-6);
+	// OBS at 30: the same (one frame).
+	r = run(30, 29.97, 1.0f / 30, 0.004, 40);
+	CHECK(r.twice == 0 && r.missed == 0 && r.looks > 29 * 39 && r.most_late <= 2.0 / 30 + 1e-6);
+	// A 25 a second camera: each once.
+	r = run(60, 25, 1.0f / 30, 0.004, 20);
+	CHECK(r.twice == 0 && r.missed == 0 && r.looks > 24 * 19);
+	// A 60 a second camera: 30 looks a second, every other frame (after
+	// the first moment, before it can tell).
+	r = run(60, 60, 1.0f / 30, 0.002, 20);
+	CHECK(r.fast && r.twice == 0 && r.uneven == 0 && r.looks >= 29 * 20 && r.looks <= 30 * 20 + 20);
+	// "Easy on my PC": 15 a second from a 30 a second camera, evenly.
+	r = run(60, 29.97, 1.0f / 15, 0.004, 20);
+	CHECK(r.fast && r.twice == 0 && r.looks >= 14 * 20 && r.looks <= 15 * 20 + 10);
+	// A still picture (a photo): ten looks a second.
+	r = run(60, 0.001, 1.0f / 30, 0, 10);
+	CHECK(r.looks >= 95 && r.looks <= 101);
+	std::printf("unit_face: looks: each of a 29.97 camera's pictures within %.0f ms at 60 fps\n",
+		    1000 * run(60, 29.97, 1.0f / 30, 0.004, 40).most_late);
 }
 
 // --- Speed --------------------------------------------------------------------------
@@ -1124,6 +1266,7 @@ int main()
 	test_set();
 	test_turns();
 	test_shown();
+	test_look_pace();
 	test_speed();
 	std::printf("unit_face: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;

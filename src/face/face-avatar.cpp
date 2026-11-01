@@ -46,6 +46,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "avatar2d.hpp"
 #include "avatar3d.hpp"
 #include "effect-check.hpp"
+#include "look-pace.hpp"
 #include "model.hpp"
 #include "rig.hpp"
 #include "tracker.hpp"
@@ -56,10 +57,10 @@ using json = nlohmann::json;
 
 namespace {
 
-// How often it looks for your face, in seconds ("Easy on my PC": half as
-// often).
+// How often it looks for your face at most, in seconds ("Easy on my PC":
+// half as often) - at each new picture the camera sends, up to that.
 constexpr float LOOK_EVERY = 1.0f / 30, EASY_LOOK_EVERY = 1.0f / 15;
-// Not looked for this long (not shown): what it saw last is too old.
+// Not drawn for this long (not shown): what it saw last is too old.
 constexpr float STALE = 0.5f;
 constexpr float FIND_EVERY = 1.0f;
 constexpr int MIN_SIZE = 64, MAX_SIZE = 4096;
@@ -67,7 +68,8 @@ constexpr int MIN_SIZE = 64, MAX_SIZE = 4096;
 // longest side (the face models work on 256 x 256 of it at most).
 constexpr uint32_t LOOK_SIZE = 960;
 // Camera pictures kept for the cut-outs: the one in use, the one the
-// tracker is looking at, the newest, and one to spare (see look).
+// tracker is looking at, the newest, and one to spare (see look; one
+// that doesn't go to the tracker is free again straight away).
 constexpr int SHOTS = 4;
 // Outfit layers at most.
 constexpr size_t MOST_LAYERS = 12;
@@ -85,6 +87,9 @@ constexpr float TURN_PAD = 0.08f, FLAT_MOST = 2048;
 // Worn on your head, when it can't see you: held this long, then faded
 // over this long (seconds).
 constexpr float WORN_HOLD = 1.0f, WORN_FADE = 0.5f;
+// A tail's usual wag: this many a second, there and back (its "wag_speed"
+// setting, a share of it).
+constexpr float WAG_SPEED = 1.5f;
 
 const char *text(const char *key)
 {
@@ -591,6 +596,7 @@ struct FaceAvatar {
 		int look = 0; // 0 its own, 1 glossy, 2 cartoon, 3 flat
 		float outline = 0, floppy = 0.5f;
 		bool swing = true;
+		float wag = 0.5f, wag_speed = 1.5f; // as RigOptions has them
 		int framing = 0; // 0 head and shoulders for a VRM, 1 all of it, 2 head
 		bool hide = true, smooth = true;
 		WornPlace place;
@@ -641,7 +647,11 @@ struct FaceAvatar {
 	uint32_t stage_w = 0, stage_h = 0;
 	bool staged = false;
 	uint64_t staged_ns = 0;
-	float since_look = 0, since_find = 0;
+	int staged_shot = -1;
+	std::vector<uint8_t> given; // the last picture that went to the tracker
+	LookPace pace;
+	std::atomic<float> lead{0.5f}; // the glide's (Shown::set_lead), from the smoothing
+	float since_render = 0, since_find = 0;
 	float frame_dt = 0; // the last frame's length
 	std::vector<uint8_t> rgba;
 	gs_effect_t *effect = nullptr;
@@ -689,7 +699,7 @@ struct FaceAvatar {
 		std::string file, problem, kind, title, author;
 		bool loaded = false, shown = false, chain = false, set_up = false;
 		size_t points = 0, triangles = 0;
-		int springs = 0, arkit = 0, upright = 0, cards = 0, layers = 0;
+		int springs = 0, tails = 0, arkit = 0, upright = 0, cards = 0, layers = 0;
 		// Each spot (its own left eye, right eye, mouth) on its front
 		// picture (shares of FaceSpots::box) and how it was found.
 		float spot[3][4] = {};
@@ -816,22 +826,45 @@ struct FaceAvatar {
 		obs_source_release(found);
 	}
 
-	// A copy of the camera for the tracker: the one read back last time
-	// goes to it, and a new one is asked for - the camera at full size
-	// into a shot (kept for the cut-outs), then shrunk from that.
+	// Is the picture read back (`line` bytes a row) the one that went to
+	// the tracker last? A camera's next picture differs all over (if only
+	// by its grain), so this stops at the first row unless it's the same.
+	bool same_as_given(const uint8_t *data, uint32_t line) const
+	{
+		const size_t row = (size_t)stage_w * 4;
+		if (given.size() != row * stage_h)
+			return false;
+		for (uint32_t y = 0; y < stage_h; y++)
+			if (std::memcmp(&given[y * row], data + (size_t)y * line, row) != 0)
+				return false;
+		return true;
+	}
+
+	// A copy of the camera for the tracker, once a frame (see LookPace):
+	// the one asked for last frame is read back and goes to it if it's
+	// new and it's time, and a new one is asked for - the camera at full
+	// size into a shot (kept for the cut-outs), then shrunk from that.
 	void look(obs_source_t *cam, uint32_t cw, uint32_t ch)
 	{
 		if (staged && stage) {
 			uint8_t *data = nullptr;
 			uint32_t line = 0;
+			bool gave = false;
 			if (gs_stagesurface_map(stage, &data, &line)) {
-				rgba.resize((size_t)stage_w * stage_h * 4);
-				for (uint32_t y = 0; y < stage_h; y++)
-					std::memcpy(&rgba[(size_t)y * stage_w * 4], data + (size_t)y * line,
-						    (size_t)stage_w * 4);
+				if (pace.give(same_as_given(data, line))) {
+					const size_t row = (size_t)stage_w * 4;
+					given.resize(row * stage_h);
+					for (uint32_t y = 0; y < stage_h; y++)
+						std::memcpy(&given[y * row], data + (size_t)y * line, row);
+					rgba.assign(given.begin(), given.end());
+					worker.give(rgba, (int)stage_w, (int)stage_h, staged_ns);
+					gave = true;
+				}
 				gs_stagesurface_unmap(stage);
-				worker.give(rgba, (int)stage_w, (int)stage_h, staged_ns);
 			}
+			// Its shot is free again.
+			if (!gave && staged_shot >= 0 && staged_shot != used_shot)
+				shots[staged_shot].ns = 0;
 			staged = false;
 		}
 		const double fit = std::min(1.0, (double)LOOK_SIZE / std::max(cw, ch));
@@ -880,6 +913,7 @@ struct FaceAvatar {
 			gs_stage_texture(stage, gs_texrender_get_texture(small));
 			staged = true;
 			staged_ns = ns;
+			staged_shot = slot;
 		}
 	}
 
@@ -1318,10 +1352,14 @@ struct FaceAvatar {
 		ro.floppy = look3d.floppy;
 		ro.springs = look3d.swing;
 		ro.setup = look3d.setup;
+		ro.wag = look3d.wag;
+		ro.wag_speed = look3d.wag_speed;
 		const std::string key = std::to_string(ro.facing.x) + "/" + std::to_string(ro.facing.y) + "/" +
 					std::to_string(ro.facing.z) + "/" + std::to_string(ro.facing.w) + "/" +
 					std::to_string(ro.floppy) + "/" + (ro.springs ? "1" : "0") + "/" +
 					look3d.setup_text;
+		if (rig)
+			rig->set_wag(ro.wag, ro.wag_speed);
 		if (!rig || key != rig_key) {
 			rig = std::make_unique<Rig>(model_now, ro);
 			rig_key = key;
@@ -1337,6 +1375,7 @@ struct FaceAvatar {
 			worker.set_cut(aspect, feather);
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d.springs = rig->springs();
+			state3d.tails = rig->tails();
 			state3d.chain = rig->auto_chain();
 			state3d.arkit = rig->arkit_parts();
 			state3d.upright = rig->upright_parts();
@@ -1869,17 +1908,14 @@ struct FaceAvatar {
 		drawing = true;
 		gs_blend_state_push();
 		if (cam && cw && ch) {
-			// Within half a frame of time to look: a frame's length wobbles
-			// (OBS at 30 frames a second looks on every one of them).
-			if (since_look + frame_dt / 2 >= (easy ? EASY_LOOK_EVERY : LOOK_EVERY)) {
-				if (since_look > STALE) {
-					staged = false;
-					worker.forget();
-				}
-				since_look = 0;
-				gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
-				look(cam, cw, ch);
+			if (since_render > STALE) {
+				staged = false;
+				worker.forget();
+				pace.reset();
 			}
+			since_render = 0;
+			gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+			look(cam, cw, ch);
 			pick_shots();
 		}
 		if (!drawn) {
@@ -1959,8 +1995,11 @@ struct FaceAvatar {
 	{
 		drawn = false;
 		frame_dt = dt;
-		since_look += dt;
+		since_render += dt;
 		since_find += dt;
+		pace.every = easy ? EASY_LOOK_EVERY : LOOK_EVERY;
+		pace.frame(dt);
+		shown.set_lead(lead);
 		if (since_find >= FIND_EVERY) {
 			since_find = 0;
 			obs_source_t *cam = get_camera();
@@ -2158,6 +2197,10 @@ struct FaceAvatar {
 		l3.outline = clampf((float)obs_data_get_int(settings, "outline") / 100.0f, 0, 1) * 0.02f;
 		l3.floppy = clampf((float)obs_data_get_int(settings, "floppy") / 100.0f, 0, 1);
 		l3.swing = obs_data_get_bool(settings, "swing");
+		// Tails: how far they wag (0 not at all), and how fast against
+		// a usual wag (WAG_SPEED wags a second).
+		l3.wag = clampf((float)obs_data_get_int(settings, "wag") / 100.0f, 0, 1);
+		l3.wag_speed = WAG_SPEED * clampf((float)obs_data_get_int(settings, "wag_speed") / 100.0f, 0.1f, 4);
 		const char *framing = obs_data_get_string(settings, "framing");
 		l3.framing = framing && std::strcmp(framing, "whole") == 0  ? 1
 			     : framing && std::strcmp(framing, "head") == 0 ? 2
@@ -2201,7 +2244,11 @@ struct FaceAvatar {
 		const char *style = obs_data_get_string(settings, "style");
 		drawn_style = style && std::strcmp(style, "drawn") == 0;
 		worn = obs_data_get_bool(settings, "worn");
-		worker.set_smoothing(clampf((float)obs_data_get_int(settings, "smoothing") / 100.0f, 0, 1));
+		// Smoothing: steadier one way; the other, snappier, and the
+		// character aims further on past each look to keep up with you.
+		const float smoothing = clampf((float)obs_data_get_int(settings, "smoothing") / 100.0f, 0, 1);
+		worker.set_smoothing(smoothing);
+		lead = 1 - smoothing;
 
 		// Each of your eyes and your mouth is cut the shape of the
 		// character's spot it goes into, so it's never stretched (a 3D
@@ -2319,6 +2366,7 @@ struct FaceAvatar {
 				      {"points", st.points},
 				      {"triangles", st.triangles},
 				      {"springs", st.springs},
+				      {"tails", st.tails},
 				      {"swinging_chain", st.chain},
 				      {"arkit_parts", st.arkit},
 				      {"set_up", st.set_up},
@@ -2456,6 +2504,8 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "outline", 0);
 	obs_data_set_default_int(settings, "floppy", 50);
 	obs_data_set_default_bool(settings, "swing", true);
+	obs_data_set_default_int(settings, "wag", 50);
+	obs_data_set_default_int(settings, "wag_speed", 100);
 	obs_data_set_default_string(settings, "framing", "auto");
 	obs_data_set_default_bool(settings, "hide_behind_head", true);
 	obs_data_set_default_bool(settings, "smooth_edges", true);
@@ -2562,6 +2612,10 @@ obs_properties_t *get_properties(void *data)
 	obs_property_int_set_suffix(p, "%");
 	obs_properties_add_bool(m3, "swing", text("FaceAvatar.Swing"));
 	p = obs_properties_add_int_slider(m3, "floppy", text("FaceAvatar.Floppy"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
+	p = obs_properties_add_int_slider(m3, "wag", text("FaceAvatar.Wag"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
+	p = obs_properties_add_int_slider(m3, "wag_speed", text("FaceAvatar.WagSpeed"), 25, 300, 5);
 	obs_property_int_set_suffix(p, "%");
 	obs_property_t *framing = obs_properties_add_list(m3, "framing", text("FaceAvatar.Framing"),
 							  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);

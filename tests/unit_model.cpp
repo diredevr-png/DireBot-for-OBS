@@ -1088,6 +1088,116 @@ static void test_dangly_parts()
 	CHECK(pr.springs() == 1);
 }
 
+// Tails wag side to side all the time, standing still or not: a spring
+// named as a tail (not a ponytail), the wag running down it, as far and
+// as fast as asked; off at 0. A dangly chain named "tail" wags too.
+static void test_tail_wag()
+{
+	CHECK(tail_name("Tail") && tail_name("Wolf Tail") && tail_name("wolf_tail0") && tail_name("J_Sec_Tail") &&
+	      tail_name("Shippo") && tail_name("\xe3\x81\x97\xe3\x81\xa3\xe3\x81\xbd"));
+	CHECK(!tail_name("ponytail") && !tail_name("PonyTail_L") && !tail_name("Pigtail") && !tail_name("Hair"));
+	for (const bool vrm0 : {false, true}) {
+		Person p = make_person(vrm0);
+		// The person's ponytail as a tail: stiff enough to hold out
+		// behind, a little gravity.
+		if (!vrm0) {
+			auto &sp = p.b.doc["extensions"]["VRMC_springBone"]["springs"][0];
+			sp["name"] = "Tail";
+			for (auto &j : sp["joints"])
+				if (j.contains("stiffness"))
+					j["stiffness"] = 1.0, j["gravityPower"] = 0.1;
+		} else {
+			auto &g = p.b.doc["extensions"]["VRM"]["secondaryAnimation"]["boneGroups"][0];
+			g["comment"] = "Tail";
+			g["stiffiness"] = 1.0;
+			g["gravityPower"] = 0.1;
+		}
+		auto m = std::make_shared<Model>();
+		CHECK(load(p.b.glb(), *m));
+		// Its tip's side to side over 4 seconds at 60 frames a second.
+		auto sway = [&](float wag, float speed, int *crossings) {
+			RigOptions o;
+			o.wag = wag;
+			o.wag_speed = speed;
+			Rig rig(m, o);
+			Drive d = still();
+			float lo = 1e9f, hi = -1e9f, last = 0;
+			int crossed = 0;
+			for (int i = 0; i < 240 + 120; i++) {
+				rig.pose(d);
+				if (i < 120)
+					continue; // settled in first
+				const float x = move_of(rig.world()[p.tail2]).x;
+				lo = std::min(lo, x);
+				hi = std::max(hi, x);
+				if (i > 120 && (x > 0) != (last > 0))
+					crossed++;
+				last = x;
+			}
+			if (crossings)
+				*crossings = crossed;
+			CHECK(rig.tails() == 1);
+			return hi - lo;
+		};
+		int crossings = 0;
+		const float wide = sway(0.5f, 1.5f, &crossings);
+		// The 20 cm tail's tip: centimetres side to side (half way: the
+		// tip's link 37 degrees or so each way), about 1.5 wags a second
+		// (each crossing the middle twice).
+		CHECK(wide > 0.06f && wide < 0.3f);
+		CHECK(crossings >= 10 && crossings <= 14);
+		// Wider at 1, faster at twice the speed, still at 0.
+		CHECK(sway(1, 1.5f, nullptr) > wide * 1.4f);
+		int fast = 0;
+		sway(0.5f, 3, &fast);
+		CHECK(fast >= 22 && fast <= 26);
+		CHECK(sway(0, 1.5f, nullptr) < 1e-3f);
+	}
+	// The ponytail as it is (a ponytail): no wag at all.
+	{
+		Person p = make_person(false);
+		auto m = std::make_shared<Model>();
+		CHECK(load(p.b.glb(), *m));
+		RigOptions o;
+		o.wag = 1;
+		Rig rig(m, o);
+		CHECK(rig.tails() == 0);
+		Drive d = still();
+		for (int i = 0; i < 120; i++)
+			rig.pose(d);
+		float lo = 1e9f, hi = -1e9f;
+		for (int i = 0; i < 120; i++) {
+			rig.pose(d);
+			const float x = move_of(rig.world()[p.tail2]).x;
+			lo = std::min(lo, x);
+			hi = std::max(hi, x);
+		}
+		CHECK(hi - lo < 1e-3f);
+	}
+	// No VRM: a dangly chain whose bones are named "tail" wags as well.
+	{
+		Bones b;
+		const int root = b.add("Body", -1, {0, 0, 0});
+		const int t0 = b.add("Tail0", root, {0, 0, -0.1f});
+		const int t1 = b.add("Tail1", t0, {0, 0, -0.1f});
+		b.add("Tail2", t1, {0, 0, -0.1f});
+		auto m = b.load_it();
+		Rig rig(m, RigOptions());
+		CHECK(rig.auto_chain() && rig.tails() == 1);
+		Drive d = still();
+		float lo = 1e9f, hi = -1e9f;
+		for (int i = 0; i < 240; i++) {
+			rig.pose(d);
+			if (i >= 60) {
+				const float x = rig.parts()[0].pos[3].x;
+				lo = std::min(lo, x);
+				hi = std::max(hi, x);
+			}
+		}
+		CHECK(hi - lo > 0.03f);
+	}
+}
+
 static void test_facing_arms_and_wearing()
 {
 	// Which way a character faces: glTF's way (+z), unless it's much
@@ -1554,6 +1664,7 @@ int main()
 	test_expressions();
 	test_names_and_sides();
 	test_springs();
+	test_tail_wag();
 	test_link_chain();
 	test_spots_on_a_vrm();
 	test_face_region();
