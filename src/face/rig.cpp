@@ -509,7 +509,7 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 		for (auto &g : given)
 			springs_.push_back(g.second);
 	} else if (!m.is_vrm() && springs_.empty()) {
-		// Its dangly parts (the Sausage's string of sausages, a doll's ears
+		// Its dangly parts (a chain of links, a doll's ears
 		// and legs): each hangs from its first bone and swings, sized to the
 		// character. A person's skeleton: only hair, tails and the like.
 		for (const Skin &skin : m.skins) {
@@ -1004,7 +1004,7 @@ M4 worn_matrix(const Model &m, Quat facing, const WornPlace &place, float &units
 			at = V3{0, -1.9f, 0.8f} - hb * units;
 		} else {
 			// Its middle over your face, 24 cm across: a big one round your
-			// head, a thin one (the Sausage) out in front of your face.
+			// head, a long thin one out in front of your face.
 			units = 24 / std::max(size.x, std::max(size.y, size.z));
 			const float z = std::max(1.0f, 8.5f - size.z * units / 2);
 			at = V3{0, 1, z} - middle * units;

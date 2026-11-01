@@ -3,7 +3,7 @@
 // glTF the ways files store their numbers (packed, interleaved, sparse,
 // squeezed into bytes, strips and fans, matrices), broken and hostile
 // files, VRM 1.0 and 0.x (bones, expressions, swinging parts, what they
-// bump into), and a string of sausages swinging on one chain of bones.
+// bump into), and a chain of links swinging on one line of bones.
 // Build and run: tools/test-link.sh (Linux, any C++17 compiler).
 
 #include "../src/face/model.hpp"
@@ -776,9 +776,9 @@ static void test_springs()
 	CHECK(near3(move_of(still_rig.world()[p.tail2]), {0, 1.7f, -0.3f}, 1e-4f));
 }
 
-// A string of sausages: one skinned chain of 4 bones hanging down from
+// A chain of links: one skinned line of 4 bones hanging down from
 // the first, no VRM - it swings on its own.
-static void test_sausage_chain()
+static void test_link_chain()
 {
 	Builder b;
 	const int armature = b.node({{"name", "Armature"}});
@@ -823,7 +823,7 @@ static void test_sausage_chain()
 		ibm.insert(ibm.end(), inv.m, inv.m + 16);
 	}
 	b.doc["skins"].push_back({{"joints", {b0, b1, b2, b3}}, {"inverseBindMatrices", b.floats(ibm, 16, "MAT4")}});
-	const int body = b.node({{"name", "Sausages"}, {"mesh", 0}, {"skin", 0}});
+	const int body = b.node({{"name", "Links"}, {"mesh", 0}, {"skin", 0}});
 	b.doc["scenes"] = json::array({{{"nodes", {armature, body}}}});
 	auto m = std::make_shared<Model>();
 	std::string why;
@@ -1261,7 +1261,7 @@ int main()
 	test_expressions();
 	test_names_and_sides();
 	test_springs();
-	test_sausage_chain();
+	test_link_chain();
 	test_dangly_parts();
 	test_facing_arms_and_wearing();
 	test_set_up();

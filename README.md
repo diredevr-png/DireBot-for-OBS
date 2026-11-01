@@ -102,7 +102,7 @@ flat, see-through round it. It turns and nods with you (a VRM's neck and
 head bones, or the whole of it round its head), makes your 52 expressions
 (parts named as Apple's ARKit names them, or VRM's expressions worked out
 from yours), looks where you look, and its swinging parts swing: VRM's
-spring bones, or any bones that hang free (a string of sausages, a doll's
+spring bones, or any bones that hang free (a chain of links, a doll's
 ears and legs). Characters standing in a T get their arms down. Your real
 eyes and mouth go on its face too, soft-edged and in its skin's colour,
 turning half as far as it does, while its own stay still under them (or

@@ -20,15 +20,15 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //
 //   - Your head's turn: a VRM's neck and head bones turn (the neck some
 //     of the way, the head the rest), or - a character with no head bone,
-//     like the Sausage - the whole of it turns round its head.
+//     like a long thin one - the whole of it turns round its head.
 //   - Your 52 expressions: parts named as Apple's ARKit names them
 //     ("jawOpen", "eyeBlinkLeft"...) follow yours as they are; VRM's
 //     expressions (blink, "aa", happy...) and the usual names other
 //     tools give them ("Blink", "A", "Smile", "まばたき"...) are worked
 //     out from yours. Your eyes' looks turn a VRM's eyes.
 //   - Swinging parts: VRM's spring bones as VRM says they move, bumping
-//     into its colliders; a character's dangly parts (the Sausage's
-//     string of sausages, a doll's ears and legs) swing, each hanging from
+//     into its colliders; a character's dangly parts (a chain of
+//     links, a doll's ears and legs) swing, each hanging from
 //     its first bone - or, set up (an imported Lens Studio project), the
 //     chains it names, pulled as it says, and parts that stay upright and
 //     trail after your head (a doll's body).
@@ -53,7 +53,7 @@ namespace direbot::face {
 
 struct RigOptions {
 	// Its front: the turn from the model as it is to facing +z (VRM 0.x
-	// models face -z; the Sausage faces x).
+	// models face -z; some others face x).
 	Quat facing;
 	// Swinging parts: 0 stiff to 1 floppy (0.5 as the file says).
 	float floppy = 0.5f;

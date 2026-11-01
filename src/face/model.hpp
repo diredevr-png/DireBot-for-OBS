@@ -230,8 +230,8 @@ bool load_model(const uint8_t *bytes, size_t size, const std::string &folder, Mo
 		std::string *problem = nullptr);
 
 // A skin's dangly parts: every line of bones, parent to child, that
-// hangs off the rest of it and ends free - the Sausage's string of
-// sausages (all of its bones), a doll's ears and legs. A line starts
+// hangs off the rest of it and ends free - a chain of links (all of
+// its bones), a doll's ears and legs. A line starts
 // where the skeleton starts or branches; one bone alone isn't one.
 std::vector<std::vector<int>> hanging_chains(const Model &m, const Skin &skin);
 // Whether a skin's bones are named as a person's are (hips, spine,
