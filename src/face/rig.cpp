@@ -1166,6 +1166,8 @@ FaceSpots face_spots(const std::shared_ptr<const Model> &mp, Quat facing, const 
 	out.box[1] = middle.y + size.y / 2;
 	out.box[2] = size.x;
 	out.box[3] = size.y;
+	out.front = middle.z + size.z / 2;
+	out.back = middle.z - size.z / 2;
 	const Quat back = conj(facing);
 
 	// The model at rest (as it stands, its own expressions only), facing +z.

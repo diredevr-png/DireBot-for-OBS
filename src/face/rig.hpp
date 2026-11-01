@@ -261,6 +261,8 @@ struct FaceSpots {
 	// Its front picture's box (the facing model's left, top, width,
 	// height), for spots given as shares of it.
 	float box[4] = {0, 0, 1, 1};
+	// How deep it is there: its front and back.
+	float front = 0.5f, back = -0.5f;
 };
 FaceSpots face_spots(const std::shared_ptr<const Model> &m, Quat facing, const CharacterSetup &setup);
 

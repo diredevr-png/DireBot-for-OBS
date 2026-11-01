@@ -750,6 +750,10 @@ def test_set_up_characters(run):
         camera_picture(face_png)
     model = os.path.join(run.home, "set-up.glb")
     set_up_character(model)
+    # Outfit pictures: a cyan hat in front, a magenta cape behind.
+    hat, cape = os.path.join(run.home, "hat.png"), os.path.join(run.home, "cape.png")
+    write_png(hat, 40, 20, [b"\x00\xff\xff\xff" * 40] * 20, alpha=True)
+    write_png(cape, 40, 40, [b"\xff\x00\xff\xff" * 40] * 40, alpha=True)
     size = 300
     still = json.dumps({"spots": SET_UP_SPOTS, "chains": []})
     swinging = json.dumps({"spots": SET_UP_SPOTS,
@@ -764,6 +768,9 @@ def test_set_up_characters(run):
         "Drawn": {"model_setup": still, "style": "drawn"},
         "Swinging": {"model_setup": swinging, "style": "drawn"},
         "Broken set-up": {"model_setup": "{not json"},
+        "Outfit": {"model_setup": still, "style": "drawn", "outfit": json.dumps([
+            {"file": hat, "place": [0.3, 0.0, 0.4, 0.12]},
+            {"file": cape, "place": [0, 0, 1, 1], "behind": True}])},
     }
     c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
     try:
@@ -817,6 +824,41 @@ def test_set_up_characters(run):
         lower = [(x, y) for x, y in changed if y > oy + (bottom - oy) * 0.15]
         assert sum(1 for x, _ in upper if x < ox - 5) > 30 and sum(1 for x, _ in upper if x > ox + 5) > 30
         assert len(lower) > 30 and abs(sum(x for x, _ in lower) / len(lower) - ox) < 15
+
+        # Outfit pictures ride on it: the hat over its top, the cape
+        # behind it (round it, never over it).
+        assert wait_for(lambda: st("Outfit")["model"]["outfit_layers"] == 2, 10, 0.1), st("Outfit")
+        dressed = screenshot(c, "Outfit")
+        cyan = lambda px: px[0] < 60 and px[1] > 180 and px[2] > 180  # noqa: E731
+        magenta = lambda px: px[0] > 180 and px[1] < 60 and px[2] > 180  # noqa: E731
+        # (Shares of its front picture: the whole of it, ear and all.)
+        cape_xs = [x for y in range(size) for x in range(size) if magenta(dressed[y][x])]
+        cape_ys = [y for y in range(size) for x in range(size) if magenta(dressed[y][x])]
+        assert len(cape_xs) > 500
+        cape_mid = (min(cape_xs) + max(cape_xs)) / 2
+        hx, hy, n = middle_of(dressed, cyan)
+        assert n > 100 and abs(hx - cape_mid) < 8 and hy < min(cape_ys) + 30, (hx, hy, n, cape_mid)
+        assert not magenta(dressed[int(oy)][int(ox)]) and orange(dressed[int(oy)][int(ox)])
+
+        # Straight from the front, for DireBot's page: its front box fills
+        # the picture, and where its eyes and mouth are on it.
+        front = vendor(c, "FaceModelFront", {"source": "Real eyes", "width": 200})
+        assert front["ok"] and front["width"] == 200, front.get("error")
+        box = front["box"]
+        assert abs(front["height"] - round(200 * box["height"] / box["width"])) <= 1
+        rgba = base64.b64decode(front["rgba"])
+        fw, fh = front["width"], front["height"]
+        assert len(rgba) == fw * fh * 4
+        px = lambda x, y: tuple(rgba[(y * fw + x) * 4:(y * fw + x) * 4 + 4])  # noqa: E731
+        assert px(1, 1)[3] == 0 and px(fw - 2, fh - 2)[3] == 0
+        mid = px(int(0.32 * fw), int(0.33 * fh))   # on the ball, off its face
+        assert mid[3] == 255 and mid[0] > 120 and mid[0] > mid[1] > mid[2], mid
+        fs = front["spots"]
+        assert {v["from"] for v in fs.values()} == {"set up"}
+        assert fs["left_eye"]["x"] > fs["right_eye"]["x"] and fs["mouth"]["y"] > fs["left_eye"]["y"]
+        assert all(0 < v["x"] < 1 and 0 < v["y"] < 1 for v in fs.values())
+        no = vendor(c, "FaceModelFront", {"source": "Set-up camera"})
+        assert not no["ok"]
 
         # Its ear: sticking out, still - or hanging down, pulled.
         green = lambda px: px[1] > 90 and px[1] > px[0] + 40 and px[1] > px[2] + 40  # noqa: E731

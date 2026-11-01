@@ -41,6 +41,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <plugin-support.h>
 
+#include "../link/crypto.hpp"
 #include "../obs/ui-call.hpp"
 #include "avatar2d.hpp"
 #include "avatar3d.hpp"
@@ -686,7 +687,7 @@ struct FaceAvatar {
 		std::string file, problem, kind, title, author;
 		bool loaded = false, shown = false, chain = false, set_up = false;
 		size_t points = 0, triangles = 0;
-		int springs = 0, arkit = 0, upright = 0, cards = 0;
+		int springs = 0, arkit = 0, upright = 0, cards = 0, layers = 0;
 		// Each spot (its own left eye, right eye, mouth) on its front
 		// picture (shares of FaceSpots::box) and how it was found.
 		float spot[3][4] = {};
@@ -1454,8 +1455,10 @@ struct FaceAvatar {
 		gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
 		if (wear && show_camera)
 			draw_camera(cam, cw, ch);
-		int cards = 0;
+		int cards = 0, drawn_layers = 0;
 		if (tex) {
+			const M4 frame = rig->head_frame();
+			drawn_layers += draw_layers_3d(true, v, frame, facing, wear, opacity);
 			// Worn, it's drawn as the camera sees you: mirrored with it.
 			gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 			gs_effect_t *base = obs_get_base_effect(OBS_EFFECT_DEFAULT);
@@ -1463,13 +1466,15 @@ struct FaceAvatar {
 			while (gs_effect_loop(base, "Draw"))
 				gs_draw_sprite(tex, wear && mirror ? GS_FLIP_U : 0, w, h);
 			if (showing * opacity > 0.001f)
-				cards = draw_cards(cut, cw, ch, tex, v, rig->head_frame(), f.upright, facing, wear,
+				cards = draw_cards(cut, cw, ch, tex, v, frame, f.upright, facing, wear,
 						   showing * opacity);
+			drawn_layers += draw_layers_3d(false, v, frame, facing, wear, opacity);
 		}
 		gs_texrender_end(out);
 		have_out = true;
 		std::lock_guard<std::mutex> l(state_lock);
 		state3d.cards = cards;
+		state3d.layers = drawn_layers;
 	}
 
 	// What it turns round, whole, in its own spot: where it's put on your
@@ -1514,6 +1519,180 @@ struct FaceAvatar {
 	// far eye fades as you turn from the camera (from 30 degrees, gone by
 	// 50), your mouth from 40, and a card turned from the camera goes.
 	// How many it drew.
+	// Outfit pictures on a 3D character, riding on its head: each where
+	// it was put on its front picture (shares of it), just in front of it
+	// - or just behind it, for those behind. -> how many were drawn.
+	int draw_layers_3d(bool behind, const View3D &v, const M4 &frame, Quat facing, bool wear, float opacity)
+	{
+		if (layers.empty() || !v.w || !v.h || opacity <= 0.001f)
+			return 0;
+		const float W = (float)v.w, H = (float)v.h;
+		const float k = 1 / std::tan(v.fov / 2), aspect = W / H;
+		const Quat back = conj(facing);
+		const float *box = spots3d.box;
+		const float z = behind ? spots3d.back : spots3d.front;
+		int drawn = 0;
+		for (const Layer &layer : layers) {
+			if (layer.behind != behind || !loaded(layer.picture))
+				continue;
+			bool ok = true;
+			auto at = [&](float sx, float sy) {
+				const V3 p{box[0] + sx * box[2], box[1] - sy * box[3], z};
+				const V3 c = point(v.view, point(frame, rotate(back, p)));
+				const float depth = -c.z;
+				if (depth < v.near * 0.5f)
+					ok = false;
+				return std::array<float, 2>{(c.x * k / aspect / std::max(depth, 1e-6f) + 1) * 0.5f * W,
+							    (1 - c.y * k / std::max(depth, 1e-6f)) * 0.5f * H};
+			};
+			const Rect &r = layer.place;
+			const auto o = at(r.x, r.y), right = at(r.x + r.w, r.y), down = at(r.x, r.y + r.h);
+			if (!ok)
+				continue;
+			float ox = o[0], ax = right[0] - o[0], dx = down[0] - o[0];
+			if (wear && mirror) {
+				ox = W - ox;
+				ax = -ax;
+				dx = -dx;
+			}
+			matrix4 m;
+			vec4_set(&m.x, ax, right[1] - o[1], 0, 0);
+			vec4_set(&m.y, dx, down[1] - o[1], 0, 0);
+			vec4_set(&m.z, 0, 0, 1, 0);
+			vec4_set(&m.t, ox, o[1], 0, 1);
+			gs_texture_t *tex = layer.picture->texture();
+			vec4 clip;
+			vec4_set(&clip, 0, 0, 1, 1);
+			gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE,
+						   GS_BLEND_INVSRCALPHA);
+			gs_effect_set_texture(p_image, tex);
+			gs_effect_set_float(p_opacity, opacity);
+			gs_effect_set_vec4(p_clip, &clip);
+			gs_matrix_push();
+			gs_matrix_mul(&m);
+			while (gs_effect_loop(effect, "Picture"))
+				gs_draw_quadf(tex, 0, 1, 1);
+			gs_matrix_pop();
+			drawn++;
+		}
+		return drawn;
+	}
+
+	// Its 3D character straight from the front, as it is made (no turn,
+	// no expressions, nothing swinging), its front box filling the picture
+	// - for DireBot's page to put its eyes, mouth and outfits on.
+	json front_picture(int want_w)
+	{
+		obs_enter_graphics();
+		json out;
+		{
+			std::lock_guard<std::mutex> l(pictures_lock);
+			out = draw_front(want_w);
+		}
+		obs_leave_graphics();
+		return out;
+	}
+	json draw_front(int want_w)
+	{
+		auto no = [](const char *words) {
+			return json{{"ok", false}, {"error", words}};
+		};
+		if (!model_now || !avatar3d || !avatar3d->ready())
+			return no("Its 3D character isn't loaded yet - is the file still there?");
+		const Model &m = *model_now;
+		RigOptions ro;
+		ro.facing = facing_of(m);
+		ro.springs = false;
+		ro.floppy = look3d.floppy;
+		ro.setup = look3d.setup;
+		Rig still(model_now, ro);
+		const FaceSpots fs = face_spots(model_now, ro.facing, *look3d.setup);
+		const float bw = std::max(1e-6f, fs.box[2]), bh = std::max(1e-6f, fs.box[3]);
+		uint32_t W = (uint32_t)std::clamp(want_w, 64, 1024);
+		uint32_t H = (uint32_t)std::clamp((int)std::lround(W * bh / bw), 16, 2048);
+		if (H > 1024) {
+			W = std::max(16u, (uint32_t)std::lround(W * 1024.0f / H));
+			H = 1024;
+		}
+		// Nearly straight on (a narrow view from far away), so its front
+		// box is the picture's edges wherever a point is in depth.
+		const float fov = 2 * RAD, s = 1 / bh, dist = 0.5f / std::tan(fov / 2);
+		const V3 mid{fs.box[0] + bw / 2, fs.box[1] - bh / 2, (fs.front + fs.back) / 2};
+		Drive d;
+		d.place = scaled(s) * moved(mid * -1) * matrix_of(ro.facing);
+		still.pose(d);
+		View3D v;
+		v.w = W;
+		v.h = H;
+		v.fov = fov;
+		v.view = moved({0, 0, -dist});
+		const float deep = std::max(1.0f, (fs.front - fs.back) * s);
+		v.near = std::max(0.01f, dist - deep * 2);
+		v.far = dist + deep * 2;
+		v.world_scale = s;
+		v.height = 1;
+		v.look = look3d.look;
+		v.outline = look3d.outline;
+		v.smooth = true;
+		gs_texture_t *tex = avatar3d->draw(still, v);
+		if (!tex)
+			return no("It couldn't be drawn.");
+		gs_texrender_t *flat_pic = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+		gs_stagesurf_t *stage = gs_stagesurface_create(W, H, GS_RGBA);
+		std::string rgba;
+		if (flat_pic && stage && gs_texrender_begin(flat_pic, W, H)) {
+			vec4 clear;
+			vec4_zero(&clear);
+			gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+			gs_ortho(0.0f, (float)W, 0.0f, (float)H, -100.0f, 100.0f);
+			gs_blend_state_push();
+			gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+			gs_effect_t *base = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+			gs_effect_set_texture(gs_effect_get_param_by_name(base, "image"), tex);
+			while (gs_effect_loop(base, "Draw"))
+				gs_draw_sprite(tex, 0, W, H);
+			gs_blend_state_pop();
+			gs_texrender_end(flat_pic);
+			gs_stage_texture(stage, gs_texrender_get_texture(flat_pic));
+			uint8_t *data = nullptr;
+			uint32_t line = 0;
+			if (gs_stagesurface_map(stage, &data, &line)) {
+				rgba.resize((size_t)W * H * 4);
+				for (uint32_t y = 0; y < H; y++)
+					std::memcpy(&rgba[(size_t)y * W * 4], data + (size_t)y * line, (size_t)W * 4);
+				gs_stagesurface_unmap(stage);
+			}
+		}
+		gs_stagesurface_destroy(stage);
+		gs_texrender_destroy(flat_pic);
+		if (rgba.empty())
+			return no("It couldn't be drawn.");
+		// Drawn with its colour already times how solid it is: back to
+		// plain colour, as a picture file has it.
+		for (size_t i = 0; i < rgba.size(); i += 4) {
+			const int a = (uint8_t)rgba[i + 3];
+			for (int c = 0; c < 3 && a > 0 && a < 255; c++)
+				rgba[i + c] = (char)std::min(255, ((uint8_t)rgba[i + c] * 255 + a / 2) / a);
+		}
+		json spots = json::object();
+		const char *names[3] = {"left_eye", "right_eye", "mouth"};
+		for (int i = 0; i < 3; i++) {
+			const V3 p = rotate(ro.facing, fs.spot[i].at);
+			spots[names[i]] = {{"x", (p.x - fs.box[0]) / bw},
+					   {"y", (fs.box[1] - p.y) / bh},
+					   {"w", fs.spot[i].w / bw},
+					   {"h", fs.spot[i].h / bw},
+					   {"from", fs.from[i]}};
+		}
+		return {{"ok", true},
+			{"width", W},
+			{"height", H},
+			{"rgba", crypto::base64(rgba)},
+			// (OBS's replies drop lists of plain numbers: an object.)
+			{"box", {{"left", fs.box[0]}, {"top", fs.box[1]}, {"width", bw}, {"height", bh}}},
+			{"spots", spots}};
+	}
+
 	int draw_cards(gs_texture_t *cam, uint32_t cw, uint32_t ch, gs_texture_t *body, const View3D &v,
 		       const M4 &frame, const M4 &unturned, Quat facing, bool wear, float opacity)
 	{
@@ -2129,6 +2308,7 @@ struct FaceAvatar {
 				      {"set_up", st.set_up},
 				      {"upright_parts", st.upright},
 				      {"cards", st.cards},
+				      {"outfit_layers", st.layers},
 				      {"expressions", values},
 				      {"yaw", r(st.yaw, 10)},
 				      {"pitch", r(st.pitch, 10)},
@@ -2482,11 +2662,23 @@ json get_state(const json &data)
 	return answer;
 }
 
+json model_front(const json &data)
+{
+	obs_source_t *src = find_avatar(data);
+	if (!src)
+		return fail("That face avatar isn't in OBS any more.");
+	auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src));
+	const int width = data.contains("width") && data["width"].is_number() ? data["width"].get<int>() : 400;
+	json answer = f ? f->front_picture(width) : fail("It isn't ready yet.");
+	obs_source_release(src);
+	return answer;
+}
+
 } // namespace
 
 const std::vector<std::string> &requests()
 {
-	static const std::vector<std::string> list = {"FaceSet", "FaceGetState"};
+	static const std::vector<std::string> list = {"FaceSet", "FaceGetState", "FaceModelFront"};
 	return list;
 }
 
@@ -2503,6 +2695,8 @@ json request(const std::string &type, const json &data)
 			return set_rest(data);
 		if (type == "FaceGetState")
 			return get_state(data);
+		if (type == "FaceModelFront")
+			return model_front(data);
 		return fail("DireBot for OBS doesn't know that request.");
 	});
 }
