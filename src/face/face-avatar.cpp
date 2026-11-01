@@ -87,9 +87,6 @@ constexpr float TURN_PAD = 0.08f, FLAT_MOST = 2048;
 // Worn on your head, when it can't see you: held this long, then faded
 // over this long (seconds).
 constexpr float WORN_HOLD = 1.0f, WORN_FADE = 0.5f;
-// A tail's usual wag: this many a second, there and back (its "wag_speed"
-// setting, a share of it).
-constexpr float WAG_SPEED = 1.5f;
 
 const char *text(const char *key)
 {
@@ -596,7 +593,7 @@ struct FaceAvatar {
 		int look = 0; // 0 its own, 1 glossy, 2 cartoon, 3 flat
 		float outline = 0, floppy = 0.5f;
 		bool swing = true;
-		float wag = 0.5f, wag_speed = 1.5f; // as RigOptions has them
+		std::string animation; // its own animation that plays, by name ("" none)
 		int framing = 0; // 0 head and shoulders for a VRM, 1 all of it, 2 head
 		bool hide = true, smooth = true;
 		WornPlace place;
@@ -699,7 +696,10 @@ struct FaceAvatar {
 		std::string file, problem, kind, title, author;
 		bool loaded = false, shown = false, chain = false, set_up = false;
 		size_t points = 0, triangles = 0;
-		int springs = 0, tails = 0, arkit = 0, upright = 0, cards = 0, layers = 0;
+		int springs = 0, arkit = 0, upright = 0, cards = 0, layers = 0;
+		// Its own animations' names, and the one playing ("" none).
+		std::vector<std::string> animations;
+		std::string animation;
 		// Each spot (its own left eye, right eye, mouth) on its front
 		// picture (shares of FaceSpots::box) and how it was found.
 		float spot[3][4] = {};
@@ -1350,6 +1350,8 @@ struct FaceAvatar {
 				st.author = m.meta.author;
 				st.points = m.points;
 				st.triangles = m.triangles;
+				for (const Animation &a : m.animations)
+					st.animations.push_back(a.name);
 			}
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d = st;
@@ -1363,14 +1365,16 @@ struct FaceAvatar {
 		ro.floppy = look3d.floppy;
 		ro.springs = look3d.swing;
 		ro.setup = look3d.setup;
-		ro.wag = look3d.wag;
-		ro.wag_speed = look3d.wag_speed;
+		ro.animation = animation_named(*model_now, look3d.animation);
 		const std::string key = std::to_string(ro.facing.x) + "/" + std::to_string(ro.facing.y) + "/" +
 					std::to_string(ro.facing.z) + "/" + std::to_string(ro.facing.w) + "/" +
 					std::to_string(ro.floppy) + "/" + (ro.springs ? "1" : "0") + "/" +
 					look3d.setup_text;
-		if (rig)
-			rig->set_wag(ro.wag, ro.wag_speed);
+		if (rig && rig->animation() != ro.animation) {
+			rig->set_animation(ro.animation);
+			std::lock_guard<std::mutex> l(state_lock);
+			state3d.animation = ro.animation >= 0 ? model_now->animations[ro.animation].name : "";
+		}
 		if (!rig || key != rig_key) {
 			rig = std::make_unique<Rig>(model_now, ro);
 			rig_key = key;
@@ -1386,7 +1390,7 @@ struct FaceAvatar {
 			worker.set_cut(aspect, feather);
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d.springs = rig->springs();
-			state3d.tails = rig->tails();
+			state3d.animation = ro.animation >= 0 ? model_now->animations[ro.animation].name : "";
 			state3d.chain = rig->auto_chain();
 			state3d.arkit = rig->arkit_parts();
 			state3d.upright = rig->upright_parts();
@@ -2212,10 +2216,8 @@ struct FaceAvatar {
 		l3.outline = clampf((float)obs_data_get_int(settings, "outline") / 100.0f, 0, 1) * 0.02f;
 		l3.floppy = clampf((float)obs_data_get_int(settings, "floppy") / 100.0f, 0, 1);
 		l3.swing = obs_data_get_bool(settings, "swing");
-		// Tails: how far they wag (0 not at all), and how fast against
-		// a usual wag (WAG_SPEED wags a second).
-		l3.wag = clampf((float)obs_data_get_int(settings, "wag") / 100.0f, 0, 1);
-		l3.wag_speed = WAG_SPEED * clampf((float)obs_data_get_int(settings, "wag_speed") / 100.0f, 0.1f, 4);
+		const char *animation = obs_data_get_string(settings, "animation");
+		l3.animation = animation ? animation : "";
 		const char *framing = obs_data_get_string(settings, "framing");
 		l3.framing = framing && std::strcmp(framing, "whole") == 0  ? 1
 			     : framing && std::strcmp(framing, "head") == 0 ? 2
@@ -2371,6 +2373,10 @@ struct FaceAvatar {
 			json values = json::object();
 			for (const auto &kv : st.values)
 				values[kv.first] = r(kv.second, 100);
+			// (Objects: OBS's own answers carry lists of objects only.)
+			json animations = json::array();
+			for (const std::string &name : st.animations)
+				animations.push_back({{"name", name}});
 			json model = {{"file", st.file},
 				      {"loaded", st.loaded},
 				      {"loading", loader.busy()},
@@ -2381,7 +2387,8 @@ struct FaceAvatar {
 				      {"points", st.points},
 				      {"triangles", st.triangles},
 				      {"springs", st.springs},
-				      {"tails", st.tails},
+				      {"animations", animations},
+				      {"animation", st.animation},
 				      {"swinging_chain", st.chain},
 				      {"arkit_parts", st.arkit},
 				      {"set_up", st.set_up},
@@ -2519,8 +2526,7 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "outline", 0);
 	obs_data_set_default_int(settings, "floppy", 50);
 	obs_data_set_default_bool(settings, "swing", true);
-	obs_data_set_default_int(settings, "wag", 50);
-	obs_data_set_default_int(settings, "wag_speed", 100);
+	obs_data_set_default_string(settings, "animation", "");
 	obs_data_set_default_string(settings, "framing", "auto");
 	obs_data_set_default_bool(settings, "hide_behind_head", true);
 	obs_data_set_default_bool(settings, "smooth_edges", true);
@@ -2628,10 +2634,15 @@ obs_properties_t *get_properties(void *data)
 	obs_properties_add_bool(m3, "swing", text("FaceAvatar.Swing"));
 	p = obs_properties_add_int_slider(m3, "floppy", text("FaceAvatar.Floppy"), 0, 100, 1);
 	obs_property_int_set_suffix(p, "%");
-	p = obs_properties_add_int_slider(m3, "wag", text("FaceAvatar.Wag"), 0, 100, 1);
-	obs_property_int_set_suffix(p, "%");
-	p = obs_properties_add_int_slider(m3, "wag_speed", text("FaceAvatar.WagSpeed"), 25, 300, 5);
-	obs_property_int_set_suffix(p, "%");
+	// Its own animations, as the character loaded has them.
+	obs_property_t *anim = obs_properties_add_list(m3, "animation", text("FaceAvatar.Animation"),
+						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(anim, text("FaceAvatar.AnimationNone"), "");
+	if (f) {
+		std::lock_guard<std::mutex> l(f->state_lock);
+		for (const std::string &name : f->state3d.animations)
+			obs_property_list_add_string(anim, name.c_str(), name.c_str());
+	}
 	obs_property_t *framing = obs_properties_add_list(m3, "framing", text("FaceAvatar.Framing"),
 							  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(framing, text("FaceAvatar.FramingAuto"), "auto");

@@ -27,7 +27,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // "MToon") and the pictures as the file has them (PNG or JPEG, turned
 // into textures by OBS). From VRM too: which bone is the head, neck and
 // eyes, the expressions (blink, "aa", happy...) and the swinging parts
-// (spring bones) with what they bump into.
+// (spring bones) with what they bump into. And its own animations
+// (moves, turns and sizes; not its expressions' strengths).
 //
 // Plain code over plain numbers (tests/unit_model.cpp). Every number in a
 // file is checked before it's used, so a broken or hostile file only
@@ -185,6 +186,26 @@ struct LookRange {
 	float in = 90, out = 10;
 };
 
+// The file's own animation (glTF's): its parts' moves over time, an
+// idle, a tail's wag... (played over and over by the rig, if chosen).
+// Each channel moves one node: where it is, its turn or its size, key
+// by key - jumping to each key, straight between them (turns the
+// shortest way round), or curved by each key's slopes.
+struct AnimChannel {
+	enum Path { Move, Turn, Size };
+	enum Ease { Step, Straight, Curved };
+	int node = -1;
+	Path path = Turn;
+	Ease ease = Straight;
+	std::vector<float> times;  // seconds, rising
+	std::vector<float> values; // 3 a key (4 for a turn); Curved: its slope in, value and slope out
+	int size() const { return path == Turn ? 4 : 3; }
+};
+struct Animation {
+	std::string name; // as the file has it, or "Animation 1", "Animation 2"...
+	std::vector<AnimChannel> channels;
+	float length = 0; // seconds: its last key
+};
 struct ModelMeta {
 	std::string title, author, licence;
 	std::string allowed;    // who may be it ("onlyAuthor", "everyone"...)
@@ -214,6 +235,7 @@ struct Model {
 	LookRange look_in, look_out, look_up, look_down;
 	std::vector<Spring> springs;
 	std::vector<Collider> colliders;
+	std::vector<Animation> animations;
 	// Which way it faces as it is: VRM 1.0 and glTF along +z, VRM 0.x -z.
 	bool faces_back = false;
 
@@ -221,6 +243,12 @@ struct Model {
 	V3 low, high;
 	size_t points = 0, triangles = 0;
 };
+
+// A channel at `t` seconds (before its first key: its first; after its
+// last: its last), into `out` (3 numbers, or a turn's 4).
+void sample(const AnimChannel &c, float t, float *out);
+// An animation's number by its name, or -1 ("" or none so named).
+int animation_named(const Model &m, const std::string &name);
 
 // Loads a .glb, .vrm or .gltf (with its files beside it). False, with why
 // in plain words, if it can't.

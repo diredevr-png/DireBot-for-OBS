@@ -1088,113 +1088,204 @@ static void test_dangly_parts()
 	CHECK(pr.springs() == 1);
 }
 
-// Tails wag side to side all the time, standing still or not: a spring
-// named as a tail (not a ponytail), the wag running down it, as far and
-// as fast as asked; off at 0. A dangly chain named "tail" wags too.
-static void test_tail_wag()
+// Its own animations (an idle, a tail's wag...): read as the file has
+// them, played over and over when chosen - nothing when not. The bot
+// itself wags no tail: a spring named "Tail" just hangs, standing still.
+static void test_own_animation()
 {
-	CHECK(tail_name("Tail") && tail_name("Wolf Tail") && tail_name("wolf_tail0") && tail_name("J_Sec_Tail") &&
-	      tail_name("Shippo") && tail_name("\xe3\x81\x97\xe3\x81\xa3\xe3\x81\xbd"));
-	CHECK(!tail_name("ponytail") && !tail_name("PonyTail_L") && !tail_name("Pigtail") && !tail_name("Hair"));
-	for (const bool vrm0 : {false, true}) {
-		Person p = make_person(vrm0);
-		// The person's ponytail as a tail: stiff enough to hold out
-		// behind, a little gravity.
-		if (!vrm0) {
-			auto &sp = p.b.doc["extensions"]["VRMC_springBone"]["springs"][0];
-			sp["name"] = "Tail";
-			for (auto &j : sp["joints"])
-				if (j.contains("stiffness"))
-					j["stiffness"] = 1.0, j["gravityPower"] = 0.1;
-		} else {
-			auto &g = p.b.doc["extensions"]["VRM"]["secondaryAnimation"]["boneGroups"][0];
-			g["comment"] = "Tail";
-			g["stiffiness"] = 1.0;
-			g["gravityPower"] = 0.1;
-		}
-		auto m = std::make_shared<Model>();
-		CHECK(load(p.b.glb(), *m));
-		// Its tip's side to side over 4 seconds at 60 frames a second.
-		auto sway = [&](float wag, float speed, int *crossings) {
-			RigOptions o;
-			o.wag = wag;
-			o.wag_speed = speed;
-			Rig rig(m, o);
-			Drive d = still();
-			float lo = 1e9f, hi = -1e9f, last = 0;
-			int crossed = 0;
-			for (int i = 0; i < 240 + 120; i++) {
-				rig.pose(d);
-				if (i < 120)
-					continue; // settled in first
-				const float x = move_of(rig.world()[p.tail2]).x;
-				lo = std::min(lo, x);
-				hi = std::max(hi, x);
-				if (i > 120 && (x > 0) != (last > 0))
-					crossed++;
-				last = x;
-			}
-			if (crossings)
-				*crossings = crossed;
-			CHECK(rig.tails() == 1);
-			return hi - lo;
-		};
-		int crossings = 0;
-		const float wide = sway(0.5f, 1.5f, &crossings);
-		// The 20 cm tail's tip: centimetres side to side (half way: the
-		// tip's link 37 degrees or so each way), about 1.5 wags a second
-		// (each crossing the middle twice).
-		CHECK(wide > 0.06f && wide < 0.3f);
-		CHECK(crossings >= 10 && crossings <= 14);
-		// Wider at 1, faster at twice the speed, still at 0.
-		CHECK(sway(1, 1.5f, nullptr) > wide * 1.4f);
-		int fast = 0;
-		sway(0.5f, 3, &fast);
-		CHECK(fast >= 22 && fast <= 26);
-		CHECK(sway(0, 1.5f, nullptr) < 1e-3f);
-	}
-	// The ponytail as it is (a ponytail): no wag at all.
-	{
-		Person p = make_person(false);
-		auto m = std::make_shared<Model>();
-		CHECK(load(p.b.glb(), *m));
-		RigOptions o;
-		o.wag = 1;
-		Rig rig(m, o);
-		CHECK(rig.tails() == 0);
+	Person p = make_person(false);
+	Builder &b = p.b;
+	const float PI = 3.14159265f;
+	const Quat q40 = axis_angle({0, 1, 0}, 40 * PI / 180);
+	const Quat nod = axis_angle({1, 0, 0}, 10 * PI / 180);
+	// The ponytail as a tail: stiff enough to hold out behind.
+	auto &sp = b.doc["extensions"]["VRMC_springBone"]["springs"][0];
+	sp["name"] = "Tail";
+	for (auto &j : sp["joints"])
+		if (j.contains("stiffness"))
+			j["stiffness"] = 1.0, j["gravityPower"] = 0.1;
+	// "Wag": the tail's root swung 40 degrees round and back over a
+	// second (straight between keys), its hips up 5 cm from 0.4 seconds
+	// (jumping to it), its left eye grown to twice its size (curved).
+	const int t3 = b.floats({0, 0.5f, 1}, 1, "SCALAR"), t2 = b.floats({0, 0.4f}, 1, "SCALAR");
+	const int t01 = b.floats({0, 1}, 1, "SCALAR");
+	const int swing = b.floats({0, 0, 0, 1, q40.x, q40.y, q40.z, q40.w, 0, 0, 0, 1}, 4, "VEC4");
+	const int hop = b.floats({0, 1, 0, 0, 1.05f, 0}, 3, "VEC3");
+	const int grow = b.floats({0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 2, 2, 2, 0, 0, 0}, 3, "VEC3");
+	const int bad = b.floats({0, 0, 0, 0, 0, 0}, 3, "VEC3");
+	b.doc["animations"] =
+		json::array({{{"name", "Wag"},
+			      {"samplers",
+			       {{{"input", t3}, {"output", swing}},
+				{{"input", t2}, {"output", hop}, {"interpolation", "STEP"}},
+				{{"input", t01}, {"output", grow}, {"interpolation", "CUBICSPLINE"}},
+				{{"input", t2}, {"output", bad}}}},
+			      {"channels",
+			       {{{"sampler", 0}, {"target", {{"node", p.tail0}, {"path", "rotation"}}}},
+				{{"sampler", 1}, {"target", {{"node", p.hips}, {"path", "translation"}}}},
+				{{"sampler", 2}, {"target", {{"node", p.leye}, {"path", "scale"}}}},
+				// Left out: an expression's strengths, a missing part, a turn
+				// of three numbers, a missing sampler.
+				{{"sampler", 1}, {"target", {{"node", p.face_node}, {"path", "weights"}}}},
+				{{"sampler", 0}, {"target", {{"node", 999}, {"path", "rotation"}}}},
+				{{"sampler", 3}, {"target", {{"node", p.tail1}, {"path", "rotation"}}}},
+				{{"sampler", 9}, {"target", {{"node", p.tail1}, {"path", "rotation"}}}}}}},
+			     {{"samplers", json::array()}, {"channels", json::array()}},
+			     {{"name", "Nod"},
+			      {"samplers",
+			       {{{"input", b.floats({0}, 1, "SCALAR")},
+				 {"output", b.floats({nod.x, nod.y, nod.z, nod.w}, 4, "VEC4")}}}},
+			      {"channels", {{{"sampler", 0}, {"target", {{"node", p.head}, {"path", "rotation"}}}}}}}});
+	auto m = std::make_shared<Model>();
+	std::string why;
+	CHECK(load(b.glb(), *m, &why));
+	CHECK(m->animations.size() == 3);
+	if (m->animations.size() != 3)
+		return;
+	const Animation &wag = m->animations[0];
+	CHECK(wag.name == "Wag" && m->animations[1].name == "Animation 2" && m->animations[2].name == "Nod");
+	CHECK(wag.channels.size() == 3 && near(wag.length, 1, 1e-6) && m->animations[1].channels.empty());
+	CHECK(animation_named(*m, "Wag") == 0 && animation_named(*m, "Nod") == 2 && animation_named(*m, "") == -1 &&
+	      animation_named(*m, "wag") == -1);
+	if (wag.channels.size() != 3)
+		return;
+	// Sampled: straight (the shortest way round), jumping, curved; held
+	// before its first key and after its last.
+	float v[4];
+	auto turn_is = [&](float deg) {
+		const Quat q = axis_angle({0, 1, 0}, deg * PI / 180);
+		return near(std::fabs(v[0] * q.x + v[1] * q.y + v[2] * q.z + v[3] * q.w), 1, 1e-5);
+	};
+	sample(wag.channels[0], 0.25f, v);
+	CHECK(turn_is(20));
+	sample(wag.channels[0], 0.5f, v);
+	CHECK(turn_is(40));
+	sample(wag.channels[0], 0.875f, v);
+	CHECK(turn_is(10));
+	sample(wag.channels[0], -1, v);
+	CHECK(turn_is(0));
+	sample(wag.channels[0], 5, v);
+	CHECK(turn_is(0));
+	sample(wag.channels[1], 0.3f, v);
+	CHECK(near3({v[0], v[1], v[2]}, {0, 1, 0}, 1e-6f));
+	sample(wag.channels[1], 0.6f, v);
+	CHECK(near3({v[0], v[1], v[2]}, {0, 1.05f, 0}, 1e-6f));
+	sample(wag.channels[2], 0.5f, v);
+	CHECK(near(v[0], 1.5, 1e-5));
+	sample(wag.channels[2], 0.25f, v);
+	CHECK(near(v[0], 1.15625, 1e-5)); // 1 + 3u^2 - 2u^3
+	// Curved with slopes: a slope out of the first key of 4 a second.
+	AnimChannel sloped = wag.channels[2];
+	sloped.values[6] = 4, sloped.values[7] = 4, sloped.values[8] = 4;
+	sample(sloped, 0.5f, v);
+	CHECK(near(v[0], 1.5 + 4 * 0.125, 1e-5)); // (u^3 - 2u^2 + u) at a half: 0.125
+
+	// Not chosen: it all stands still, the tail too.
+	auto tip_x = [&](Rig &rig, int frames, float *lo, float *hi) {
 		Drive d = still();
-		for (int i = 0; i < 120; i++)
-			rig.pose(d);
-		float lo = 1e9f, hi = -1e9f;
-		for (int i = 0; i < 120; i++) {
+		*lo = 1e9f, *hi = -1e9f;
+		for (int i = 0; i < frames; i++) {
 			rig.pose(d);
 			const float x = move_of(rig.world()[p.tail2]).x;
-			lo = std::min(lo, x);
-			hi = std::max(hi, x);
+			*lo = std::min(*lo, x), *hi = std::max(*hi, x);
 		}
+	};
+	{
+		Rig rig(m, RigOptions());
+		CHECK(rig.animation() == -1);
+		float lo, hi;
+		tip_x(rig, 240, &lo, &hi);
 		CHECK(hi - lo < 1e-3f);
 	}
-	// No VRM: a dangly chain whose bones are named "tail" wags as well.
+	// Chosen, nothing swinging: exactly as it has them, over and over.
 	{
-		Bones b;
-		const int root = b.add("Body", -1, {0, 0, 0});
-		const int t0 = b.add("Tail0", root, {0, 0, -0.1f});
-		const int t1 = b.add("Tail1", t0, {0, 0, -0.1f});
-		b.add("Tail2", t1, {0, 0, -0.1f});
-		auto m = b.load_it();
-		Rig rig(m, RigOptions());
-		CHECK(rig.auto_chain() && rig.tails() == 1);
+		RigOptions o;
+		o.springs = false;
+		o.animation = 0;
+		Rig rig(m, o);
 		Drive d = still();
-		float lo = 1e9f, hi = -1e9f;
-		for (int i = 0; i < 240; i++) {
-			rig.pose(d);
-			if (i >= 60) {
-				const float x = rig.parts()[0].pos[3].x;
-				lo = std::min(lo, x);
-				hi = std::max(hi, x);
-			}
-		}
-		CHECK(hi - lo > 0.03f);
+		for (int i = 0; i < 30; i++)
+			rig.pose(d); // half a second in
+		const float x_at_half = move_of(rig.world()[p.tail2]).x;
+		CHECK(near(x_at_half, -0.2 * std::sin(40 * PI / 180), 1e-3));
+		CHECK(near(move_of(rig.world()[p.head]).y, 1.05 + 0.5 + 0.1, 1e-4));
+		const M4 &eye = rig.world()[p.leye];
+		CHECK(near(length(V3{eye.m[0], eye.m[1], eye.m[2]}), 1.5, 1e-3));
+		for (int i = 0; i < 45; i++)
+			rig.pose(d); // 1.25 seconds: a quarter into it again
+		CHECK(near(move_of(rig.world()[p.tail2]).x, -0.2 * std::sin(20 * PI / 180), 1e-3));
+		CHECK(near(move_of(rig.world()[p.head]).y, 1.6, 1e-4));
+		// Another of them (with nothing in it): all at rest at once;
+		// one it hasn't got: none.
+		rig.set_animation(1);
+		rig.pose(d);
+		CHECK(near(move_of(rig.world()[p.tail2]).x, 0, 1e-5) && rig.animation() == 1);
+		rig.set_animation(7);
+		CHECK(rig.animation() == -1);
+	}
+	// Chosen, swinging: the tail swings from where its animation has it,
+	// side to side, a little after it.
+	{
+		RigOptions o;
+		o.animation = 0;
+		Rig rig(m, o);
+		float lo, hi;
+		tip_x(rig, 120, &lo, &hi); // settled in
+		tip_x(rig, 120, &lo, &hi);
+		CHECK(hi - lo > 0.06f && lo < -0.05f);
+	}
+	// Your head turns from where its animation has it: nodded 10 degrees,
+	// and turned with you.
+	{
+		RigOptions o;
+		o.springs = false;
+		o.animation = 2;
+		Rig rig(m, o);
+		Drive d = still();
+		rig.pose(d);
+		V3 ahead = rotate(quat_of(rig.world()[p.head]), {0, 0, 1});
+		CHECK(near3(ahead, {0, -std::sin(10 * PI / 180), std::cos(10 * PI / 180)}, 1e-4f));
+		d.head = axis_angle({0, 1, 0}, 20 * PI / 180);
+		rig.pose(d);
+		ahead = rotate(quat_of(rig.world()[p.head]), {0, 0, 1});
+		CHECK(near(ahead.y, -std::sin(10 * PI / 180), 0.02) && near(ahead.x, std::sin(20 * PI / 180), 0.03));
+	}
+	// Arms its animation turns stay where it has them (not brought down
+	// again); arms it doesn't come down by its sides as ever.
+	{
+		Person a = make_person(false);
+		Builder &ab = a.b;
+		const int lu = ab.node({{"name", "upper_arm.L"}, {"translation", {0.1f, 0.4f, 0}}});
+		const int ll = ab.node({{"name", "lower_arm.L"}, {"translation", {0.25f, 0, 0}}});
+		const int ru = ab.node({{"name", "upper_arm.R"}, {"translation", {-0.1f, 0.4f, 0}}});
+		const int rl = ab.node({{"name", "lower_arm.R"}, {"translation", {-0.25f, 0, 0}}});
+		ab.doc["nodes"][a.hips]["children"].push_back(lu);
+		ab.doc["nodes"][a.hips]["children"].push_back(ru);
+		ab.doc["nodes"][lu]["children"] = {ll};
+		ab.doc["nodes"][ru]["children"] = {rl};
+		json &bones = ab.doc["extensions"]["VRMC_vrm"]["humanoid"]["humanBones"];
+		bones["leftUpperArm"] = {{"node", lu}};
+		bones["leftLowerArm"] = {{"node", ll}};
+		bones["rightUpperArm"] = {{"node", ru}};
+		bones["rightLowerArm"] = {{"node", rl}};
+		const Quat down = axis_angle({0, 0, 1}, -70 * PI / 180);
+		ab.doc["animations"] = json::array(
+			{{{"name", "Arm down"},
+			  {"samplers",
+			   {{{"input", ab.floats({0}, 1, "SCALAR")},
+			     {"output", ab.floats({down.x, down.y, down.z, down.w}, 4, "VEC4")}}}},
+			  {"channels", {{{"sampler", 0}, {"target", {{"node", lu}, {"path", "rotation"}}}}}}}});
+		auto am = std::make_shared<Model>();
+		CHECK(load(ab.glb(), *am));
+		RigOptions o;
+		o.springs = false;
+		o.animation = 0;
+		Rig rig(am, o);
+		rig.pose(still());
+		const V3 left = move_of(rig.world()[ll]) - move_of(rig.world()[lu]);
+		const V3 right = move_of(rig.world()[rl]) - move_of(rig.world()[ru]);
+		CHECK(near(std::acos(dot(normalized(left), {0, -1, 0})), 20 * PI / 180, 1e-3));
+		CHECK(near(std::acos(dot(normalized(right), {0, -1, 0})), 0.3, 1e-3));
 	}
 }
 
@@ -1678,7 +1769,7 @@ int main()
 	test_expressions();
 	test_names_and_sides();
 	test_springs();
-	test_tail_wag();
+	test_own_animation();
 	test_link_chain();
 	test_spots_on_a_vrm();
 	test_face_region();

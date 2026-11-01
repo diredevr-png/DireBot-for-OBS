@@ -40,11 +40,6 @@ constexpr int MOST_STEPS = 4;
 constexpr float PULLED_DRAG = 0.02f;
 // How far your eyes turn at their most (degrees), for a full look.
 constexpr float EYE_SIDEWAYS = 30, EYE_UPDOWN = 25;
-// A tail's wag at its widest (RigOptions::wag 1): this far each way at its
-// tip (radians); each link comes this much later than the one before
-// (radians of the wag), so it runs down the tail; and a tail with no
-// stiffness of its own (only gravity) is pulled round this much to wag.
-constexpr float WAG_MOST = 75 * PI_F / 180, WAG_LATE = 0.55f, WAG_STIFF = 0.5f;
 
 float clamp01(float v)
 {
@@ -283,22 +278,6 @@ int guess_turn(const Model &m)
 	return deep > wide * 1.25f ? 270 : 0;
 }
 
-// A tail, by its name: "Tail", "wolf_tail0", "しっぽ"... - not a ponytail
-// or pigtails (hair).
-bool tail_name(std::string n)
-{
-	for (char &c : n)
-		c = (char)std::tolower((unsigned char)c);
-	for (const char *hair : {"ponytail", "pony_tail", "pony tail", "pigtail"})
-		for (size_t at; (at = n.find(hair)) != std::string::npos;)
-			n.erase(at, std::strlen(hair));
-	for (const char *w : {"tail", "shippo", "\xe3\x81\x97\xe3\x81\xa3\xe3\x81\xbd" /* しっぽ */,
-			      "\xe5\xb0\xbb\xe5\xb0\xbe" /* 尻尾 */})
-		if (n.find(w) != std::string::npos)
-			return true;
-	return false;
-}
-
 int arkit_move(const std::string &name)
 {
 	const std::string p = plain(name);
@@ -351,6 +330,9 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 	rest_world_ = rest_world(m);
 	world_ = rest_world_;
 	held_.assign(n, 0);
+	anim_turns_.assign(n, 0);
+	if (options_.animation >= (int)m.animations.size())
+		options_.animation = -1;
 	head_ = m.bone("head");
 	neck_ = m.bone("neck");
 	left_eye_ = m.bone("leftEye");
@@ -487,12 +469,8 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 			j.axis = normalized(j.tail);
 			c.joints.push_back(j);
 		}
-		if (c.joints.empty())
-			continue;
-		// A tail by the spring's name (or, with none, its first bone's).
-		c.tail = tail_name(sp.name.empty() ? m.nodes[c.joints[0].s.node].name : sp.name);
-		make_tail(c);
-		springs_.push_back(c);
+		if (!c.joints.empty())
+			springs_.push_back(c);
 	}
 	if (setup && setup->chains_given) {
 		// The chains its set-up names (an imported Lens Studio project's):
@@ -570,9 +548,6 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 					c.joints.push_back(j);
 				}
 				if (!c.joints.empty()) {
-					c.tail = tail_name(m.nodes[chain[0]].name) ||
-						 tail_name(m.nodes[c.joints[0].s.node].name);
-					make_tail(c);
 					springs_.push_back(c);
 					auto_chain_ = true;
 				}
@@ -586,52 +561,36 @@ void Rig::settle()
 	settled_ = true;
 }
 
-// A tail's links: each wags a share, more of it towards the tip, each a
-// little after the one it hangs from - round the character's up and down
-// (a tail held out, behind or to the side, sweeps from side to side), or
-// round its front to back (a tail hanging down or held up).
-void Rig::make_tail(Chain &c)
+void Rig::set_animation(int which)
 {
-	if (!c.tail)
-		return;
-	const Model &m = *model_;
-	const Quat F = options_.facing;
-	const V3 up = rotate(conj(F), {0, 1, 0}), front = rotate(conj(F), {0, 0, 1});
-	for (Joint &j : c.joints) {
-		const int p = m.nodes[j.s.node].parent;
-		const Quat parent = p >= 0 ? rot_of(rest_world_[p]) : Quat();
-		const V3 way = rotate(parent * j.rest, j.axis); // the model's space
-		const V3 base = std::fabs(dot(way, up)) < 0.8f ? up : front;
-		const V3 axis = normalized(base - way * dot(base, way), up);
-		j.wag_axis = rotate(conj(parent), axis);
-	}
-	// How far down the tail each link is (links of the chain above it).
-	std::vector<int> depth(c.joints.size(), 0);
-	float total = 0;
-	for (size_t i = 0; i < c.joints.size(); i++) {
-		for (int p = m.nodes[c.joints[i].s.node].parent; p >= 0; p = m.nodes[p].parent)
-			for (const Joint &other : c.joints)
-				if (other.s.node == p)
-					depth[i]++;
-	}
-	int deepest = 0;
-	for (int d : depth)
-		deepest = std::max(deepest, d);
-	// Shares 1, 2, 3... from the root: summed down any one line of it, 1.
-	for (int d = 0; d <= deepest; d++)
-		total += (float)(d + 1);
-	for (size_t i = 0; i < c.joints.size(); i++) {
-		c.joints[i].wag = (float)(depth[i] + 1) / total;
-		c.joints[i].wag_late = WAG_LATE * (float)depth[i];
-	}
+	if (which < 0 || which >= (int)model_->animations.size())
+		which = -1;
+	if (which != options_.animation)
+		anim_time_ = 0;
+	options_.animation = which;
 }
 
-int Rig::tails() const
+// Its own animation, on from where it was by `dt`, over and over: the
+// nodes it moves are where it has them (the rest as they are).
+void Rig::animate(float dt)
 {
-	int n = 0;
-	for (const Chain &c : springs_)
-		n += c.tail ? 1 : 0;
-	return n;
+	const Model &m = *model_;
+	anim_turns_.assign(m.nodes.size(), 0);
+	if (options_.animation < 0 || options_.animation >= (int)m.animations.size())
+		return;
+	const Animation &a = m.animations[options_.animation];
+	if (a.length > 0)
+		anim_time_ = std::fmod(anim_time_ + std::max(0.0f, std::min(dt, 1.0f)), a.length);
+	float v[4];
+	for (const AnimChannel &c : a.channels) {
+		sample(c, anim_time_, v);
+		if (c.path == AnimChannel::Move)
+			t_[c.node] = {v[0], v[1], v[2]};
+		else if (c.path == AnimChannel::Size)
+			s_[c.node] = {v[0], v[1], v[2]};
+		else
+			r_[c.node] = Quat{v[0], v[1], v[2], v[3]}, anim_turns_[c.node] = 1;
+	}
 }
 
 // A node's place in the world from its parent's (or the root), and all
@@ -657,12 +616,15 @@ void Rig::drive_head(const Drive &d)
 	const Quat F = options_.facing;
 	const Quat R = conj(F) * d.head * F; // in the model's own terms
 	auto turn_local = [this](int node, Quat by) {
-		// Its rest turn, then `by` as the model at rest has it.
+		// Its turn (at rest, or as its own animation has it now), then
+		// `by` as the model at rest has it.
 		const Quat w = rot_of(rest_world_[node]);
-		r_[node] = model_->nodes[node].r * (conj(w) * by * w);
+		r_[node] = r_[node] * (conj(w) * by * w);
 	};
+	// (Arms its animation turns are where it has them, down or not.)
 	for (const Arm &a : arms_)
-		turn_local(a.node, a.turn);
+		if (!anim_turns_[a.node])
+			turn_local(a.node, a.turn);
 	if (head_ < 0)
 		return;
 	if (neck_ >= 0 && neck_ != head_) {
@@ -703,7 +665,7 @@ void Rig::drive_eyes(const Drive &d)
 		const Quat g = axis_angle({0, 1, 0}, yaw * RAD) * axis_angle({1, 0, 0}, -pitch * RAD);
 		const Quat gm = conj(F) * g * F;
 		const Quat w = rot_of(rest_world_[eye]);
-		r_[eye] = m.nodes[eye].r * (conj(w) * gm * w);
+		r_[eye] = r_[eye] * (conj(w) * gm * w);
 	}
 }
 
@@ -783,7 +745,6 @@ void Rig::step_springs(float dt, float scale)
 	// upright, so gravity pulls only as far as it's tipped from that.
 	const V3 upright_down = auto_chain_ ? normalized(direction(root_, {0, -1, 0}), {0, -1, 0}) : V3{0, 0, 0};
 	const Quat head_turn = head_turn_now();
-	const float wag = clamp01(options_.wag) * WAG_MOST;
 	for (Chain &c : springs_) {
 		for (Joint &j : c.joints) {
 			const int n = j.s.node;
@@ -794,15 +755,8 @@ void Rig::step_springs(float dt, float scale)
 			const float len = length(direction(world_[n], j.tail));
 			if (len < 1e-7f)
 				continue;
-			V3 rest_dir = rotate(parent_rot * j.rest, j.axis);
+			const V3 rest_dir = rotate(parent_rot * j.rest, j.axis);
 			const float k = scale * auto_k;
-			float stiffness = j.s.stiffness;
-			if (c.tail && wag > 0 && j.wag > 0 && !j.pulled) {
-				// A tail: turned one way, then the other (make_tail).
-				const float a = wag * j.wag * std::sin(wag_phase_ - j.wag_late);
-				rest_dir = rotate(axis_angle(rotate(parent_rot, j.wag_axis), a), rest_dir);
-				stiffness = std::max(stiffness, WAG_STIFF);
-			}
 			V3 next;
 			if (j.pulled) {
 				// Swung and pulled, never back to how it was made: it hangs
@@ -811,7 +765,7 @@ void Rig::step_springs(float dt, float scale)
 				next = j.now + (j.now - j.before) * (1 - j.s.drag) + pull * (dt * dt * scale);
 			} else {
 				next = j.now + (j.now - j.before) * (1 - j.s.drag) +
-				       rest_dir * (stiffness * stiff_k * dt * k) +
+				       rest_dir * (j.s.stiffness * stiff_k * dt * k) +
 				       (j.s.gravity_dir - upright_down) * (j.s.gravity * dt * k);
 			}
 			next = head + normalized(next - head, rest_dir) * len;
@@ -885,8 +839,17 @@ void Rig::stand_upright(const Drive &d)
 void Rig::pose(const Drive &d)
 {
 	const Model &m = *model_;
-	for (size_t i = 0; i < m.nodes.size(); i++)
+	for (size_t i = 0; i < m.nodes.size(); i++) {
+		t_[i] = m.nodes[i].t;
 		r_[i] = m.nodes[i].r;
+		s_[i] = m.nodes[i].s;
+	}
+	animate(d.dt);
+	// Swinging parts hang as its animation has them (it may swing a tail
+	// itself), and swing from there.
+	for (Chain &c : springs_)
+		for (Joint &j : c.joints)
+			j.rest = r_[j.s.node];
 	std::fill(held_.begin(), held_.end(), 0);
 	// No head bone: it all turns round its head.
 	if (head_ < 0) {
@@ -932,8 +895,6 @@ void Rig::pose(const Drive &d)
 		while (spring_time_ >= SPRING_STEP && steps < MOST_STEPS) {
 			step_springs(SPRING_STEP, scale);
 			spring_time_ -= SPRING_STEP;
-			wag_phase_ = std::fmod(wag_phase_ + 2 * PI_F * std::max(0.0f, options_.wag_speed) * SPRING_STEP,
-					       2 * PI_F);
 			steps++;
 		}
 		if (steps == MOST_STEPS)

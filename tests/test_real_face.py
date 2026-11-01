@@ -164,19 +164,21 @@ def ball_points(cx, cy, cz, rx, ry, rz, n=24):
     return pos, nrm, ix
 
 
-def write_glb(path, parts, tree=None):
+def write_glb(path, parts, tree=None, animations=None):
     """A plain .glb: one node a part, each (points, facings, triangles,
     colour as linear red/green/blue, roughness) - or, given `tree` (glTF
     nodes, the first the top one, "mesh" naming a part), its parts hung on
-    those."""
+    those. `animations`: its own, {name: [(node, path, times, values)]}
+    (values flat, straight between keys)."""
     blob = bytearray()
     views, accessors, meshes, nodes, materials = [], [], [], [], []
 
-    def add(data, target):
+    def add(data, target=None):
         while len(blob) % 4:
             blob.append(0)
-        views.append({"buffer": 0, "byteOffset": len(blob),
-                      "byteLength": len(data), "target": target})
+        views.append({"buffer": 0, "byteOffset": len(blob), "byteLength": len(data)})
+        if target:
+            views[-1]["target"] = target
         blob.extend(data)
         return len(views) - 1
 
@@ -197,11 +199,27 @@ def write_glb(path, parts, tree=None):
         nodes.append({"name": "part%d" % i, "mesh": i})
     if tree is not None:
         nodes = tree
+    anims = []
+    for name, channels in (animations or {}).items():
+        samplers, chans = [], []
+        for node, kind, times, values in channels:
+            t = add(struct.pack("<%df" % len(times), *times))
+            accessors.append({"bufferView": t, "componentType": 5126, "count": len(times),
+                              "type": "SCALAR", "min": [min(times)], "max": [max(times)]})
+            v = add(struct.pack("<%df" % len(values), *values))
+            accessors.append({"bufferView": v, "componentType": 5126, "count": len(times),
+                              "type": "VEC4" if kind == "rotation" else "VEC3"})
+            samplers.append({"input": len(accessors) - 2, "output": len(accessors) - 1})
+            chans.append({"sampler": len(samplers) - 1, "target": {"node": node, "path": kind}})
+        anims.append({"name": name, "samplers": samplers, "channels": chans} if name else
+                     {"samplers": samplers, "channels": chans})
     doc = {"asset": {"version": "2.0"}, "scene": 0,
            "scenes": [{"nodes": [0] if tree is not None else list(range(len(nodes)))}],
            "nodes": nodes,
            "meshes": meshes, "materials": materials, "accessors": accessors,
            "bufferViews": views, "buffers": [{"byteLength": len(blob)}]}
+    if anims:
+        doc["animations"] = anims
     text = json.dumps(doc).encode()
     text += b" " * (-len(text) % 4)
     while len(blob) % 4:
@@ -221,11 +239,11 @@ def ball_character(path):
     ])
 
 
-def set_up_character(path):
+def set_up_character(path, animations=None):
     """An orange ball head with a blue body under it (a red badge on its
     front, right) and a green ear sticking out to its right: two links,
     a bead and a tip. Its nodes are named, as a set-up names them."""
-    write_glb(path, [
+    write_glb(path, animations=animations, parts=[
         ball_points(0, 0, 0, 0.1, 0.1, 0.1) + ((0.8, 0.25, 0.04), 0.4),
         ball_points(0, 0, 0, 0.07, 0.06, 0.05) + ((0.05, 0.1, 0.7), 0.5),
         ball_points(0, 0, 0, 0.016, 0.016, 0.016) + ((0.8, 0.01, 0.01), 0.5),
@@ -1003,6 +1021,69 @@ def test_set_up_characters(run):
         assert abs(turned_badge - drawn_badge) > 12 and abs(kept_badge - upright_badge) < 6
         for name in list(avatars) + ["Set-up camera"]:
             send(c, "RemoveInput", {"inputName": name})
+    finally:
+        c.disconnect()
+
+
+def test_its_own_animation(run):
+    """A character's own animation (glTF's, saved in its file): listed,
+    nothing playing until one is chosen, then played over and over - its
+    red badge sliding side to side across its body; None (or one it
+    hasn't got) stops it, at rest."""
+    face_png = os.path.join(run.home, "camera.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+    model = os.path.join(run.home, "animated.glb")
+    slide = [(3, "translation", [0, 0.5, 1], [0.04, 0, 0.045, -0.04, 0, 0.045, 0.04, 0, 0.045])]
+    set_up_character(model, animations={"Slide": slide, "": []})
+    size = 300
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "Own animation"})
+        send(c, "CreateInput", {"sceneName": "Own animation", "inputName": "Animated camera",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        send(c, "CreateInput", {"sceneName": "Own animation", "inputName": "Animated",
+                                "inputKind": "direbot_face_avatar", "inputSettings": {
+                                    "source": "Animated camera", "width": size, "height": size,
+                                    "size": 100, "mirror": False, "smoothing": 100,
+                                    "follow_move": 0, "follow_grow": 0, "follow_tilt": 0,
+                                    "bend": 100, "model": model, "style": "drawn",
+                                    "model_setup": json.dumps({"spots": SET_UP_SPOTS, "chains": []})}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Own animation"})
+
+        def st():
+            return vendor(c, "FaceGetState", {"source": "Animated"})["model"]
+        assert wait_for(lambda: st()["shown"], 30, 0.2), st()
+        assert st()["animations"] == [{"name": "Slide"}, {"name": "Animation 2"}], st()
+        assert st()["animation"] == ""
+        red = lambda px: px[0] > 120 and px[1] < 70 and px[2] < 70  # noqa: E731
+
+        def badge_xs(shots, gap):
+            xs = []
+            for _ in range(shots):
+                x, _, n = middle_of(screenshot(c, "Animated"), red)
+                assert n > 20, n
+                xs.append(x)
+                time.sleep(gap)
+            return xs
+        still = badge_xs(5, 0.15)
+        assert max(still) - min(still) < 1.5, still
+        send(c, "SetInputSettings", {"inputName": "Animated", "inputSettings": {"animation": "Slide"}})
+        assert wait_for(lambda: st()["animation"] == "Slide", 5, 0.1), st()
+        moving = badge_xs(12, 0.09)
+        print(f"own animation: badge x {min(moving):.1f} to {max(moving):.1f} (still at {still[0]:.1f})")
+        assert max(moving) - min(moving) > 15, moving
+        for off in ("", "Nope"):
+            send(c, "SetInputSettings", {"inputName": "Animated", "inputSettings": {"animation": off}})
+            assert wait_for(lambda: st()["animation"] == "", 5, 0.1), st()
+            time.sleep(0.2)
+            again = badge_xs(4, 0.15)
+            assert max(again) - min(again) < 1.5 and abs(again[0] - still[0]) < 1.5, (again, still)
+        # OBS's own settings list them, None first.
+        props = send(c, "GetInputPropertiesListPropertyItems",
+                     {"inputName": "Animated", "propertyName": "animation"})["propertyItems"]
+        assert [p["itemValue"] for p in props] == ["", "Slide", "Animation 2"], props
+        send(c, "RemoveInput", {"inputName": "Animated"})
     finally:
         c.disconnect()
 

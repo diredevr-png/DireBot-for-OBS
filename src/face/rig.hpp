@@ -31,8 +31,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //     links, a doll's ears and legs) swing, each hanging from
 //     its first bone - or, set up (an imported Lens Studio project), the
 //     chains it names, pulled as it says, and parts that stay upright and
-//     trail after your head (a doll's body). Its tails wag, side to side,
-//     still or not.
+//     trail after your head (a doll's body).
+//   - Its own animation, if it has one and it's chosen (an idle, a tail's
+//     wag...), over and over: your head, eyes and its swinging parts move
+//     from where it has them.
 //   - Where your real eyes and mouth go on it (face_spots).
 //
 // Then its points are moved by its bones and expressions ("skinned"),
@@ -59,10 +61,8 @@ struct RigOptions {
 	// Swinging parts: 0 stiff to 1 floppy (0.5 as the file says).
 	float floppy = 0.5f;
 	bool springs = true;
-	// Its tails (swinging parts named so: tail_name) wag side to side all
-	// the time: how far, 0 not at all to 1 a wide wag (WAG_MOST at the
-	// tip), and how fast (wags a second, there and back).
-	float wag = 0.5f, wag_speed = 1.5f;
+	// Which of its own animations plays (Model::animations), or -1 none.
+	int animation = -1;
 	// How much of your head's turn the neck takes (the head the rest).
 	float neck_share = 0.4f;
 	// A character made standing in a T: its arms down by its sides.
@@ -99,12 +99,10 @@ public:
 	Rig(std::shared_ptr<const Model> model, const RigOptions &options);
 
 	void pose(const Drive &drive);
-	// The wag changed (RigOptions' wag and wag_speed): no need to start again.
-	void set_wag(float wag, float speed)
-	{
-		options_.wag = wag;
-		options_.wag_speed = speed;
-	}
+	// Another of its own animations (or -1 none), from its start: no need
+	// to start again.
+	void set_animation(int which);
+	int animation() const { return options_.animation; }
 	// Swinging parts back at rest (when it's put somewhere new).
 	void settle();
 
@@ -128,7 +126,6 @@ public:
 	int arkit_parts() const { return arkit_count_; }
 	const std::vector<std::vector<float>> &weights() const { return weights_; }
 	int springs() const { return (int)springs_.size(); }
-	int tails() const;
 	bool auto_chain() const { return auto_chain_; }
 	int upright_parts() const { return (int)upright_.size(); }
 	// What your eyes and mouth ride on: the model -> the world as its head
@@ -138,7 +135,7 @@ public:
 private:
 	struct Joint {
 		SpringJoint s;
-		Quat rest; // its own turn at rest
+		Quat rest; // its own turn at rest (as its animation has it now)
 		V3 tail;   // in its own space
 		V3 axis;   // the tail's way, in its own space
 		V3 now, before;
@@ -147,11 +144,6 @@ private:
 		// not), never back to how it was made.
 		bool pulled = false, with_head = true;
 		V3 pull;
-		// A tail's: its share of the wag, how far behind the root's it
-		// comes (radians), so the wag runs down the tail, and what it
-		// wags round (in the space of the bone it hangs from).
-		float wag = 0, wag_late = 0;
-		V3 wag_axis;
 	};
 	struct Upright {
 		int node = -1;
@@ -161,7 +153,6 @@ private:
 	struct Chain {
 		std::vector<Joint> joints;
 		std::vector<int> colliders;
-		bool tail = false;
 	};
 	struct Sparse {
 		std::vector<uint32_t> at;
@@ -179,7 +170,7 @@ private:
 	void drive_head(const Drive &d);
 	void drive_eyes(const Drive &d);
 	void step_springs(float dt, float scale);
-	void make_tail(Chain &c);
+	void animate(float dt);
 	void stand_upright(const Drive &d);
 	Quat head_turn_now() const;
 	void skin();
@@ -208,7 +199,8 @@ private:
 	bool auto_chain_ = false;
 	bool settled_ = true;
 	float spring_time_ = 0;
-	float wag_phase_ = 0; // the wag, radians round
+	float anim_time_ = 0;          // seconds into its animation
+	std::vector<char> anim_turns_; // a node its animation turns
 	V3 last_root_;
 	std::vector<std::vector<std::vector<Sparse>>> sparse_; // mesh, part, morph
 	std::vector<std::vector<float>> weights_;
@@ -303,10 +295,6 @@ FaceRegion face_region(const FaceSpots &fs, Quat facing);
 // (+z), unless it's much deeper than it's wide - then it was made facing
 // +x (as the AR VTuber characters are).
 int guess_turn(const Model &m);
-
-// A tail, by its name ("Tail", "wolf_tail0", "しっぽ"...; not a ponytail
-// or pigtails): it wags (RigOptions::wag).
-bool tail_name(std::string name);
 
 // An ARKit move's number by its name (any case, with or without a
 // prefix like "blendShape1."), or -1.

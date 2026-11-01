@@ -42,6 +42,8 @@ constexpr size_t MOST_INDEX = 24'000'000;
 constexpr size_t MOST_NODES = 100'000;
 constexpr size_t MOST_MORPHS = 512;
 constexpr size_t MOST_IMAGES = 256;
+constexpr size_t MOST_ANIMATIONS = 256;
+constexpr size_t MOST_KEY_NUMBERS = 8'000'000; // all its animations' keys' numbers
 
 struct Fail {
 	std::string why;
@@ -1073,6 +1075,68 @@ void read_skins(Reader &rd, const json &doc, Model &m)
 	}
 }
 
+// Its own animations. A channel DireBot can't play (an expression's
+// strengths, a missing part, numbers that don't add up) is left out; the
+// model loads all the same.
+void read_animations(Reader &rd, const json &doc, Model &m)
+{
+	const json &animations = list(doc, "animations");
+	size_t numbers = 0;
+	for (size_t ai = 0; ai < animations.size() && ai < MOST_ANIMATIONS; ai++) {
+		const json &aj = animations[ai];
+		Animation anim;
+		anim.name = text(aj, "name");
+		if (anim.name.empty())
+			anim.name = "Animation " + std::to_string(ai + 1);
+		const json &samplers = list(aj, "samplers");
+		for (const json &cj : list(aj, "channels")) {
+			const json &target = field(cj, "target");
+			const std::string path = text(target, "path");
+			const int node = index_of(target, "node");
+			const int si = index_of(cj, "sampler");
+			if (node < 0 || node >= (int)m.nodes.size() || si < 0 || si >= (int)samplers.size())
+				continue;
+			AnimChannel c;
+			c.node = node;
+			if (path == "translation")
+				c.path = AnimChannel::Move;
+			else if (path == "rotation")
+				c.path = AnimChannel::Turn;
+			else if (path == "scale")
+				c.path = AnimChannel::Size;
+			else
+				continue; // "weights" (its expressions' strengths): not played
+			const json &sj = samplers[si];
+			const std::string ease = text(sj, "interpolation");
+			c.ease = ease == "STEP"          ? AnimChannel::Step
+				 : ease == "CUBICSPLINE" ? AnimChannel::Curved
+							 : AnimChannel::Straight;
+			try {
+				c.times = rd.floats(index_of(sj, "input"), 1);
+				c.values = rd.floats(index_of(sj, "output"), c.size());
+			} catch (const Fail &) {
+				continue;
+			}
+			const size_t keys = c.times.size();
+			const size_t per = (size_t)c.size() * (c.ease == AnimChannel::Curved ? 3 : 1);
+			if (!keys || c.values.size() != keys * per)
+				continue;
+			bool rising = true;
+			for (size_t k = 0; k < keys; k++)
+				if (!std::isfinite(c.times[k]) || c.times[k] < 0 || (k && c.times[k] < c.times[k - 1]))
+					rising = false;
+			if (!rising)
+				continue;
+			if (numbers + c.values.size() + keys > MOST_KEY_NUMBERS)
+				continue; // too much of it: the rest left out
+			numbers += c.values.size() + keys;
+			anim.length = std::max(anim.length, c.times.back());
+			anim.channels.push_back(std::move(c));
+		}
+		m.animations.push_back(std::move(anim));
+	}
+}
+
 void read_images(Reader &rd, const json &doc, Model &m)
 {
 	const json &images = list(doc, "images");
@@ -1169,6 +1233,7 @@ void load_json(Reader &rd, const json &doc, Model &m)
 	read_nodes(doc, m);
 	read_meshes(rd, doc, m);
 	read_skins(rd, doc, m);
+	read_animations(rd, doc, m);
 	read_images(rd, doc, m);
 	const json &ext = field(doc, "extensions");
 	if (field(ext, "VRMC_vrm").is_object())
@@ -1255,6 +1320,65 @@ bool load_model(const std::string &path, Model &out, std::string *problem)
 	const size_t slash = path.find_last_of("/\\");
 	const std::string folder = slash == std::string::npos ? "." : path.substr(0, slash);
 	return load_model(bytes.data(), bytes.size(), folder, out, problem);
+}
+
+void sample(const AnimChannel &c, float t, float *out)
+{
+	const int n = c.size();
+	const size_t keys = c.times.size();
+	const bool curved = c.ease == AnimChannel::Curved;
+	const size_t per = curved ? 3 : 1;
+	// Key k's value (and, curved, its slopes either side of it).
+	auto value = [&](size_t k) {
+		return &c.values[(k * per + (curved ? 1 : 0)) * n];
+	};
+	if (!keys) {
+		return;
+	}
+	if (keys == 1 || !(t > c.times.front())) {
+		std::copy(value(0), value(0) + n, out);
+	} else if (t >= c.times.back()) {
+		std::copy(value(keys - 1), value(keys - 1) + n, out);
+	} else {
+		const size_t k = (size_t)(std::upper_bound(c.times.begin(), c.times.end(), t) - c.times.begin()) - 1;
+		const float span = c.times[k + 1] - c.times[k];
+		const float u = span > 0 ? (t - c.times[k]) / span : 0;
+		const float *a = value(k), *b = value(k + 1);
+		if (c.ease == AnimChannel::Step || span <= 0) {
+			std::copy(a, a + n, out);
+		} else if (!curved) {
+			if (c.path == AnimChannel::Turn) {
+				const Quat q = slerp(Quat{a[0], a[1], a[2], a[3]}, Quat{b[0], b[1], b[2], b[3]}, u);
+				out[0] = q.x, out[1] = q.y, out[2] = q.z, out[3] = q.w;
+			} else {
+				for (int i = 0; i < n; i++)
+					out[i] = a[i] + (b[i] - a[i]) * u;
+			}
+		} else {
+			// glTF's curve: each key's value, its slope out of k and into
+			// k + 1 (a second's worth, so times the gap).
+			const float *slope_out = a + n, *slope_in = b - n;
+			const float u2 = u * u, u3 = u2 * u;
+			const float ka = 2 * u3 - 3 * u2 + 1, kb = -2 * u3 + 3 * u2;
+			const float ta = (u3 - 2 * u2 + u) * span, tb = (u3 - u2) * span;
+			for (int i = 0; i < n; i++)
+				out[i] = ka * a[i] + ta * slope_out[i] + kb * b[i] + tb * slope_in[i];
+		}
+	}
+	if (c.path == AnimChannel::Turn) {
+		const Quat q = normalized(Quat{out[0], out[1], out[2], out[3]});
+		out[0] = q.x, out[1] = q.y, out[2] = q.z, out[3] = q.w;
+	}
+}
+
+int animation_named(const Model &m, const std::string &name)
+{
+	if (name.empty())
+		return -1;
+	for (size_t i = 0; i < m.animations.size(); i++)
+		if (m.animations[i].name == name)
+			return (int)i;
+	return -1;
 }
 
 std::vector<std::vector<int>> hanging_chains(const Model &m, const Skin &skin)
