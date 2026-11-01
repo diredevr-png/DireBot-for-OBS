@@ -1156,6 +1156,35 @@ int face_part_of(const std::string &name)
 
 } // namespace
 
+FaceRegion face_region(const FaceSpots &fs, Quat facing)
+{
+	const FaceRegion all;
+	const float bw = fs.box[2], bh = fs.box[3];
+	if (!(bw > 0 && bh > 0))
+		return all;
+	// The eyes and mouth together, in the box (x right, y down).
+	float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+	for (const FaceSpot &s : fs.spot) {
+		const V3 p = rotate(facing, s.at);
+		const float x = p.x - fs.box[0], y = fs.box[1] - p.y;
+		x0 = std::min(x0, x - s.w / 2);
+		x1 = std::max(x1, x + s.w / 2);
+		y0 = std::min(y0, y - s.h / 2);
+		y1 = std::max(y1, y + s.h / 2);
+	}
+	// A face round them: three times as big, a little higher (a forehead
+	// is bigger than a chin), square.
+	const float side = 3 * std::max(x1 - x0, y1 - y0);
+	if (!(side > 0) || !std::isfinite(side))
+		return all;
+	const float w = std::min(side, bw), h = std::min(side, bh);
+	if (w > 0.6f * bw && h > 0.6f * bh)
+		return all;
+	const float cx = (x0 + x1) / 2, cy = (y0 + y1) / 2 - 0.08f * side;
+	const float left = std::clamp(cx - w / 2, 0.0f, bw - w), top = std::clamp(cy - h / 2, 0.0f, bh - h);
+	return {left / bw, top / bh, w / bw, h / bh};
+}
+
 FaceSpots face_spots(const std::shared_ptr<const Model> &mp, Quat facing, const CharacterSetup &setup)
 {
 	const Model &m = *mp;

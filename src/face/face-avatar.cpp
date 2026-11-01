@@ -1580,19 +1580,20 @@ struct FaceAvatar {
 
 	// Its 3D character straight from the front, as it is made (no turn,
 	// no expressions, nothing swinging), its front box filling the picture
-	// - for DireBot's page to put its eyes, mouth and outfits on.
-	json front_picture(int want_w)
+	// - for DireBot's page to put its eyes, mouth and outfits on. `close`:
+	// just the part round its face, for its eyes and mouth up close.
+	json front_picture(int want_w, bool close)
 	{
 		obs_enter_graphics();
 		json out;
 		{
 			std::lock_guard<std::mutex> l(pictures_lock);
-			out = draw_front(want_w);
+			out = draw_front(want_w, close);
 		}
 		obs_leave_graphics();
 		return out;
 	}
-	json draw_front(int want_w)
+	json draw_front(int want_w, bool close)
 	{
 		auto no = [](const char *words) {
 			return json{{"ok", false}, {"error", words}};
@@ -1608,16 +1609,20 @@ struct FaceAvatar {
 		Rig still(model_now, ro);
 		const FaceSpots fs = face_spots(model_now, ro.facing, *look3d.setup);
 		const float bw = std::max(1e-6f, fs.box[2]), bh = std::max(1e-6f, fs.box[3]);
+		// What's drawn: the whole box, or (`close`) the part round its face.
+		const FaceRegion region = close ? face_region(fs, ro.facing) : FaceRegion();
+		const float rx = fs.box[0] + region.x * bw, ry = fs.box[1] - region.y * bh;
+		const float rw = std::max(1e-6f, region.w * bw), rh = std::max(1e-6f, region.h * bh);
 		uint32_t W = (uint32_t)std::clamp(want_w, 64, 1024);
-		uint32_t H = (uint32_t)std::clamp((int)std::lround(W * bh / bw), 16, 2048);
+		uint32_t H = (uint32_t)std::clamp((int)std::lround(W * rh / rw), 16, 2048);
 		if (H > 1024) {
 			W = std::max(16u, (uint32_t)std::lround(W * 1024.0f / H));
 			H = 1024;
 		}
 		// Nearly straight on (a narrow view from far away), so its front
 		// box is the picture's edges wherever a point is in depth.
-		const float fov = 2 * RAD, s = 1 / bh, dist = 0.5f / std::tan(fov / 2);
-		const V3 mid{fs.box[0] + bw / 2, fs.box[1] - bh / 2, (fs.front + fs.back) / 2};
+		const float fov = 2 * RAD, s = 1 / rh, dist = 0.5f / std::tan(fov / 2);
+		const V3 mid{rx + rw / 2, ry - rh / 2, (fs.front + fs.back) / 2};
 		Drive d;
 		d.place = scaled(s) * moved(mid * -1) * matrix_of(ro.facing);
 		still.pose(d);
@@ -1690,6 +1695,8 @@ struct FaceAvatar {
 			{"rgba", crypto::base64(rgba)},
 			// (OBS's replies drop lists of plain numbers: an object.)
 			{"box", {{"left", fs.box[0]}, {"top", fs.box[1]}, {"width", bw}, {"height", bh}}},
+			// The part of the box drawn (shares of it): all, or round its face.
+			{"region", {{"x", region.x}, {"y", region.y}, {"w", region.w}, {"h", region.h}}},
 			{"spots", spots}};
 	}
 
@@ -2669,7 +2676,8 @@ json model_front(const json &data)
 		return fail("That face avatar isn't in OBS any more.");
 	auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src));
 	const int width = data.contains("width") && data["width"].is_number() ? data["width"].get<int>() : 400;
-	json answer = f ? f->front_picture(width) : fail("It isn't ready yet.");
+	const bool close = data.contains("close") && data["close"].is_boolean() && data["close"].get<bool>();
+	json answer = f ? f->front_picture(width, close) : fail("It isn't ready yet.");
 	obs_source_release(src);
 	return answer;
 }

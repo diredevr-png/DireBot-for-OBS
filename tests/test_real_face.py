@@ -860,6 +860,15 @@ def test_set_up_characters(run):
         assert {v["from"] for v in fs.values()} == {"set up"}
         assert fs["left_eye"]["x"] > fs["right_eye"]["x"] and fs["mouth"]["y"] > fs["left_eye"]["y"]
         assert all(0 < v["x"] < 1 and 0 < v["y"] < 1 for v in fs.values())
+        assert front["region"] == {"x": 0, "y": 0, "w": 1, "h": 1}
+        # Up close: the part round its face (still inside the box), the
+        # spots still shares of the whole box.
+        close = vendor(c, "FaceModelFront", {"source": "Real eyes", "width": 200, "close": True})
+        assert close["ok"] and close["width"] == 200 and close["spots"] == fs and close["box"] == box
+        r = close["region"]
+        assert 0 <= r["x"] and 0 <= r["y"] and r["x"] + r["w"] <= 1.0001 and r["y"] + r["h"] <= 1.0001
+        assert abs(close["height"] - round(200 * r["h"] * box["height"] / (r["w"] * box["width"]))) <= 1
+        assert len(base64.b64decode(close["rgba"])) == close["width"] * close["height"] * 4
         no = vendor(c, "FaceModelFront", {"source": "Set-up camera"})
         assert not no["ok"]
 

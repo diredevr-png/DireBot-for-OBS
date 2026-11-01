@@ -265,6 +265,14 @@ struct FaceSpots {
 	float front = 0.5f, back = -0.5f;
 };
 FaceSpots face_spots(const std::shared_ptr<const Model> &m, Quat facing, const CharacterSetup &setup);
+// The part of its front box round its face, for a close look at its eyes
+// and mouth: left, top, width, height, as shares of the box (left and
+// width of its width, top and height of its height), as square as the
+// box lets it be. All of it (0, 0, 1, 1) when its face is most of it.
+struct FaceRegion {
+	float x = 0, y = 0, w = 1, h = 1;
+};
+FaceRegion face_region(const FaceSpots &fs, Quat facing);
 
 // Which way it most likely faces, as a turn (degrees about y) to face
 // the camera: a VRM as its version says; any other the way glTF says

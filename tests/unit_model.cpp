@@ -555,6 +555,49 @@ static void test_spots_on_a_vrm()
 	}
 }
 
+static void test_face_region()
+{
+	// Someone with a big wolf beside them: a close look is round their
+	// face, square, inside the box, every eye and the mouth in it.
+	FaceSpots fs;
+	fs.box[0] = -0.8f;
+	fs.box[1] = 1.8f;
+	fs.box[2] = 1.6f;
+	fs.box[3] = 1.8f;
+	fs.spot[0] = {{-0.364f, 1.68f, 0.1f}, 0.03f, 0.02f};
+	fs.spot[1] = {{-0.436f, 1.68f, 0.1f}, 0.03f, 0.02f};
+	fs.spot[2] = {{-0.4f, 1.6f, 0.1f}, 0.04f, 0.02f};
+	const FaceRegion r = face_region(fs, Quat{});
+	CHECK(r.w < 0.3f && r.h < 0.3f);
+	CHECK(near(r.w * fs.box[2], r.h * fs.box[3], 1e-4));
+	CHECK(r.x >= 0 && r.y >= 0 && r.x + r.w <= 1 + 1e-6f && r.y + r.h <= 1 + 1e-6f);
+	for (const FaceSpot &s : fs.spot) {
+		const float x = (s.at.x - fs.box[0]) / fs.box[2], y = (fs.box[1] - s.at.y) / fs.box[3];
+		CHECK(x > r.x && x < r.x + r.w && y > r.y && y < r.y + r.h);
+	}
+	// Its middle a little above the eyes and mouth's (it's near the top
+	// of the box here, so it can't go all the way).
+	CHECK(r.y == 0);
+	CHECK(near(r.x + r.w / 2, (-0.4f - fs.box[0]) / fs.box[2], 1e-3));
+	// Turned round, the face is on the other side.
+	const FaceRegion turned = face_region(fs, axis_angle({0, 1, 0}, 3.14159265f));
+	CHECK(near(turned.x + turned.w / 2, (0.4f - fs.box[0]) / fs.box[2], 1e-3));
+	// A head that's mostly face: all of it.
+	FaceSpots head = fs;
+	head.box[0] = -0.55f;
+	head.box[1] = 1.75f;
+	head.box[2] = 0.3f;
+	head.box[3] = 0.3f;
+	const FaceRegion whole = face_region(head, Quat{});
+	CHECK(whole.x == 0 && whole.y == 0 && whole.w == 1 && whole.h == 1);
+	// A tall thin one: its width, the top of it.
+	FaceSpots thin = fs;
+	thin.box[0] = -0.55f;
+	thin.box[2] = 0.3f;
+	const FaceRegion top = face_region(thin, Quat{});
+	CHECK(top.w == 1 && top.h < 0.25f && top.y == 0);
+}
+
 static void test_vrm1_reading()
 {
 	Person p = make_person(false);
@@ -1411,6 +1454,7 @@ int main()
 	test_springs();
 	test_link_chain();
 	test_spots_on_a_vrm();
+	test_face_region();
 	test_dangly_parts();
 	test_facing_arms_and_wearing();
 	test_set_up();
