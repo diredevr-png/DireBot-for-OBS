@@ -695,6 +695,9 @@ struct FaceAvatar {
 	struct State3D {
 		std::string file, problem, kind, title, author;
 		bool loaded = false, shown = false, chain = false, set_up = false;
+		// Its own face can blink / open its mouth where you'd see it
+		// (known once it's rigged).
+		bool rigged = false, blinks = false, talks = false;
 		size_t points = 0, triangles = 0;
 		int springs = 0, arkit = 0, upright = 0, cards = 0, layers = 0;
 		// Its own animations' names, and the one playing ("" none).
@@ -1393,6 +1396,9 @@ struct FaceAvatar {
 			state3d.animation = ro.animation >= 0 ? model_now->animations[ro.animation].name : "";
 			state3d.chain = rig->auto_chain();
 			state3d.arkit = rig->arkit_parts();
+			state3d.rigged = true;
+			state3d.blinks = rig->blinks();
+			state3d.talks = rig->talks();
 			state3d.upright = rig->upright_parts();
 			state3d.set_up = !look3d.setup->empty();
 			const float *box = spots3d.box;
@@ -2402,6 +2408,10 @@ struct FaceAvatar {
 				      {"y", r(st.y, 10)}};
 			if (!st.problem.empty())
 				model["problem"] = st.problem;
+			if (st.rigged) {
+				model["blinks"] = st.blinks;
+				model["talks"] = st.talks;
+			}
 			if (st.loaded) {
 				json spots = json::object();
 				for (int i = 0; i < PARTS; i++)

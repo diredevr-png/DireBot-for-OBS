@@ -421,6 +421,27 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 		drivers_.clear();
 	drivers_.insert(drivers_.end(), arkit.begin(), arkit.end());
 
+	// Whether its own blink and open mouth show: a shape that moves its
+	// face at least FACE_SHOWS of its height (a real eyelid or jaw), not
+	// a tiny marker (a shape only there to say where its eyes are).
+	for (const Driver &d : drivers_) {
+		const std::string name = d.move > 0 ? std::string(EXPRESSION_NAMES[d.move]) : d.expression;
+		const bool blink = d.move > 0 ? name.rfind("eyeBlink", 0) == 0 : is_blink(name);
+		const bool mouth = d.move > 0 ? name.rfind("jaw", 0) == 0 || name.rfind("mouth", 0) == 0 : is_mouth(name);
+		if ((!blink || blinks_) && (!mouth || talks_))
+			continue;
+		float most = 0;
+		if (d.mesh >= 0 && d.mesh < (int)sparse_.size())
+			for (const std::vector<Sparse> &part : sparse_[d.mesh])
+				if (d.morph >= 0 && d.morph < (int)part.size())
+					for (const V3 &dp : part[d.morph].pos)
+						most = std::max(most, length(dp));
+		if (most * d.weight < FACE_SHOWS * height_)
+			continue;
+		blinks_ = blinks_ || blink;
+		talks_ = talks_ || mouth;
+	}
+
 	// Parts that stay upright (a doll's body), as its set-up names them.
 	const CharacterSetup *setup = options_.setup.get();
 	if (setup)

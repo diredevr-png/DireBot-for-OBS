@@ -54,6 +54,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 namespace direbot::face {
 
+// The least a blink or mouth shape must move its face (a share of its
+// height: about 1.5 mm on a person) for its own face to show it.
+constexpr float FACE_SHOWS = 0.001f;
+
 struct RigOptions {
 	// Its front: the turn from the model as it is to facing +z (VRM 0.x
 	// models face -z; some others face x).
@@ -124,6 +128,12 @@ public:
 	// has, and each mesh's expression strengths.
 	const std::map<std::string, float> &expression_values() const { return values_; }
 	int arkit_parts() const { return arkit_count_; }
+	// Whether its own face can blink and open its mouth where you'd see
+	// it: a blink (or mouth) shape that moves it at least FACE_SHOWS of
+	// its height. A shape that barely moves (a marker for where its eyes
+	// and mouth are) doesn't count.
+	bool blinks() const { return blinks_; }
+	bool talks() const { return talks_; }
 	const std::vector<std::vector<float>> &weights() const { return weights_; }
 	int springs() const { return (int)springs_.size(); }
 	bool auto_chain() const { return auto_chain_; }
@@ -207,6 +217,7 @@ private:
 	std::vector<Driver> drivers_;
 	bool perfect_sync_ = false;
 	int arkit_count_ = 0;
+	bool blinks_ = false, talks_ = false;
 	std::map<std::string, float> values_;
 	std::vector<Part> parts_;
 };

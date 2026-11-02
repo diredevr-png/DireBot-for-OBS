@@ -379,7 +379,8 @@ struct Person {
 	int hips, neck, head, leye, reye, tail0, tail1, tail2, face_node;
 };
 
-static Person make_person(bool vrm0)
+// `shapes`: how far its face shapes move (1 as made; tiny: markers).
+static Person make_person(bool vrm0, float shapes = 1)
 {
 	Person p;
 	Builder &b = p.b;
@@ -405,8 +406,8 @@ static Person make_person(bool vrm0)
 	std::vector<float> weights;
 	for (int i = 0; i < 8; i++)
 		weights.insert(weights.end(), {1, 0, 0, 0});
-	std::vector<V3> open(8, V3{0, -0.05f, 0}), shut(8, V3{0.01f, 0, 0}), smile(8, V3{0, 0, 0.02f}),
-		jaw(8, V3{0, 0, -0.03f});
+	std::vector<V3> open(8, V3{0, -0.05f * shapes, 0}), shut(8, V3{0.01f * shapes, 0, 0}),
+		smile(8, V3{0, 0, 0.02f * shapes}), jaw(8, V3{0, 0, -0.03f * shapes});
 	const int a_pos = b.vec3s(pos), a_ix = b.indices(ix);
 	const int a_j = b.accessor(b.view(joints.data(), joints.size()), 5121, 8, "VEC4");
 	const int a_w = b.floats(weights, 4, "VEC4");
@@ -756,6 +757,56 @@ static void test_expressions()
 	CHECK(near(rig0.expression_values().at("blinkLeft"), 1, 1e-5) &&
 	      near(rig0.expression_values().at("blinkRight"), 0, 1e-5));
 	CHECK(near(rig0.weights()[0][1], 0.5, 1e-5));
+}
+
+// Whether its own face shows a blink and an open mouth: real shapes do;
+// tiny marker shapes (only there to say where its eyes and mouth are)
+// don't, on a VRM 1.0, a VRM 0.x or a plain one.
+static void test_own_face_shows()
+{
+	RigOptions o;
+	o.springs = false;
+	for (bool vrm0 : {false, true}) {
+		auto real = std::make_shared<Model>();
+		CHECK(load(make_person(vrm0).b.glb(), *real));
+		Rig r(real, o);
+		CHECK(r.blinks() && r.talks());
+		auto markers = std::make_shared<Model>();
+		CHECK(load(make_person(vrm0, 0.001f).b.glb(), *markers));
+		Rig k(markers, o);
+		CHECK(!k.blinks() && !k.talks());
+		// Its marker shapes are still driven as before (only too small to see).
+		Drive d = still();
+		d.moves[move_of_name("jawOpen")] = 1;
+		k.pose(d);
+		CHECK(near(k.weights()[0][3], 1, 1e-5));
+	}
+	// A real mouth but a marker blink: talks, doesn't blink.
+	Person p = make_person(false);
+	{
+		// Its blink shape (target 1) made tiny.
+		const int acc = p.b.doc["meshes"][0]["primitives"][0]["targets"][1]["POSITION"].get<int>();
+		const json &view = p.b.doc["bufferViews"][p.b.doc["accessors"][acc]["bufferView"].get<int>()];
+		float *f = reinterpret_cast<float *>(p.b.bin.data() + view["byteOffset"].get<size_t>());
+		for (int i = 0; i < 24; i++)
+			f[i] *= 0.001f;
+	}
+	auto half = std::make_shared<Model>();
+	CHECK(load(p.b.glb(), *half));
+	Rig h(half, o);
+	CHECK(!h.blinks() && h.talks());
+	// Nothing at all: a box with no shapes neither blinks nor talks.
+	Builder b;
+	std::vector<V3> pos;
+	std::vector<uint16_t> ix;
+	cube(pos, ix);
+	json prim = {{"attributes", {{"POSITION", b.vec3s(pos)}}}, {"indices", b.indices(ix)}};
+	b.doc["meshes"].push_back({{"primitives", json::array({prim})}});
+	b.node({{"mesh", 0}});
+	auto plain = std::make_shared<Model>();
+	CHECK(load(b.glb(), *plain));
+	Rig n(plain, o);
+	CHECK(!n.blinks() && !n.talks());
 }
 
 static void test_names_and_sides()
@@ -1767,6 +1818,7 @@ int main()
 	test_vrm0_reading();
 	test_head_and_eyes();
 	test_expressions();
+	test_own_face_shows();
 	test_names_and_sides();
 	test_springs();
 	test_own_animation();
