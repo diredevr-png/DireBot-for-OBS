@@ -22,6 +22,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <functional>
+#include <map>
 
 namespace direbot::face {
 
@@ -695,6 +697,13 @@ void Rig::drive_expressions(const Drive &d)
 	const Model &m = *model_;
 	for (size_t mi = 0; mi < m.meshes.size(); mi++)
 		weights_[mi] = m.meshes[mi].weights;
+	// A shape your face moves starts from nothing, whatever strength the
+	// file was saved with (a file saved with its blink on would otherwise
+	// have its eyes shut for good) - as VRM apps do.
+	for (const Driver &dr : drivers_)
+		if (dr.mesh >= 0 && dr.mesh < (int)weights_.size() && dr.morph >= 0 &&
+		    dr.morph < (int)weights_[dr.mesh].size())
+			weights_[dr.mesh][dr.morph] = 0;
 	values_.clear();
 	if (!d.expressions)
 		return;
@@ -1332,37 +1341,136 @@ FaceSpots face_spots(const std::shared_ptr<const Model> &mp, Quat facing, const 
 	// What each moves (the facing model's points) and how far; a blink of
 	// both eyes, split between them afterwards.
 	std::vector<std::pair<V3, float>> moved_by[3], both;
-	int mouth_kind = 0;
-	for (int pass = 0; pass < 2; pass++)
-		for (size_t pi = 0; pi < parts.size(); pi++) {
-			const int mi = m.nodes[parts[pi].node].mesh;
-			const Primitive &prim = *parts[pi].prim;
-			if (mi < 0)
+	struct Hit {
+		int node, kind;
+		V3 p;
+		float w;
+	};
+	std::vector<Hit> hits;
+	for (size_t pi = 0; pi < parts.size(); pi++) {
+		const int mi = m.nodes[parts[pi].node].mesh;
+		const Primitive &prim = *parts[pi].prim;
+		if (mi < 0)
+			continue;
+		const Mesh &mesh = m.meshes[mi];
+		for (size_t k = 0; k < prim.morphs.size(); k++) {
+			const int kind = kind_of(mi, k, mesh);
+			if (kind == 0)
 				continue;
-			const Mesh &mesh = m.meshes[mi];
-			for (size_t k = 0; k < prim.morphs.size(); k++) {
-				const int kind = kind_of(mi, k, mesh);
-				// First pass: which mouth expression says most surely where it is.
-				if (pass == 0) {
-					if (kind > 10)
-						mouth_kind = std::max(mouth_kind, kind);
-					continue;
-				}
-				if (kind == 0 || (kind > 10 && kind != mouth_kind))
-					continue;
-				const std::vector<V3> &moved = prim.morphs[k].pos;
-				for (size_t v = 0; v < moved.size() && v < points[pi].size(); v++) {
-					const float w = length(moved[v]);
-					if (w < 1e-7f)
-						continue;
-					const V3 p = points[pi][v];
-					if (kind == 3)
-						both.push_back({p, w});
-					else
-						moved_by[kind > 10 ? 2 : kind - 1].push_back({p, w});
-				}
+			const std::vector<V3> &moved = prim.morphs[k].pos;
+			for (size_t v = 0; v < moved.size() && v < points[pi].size(); v++) {
+				const float w = length(moved[v]);
+				if (w >= 1e-7f)
+					hits.push_back({parts[pi].node, kind, points[pi][v], w});
 			}
 		}
+	}
+	// Two characters in one file (each its own part, as a VRM made of
+	// two has them) can share a blink and a mouth: your eyes and mouth go
+	// on one of them, not stretched across both. Parts whose moving bits
+	// are near each other (a face, its teeth, its lashes) are one
+	// character; the one used is the one round the head bone (a VRM's
+	// own character), else the one with the biggest mouth, else the most.
+	std::map<int, std::pair<V3, V3>> box_of; // each part's moving bits
+	for (const Hit &h : hits) {
+		auto it = box_of.find(h.node);
+		if (it == box_of.end())
+			box_of[h.node] = {h.p, h.p};
+		else {
+			V3 &lo = it->second.first, &hi = it->second.second;
+			lo = {std::min(lo.x, h.p.x), std::min(lo.y, h.p.y), std::min(lo.z, h.p.z)};
+			hi = {std::max(hi.x, h.p.x), std::max(hi.y, h.p.y), std::max(hi.z, h.p.z)};
+		}
+	}
+	std::map<int, int> who; // part -> character
+	if (box_of.size() > 1) {
+		std::vector<int> nodes;
+		for (const auto &kv : box_of)
+			nodes.push_back(kv.first);
+		std::vector<int> up(nodes.size());
+		for (size_t i = 0; i < up.size(); i++)
+			up[i] = (int)i;
+		std::function<int(int)> root = [&](int i) { return up[i] == i ? i : (up[i] = root(up[i])); };
+		auto gap = [](const std::pair<V3, V3> &a, const std::pair<V3, V3> &b) {
+			const V3 d{std::max(0.0f, std::max(a.first.x - b.second.x, b.first.x - a.second.x)),
+				   std::max(0.0f, std::max(a.first.y - b.second.y, b.first.y - a.second.y)),
+				   std::max(0.0f, std::max(a.first.z - b.second.z, b.first.z - a.second.z))};
+			return length(d);
+		};
+		for (size_t i = 0; i < nodes.size(); i++)
+			for (size_t j = i + 1; j < nodes.size(); j++) {
+				const auto &a = box_of[nodes[i]], &b = box_of[nodes[j]];
+				const float across =
+					std::max(length(a.second - a.first), length(b.second - b.first));
+				if (gap(a, b) <= across)
+					up[root((int)i)] = root((int)j);
+			}
+		for (size_t i = 0; i < nodes.size(); i++)
+			who[nodes[i]] = root((int)i);
+	}
+	if (!who.empty()) {
+		std::map<int, float> mouth, all, near;
+		std::map<int, std::pair<V3, V3>> box;
+		for (const auto &kv : box_of) {
+			const int c = who[kv.first];
+			auto it = box.find(c);
+			if (it == box.end())
+				box[c] = kv.second;
+			else {
+				V3 &lo = it->second.first, &hi = it->second.second;
+				const V3 &a = kv.second.first, &b = kv.second.second;
+				lo = {std::min(lo.x, a.x), std::min(lo.y, a.y), std::min(lo.z, a.z)};
+				hi = {std::max(hi.x, b.x), std::max(hi.y, b.y), std::max(hi.z, b.z)};
+			}
+		}
+		for (const Hit &h : hits) {
+			all[who[h.node]] += h.w;
+			if (h.kind > 10)
+				mouth[who[h.node]] += h.w;
+		}
+		int pick = who.begin()->second;
+		const int head_bone = m.bone("head");
+		if (head_bone >= 0) {
+			const V3 hb = rotate(facing, move_of(rest_world(m)[head_bone]));
+			float best = 1e30f;
+			for (const auto &kv : box) {
+				const V3 &lo = kv.second.first, &hi = kv.second.second;
+				const V3 d{std::max(0.0f, std::max(lo.x - hb.x, hb.x - hi.x)),
+					   std::max(0.0f, std::max(lo.y - hb.y, hb.y - hi.y)),
+					   std::max(0.0f, std::max(lo.z - hb.z, hb.z - hi.z))};
+				if (length(d) < best) {
+					best = length(d);
+					pick = kv.first;
+				}
+			}
+		} else {
+			const std::map<int, float> &by = mouth.empty() ? all : mouth;
+			float best = -1;
+			for (const auto &kv : by)
+				if (kv.second > best) {
+					best = kv.second;
+					pick = kv.first;
+				}
+		}
+		std::vector<Hit> kept;
+		for (const Hit &h : hits)
+			if (who[h.node] == pick)
+				kept.push_back(h);
+		hits.swap(kept);
+	}
+	// Which mouth expression says most surely where it is.
+	int mouth_kind = 0;
+	for (const Hit &h : hits)
+		if (h.kind > 10)
+			mouth_kind = std::max(mouth_kind, h.kind);
+	for (const Hit &h : hits) {
+		if (h.kind > 10 && h.kind != mouth_kind)
+			continue;
+		if (h.kind == 3)
+			both.push_back({h.p, h.w});
+		else
+			moved_by[h.kind > 10 ? 2 : h.kind - 1].push_back({h.p, h.w});
+	}
 	// Both eyes' blink: each side of the middle of what it moves (not the
 	// model's middle - two characters in one file), its own left eye on
 	// the right.

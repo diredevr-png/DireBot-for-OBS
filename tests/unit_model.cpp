@@ -563,6 +563,42 @@ static void test_spots_on_a_vrm()
 	}
 }
 
+// Two characters in one file sharing a blink and a mouth (a VRM's blink
+// and aa bound to both): your eyes and mouth go on the one with the head
+// bone, not stretched across both - even with the other one bigger.
+static void test_spots_on_two_characters()
+{
+	Person alone = make_person(false);
+	auto one = std::make_shared<Model>();
+	CHECK(load(alone.b.glb(), *one));
+	const FaceSpots solo = face_spots(one, Quat(), CharacterSetup());
+
+	Person p = make_person(false);
+	Builder &b = p.b;
+	// A big wolf's head to its left, moved further by the same shapes.
+	std::vector<V3> pos;
+	std::vector<uint16_t> ix;
+	cube(pos, ix, {1.5f, 1.0f, 0}, 0.2f);
+	std::vector<V3> open(8, V3{0, -0.2f, 0}), shut(8, V3{0.05f, 0, 0});
+	json targets = json::array({{{"POSITION", b.vec3s(open)}}, {{"POSITION", b.vec3s(shut)}}});
+	json prim = {{"attributes", {{"POSITION", b.vec3s(pos)}}}, {"indices", b.indices(ix)}, {"targets", targets}};
+	b.doc["meshes"].push_back({{"primitives", json::array({prim})}, {"extras", {{"targetNames", {"wolf_A", "wolf_Close"}}}}});
+	const int wolf = b.node({{"name", "Wolf"}, {"mesh", 1}});
+	b.doc["scenes"][0]["nodes"].push_back(wolf);
+	json &preset = b.doc["extensions"]["VRMC_vrm"]["expressions"]["preset"];
+	preset["aa"]["morphTargetBinds"].push_back({{"node", wolf}, {"index", 0}, {"weight", 1.0}});
+	preset["blink"]["morphTargetBinds"].push_back({{"node", wolf}, {"index", 1}, {"weight", 1.0}});
+	auto two = std::make_shared<Model>();
+	CHECK(load(b.glb(), *two));
+	const FaceSpots fs = face_spots(two, Quat(), CharacterSetup());
+	for (int i = 0; i < 3; i++) {
+		CHECK(std::strcmp(fs.from[i], "expressions") == 0);
+		CHECK(near3(fs.spot[i].at, solo.spot[i].at, 1e-3f));
+		CHECK(near(fs.spot[i].w, solo.spot[i].w, 1e-3) && near(fs.spot[i].h, solo.spot[i].h, 1e-3));
+	}
+	CHECK(fs.spot[0].at.x > 0 && fs.spot[1].at.x < 0); // its own left eye on its left
+}
+
 static void test_face_region()
 {
 	// Someone with a big wolf beside them: a close look is round their
@@ -780,6 +816,30 @@ static void test_own_face_shows()
 		d.moves[move_of_name("jawOpen")] = 1;
 		k.pose(d);
 		CHECK(near(k.weights()[0][3], 1, 1e-5));
+	}
+	// A file saved with its blink and mouth on (the mesh's own strengths
+	// 1): they start shut and open as your face does, not stuck on.
+	{
+		Person p = make_person(false);
+		p.b.doc["meshes"][0]["weights"] = {1.0, 1.0, 0.0, 1.0};
+		auto saved = std::make_shared<Model>();
+		CHECK(load(p.b.glb(), *saved));
+		Rig r(saved, o);
+		r.pose(still());
+		CHECK(near(r.weights()[0][0], 0, 1e-6) && near(r.weights()[0][1], 0, 1e-6) &&
+		      near(r.weights()[0][3], 0, 1e-6));
+		Drive d = still();
+		d.moves[move_of_name("eyeBlinkLeft")] = 1;
+		d.moves[move_of_name("eyeBlinkRight")] = 1;
+		r.pose(d);
+		CHECK(near(r.weights()[0][1], 1, 1e-5));
+		// Its eyes and mouth are found where they are open, too.
+		const FaceSpots a = face_spots(saved, Quat(), CharacterSetup());
+		auto plain = std::make_shared<Model>();
+		CHECK(load(make_person(false).b.glb(), *plain));
+		const FaceSpots b = face_spots(plain, Quat(), CharacterSetup());
+		for (int i = 0; i < 3; i++)
+			CHECK(near3(a.spot[i].at, b.spot[i].at, 1e-4f));
 	}
 	// A real mouth but a marker blink: talks, doesn't blink.
 	Person p = make_person(false);
@@ -1824,6 +1884,7 @@ int main()
 	test_own_animation();
 	test_link_chain();
 	test_spots_on_a_vrm();
+	test_spots_on_two_characters();
 	test_face_region();
 	test_dangly_parts();
 	test_facing_arms_and_wearing();
