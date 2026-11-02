@@ -923,8 +923,16 @@ def test_set_up_characters(run):
         assert {v["from"] for v in b["spots"].values()} == {"guessed"}
 
         # Your eyes and mouth: on its face where its set-up says (two up
-        # top, one under them), nowhere else - and never outside it.
+        # top, one under them), nowhere else - and never outside it. Each
+        # source tracks you itself and settles in its own time (the
+        # steadiest smoothing), so they're compared once both have
+        # settled on the same turn and place - its ear and body edges
+        # otherwise differ by a pixel or two.
+        def same_pose():
+            a, b = st("Real eyes")["model"], st("Drawn")["model"]
+            return all(abs(a[k] - b[k]) <= 0.2 for k in ("yaw", "pitch", "x", "y"))
         time.sleep(1.5)
+        assert wait_for(same_pose, 15, 0.2), (st("Real eyes")["model"], st("Drawn")["model"])
         real, drawn = screenshot(c, "Real eyes"), screenshot(c, "Drawn")
         orange = lambda px: px[0] > 120 and px[0] > px[1] + 30 > px[2] + 30  # noqa: E731
         ox, oy, n = middle_of(drawn, orange)
