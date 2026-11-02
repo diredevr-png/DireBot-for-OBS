@@ -423,6 +423,18 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 		drivers_.clear();
 	drivers_.insert(drivers_.end(), arkit.begin(), arkit.end());
 
+	// The faces your face doesn't move (their meshes).
+	still_mesh_.assign(m.meshes.size(), 0);
+	for (size_t i = 0; i < m.nodes.size(); i++) {
+		const int mesh = m.nodes[i].mesh;
+		if (mesh < 0 || mesh >= (int)m.meshes.size())
+			continue;
+		const std::string label = m.nodes[i].name.empty() ? "#" + std::to_string(i) : m.nodes[i].name;
+		for (const std::string &s : options_.still_faces)
+			if (s == label || s == "#" + std::to_string(i))
+				still_mesh_[mesh] = 1;
+	}
+
 	// Whether its own blink and open mouth show: a shape that moves its
 	// face at least FACE_SHOWS of its height (a real eyelid or jaw), not
 	// a tiny marker (a shape only there to say where its eyes are).
@@ -759,6 +771,8 @@ void Rig::drive_expressions(const Drive &d)
 			auto it = on.find(dr.expression);
 			amount = it == on.end() ? 0 : it->second;
 		}
+		if (still_mesh_[dr.mesh])
+			continue; // a face your face doesn't move: as it rests
 		float &w = weights_[dr.mesh][dr.morph];
 		w = clamp01(w + amount * dr.weight);
 	}

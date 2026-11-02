@@ -594,6 +594,8 @@ struct FaceAvatar {
 		float outline = 0, floppy = 0.5f;
 		bool swing = true;
 		std::string animation; // its own animation that plays, by name ("" none)
+		// Its parts whose own face your face doesn't move, a name a line.
+		std::string still_faces;
 		int framing = 0; // 0 head and shoulders for a VRM, 1 all of it, 2 head
 		bool hide = true, smooth = true;
 		WornPlace place;
@@ -1369,10 +1371,21 @@ struct FaceAvatar {
 		ro.springs = look3d.swing;
 		ro.setup = look3d.setup;
 		ro.animation = animation_named(*model_now, look3d.animation);
+		{
+			std::string line;
+			for (char c : look3d.still_faces + "\n")
+				if (c == '\n') {
+					if (!line.empty())
+						ro.still_faces.push_back(line);
+					line.clear();
+				} else if (c != '\r') {
+					line += c;
+				}
+		}
 		const std::string key = std::to_string(ro.facing.x) + "/" + std::to_string(ro.facing.y) + "/" +
 					std::to_string(ro.facing.z) + "/" + std::to_string(ro.facing.w) + "/" +
 					std::to_string(ro.floppy) + "/" + (ro.springs ? "1" : "0") + "/" +
-					look3d.setup_text;
+					look3d.setup_text + "/" + look3d.still_faces;
 		if (rig && rig->animation() != ro.animation) {
 			rig->set_animation(ro.animation);
 			std::lock_guard<std::mutex> l(state_lock);
@@ -2224,6 +2237,8 @@ struct FaceAvatar {
 		l3.swing = obs_data_get_bool(settings, "swing");
 		const char *animation = obs_data_get_string(settings, "animation");
 		l3.animation = animation ? animation : "";
+		const char *still = obs_data_get_string(settings, "still_faces");
+		l3.still_faces = still ? still : "";
 		const char *framing = obs_data_get_string(settings, "framing");
 		l3.framing = framing && std::strcmp(framing, "whole") == 0  ? 1
 			     : framing && std::strcmp(framing, "head") == 0 ? 2
@@ -2537,6 +2552,7 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "floppy", 50);
 	obs_data_set_default_bool(settings, "swing", true);
 	obs_data_set_default_string(settings, "animation", "");
+	obs_data_set_default_string(settings, "still_faces", "");
 	obs_data_set_default_string(settings, "framing", "auto");
 	obs_data_set_default_bool(settings, "hide_behind_head", true);
 	obs_data_set_default_bool(settings, "smooth_edges", true);

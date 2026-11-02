@@ -107,6 +107,11 @@ ears and legs). Characters standing in a T get their arms down. Its file's
 own animation (an idle, a tail's wag: glTF animations, as Blender saves
 them) plays over and over if one is chosen (the `animation` setting, its
 name); your head, eyes and its swinging parts move from where it has them.
+A file of more than one character (each its own part) can keep one's face
+still: the `still_faces` setting names them, a part's name a line ("#n" for
+an unnamed n-th node). Shapes your face moves start from nothing, whatever
+strength the file was saved with. With two characters sharing a blink or a
+mouth, your real eyes and mouth go on the one round the head bone.
 Your real
 eyes and mouth go on its face too, soft-edged and in its skin's colour,
 turning half as far as it does, while its own stay still under them (or

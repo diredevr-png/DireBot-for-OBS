@@ -67,6 +67,9 @@ struct RigOptions {
 	bool springs = true;
 	// Which of its own animations plays (Model::animations), or -1 none.
 	int animation = -1;
+	// Its parts (by node name, or "#n" for its n-th node) whose own face
+	// your face doesn't move: in a file of two characters, one talks.
+	std::vector<std::string> still_faces;
 	// How much of your head's turn the neck takes (the head the rest).
 	float neck_share = 0.4f;
 	// A character made standing in a T: its arms down by its sides.
@@ -218,6 +221,7 @@ private:
 	bool perfect_sync_ = false;
 	int arkit_count_ = 0;
 	bool blinks_ = false, talks_ = false;
+	std::vector<char> still_mesh_; // a mesh of a face your face doesn't move
 	std::map<std::string, float> values_;
 	std::vector<Part> parts_;
 };

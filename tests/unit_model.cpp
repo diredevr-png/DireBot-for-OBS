@@ -566,6 +566,8 @@ static void test_spots_on_a_vrm()
 // Two characters in one file sharing a blink and a mouth (a VRM's blink
 // and aa bound to both): your eyes and mouth go on the one with the head
 // bone, not stretched across both - even with the other one bigger.
+static Drive still();
+
 static void test_spots_on_two_characters()
 {
 	Person alone = make_person(false);
@@ -597,6 +599,32 @@ static void test_spots_on_two_characters()
 		CHECK(near(fs.spot[i].w, solo.spot[i].w, 1e-3) && near(fs.spot[i].h, solo.spot[i].h, 1e-3));
 	}
 	CHECK(fs.spot[0].at.x > 0 && fs.spot[1].at.x < 0); // its own left eye on its left
+
+	// Whose face moves: both, or one of them as picked (by name).
+	RigOptions o;
+	o.springs = false;
+	Drive d = still();
+	d.moves[move_of_name("jawOpen")] = 1;
+	d.moves[move_of_name("eyeBlinkLeft")] = 1;
+	d.moves[move_of_name("eyeBlinkRight")] = 1;
+	Rig both(two, o);
+	both.pose(d);
+	CHECK(both.weights()[0][0] > 0.5f && both.weights()[1][0] > 0.5f && both.weights()[1][1] > 0.5f);
+	o.still_faces = {"Wolf"};
+	Rig only_person(two, o);
+	only_person.pose(d);
+	CHECK(only_person.weights()[0][0] > 0.5f && near(only_person.weights()[1][0], 0, 1e-6) &&
+	      near(only_person.weights()[1][1], 0, 1e-6));
+	o.still_faces = {"face"};
+	Rig only_wolf(two, o);
+	only_wolf.pose(d);
+	CHECK(near(only_wolf.weights()[0][0], 0, 1e-6) && near(only_wolf.weights()[0][3], 0, 1e-6) &&
+	      only_wolf.weights()[1][0] > 0.5f);
+	// A part with no name goes by its place ("#n"); a name it hasn't, nothing.
+	o.still_faces = {"#" + std::to_string(wolf), "Nobody"};
+	Rig by_place(two, o);
+	by_place.pose(d);
+	CHECK(by_place.weights()[0][0] > 0.5f && near(by_place.weights()[1][0], 0, 1e-6));
 }
 
 static void test_face_region()
