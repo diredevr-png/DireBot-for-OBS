@@ -54,6 +54,11 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // eyes and mouth cut out of your camera, set up through "Face..." vendor
 // requests.
 //
+// 0.4.1: a 3D character's own face - its face shapes start shut each
+// frame, it says whether they move enough to see (blinks, talks), and in
+// a file of more than one character you pick whose face moves with yours
+// (still_faces); your real eyes and mouth keep to one character.
+//
 // Later parts plug in beside these: each gets its own folder under src/,
 // its own vendor requests, and a line in features().
 
