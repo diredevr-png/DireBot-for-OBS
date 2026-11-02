@@ -491,6 +491,40 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 			return tail;
 		return point(inverse(rest_world_[node]), move_of(rest_world_[tail_node]));
 	};
+	// A line of bones, each but the first swinging from the one before
+	// (a dangly part's: in the character's own size, scaled by its world's
+	// below; gravity only as far as it's tipped from upright - step_springs
+	// - so it keeps its shape standing still).
+	auto add_auto_chain = [&](const std::vector<int> &chain) {
+		Chain c;
+		for (size_t i = 1; i < chain.size(); i++) {
+			Joint j;
+			j.s.node = chain[i];
+			if (i + 1 < chain.size()) {
+				j.s.tail_node = chain[i + 1];
+				j.tail = local_tail(chain[i], chain[i + 1], {});
+			} else {
+				// The last: as long again as the bone before it, on the
+				// way it points.
+				const Node &node = m.nodes[chain[i]];
+				j.tail = rotate(conj(node.r), node.t);
+			}
+			if (length(j.tail) < 1e-6f)
+				continue;
+			j.axis = normalized(j.tail);
+			j.rest = m.nodes[chain[i]].r;
+			j.s.stiffness = 1.0f;
+			j.s.gravity = 0.8f;
+			j.s.drag = 0.06f;
+			j.s.gravity_dir = {0, -1, 0};
+			j.s.radius = 0;
+			c.joints.push_back(j);
+		}
+		if (c.joints.empty())
+			return false;
+		springs_.push_back(c);
+		return true;
+	};
 	for (const Spring &sp : m.springs) {
 		Chain c;
 		c.colliders = sp.colliders;
@@ -547,46 +581,47 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 		for (auto &g : given)
 			springs_.push_back(g.second);
 	} else if (!m.is_vrm() && springs_.empty()) {
-		// Its dangly parts (a chain of links, a doll's ears
-		// and legs): each hangs from its first bone and swings, sized to the
+		// Its dangly parts (a chain of links, a doll's ears and legs):
+		// each hangs from its first bone and swings, sized to the
 		// character. A person's skeleton: only hair, tails and the like.
-		for (const Skin &skin : m.skins) {
+		// (Its own skins: an outfit piece's are on the same bones.)
+		for (size_t si = 0; si < m.own_skins(); si++) {
+			const Skin &skin = m.skins[si];
 			const bool person = person_skeleton(m, skin);
 			for (const std::vector<int> &chain : hanging_chains(m, skin)) {
 				if (person && !dangly_name(m.nodes[chain[0]].name))
 					continue;
-				Chain c;
-				for (size_t i = 1; i < chain.size(); i++) {
-					Joint j;
-					j.s.node = chain[i];
-					if (i + 1 < chain.size()) {
-						j.s.tail_node = chain[i + 1];
-						j.tail = local_tail(chain[i], chain[i + 1], {});
-					} else {
-						// The last: as long again as the bone before it, on the
-						// way it points.
-						const Node &node = m.nodes[chain[i]];
-						j.tail = rotate(conj(node.r), node.t);
-					}
-					if (length(j.tail) < 1e-6f)
-						continue;
-					j.axis = normalized(j.tail);
-					j.rest = m.nodes[chain[i]].r;
-					// In the character's own size (scaled by its world's
-					// below); gravity only as far as it's tipped from upright
-					// (step_springs), so it keeps its shape standing still.
-					j.s.stiffness = 1.0f;
-					j.s.gravity = 0.8f;
-					j.s.drag = 0.06f;
-					j.s.gravity_dir = {0, -1, 0};
-					j.s.radius = 0;
-					c.joints.push_back(j);
-				}
-				if (!c.joints.empty()) {
-					springs_.push_back(c);
+				if (add_auto_chain(chain))
 					auto_chain_ = true;
-				}
 			}
+		}
+	}
+	// An outfit piece's own bones (a cape's, a strap's) hanging off the
+	// character's: each line of them swings, as a dangly part does.
+	for (const WornPiece &w : m.worn) {
+		auto own = [&](int n) { return n >= w.first_node && n < w.end_node && m.nodes[n].mesh < 0; };
+		auto own_kids = [&](int n) {
+			std::vector<int> out;
+			if (n >= 0)
+				for (int c : m.nodes[n].children)
+					if (own(c))
+						out.push_back(c);
+			return out;
+		};
+		// A line starts off the character's bone, or where its own branch.
+		for (int start = w.first_node; start < w.end_node; start++) {
+			const int parent = m.nodes[start].parent;
+			if (!own(start) || parent < 0 || (own(parent) && own_kids(parent).size() == 1))
+				continue;
+			std::vector<int> chain = {parent, start};
+			for (int at = start; chain.size() <= m.nodes.size();) {
+				const std::vector<int> next = own_kids(at);
+				if (next.size() != 1)
+					break;
+				at = next[0];
+				chain.push_back(at);
+			}
+			add_auto_chain(chain);
 		}
 	}
 }

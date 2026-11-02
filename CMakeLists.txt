@@ -90,6 +90,7 @@ target_sources(
     src/face/pose.cpp
     src/face/avatar2d.cpp
     src/face/model.cpp
+    src/face/pieces.cpp
     src/face/rig.cpp
     src/face/setup.cpp
     src/face/avatar3d.cpp

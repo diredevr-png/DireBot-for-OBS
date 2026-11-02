@@ -212,6 +212,15 @@ struct ModelMeta {
 	std::string commercial; // may it earn money ("personalNonProfit", "corporation"...)
 };
 
+// An outfit's 3D piece put on the character (put_on): what was added for
+// it. Its nodes and meshes come after the character's own, in order.
+struct WornPiece {
+	int first_node = 0, end_node = 0; // [first, end): its own bones and parts
+	int first_mesh = 0, end_mesh = 0;
+	int first_skin = 0, end_skin = 0;
+	bool hide = true; // the character's own skin under it isn't drawn (hide_under_pieces)
+};
+
 struct Model {
 	std::vector<Node> nodes;
 	std::vector<Mesh> meshes;
@@ -239,9 +248,17 @@ struct Model {
 	// Which way it faces as it is: VRM 1.0 and glTF along +z, VRM 0.x -z.
 	bool faces_back = false;
 
-	// Its size standing as it is (no expressions, bones at rest).
+	// Its size standing as it is (no expressions, bones at rest) - the
+	// character's own, outfit pieces left out, so a rifle on its back
+	// doesn't shrink it in its spot.
 	V3 low, high;
 	size_t points = 0, triangles = 0;
+	// Outfit pieces put on it (put_on), in order.
+	std::vector<WornPiece> worn;
+	// How many of its meshes, skins and nodes are its own (the rest are
+	// its pieces').
+	size_t own_meshes() const { return worn.empty() ? meshes.size() : (size_t)worn.front().first_mesh; }
+	size_t own_skins() const { return worn.empty() ? skins.size() : (size_t)worn.front().first_skin; }
 };
 
 // A channel at `t` seconds (before its first key: its first; after its
@@ -268,6 +285,55 @@ bool person_skeleton(const Model &m, const Skin &skin);
 
 // Every node's place in the model at rest (world matrices).
 std::vector<M4> rest_world(const Model &m);
+
+// --- Outfit pieces (0.5.0) ------------------------------------------------
+//
+// A 3D piece of an outfit in a file of its own - a shirt, boots, a vest,
+// a hat - put on a character as it's loaded, so it moves with it:
+//
+//   - A piece with bones (made on the character's own skeleton, as
+//     Blender exports a piece of clothing): its bones are found among the
+//     character's by name - the same, any case, or the same with a prefix
+//     the character's bones all have ("wolf_hips" for "hips", a file of
+//     two characters) - and it's fitted onto them (moved, turned and
+//     sized as its bones are to theirs; each point then follows its own
+//     bones' places). Bones of its own (a cape's) hang off the nearest of
+//     the character's, and swing.
+//   - A loose piece (no bones: a hat from anywhere): it rides one of the
+//     character's bones (the nearest, or the one named), nudged into
+//     place. One far away or of another size is put on top of its head
+//     first, to nudge from.
+//
+// The character's own skin under a piece can be hidden (hide_under_pieces),
+// so it doesn't poke through as it moves.
+struct PieceHow {
+	bool hide = true;
+	// A loose piece's bone: a VRM bone's name ("head", "leftHand"...) or
+	// the file's own; "" the nearest.
+	std::string bone;
+	// A loose piece's nudge, as the character faces you: moved right, up
+	// and towards you (shares of its height), turned round those (degrees)
+	// and grown round its middle.
+	V3 move, turn;
+	float size = 1;
+	// The turn from the character as it is to facing you (RigOptions::facing).
+	Quat facing;
+};
+struct PieceOn {
+	bool on = false;
+	std::string problem; // why not, in plain words
+	int bones = 0;       // its bones found among the character's
+	int own_bones = 0;   // bones of its own, added
+	bool loose = false;
+	std::string rides; // a loose piece's bone
+	bool placed = false; // a loose piece put on its head first (it was far away, or another size)
+};
+PieceOn put_on(Model &m, const Model &piece, const PieceHow &how);
+// The character's own triangles under its pieces (those with `hide`)
+// taken out: every corner of one covered. How many were.
+size_t hide_under_pieces(Model &m);
+// One of a character's bones by a VRM bone's name or its own, or -1.
+int bone_called(const Model &m, const std::string &name);
 
 // A plain .glb from parts (for tests and for characters built in DireBot):
 // one node a part, its picture (a PNG's bytes, or none) on it.
