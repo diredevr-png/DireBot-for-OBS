@@ -21,8 +21,13 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //   - Your head's turn: a VRM's neck and head bones turn (the neck some
 //     of the way, the head the rest), or - a character with no head bone,
 //     like a long thin one - the whole of it turns round its head.
-//   - Your 52 expressions: parts named as Apple's ARKit names them
-//     ("jawOpen", "eyeBlinkLeft"...) follow yours as they are; VRM's
+//   - Its body (a VRM's spine and chest): some of your head's turn and
+//     its own slow sway, its chest and shoulders rising with each breath
+//     (alive.hpp); a character with no head bone grows a touch with each
+//     breath instead. Its fingers rest relaxed (or as curled as asked).
+//   - Your 52 expressions (through your face's tuning, alive.hpp): parts
+//     named as Apple's ARKit names them ("jawOpen", "eyeBlinkLeft"...)
+//     follow yours as they are; VRM's
 //     expressions (blink, "aa", happy...) and the usual names other
 //     tools give them ("Blink", "A", "Smile", "まばたき"...) are worked
 //     out from yours. Your eyes' looks turn a VRM's eyes.
@@ -77,6 +82,10 @@ struct RigOptions {
 	// Its set-up (setup.hpp): the chains that swing and the parts that
 	// stay upright, if it names any.
 	std::shared_ptr<const CharacterSetup> setup;
+	// Its fingers (a VRM's finger bones): 0 as the file has them, 0.5
+	// relaxed as hands rest, 1 curled. Fingers its file already bends are
+	// only bent the rest of the way.
+	float fingers = 0.5f;
 };
 
 struct Drive {
@@ -86,8 +95,9 @@ struct Drive {
 	// The model -> the world it's drawn in (any size; the swinging parts
 	// swing in it, with gravity down -y).
 	M4 place;
-	// Your expressions (the tracker's moves, 0 at rest to 1), with left
-	// and right already the character's own.
+	// Your expressions (the tracker's moves through your face's tuning,
+	// alive.hpp's tune_moves: 0 at rest to 1 all the way), with left and
+	// right already the character's own.
 	float moves[EXPRESSIONS] = {};
 	float dt = 0;     // seconds since the last frame
 	bool look = true; // turn its eyes with yours
@@ -99,6 +109,16 @@ struct Drive {
 	// Your real eyes and mouth are on it: its own drawn ones (its set-up's
 	// "own_face") aren't drawn.
 	bool hide_own_face = false;
+	// Alive when you're still (alive.hpp): its breath (0 breathed out to
+	// 1 in, already times how much), how much of your head's turn its body
+	// takes (0 none to 1 the most: 40% of it), and its body's own sway
+	// (degrees: a turn about up, a lean to the side). A VRM breathes with
+	// its chest and shoulders; one with no head bone (it turns whole)
+	// grows a little with each breath, if `breathe_whole`.
+	float breath = 0;
+	float body_follow = 0;
+	float body_yaw = 0, body_roll = 0;
+	bool breathe_whole = true;
 };
 
 class Rig {
@@ -139,6 +159,10 @@ public:
 	bool talks() const { return talks_; }
 	const std::vector<std::vector<float>> &weights() const { return weights_; }
 	int springs() const { return (int)springs_.size(); }
+	// How many of its finger joints relax (RigOptions::fingers), and
+	// whether it has a body that breathes and follows your head.
+	int finger_joints() const { return (int)fingers_.size(); }
+	bool has_body() const { return !torso_.empty(); }
 	bool auto_chain() const { return auto_chain_; }
 	int upright_parts() const { return (int)upright_.size(); }
 	// What your eyes and mouth ride on: the model -> the world as its head
@@ -179,6 +203,9 @@ private:
 	};
 
 	void world_from(int node);
+	void turn_in_rest(int node, Quat by);
+	void find_fingers();
+	void curl_fingers();
 	void drive_expressions(const Drive &d);
 	void drive_head(const Drive &d);
 	void drive_eyes(const Drive &d);
@@ -204,6 +231,18 @@ private:
 		Quat turn; // as the model at rest has it
 	};
 	std::vector<Arm> arms_;
+	// A finger joint: bent about `axis` (the model at rest) by `most` at
+	// a full curl, less what the file already bends it (`has`; radians).
+	struct Finger {
+		int node = -1;
+		V3 axis;
+		float most = 0, has = 0;
+	};
+	std::vector<Finger> fingers_;
+	// Its spine, chest and upper chest (as it has them, lowest first) and
+	// its shoulders: they breathe and follow your head.
+	std::vector<int> torso_;
+	int shoulder_[2] = {-1, -1}, upper_arm_[2] = {-1, -1};
 	std::vector<Chain> springs_;
 	std::vector<Upright> upright_;
 	std::vector<char> held_;     // a node standing upright this frame

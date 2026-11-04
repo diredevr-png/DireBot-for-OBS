@@ -506,15 +506,16 @@ static void test_drawn()
 	CHECK(d.eye[0] == EYE_CLOSED && d.eye[1] == EYE_OPEN);
 	d = drawn_face(moves, true, Drawn{});
 	CHECK(d.eye[0] == EYE_OPEN && d.eye[1] == EYE_CLOSED);
-	// Half shut; and it doesn't flicker between two.
-	moves[index_of("eyeBlinkRight")] = 0.3f;
+	// Half shut; and it doesn't flicker between two. (The moves are
+	// through the tuning: 1 is all the way.)
+	moves[index_of("eyeBlinkRight")] = 0.4f;
 	CHECK(drawn_face(moves, false, Drawn{}).eye[0] == EYE_HALF);
-	moves[index_of("eyeBlinkRight")] = 0.46f;
+	moves[index_of("eyeBlinkRight")] = 0.55f;
 	Drawn shut;
 	shut.eye[0] = EYE_CLOSED;
 	CHECK(drawn_face(moves, false, shut).eye[0] == EYE_CLOSED);
 	CHECK(drawn_face(moves, false, Drawn{}).eye[0] == EYE_HALF);
-	moves[index_of("eyeBlinkRight")] = 0.2f;
+	moves[index_of("eyeBlinkRight")] = 0.25f;
 	Drawn half;
 	half.eye[0] = EYE_HALF;
 	CHECK(drawn_face(moves, false, half).eye[0] == EYE_HALF);
@@ -526,9 +527,9 @@ static void test_drawn()
 	const int smile_l = index_of("mouthSmileLeft"), smile_r = index_of("mouthSmileRight");
 	moves[jaw] = 0.3f;
 	CHECK(drawn_face(moves, false, Drawn{}).mouth == MOUTH_OPEN);
-	moves[jaw] = 0.5f;
+	moves[jaw] = 0.7f;
 	CHECK(drawn_face(moves, false, Drawn{}).mouth == MOUTH_WIDE);
-	moves[jaw] = 0.39f;
+	moves[jaw] = 0.6f;
 	Drawn wide;
 	wide.mouth = MOUTH_WIDE;
 	CHECK(drawn_face(moves, false, wide).mouth == MOUTH_WIDE);
@@ -538,7 +539,7 @@ static void test_drawn()
 	open.mouth = MOUTH_OPEN;
 	CHECK(drawn_face(moves, false, open).mouth == MOUTH_OPEN);
 	CHECK(drawn_face(moves, false, Drawn{}).mouth == MOUTH_CLOSED);
-	moves[funnel] = 0.3f;
+	moves[funnel] = 0.4f;
 	CHECK(drawn_face(moves, false, Drawn{}).mouth == MOUTH_O);
 	moves[funnel] = 0;
 	moves[jaw] = 0;

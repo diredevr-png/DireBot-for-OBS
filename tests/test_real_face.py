@@ -30,6 +30,9 @@ from test_real_obs import HERE, Obs, vendor, wait_for  # noqa: E402
 from test_real_obs import pytestmark  # noqa: E402,F401
 
 SCENE = "Face test"
+# 0.5.0's "alive when you're still" off, for pictures compared pixel by
+# pixel.
+STILL = {"breathing": 0, "sway": 0, "eye_moves": False}
 FACE = os.path.join(HERE, "tests", "data", "face")
 # The camera's picture: the photo twice as big, this far in.
 W, H, AT_X, AT_Y = 960, 540, 220, 20
@@ -500,7 +503,7 @@ def test_cutouts_sit_still_while_you_move(run):
                 "source": "Moving", "character": body_png, "width": size,
                 "height": size, "size": 100, "mirror": False,
                 "follow_move": 0, "follow_grow": 0, "follow_tilt": 0,
-                "turn_pictures": False, "smoothing": 100,
+                "turn_pictures": False, "smoothing": 100, **STILL,
                 "spots": json.dumps({"left_eye": spot,
                                      "right_eye": [0.55, 0.3, 0.2, 0.14],
                                      "mouth": [0.38, 0.6, 0.24, 0.14]})}})
@@ -630,7 +633,7 @@ def test_it_turns_blends_draws_and_wears(run):
     # can be checked.
     common = {"source": "Looks camera", "width": size, "height": size, "size": 100,
               "mirror": False, "smoothing": 100, "spots": json.dumps(SPOTS),
-              "follow_move": 0, "follow_grow": 0, "follow_tilt": 0, "bend": 0}
+              "follow_move": 0, "follow_grow": 0, "follow_tilt": 0, "bend": 0, **STILL}
     avatars = {
         "Plain": {"character": body_png},
         "Turned": {"character": body_png, "bend": 85},
@@ -778,7 +781,7 @@ def test_3d_characters(run):
     size = 300
     common = {"source": "3D camera", "width": size, "height": size, "size": 100,
               "mirror": False, "smoothing": 100, "follow_move": 0, "follow_grow": 0,
-              "follow_tilt": 0, "bend": 100}
+              "follow_tilt": 0, "bend": 100, **STILL}
     avatars = {
         "3D": {"model": ball},
         "3D turned": {"model": ball},
@@ -880,9 +883,11 @@ def test_set_up_characters(run):
                            "chains": [{"bones": ["Ear0", "Ear1", "Ear2"],
                                        "pull": [0, -9.8, 0], "with_head": False}],
                            "upright": [{"bone": "Body", "follow": 6}]})
+    # Held still (0.5.0's breathing, sway and eye moves off): two sources
+    # breathe in their own time, and these compare them pixel by pixel.
     common = {"source": "Set-up camera", "width": size, "height": size, "size": 100,
               "mirror": False, "smoothing": 100, "follow_move": 0, "follow_grow": 0,
-              "follow_tilt": 0, "bend": 100, "model": model}
+              "follow_tilt": 0, "bend": 100, "model": model, **STILL}
     avatars = {
         "Real eyes": {"model_setup": still},
         "Drawn": {"model_setup": still, "style": "drawn"},
@@ -1055,7 +1060,7 @@ def test_its_own_animation(run):
                                     "source": "Animated camera", "width": size, "height": size,
                                     "size": 100, "mirror": False, "smoothing": 100,
                                     "follow_move": 0, "follow_grow": 0, "follow_tilt": 0,
-                                    "bend": 100, "model": model, "style": "drawn",
+                                    "bend": 100, "model": model, "style": "drawn", **STILL,
                                     "model_setup": json.dumps({"spots": SET_UP_SPOTS, "chains": []})}})
         send(c, "SetCurrentProgramScene", {"sceneName": "Own animation"})
 
@@ -1092,6 +1097,116 @@ def test_its_own_animation(run):
                      {"inputName": "Animated", "propertyName": "animation"})["propertyItems"]
         assert [p["itemValue"] for p in props] == ["", "Slide", "Animation 2"], props
         send(c, "RemoveInput", {"inputName": "Animated"})
+    finally:
+        c.disconnect()
+
+
+def test_alive_when_still_tuning_and_camera_check(run):
+    """0.5.0: it breathes while you hold still (the picture rises and falls
+    a breath at a time; not with breathing off), the tuning's live readings
+    and the camera check's are in FaceGetState, and when it can't see you
+    it eases into its idle - and is back with you as soon as it sees you."""
+    face_png = os.path.join(run.home, "camera.png")
+    body_png = os.path.join(run.home, "character.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+    if not os.path.exists(body_png):
+        character_picture(body_png)
+    size = 400
+    common = {"source": "Alive camera", "character": body_png, "width": size,
+              "height": size, "size": 100, "mirror": False, "smoothing": 100,
+              "spots": json.dumps(SPOTS), "follow_move": 0, "follow_grow": 0,
+              "follow_tilt": 0, "bend": 0, "sway": 0, "eye_moves": False}
+    avatars = {"Breathing": {"breathing": 100, "breath_time": 2},
+               "Not breathing": {"breathing": 0}}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "Alive camera"})
+        send(c, "CreateInput", {"sceneName": "Alive camera", "inputName": "Alive photo",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        photo = send(c, "GetSceneItemId", {"sceneName": "Alive camera",
+                                           "sourceName": "Alive photo"})["sceneItemId"]
+        send(c, "CreateScene", {"sceneName": "Alive"})
+        for name, extra in avatars.items():
+            send(c, "CreateInput", {"sceneName": "Alive", "inputName": name,
+                                    "inputKind": "direbot_face_avatar",
+                                    "inputSettings": {**common, **extra}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Alive"})
+
+        def st(name="Breathing"):
+            return vendor(c, "FaceGetState", {"source": name})
+        for name in avatars:
+            assert wait_for(lambda: st(name)["found"] and st(name)["shown"] == 1, 30, 0.2), st(name)
+
+        # A breath every 2 seconds: the picture rises and falls (up to 0.8%
+        # of its height), the other holds still.
+        orange = lambda px: px[0] > 150 and 90 < px[1] < 170 and px[2] < 90  # noqa: E731
+        ys = {name: [] for name in avatars}
+        breaths = []
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < 2.6:
+            for name in avatars:
+                _, y, n = middle_of(screenshot(c, name), orange)
+                assert n > 1000, (name, n)
+                ys[name].append(y)
+            breaths.append(st()["alive"]["breath"])
+        print("\nbreathing: middle %.1f..%.1f px, still: %.1f..%.1f px, breath %s" % (
+            min(ys["Breathing"]), max(ys["Breathing"]), min(ys["Not breathing"]),
+            max(ys["Not breathing"]), breaths))
+        assert max(ys["Breathing"]) - min(ys["Breathing"]) > 1.2, ys
+        assert max(ys["Not breathing"]) - min(ys["Not breathing"]) < 0.3, ys
+        assert min(breaths) < 0.3 and max(breaths) > 0.7, breaths
+        assert all(0 <= b <= 1 for b in breaths), breaths
+        assert st("Not breathing")["alive"]["breath"] == 0
+
+        # The tuning's readings, live, for each group.
+        s = st()
+        assert s["alive"]["idle"] == 0, s["alive"]
+        groups = {"blink", "mouth", "smile", "round", "brows_up", "brows_down", "look"}
+        for part in ("reading", "reading_peak", "shows", "shows_peak"):
+            assert set(s["tune"][part]) == groups, s["tune"]
+            assert all(0 <= v <= 1 for v in s["tune"][part].values()), s["tune"]
+        for g in groups:
+            assert s["tune"]["reading_peak"][g] >= s["tune"]["reading"][g] - 0.01, s["tune"]
+
+        # The camera check: the photo's face, where it is, lit by a grey room.
+        check = s["camera_check"]
+        assert check["seen"] is True, check
+        box = check["box"]
+        assert 0 < box["x"] < box["x"] + box["w"] <= 1 and 0 < box["y"] < box["y"] + box["h"] <= 1, box
+        assert 0.05 < box["w"] < 0.6 and 0.05 < box["h"] < 0.9, box
+        assert abs(check["facing"]["yaw"]) < 25 and abs(check["facing"]["roll"]) < 25, check
+        light = check["light"]
+        assert all(0 <= light[k] <= 1 for k in ("face", "left", "right", "room")), light
+        # Its "camera" is a scene as big as OBS's canvas: the grey room is
+        # the photo's part of it, the rest black.
+        video = send(c, "GetVideoSettings")
+        cw, ch = video["baseWidth"], video["baseHeight"]
+        assert (check["camera_width"], check["camera_height"]) == (cw, ch), (check, video)
+        face_area = box["w"] * cw * box["h"] * ch
+        room = 96 / 255 * (W * H - face_area) / (cw * ch - face_area)
+        assert 0.15 < light["face"] and abs(light["room"] - room) < 0.04, (light, room)
+
+        # Gone: it holds your look a moment, then eases into its idle.
+        send(c, "SetSceneItemEnabled", {"sceneName": "Alive camera", "sceneItemId": photo,
+                                        "sceneItemEnabled": False})
+        assert wait_for(lambda: not st()["found"], 5, 0.05), st()
+        lost = time.perf_counter()
+        assert wait_for(lambda: st()["alive"]["idle"] > 0, 5, 0.05), st()["alive"]
+        began = time.perf_counter() - lost
+        assert wait_for(lambda: st()["alive"]["idle"] == 1, 6, 0.05), st()["alive"]
+        print("idle: begins %.1f s after it's lost, all the way at %.1f s" % (
+            began, time.perf_counter() - lost))
+        assert 0.6 < began < 2.0, began
+        gone = st()["camera_check"]
+        assert gone["seen"] is False and "box" not in gone, gone
+        # Back: with you again at once.
+        send(c, "SetSceneItemEnabled", {"sceneName": "Alive camera", "sceneItemId": photo,
+                                        "sceneItemEnabled": True})
+        assert wait_for(lambda: st()["found"], 5, 0.05), st()
+        assert wait_for(lambda: st()["alive"]["idle"] == 0, 2, 0.05), st()["alive"]
+        send(c, "RemoveScene", {"sceneName": "Alive"})
+        send(c, "RemoveScene", {"sceneName": "Alive camera"})
     finally:
         c.disconnect()
 

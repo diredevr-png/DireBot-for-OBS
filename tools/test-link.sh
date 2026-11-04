@@ -45,7 +45,7 @@ done
 	"$here/src/face/avatar2d.cpp" "$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
 "$out/unit-avatar"
 "$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-model" "$here/tests/unit_model.cpp" "$here/src/face/model.cpp" \
-	"$here/src/face/rig.cpp" "$here/src/face/setup.cpp" "$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
+	"$here/src/face/rig.cpp" "$here/src/face/alive.cpp" "$here/src/face/setup.cpp" "$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
 "$out/unit-model"
 
 "$cxx" "${flags[@]}" -o "$out/harness" "$here/tests/harness.cpp" "$here/src/link/server.cpp" "${link_src[@]}"

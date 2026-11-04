@@ -159,9 +159,10 @@ struct Drawn {
 	int eye[2] = {EYE_OPEN, EYE_OPEN}; // the viewer's left eye, right eye
 	int mouth = MOUTH_CLOSED;
 };
-// What your face is doing, from its expressions against "Set" (`moves`).
-// `mirror`: the camera's picture is shown mirrored. `before`: what it
-// was, so it doesn't flicker between two.
+// What your face is doing, from its expressions against "Set" through
+// the tuning (`moves`: alive.hpp's tune_moves - 0 at rest, 1 all the
+// way). `mirror`: the camera's picture is shown mirrored. `before`: what
+// it was, so it doesn't flicker between two.
 Drawn drawn_face(const float moves[EXPRESSIONS], bool mirror, const Drawn &before);
 // The picture to show for a look, given which there are (`have`: a bit
 // per look): the nearest there is, or -1 for none.

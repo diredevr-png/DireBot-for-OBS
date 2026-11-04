@@ -43,6 +43,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "../link/crypto.hpp"
 #include "../obs/ui-call.hpp"
+#include "alive.hpp"
 #include "avatar2d.hpp"
 #include "avatar3d.hpp"
 #include "effect-check.hpp"
@@ -96,6 +97,11 @@ const char *text(const char *key)
 float clampf(float v, float lo, float hi)
 {
 	return std::min(hi, std::max(lo, v));
+}
+
+float mix(float a, float b, float t)
+{
+	return a + (b - a) * t;
 }
 
 uint32_t even_size(long long v)
@@ -382,6 +388,9 @@ public:
 		std::string problem;
 		uint64_t looks = 0;
 		float rate = 0, ms = 0;
+		// How lit the camera's picture is lately (alive.hpp), while it
+		// sees your face.
+		Light light;
 	};
 	void state(State &out) const
 	{
@@ -396,6 +405,7 @@ public:
 		out.looks = looks_;
 		out.rate = rate_;
 		out.ms = ms_;
+		out.light = light_;
 	}
 
 private:
@@ -413,6 +423,7 @@ private:
 		}
 		std::vector<uint8_t> rgba;
 		Pieces pieces;
+		Light light;
 		uint64_t window_start = os_gettime_ns();
 		int window_looks = 0;
 		double window_ms = 0;
@@ -459,8 +470,10 @@ private:
 			}
 			if (start)
 				tracker.set_rest();
-			if (forget)
+			if (forget) {
 				tracker.forget();
+				light = Light();
+			}
 			tracker.set_smoothing(smoothing_);
 			const bool was_setting = tracker.setting();
 			if (look && ok) {
@@ -468,6 +481,16 @@ private:
 				tracker.look(frame, (double)ns / 1e9);
 				cut_pieces(tracker.face(), aspect, soft, pieces);
 				skin_round(frame, pieces);
+				// How lit it is, over about the last half second.
+				const Light now = light_of(frame, tracker.face());
+				if (now.seen) {
+					const float k = light.seen ? 0.1f : 1.0f;
+					light.face += (now.face - light.face) * k;
+					light.left += (now.left - light.left) * k;
+					light.right += (now.right - light.right) * k;
+					light.room += (now.room - light.room) * k;
+					light.seen = true;
+				}
 			}
 			std::string finished;
 			if (was_setting && !tracker.setting() && tracker.has_rest())
@@ -484,6 +507,7 @@ private:
 				if (look) {
 					face_ns_ = ns;
 					pieces_ = pieces;
+					light_ = light;
 				}
 				rest_ = tracker.rest();
 				setting_ = tracker.setting();
@@ -525,6 +549,7 @@ private:
 	bool ready_ = false;
 	std::string problem_;
 	float rate_ = 0, ms_ = 0;
+	Light light_;
 };
 
 // Where the face models are: data/face, next to the add-on.
@@ -598,6 +623,7 @@ struct FaceAvatar {
 		std::string still_faces;
 		int framing = 0; // 0 head and shoulders for a VRM, 1 all of it, 2 head
 		bool hide = true, smooth = true;
+		float fingers = 0.5f; // its fingers: 0 as made, 0.5 relaxed, 1 curled (RigOptions)
 		WornPlace place;
 		// Its set-up (DireBot's "model_setup": an imported Lens Studio
 		// project, spots dragged into place), and as text, to see changes.
@@ -606,10 +632,38 @@ struct FaceAvatar {
 	};
 	Look3D look3d; // under pictures_lock
 	ModelLoader loader;
+	// Your face's tuning, alive when you're still, and how much its body
+	// follows your head (alive.hpp; under pictures_lock).
+	FaceTune tune;
+	AliveOptions alive_options;
+	float body_follow = 0.3f;
 
 	Worker worker;
 	// Only on OBS's graphics thread (video_tick and video_render).
 	Shown shown;
+	// Your moves through the tuning, and what it does by itself on top
+	// (alive.hpp), this frame.
+	float tuned_now[EXPRESSIONS] = {};
+	Alive alive;
+	AliveOut alive_now;
+	int held_turned = 0; // the way you last faced (Shown::Out::turned), while it's held
+	// The tuning's readings, and what the character shows from them,
+	// each held at its highest for PEAK_TIME seconds, for the page's live
+	// bars: a blink is over before the page asks again.
+	static constexpr double PEAK_TIME = 0.6;
+	struct Peak {
+		float value = 0;
+		double at = -1e9;
+		void take(float v, double now)
+		{
+			if (v >= value || now - at > PEAK_TIME) {
+				value = v;
+				at = now;
+			}
+		}
+	};
+	Peak reading_peak[TUNE_GROUPS], shows_peak[TUNE_GROUPS];
+	double clock = 0;
 	std::atomic<bool> reset_shown{false};
 	uint64_t seen_looks = 0;
 	Worker::State seen;
@@ -669,6 +723,9 @@ struct FaceAvatar {
 	Shown::Out shown_now;
 	Worker::State state_now;
 	Drawn drawn_state;
+	float tune_reading[TUNE_GROUPS] = {}, tune_reading_peak[TUNE_GROUPS] = {};
+	float tune_shows[TUNE_GROUPS] = {}, tune_shows_peak[TUNE_GROUPS] = {};
+	float idle_state = 1, breath_state = 0;
 	// Where the character goes this frame.
 	struct Placed {
 		bool shown = false;
@@ -702,6 +759,10 @@ struct FaceAvatar {
 		bool rigged = false, blinks = false, talks = false;
 		size_t points = 0, triangles = 0;
 		int springs = 0, arkit = 0, upright = 0, cards = 0, layers = 0;
+		// Finger joints it curls, and a body (spine, chest) that breathes
+		// and follows your head.
+		int fingers = 0;
+		bool body = false;
 		// Its own animations' names, and the one playing ("" none).
 		std::vector<std::string> animations;
 		std::string animation;
@@ -1113,10 +1174,14 @@ struct FaceAvatar {
 		if (!wear) {
 			// In its own spot: sized to fit, then following you - moved,
 			// grown, tilted, turned and nodded as you are against "Set",
-			// within limits, gliding between looks.
+			// within limits, gliding between looks. When it can't see you
+			// it holds your last look a moment, then eases back to its own
+			// spot and size (alive.hpp); it sways and breathes on top.
 			const Shown::Glide &g = o.steady;
+			const AliveOut &a = alive_now;
 			const float fit = std::min(w / char_w, h / char_h) * size;
-			const float grow = clampf(std::pow(std::max(0.05f, g.scale), follow_grow), 0.6f, 1.6f);
+			const float grow =
+				mix(clampf(std::pow(std::max(0.05f, g.scale), follow_grow), 0.6f, 1.6f), 1, a.idle);
 			// Moved in proportion to its size: its eye gap, as it's shown.
 			float its_gap = 0;
 			if (have_spots) {
@@ -1128,22 +1193,23 @@ struct FaceAvatar {
 			}
 			float dx = 0, dy = 0;
 			follow_of(o, g, follow_move, its_gap / std::max(1u, w), its_gap / std::max(1u, h), dx, dy);
-			dx = clampf(dx * flip, -most_move, most_move);
-			dy = clampf(dy, -most_move, most_move);
+			dx = clampf(dx * flip * (1 - a.idle), -most_move, most_move);
+			dy = clampf(dy * (1 - a.idle), -most_move, most_move);
 			at.shown = true;
 			at.x = w * (0.5f + dx);
-			at.y = h * (0.5f + dy);
+			// A breath lifts it a little (up to 0.8% of its height).
+			at.y = h * (0.5f + dy) - a.breath * 0.008f * char_h * fit * grow;
 			at.ax = char_w / 2 - CX;
 			at.ay = char_h / 2 - CY;
 			at.scale = fit * grow;
-			at.angle = clampf(g.angle * follow_tilt * flip, -0.6f, 0.6f);
+			at.angle = clampf((a.roll * follow_tilt + a.sway_roll) * RAD * flip, -0.6f, 0.6f);
 			if (shaped) {
 				// A turned picture is already turned some of the way.
-				float yaw = g.yaw * flip;
+				float yaw = a.yaw * flip;
 				if (which)
 					yaw -= (which == 1 ? -1 : 1) * Shown::TURN_ON;
-				at.yaw = clampf(yaw * bend, -MOST_YAW, MOST_YAW);
-				at.pitch = clampf(g.pitch * bend * 0.6f, -MOST_PITCH, MOST_PITCH);
+				at.yaw = clampf(yaw * bend + a.sway_yaw, -MOST_YAW, MOST_YAW);
+				at.pitch = clampf((a.pitch * bend + a.sway_pitch) * 0.6f, -MOST_PITCH, MOST_PITCH);
 			}
 			return at;
 		}
@@ -1371,6 +1437,7 @@ struct FaceAvatar {
 		ro.springs = look3d.swing;
 		ro.setup = look3d.setup;
 		ro.animation = animation_named(*model_now, look3d.animation);
+		ro.fingers = look3d.fingers;
 		{
 			std::string line;
 			for (char c : look3d.still_faces + "\n")
@@ -1385,7 +1452,7 @@ struct FaceAvatar {
 		const std::string key = std::to_string(ro.facing.x) + "/" + std::to_string(ro.facing.y) + "/" +
 					std::to_string(ro.facing.z) + "/" + std::to_string(ro.facing.w) + "/" +
 					std::to_string(ro.floppy) + "/" + (ro.springs ? "1" : "0") + "/" +
-					look3d.setup_text + "/" + look3d.still_faces;
+					std::to_string(ro.fingers) + "/" + look3d.setup_text + "/" + look3d.still_faces;
 		if (rig && rig->animation() != ro.animation) {
 			rig->set_animation(ro.animation);
 			std::lock_guard<std::mutex> l(state_lock);
@@ -1414,6 +1481,8 @@ struct FaceAvatar {
 			state3d.talks = rig->talks();
 			state3d.upright = rig->upright_parts();
 			state3d.set_up = !look3d.setup->empty();
+			state3d.fingers = rig->finger_joints();
+			state3d.body = rig->has_body();
 			const float *box = spots3d.box;
 			for (int i = 0; i < 3; i++) {
 				const FaceSpot &sp = spots3d.spot[i];
@@ -1437,7 +1506,12 @@ struct FaceAvatar {
 		const Quat facing = facing_of(m);
 		Drive d;
 		d.dt = frame_dt;
-		std::copy(o.moves, o.moves + EXPRESSIONS, d.moves);
+		// Your face through its tuning, with its own blinks and its eyes'
+		// small moves (alive.hpp).
+		const AliveOut &a = alive_now;
+		std::copy(a.moves, a.moves + EXPRESSIONS, d.moves);
+		add_eye_turn(d.moves, a.eye_yaw, a.eye_pitch);
+		d.breath = a.breath;
 		Framing f;
 		View3D v;
 		bool show = true;
@@ -1448,7 +1522,9 @@ struct FaceAvatar {
 				swap_sides(d.moves);
 			const Shown::Glide &g = o.steady;
 			const float flip = mirror ? -1.0f : 1.0f;
-			const float grow = clampf(std::pow(std::max(0.05f, g.scale), follow_grow), 0.6f, 1.6f);
+			// When it can't see you it eases back to its own spot, its own size.
+			const float grow =
+				mix(clampf(std::pow(std::max(0.05f, g.scale), follow_grow), 0.6f, 1.6f), 1, a.idle);
 			const bool head = look3d.framing == 2 || (look3d.framing == 0 && m.is_vrm());
 			// Moved in proportion to its size: its eye gap (its spots), as
 			// it's framed.
@@ -1456,10 +1532,17 @@ struct FaceAvatar {
 			const float its_gap = length(spots3d.spot[0].at - spots3d.spot[1].at) * f.world_scale;
 			float dx = 0, dy = 0;
 			follow_of(o, g, follow_move, its_gap / f.seen_w, its_gap / f.seen_h, dx, dy);
+			dx *= 1 - a.idle;
+			dy *= 1 - a.idle;
 			move_own_spot(f, clampf(dx * flip, -most_move, most_move), clampf(dy, -most_move, most_move));
-			d.head = head_turn(clampf(g.yaw * bend, -MOST_YAW_3D, MOST_YAW_3D),
-					   clampf(g.pitch * bend, -MOST_PITCH_3D, MOST_PITCH_3D),
-					   clampf(g.angle * follow_tilt, -0.6f, 0.6f), mirror);
+			// Your head's turn (held, then easing ahead when it can't see
+			// you), its own sway on top; its body takes some of it.
+			d.head = head_turn(clampf(a.yaw * bend + a.sway_yaw, -MOST_YAW_3D, MOST_YAW_3D),
+					   clampf(a.pitch * bend + a.sway_pitch, -MOST_PITCH_3D, MOST_PITCH_3D),
+					   clampf((a.roll * follow_tilt + a.sway_roll) * RAD, -0.6f, 0.6f), mirror);
+			d.body_follow = body_follow;
+			d.body_yaw = a.body_yaw;
+			d.body_roll = a.body_roll;
 			v.w = w;
 			v.h = h;
 		} else {
@@ -1477,6 +1560,9 @@ struct FaceAvatar {
 			v.h = ch;
 			v.hide_behind_head = look3d.hide;
 			v.head = worn_pose;
+			// On your head it sits as your head is: it doesn't grow as a
+			// whole with its breath.
+			d.breathe_whole = false;
 		}
 		d.place = f.place;
 		d.upright = f.upright;
@@ -1691,6 +1777,7 @@ struct FaceAvatar {
 		ro.springs = false;
 		ro.floppy = look3d.floppy;
 		ro.setup = look3d.setup;
+		ro.fingers = look3d.fingers;
 		Rig still(model_now, ro);
 		const FaceSpots fs = face_spots(model_now, ro.facing, *look3d.setup);
 		const float bw = std::max(1e-6f, fs.box[2]), bh = std::max(1e-6f, fs.box[3]);
@@ -1990,8 +2077,13 @@ struct FaceAvatar {
 			return;
 		}
 		gs_texture_t *cut = cam && used_shot >= 0 ? gs_texrender_get_texture(shots[used_shot].tex) : nullptr;
-		// Which way it faces: turned pictures if there are any.
-		const int turned = turn_pictures ? o.turned * (mirror ? -1 : 1) : 0;
+		// Which way it faces: turned pictures if there are any (while it
+		// holds your last look, the way you last faced).
+		if (o.found)
+			held_turned = o.turned;
+		else if (std::fabs(alive_now.yaw) < Shown::TURN_OFF)
+			held_turned = 0;
+		const int turned = turn_pictures ? held_turned * (mirror ? -1 : 1) : 0;
 		int which = 0;
 		if (turned < 0 && loaded(body_left))
 			which = 1;
@@ -2052,12 +2144,46 @@ struct FaceAvatar {
 		if (reset_shown.exchange(false))
 			shown.reset();
 		const Shown::Out o = shown.step(seen.face, seen.rest, dt, fresh);
-		// Its drawn face, from yours (at rest while it can't see you).
-		drawn_now = o.found || o.holding ? drawn_face(o.moves, mirror, drawn_now) : Drawn();
+		// Your face through its tuning, and what it does by itself on top:
+		// breathing, swaying, its eyes' small moves, and when it can't see
+		// you, your last look held a moment and then easing into idle.
+		FaceTune t;
+		AliveOptions ao;
+		{
+			std::lock_guard<std::mutex> l(pictures_lock);
+			t = tune;
+			ao = alive_options;
+		}
+		tune_moves(o.moves, t, tuned_now);
+		alive.set(ao);
+		const Shown::Glide &g = o.steady;
+		alive_now = alive.step(dt, o.found, g.yaw, g.pitch, g.angle / RAD, tuned_now);
+		// The page's live bars: what the camera reads, and what it shows.
+		clock += dt;
+		float reading[TUNE_GROUPS] = {}, shows[TUNE_GROUPS] = {};
+		if (o.found) {
+			tune_readings(o.moves, t, reading);
+			tune_readings(tuned_now, t, shows);
+		}
+		for (int i = 0; i < TUNE_GROUPS; i++) {
+			reading_peak[i].take(reading[i], clock);
+			shows_peak[i].take(shows[i], clock);
+		}
+		// Its drawn face, from yours (easing to rest when it can't see
+		// you, blinking by itself).
+		drawn_now = drawn_face(alive_now.moves, mirror, drawn_now);
 		std::lock_guard<std::mutex> l(state_lock);
 		shown_now = o;
 		state_now = seen;
 		drawn_state = drawn_now;
+		for (int i = 0; i < TUNE_GROUPS; i++) {
+			tune_reading[i] = reading[i];
+			tune_reading_peak[i] = reading_peak[i].value;
+			tune_shows[i] = shows[i];
+			tune_shows_peak[i] = shows_peak[i].value;
+		}
+		idle_state = alive_now.idle;
+		breath_state = alive_now.breath;
 		if (os_gettime_ns() - last_render > 500'000'000ULL)
 			showing_now = false;
 	}
@@ -2245,6 +2371,7 @@ struct FaceAvatar {
 									    : 0;
 		l3.hide = obs_data_get_bool(settings, "hide_behind_head");
 		l3.smooth = obs_data_get_bool(settings, "smooth_edges");
+		l3.fingers = clampf((float)obs_data_get_int(settings, "fingers") / 100.0f, 0, 1);
 		const json model_place = json::parse(obs_data_get_string(settings, "model_place"), nullptr, false);
 		if (model_place.is_object()) {
 			auto number = [&model_place](const char *key, float def) {
@@ -2271,9 +2398,28 @@ struct FaceAvatar {
 			else
 				l3.setup = std::make_shared<CharacterSetup>(setup_from(l3.setup_text));
 		}
+		// Your face's tuning, and alive when you're still (alive.hpp).
+		FaceTune t;
+		for (int g = 0; g < TUNE_GROUPS; g++) {
+			const std::string key = std::string("tune_") + TUNE_NAMES[g];
+			t.range[g].from = clampf((float)obs_data_get_int(settings, (key + "_from").c_str()) / 100.0f, 0, 1);
+			t.range[g].to = clampf((float)obs_data_get_int(settings, (key + "_to").c_str()) / 100.0f, 0, 1);
+		}
+		t.linked_blink = obs_data_get_bool(settings, "linked_blink");
+		t.open_when_smiling = obs_data_get_bool(settings, "open_when_smiling");
+		t.eye_move = clampf((float)obs_data_get_int(settings, "eye_move") / 100.0f, 0, 2);
+		AliveOptions ao;
+		ao.breath = clampf((float)obs_data_get_int(settings, "breathing") / 100.0f, 0, 1);
+		ao.breath_time = clampf((float)obs_data_get_int(settings, "breath_time"), 2, 20);
+		ao.sway = clampf((float)obs_data_get_int(settings, "sway") / 100.0f, 0, 1);
+		ao.eye_moves = obs_data_get_bool(settings, "eye_moves");
+		ao.auto_blink = obs_data_get_bool(settings, "auto_blink");
 		{
 			std::lock_guard<std::mutex> l(pictures_lock);
 			look3d = l3;
+			tune = t;
+			alive_options = ao;
+			body_follow = clampf((float)obs_data_get_int(settings, "body_follow") / 100.0f, 0, 1);
 		}
 		const char *model_file = obs_data_get_string(settings, "model");
 		loader.want(model_file ? model_file : "");
@@ -2369,6 +2515,56 @@ struct FaceAvatar {
 			{"ms", r(state_now.ms, 10)}};
 		if (!state_now.problem.empty())
 			answer["problem"] = state_now.problem;
+		// Your face's tuning, live: what the camera reads for each group
+		// and what the character shows from it (alive.hpp), now and at its
+		// highest lately.
+		{
+			json reading = json::object(), reading_peak = json::object(), shows = json::object(),
+			     shows_peak = json::object();
+			for (int i = 0; i < TUNE_GROUPS; i++) {
+				reading[TUNE_NAMES[i]] = r(tune_reading[i], 100);
+				reading_peak[TUNE_NAMES[i]] = r(tune_reading_peak[i], 100);
+				shows[TUNE_NAMES[i]] = r(tune_shows[i], 100);
+				shows_peak[TUNE_NAMES[i]] = r(tune_shows_peak[i], 100);
+			}
+			answer["tune"] = {{"reading", reading},
+					  {"reading_peak", reading_peak},
+					  {"shows", shows},
+					  {"shows_peak", shows_peak}};
+		}
+		answer["alive"] = {{"idle", r(idle_state, 100)}, {"breath", r(breath_state, 100)}};
+		// For "Check my camera": where your face is in the camera's
+		// picture (shares of it), which way you face the camera itself
+		// (degrees, as Turn - not against "Set"), and how lit it is.
+		{
+			json check = {{"seen", face.found}};
+			if (face.found && face.w > 0 && face.h > 0) {
+				float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+				for (const Point &p : face.points) {
+					x0 = std::min(x0, p.x);
+					y0 = std::min(y0, p.y);
+					x1 = std::max(x1, p.x);
+					y1 = std::max(y1, p.y);
+				}
+				check["box"] = {{"x", r(x0 / face.w, 1e3f)},
+						{"y", r(y0 / face.h, 1e3f)},
+						{"w", r((x1 - x0) / face.w, 1e3f)},
+						{"h", r((y1 - y0) / face.h, 1e3f)}};
+				const Turn facing = turn_of(face.pose);
+				check["facing"] = {{"yaw", r(facing.yaw, 10)},
+						   {"pitch", r(facing.pitch, 10)},
+						   {"roll", r(facing.roll, 10)}};
+			}
+			const Light &lit = state_now.light;
+			if (lit.seen)
+				check["light"] = {{"face", r(lit.face, 100)},
+						  {"left", r(lit.left, 100)},
+						  {"right", r(lit.right, 100)},
+						  {"room", r(lit.room, 100)}};
+			check["camera_width"] = cam_w.load();
+			check["camera_height"] = cam_h.load();
+			answer["camera_check"] = check;
+		}
 		answer["style"] = drawn_style ? "drawn" : "real";
 		answer["worn"] = worn.load();
 		// (No lists of plain values: OBS only passes on lists of objects.)
@@ -2413,6 +2609,8 @@ struct FaceAvatar {
 				      {"swinging_chain", st.chain},
 				      {"arkit_parts", st.arkit},
 				      {"set_up", st.set_up},
+				      {"finger_joints", st.fingers},
+				      {"body", st.body},
 				      {"upright_parts", st.upright},
 				      {"cards", st.cards},
 				      {"outfit_layers", st.layers},
@@ -2556,6 +2754,23 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "framing", "auto");
 	obs_data_set_default_bool(settings, "hide_behind_head", true);
 	obs_data_set_default_bool(settings, "smooth_edges", true);
+	obs_data_set_default_int(settings, "fingers", 50);
+	// Your face's tuning (alive.hpp's starting values), and alive when
+	// you're still.
+	for (int g = 0; g < TUNE_GROUPS; g++) {
+		const std::string key = std::string("tune_") + TUNE_NAMES[g];
+		obs_data_set_default_int(settings, (key + "_from").c_str(), tune_default(g, false));
+		obs_data_set_default_int(settings, (key + "_to").c_str(), tune_default(g, true));
+	}
+	obs_data_set_default_bool(settings, "linked_blink", true);
+	obs_data_set_default_bool(settings, "open_when_smiling", true);
+	obs_data_set_default_int(settings, "eye_move", 100);
+	obs_data_set_default_int(settings, "body_follow", 30);
+	obs_data_set_default_int(settings, "breathing", 50);
+	obs_data_set_default_int(settings, "breath_time", 5);
+	obs_data_set_default_int(settings, "sway", 50);
+	obs_data_set_default_bool(settings, "eye_moves", true);
+	obs_data_set_default_bool(settings, "auto_blink", false);
 	obs_data_set_default_string(settings, "model_place", "");
 	obs_data_set_default_string(settings, "model_setup", "");
 }
@@ -2676,7 +2891,43 @@ obs_properties_t *get_properties(void *data)
 	obs_property_list_add_string(framing, text("FaceAvatar.FramingHead"), "head");
 	obs_properties_add_bool(m3, "hide_behind_head", text("FaceAvatar.HideBehindHead"));
 	obs_properties_add_bool(m3, "smooth_edges", text("FaceAvatar.SmoothEdges"));
+	p = obs_properties_add_int_slider(m3, "fingers", text("FaceAvatar.Fingers"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
 	obs_properties_add_group(props, "model3d", text("FaceAvatar.Model3D"), OBS_GROUP_NORMAL, m3);
+
+	// Your face's tuning: where each of the camera's readings starts and
+	// where it's full (DireBot's page shows them live).
+	obs_properties_t *tune = obs_properties_create();
+	obs_properties_add_text(tune, "tune_about", text("FaceAvatar.TuneAbout"), OBS_TEXT_INFO);
+	for (int g = 0; g < TUNE_GROUPS; g++) {
+		const std::string key = std::string("tune_") + TUNE_NAMES[g], name = std::string("FaceAvatar.Tune.") +
+										     TUNE_NAMES[g];
+		const std::string from = std::string(text(name.c_str())) + " - " + text("FaceAvatar.TuneFrom"),
+				  to = std::string(text(name.c_str())) + " - " + text("FaceAvatar.TuneTo");
+		p = obs_properties_add_int_slider(tune, (key + "_from").c_str(), from.c_str(), 0, 100, 1);
+		obs_property_int_set_suffix(p, "%");
+		p = obs_properties_add_int_slider(tune, (key + "_to").c_str(), to.c_str(), 0, 100, 1);
+		obs_property_int_set_suffix(p, "%");
+	}
+	obs_properties_add_bool(tune, "linked_blink", text("FaceAvatar.LinkedBlink"));
+	obs_properties_add_bool(tune, "open_when_smiling", text("FaceAvatar.OpenWhenSmiling"));
+	p = obs_properties_add_int_slider(tune, "eye_move", text("FaceAvatar.EyeMove"), 0, 200, 5);
+	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_group(props, "tune", text("FaceAvatar.Tune"), OBS_GROUP_NORMAL, tune);
+
+	// Alive when you're still.
+	obs_properties_t *alive = obs_properties_create();
+	p = obs_properties_add_int_slider(alive, "breathing", text("FaceAvatar.Breathing"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
+	p = obs_properties_add_int_slider(alive, "breath_time", text("FaceAvatar.BreathTime"), 2, 20, 1);
+	obs_property_int_set_suffix(p, " s");
+	p = obs_properties_add_int_slider(alive, "sway", text("FaceAvatar.Sway"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
+	p = obs_properties_add_int_slider(alive, "body_follow", text("FaceAvatar.BodyFollow"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_bool(alive, "eye_moves", text("FaceAvatar.EyeMoves"));
+	obs_properties_add_bool(alive, "auto_blink", text("FaceAvatar.AutoBlink"));
+	obs_properties_add_group(props, "alive", text("FaceAvatar.Alive"), OBS_GROUP_NORMAL, alive);
 	return props;
 }
 

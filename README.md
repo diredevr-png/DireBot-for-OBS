@@ -112,6 +112,28 @@ still: the `still_faces` setting names them, a part's name a line ("#n" for
 an unnamed n-th node). Shapes your face moves start from nothing, whatever
 strength the file was saved with. With two characters sharing a blink or a
 mouth, your real eyes and mouth go on the one round the head bone.
+A VRM's fingers rest relaxed (the `fingers` setting: 0 as made, 50
+relaxed, 100 curled; fingers its file already bends are bent only the rest
+of the way, and ones its own animation moves are left to it).
+
+**Tune your face, and alive when you're still (0.5.0).** Google's face
+models read some faces and cameras muted (a blink that never quite
+closes, a mouth that barely opens), so for each of the face's main moves
+(`blink`, `mouth`, `smile`, `round`, `brows_up`, `brows_down`, `look`)
+the `tune_<name>_from` and `tune_<name>_to` settings (0-100) say where the
+camera's reading starts to move the character and where it's all the way;
+`linked_blink` blinks both eyes together, `open_when_smiling` keeps its
+eyes open in a big smile (a real blink still shuts them), and `eye_move`
+(0-200) is how far its eyes move. A character that holds perfectly still
+looks frozen, so it breathes (`breathing` 0-100, a breath every
+`breath_time` seconds: VMagicMirror's sin-squared breath), sways and looks
+about a little (`sway`), and its eyes make small moves (`eye_moves`).
+When it can't see you it holds your last look for a second, then eases
+into a gentle idle - looking about, blinking by itself - and is back with
+you as soon as it sees you; `auto_blink` makes it blink by itself while it
+sees you too. A VRM's chest and shoulders rise with each breath and its
+body takes some of your head's turn (`body_follow` 0-100); a 3D character
+with no bones grows a touch with each breath, and a 2D one rises.
 Your real
 eyes and mouth go on its face too, soft-edged and in its skin's colour,
 turning half as far as it does, while its own stay still under them (or
@@ -188,7 +210,7 @@ The add-on's own requests go through `CallVendorRequest` with
 | `RecordSetOptions` `{options}` | saves them (the same shape as `options` above); answers the state |
 | `RecordStart` / `RecordStop` | the state, plus `note` when some couldn't start, or `error` in words when none could. The `RecordChanged` vendor event sends the state whenever it changes |
 | `FaceSet` `{source, clear?}` | "Set": the next looks that find the face are its rest, kept in the source's `rest` setting (`setting` while it's taking them); `clear` forgets it. `ok`, or `error` in words (for one, the face avatar isn't shown) |
-| `FaceGetState` `{source, points?}` | `camera`, `ready`, `showing`, `found`, `presence` (0-1), `set`, `setting`, `turn` (`yaw`, `pitch`, `roll` in degrees, since "Set"), `turned` (-1, 0, 1), `moves` (the 51 expressions, 0-1 since "Set", ARKit's names), `parts` (first eye, second eye, mouth: `x`, `y`, `w`, `h` shares of the camera's picture), `shown`, `holding`, `looks_per_second`, `ms`, `problem`; with `points`, the 478 `points` (`x`, `y` shares); with a 3D character, `model`: `file`, `loaded`, `loading`, `shown`, `kind` (`gltf`, `vrm0`, `vrm1`), `title`, `author`, `points`, `triangles`, `springs`, `animations` (its own animations: `name` each), `animation` (the one playing, or ""), `swinging_chain`, `arkit_parts`, `blinks` and `talks` (once it's rigged: whether its own blink and mouth shapes move its face enough to see, at least 0.1% of its height; tiny marker shapes don't count), `set_up` (it has a set-up), `upright_parts`, `cards` (your eyes and mouth drawn on it last frame, 0-3), `outfit_layers` (outfit pictures drawn on it last frame), `spots` (`left_eye`, `right_eye`, `mouth`: `x`, `y`, `w`, `h` shares of its picture from the front, `from` where it found them: `expressions`, `eye bones`, `set up`, `guessed`), `expressions` (VRM's, 0-1), `yaw`, `pitch`, `x`, `y` (its middle in the picture, pixels), `problem` in words when it couldn't be read |
+| `FaceGetState` `{source, points?}` | `camera`, `ready`, `showing`, `found`, `presence` (0-1), `set`, `setting`, `turn` (`yaw`, `pitch`, `roll` in degrees, since "Set"), `turned` (-1, 0, 1), `moves` (the 51 expressions, 0-1 since "Set", ARKit's names), `parts` (first eye, second eye, mouth: `x`, `y`, `w`, `h` shares of the camera's picture), `shown`, `holding`, `looks_per_second`, `ms`, `problem`; with `points`, the 478 `points` (`x`, `y` shares); with a 3D character, `model`: `file`, `loaded`, `loading`, `shown`, `kind` (`gltf`, `vrm0`, `vrm1`), `title`, `author`, `points`, `triangles`, `springs`, `animations` (its own animations: `name` each), `animation` (the one playing, or ""), `swinging_chain`, `arkit_parts`, `blinks` and `talks` (once it's rigged: whether its own blink and mouth shapes move its face enough to see, at least 0.1% of its height; tiny marker shapes don't count), `set_up` (it has a set-up), `upright_parts`, `cards` (your eyes and mouth drawn on it last frame, 0-3), `outfit_layers` (outfit pictures drawn on it last frame), `spots` (`left_eye`, `right_eye`, `mouth`: `x`, `y`, `w`, `h` shares of its picture from the front, `from` where it found them: `expressions`, `eye bones`, `set up`, `guessed`), `expressions` (VRM's, 0-1), `yaw`, `pitch`, `x`, `y` (its middle in the picture, pixels), `finger_joints` (the finger joints it curls), `body` (it has a spine or chest that breathes and follows your head), `problem` in words when it couldn't be read. Always (0.5.0): `tune`: `reading` and `shows` (each tune group, 0-1: what the camera reads and what the character shows from it) and `reading_peak`, `shows_peak` (the same, held at their highest for 0.6 s); `alive`: `idle` (0 following you to 1 idle), `breath` (0-1); `camera_check`: `seen`, `box` (`x`, `y`, `w`, `h`: your face in the camera's picture, shares of it), `facing` (`yaw`, `pitch`, `roll`: which way you face the camera itself, degrees, not since "Set"), `light` (`face`, `left`, `right` - each side of your face as the picture shows it - and `room`, the rest of the picture: 0 black to 1 white), `camera_width`, `camera_height` |
 | `FaceModelFront` `{source, width?, close?}` | its 3D character straight from the front as it's made: `width`, `height`, `rgba` (base64, plain colour), `box` (`left`, `top`, `width`, `height` in the model), `region` (`x`, `y`, `w`, `h`: the part of the box drawn, as shares of it), `spots` (as in `FaceGetState`) - its front picture, which spots and outfit places are shares of. `close`: just the part round its face, for its eyes and mouth up close (`spots` are still shares of the whole box) |
 | `GetUsage` | `measuring` (first 3 seconds), `fps`, `fps_now`, `frame_ms`, `frame_budget_ms`, `frames`, `frames_lagged`, `encoded`, `encoded_skipped`, `cpu`, `memory_mb`, `stream_frames`, `stream_dropped`, and `sources`: per input and filter `name`, `uuid`, `kind`, `type`, `active`, `showing`, `measured`, `tick_ms`, `render_ms`, `gpu_ms` (+ `_max_ms`), `fps_in`/`fps_shown` for cameras and media, `parent`/`enabled` for filters (and `own_ms`/`own_gpu_ms`: a filter's time takes in what it draws on, so this is its own part), and `hints` (browser size/fps/"shut down when hidden", whether it shows a page on this PC and its port, a short fingerprint of a camera to spot the same one added twice) |
 

@@ -3,9 +3,12 @@
 // glTF the ways files store their numbers (packed, interleaved, sparse,
 // squeezed into bytes, strips and fans, matrices), broken and hostile
 // files, VRM 1.0 and 0.x (bones, expressions, swinging parts, what they
-// bump into), and a chain of links swinging on one line of bones.
+// bump into, a body that breathes, fingers that rest relaxed), and a
+// chain of links swinging on one line of bones. And your face's tuning,
+// alive when you're still and the camera check (src/face/alive.cpp).
 // Build and run: tools/test-link.sh (Linux, any C++17 compiler).
 
+#include "../src/face/alive.hpp"
 #include "../src/face/effect-needs.hpp"
 #include "../src/face/model.hpp"
 #include "../src/face/rig.hpp"
@@ -786,11 +789,13 @@ static void test_expressions()
 	d.moves[move_of_name("jawOpen")] = 0.8f;
 	rig.pose(d);
 	const std::vector<float> &w = rig.weights()[0];
-	CHECK(near(w[3], 0.8, 1e-5));                            // jawOpen itself
-	CHECK(near(w[0], (0.8 - 0.05) / 0.5 > 1 ? 1 : 0, 1e-5)); // aa, all the way
-	CHECK(near(rig.expression_values().at("aa"), 1, 1e-5));
+	CHECK(near(w[3], 0.8, 1e-5)); // jawOpen itself
+	// aa as far: your moves come through your face's tuning (alive.hpp),
+	// so an open mouth is already as open as it's tuned to be.
+	CHECK(near(w[0], 0.8, 1e-5));
+	CHECK(near(rig.expression_values().at("aa"), 0.8, 1e-5));
 	// The box's points moved by them.
-	CHECK(near(rig.parts()[0].pos[0].y, 1.6f - 0.05f, 1e-4));
+	CHECK(near(rig.parts()[0].pos[0].y, 1.6f - 0.05f * 0.8f, 1e-4));
 	// Blinks: both eyes shut -> blink.
 	d = still();
 	d.moves[move_of_name("eyeBlinkLeft")] = 1;
@@ -932,7 +937,7 @@ static void test_names_and_sides()
 	d.moves[move_of_name("jawOpen")] = 0.3f;
 	rig.pose(d);
 	CHECK(near(rig.weights()[0][0], 1, 1e-5));
-	CHECK(near(rig.weights()[0][1], 0.5, 1e-5));
+	CHECK(near(rig.weights()[0][1], 0.3, 1e-5));
 	CHECK(near(rig.weights()[0][2], 0, 1e-5) && near(rig.weights()[0][3], 0, 1e-5));
 
 	// Made for ARKit: 52 morphs named as ARKit's, driven straight.
@@ -1897,6 +1902,514 @@ static void test_effect_needs()
 	check_effect_needs("direbot-face.effect", direbot::face::face_2d_needs());
 }
 
+
+// --- Tune your face, alive when you're still, the camera check ---------------
+
+static void test_tune()
+{
+	CHECK(tune_default(TUNE_BLINK, false) == 20 && tune_default(TUNE_BLINK, true) == 65);
+	CHECK(tune_default(TUNE_MOUTH, true) == 50 && tune_default(-1, true) == 100 && tune_default(99, false) == 0);
+	CHECK(std::string(TUNE_NAMES[TUNE_BROWS_DOWN]) == "brows_down" && std::string(TUNE_NAMES[TUNE_LOOK]) == "look");
+	const int bl = move_of_name("eyeBlinkLeft"), br = move_of_name("eyeBlinkRight"), jaw = move_of_name("jawOpen"),
+		  sl = move_of_name("mouthSmileLeft"), sr = move_of_name("mouthSmileRight"),
+		  funnel = move_of_name("mouthFunnel"), pucker = move_of_name("mouthPucker"),
+		  inner = move_of_name("browInnerUp"), outer_l = move_of_name("browOuterUpLeft"),
+		  outer_r = move_of_name("browOuterUpRight"), down_l = move_of_name("browDownLeft"),
+		  down_r = move_of_name("browDownRight"), look_in = move_of_name("eyeLookInLeft"),
+		  look_down = move_of_name("eyeLookDownRight"), cheek = move_of_name("cheekPuff");
+
+	// What the camera reads for each group.
+	FaceTune t;
+	float mv[EXPRESSIONS] = {}, read[TUNE_GROUPS], out[EXPRESSIONS];
+	mv[bl] = 0.6f, mv[br] = 0.2f, mv[jaw] = 0.3f, mv[sl] = 0.4f, mv[sr] = 0.2f, mv[funnel] = 0.1f;
+	mv[pucker] = 0.5f, mv[inner] = 0.2f, mv[outer_l] = 0.6f, mv[outer_r] = 0.4f, mv[down_l] = 0.3f;
+	mv[down_r] = 0.1f, mv[look_in] = 0.45f, mv[look_down] = 0.3f, mv[cheek] = 0.4f;
+	tune_readings(mv, t, read);
+	CHECK(near(read[TUNE_BLINK], 0.4, 1e-6)); // both eyes together
+	CHECK(near(read[TUNE_MOUTH], 0.3, 1e-6) && near(read[TUNE_SMILE], 0.3, 1e-6));
+	CHECK(near(read[TUNE_ROUND], 0.5, 1e-6) && near(read[TUNE_BROWS_UP], 0.5, 1e-6));
+	CHECK(near(read[TUNE_BROWS_DOWN], 0.2, 1e-6) && near(read[TUNE_LOOK], 0.45, 1e-6));
+	t.linked_blink = false;
+	tune_readings(mv, t, read);
+	CHECK(near(read[TUNE_BLINK], 0.6, 1e-6)); // the more shut eye
+
+	// Each from where it starts (0) to where it's full (1); moves
+	// outside the groups as they are.
+	t = FaceTune();
+	t.open_when_smiling = false;
+	float m2[EXPRESSIONS] = {};
+	m2[jaw] = 0.05f + 0.45f * 0.5f;
+	m2[cheek] = 0.4f;
+	m2[funnel] = 0.1f; // under where it starts
+	m2[pucker] = 0.9f; // past full
+	tune_moves(m2, t, out);
+	CHECK(near(out[jaw], 0.5, 1e-5) && near(out[cheek], 0.4, 1e-6) && out[funnel] == 0 && out[pucker] == 1);
+	tune_moves(m2, t, m2); // in place, the same
+	CHECK(near(m2[jaw], 0.5, 1e-5) && m2[pucker] == 1 && near(m2[cheek], 0.4, 1e-6));
+
+	// One eye reads shut and the other doesn't: no half-wink, linked.
+	float m3[EXPRESSIONS] = {};
+	m3[bl] = 0.65f, m3[br] = 0.2f;
+	tune_moves(m3, t, out);
+	CHECK(near(out[bl], out[br], 1e-6) && near(out[bl], (0.425 - 0.2) / 0.45, 1e-5));
+	t.linked_blink = false;
+	tune_moves(m3, t, out);
+	CHECK(near(out[bl], 1, 1e-6) && out[br] == 0);
+
+	// A big smile pushes the cheeks up and reads as the eyes shutting:
+	// they stay open - and a real blink still shuts them.
+	t = FaceTune();
+	float m4[EXPRESSIONS] = {};
+	m4[bl] = m4[br] = 0.5f;
+	tune_moves(m4, t, out);
+	const float plain = out[bl];
+	m4[sl] = m4[sr] = 0.7f;
+	tune_moves(m4, t, out);
+	CHECK(plain > 0.6f && out[bl] < 0.3f && out[br] < 0.3f);
+	m4[bl] = m4[br] = 0.7f;
+	tune_moves(m4, t, out);
+	CHECK(out[bl] == 1 && out[br] == 1);
+	t.open_when_smiling = false;
+	m4[bl] = m4[br] = 0.5f;
+	tune_moves(m4, t, out);
+	CHECK(near(out[bl], plain, 1e-6));
+
+	// The eyes as far as they're set to move.
+	t = FaceTune();
+	float m5[EXPRESSIONS] = {};
+	m5[look_in] = 0.4f; // (0.4 - 0.1) / 0.6: halfway
+	tune_moves(m5, t, out);
+	CHECK(near(out[look_in], 0.5, 1e-5));
+	t.eye_move = 2;
+	tune_moves(m5, t, out);
+	CHECK(near(out[look_in], 1, 1e-5));
+	t.eye_move = 0;
+	tune_moves(m5, t, out);
+	CHECK(out[look_in] == 0);
+	t.eye_move = NAN;
+	tune_moves(m5, t, out);
+	CHECK(near(out[look_in], 0.5, 1e-5));
+
+	// Ranges the wrong way round, or not numbers: full just past where it
+	// starts, never a NaN.
+	t = FaceTune();
+	t.range[TUNE_MOUTH] = {0.8f, 0.3f};
+	float m6[EXPRESSIONS] = {};
+	m6[jaw] = 0.81f;
+	tune_moves(m6, t, out);
+	CHECK(near(out[jaw], 0.5, 1e-3));
+	t.range[TUNE_MOUTH] = {NAN, 2};
+	t.range[TUNE_BLINK] = {INFINITY, -INFINITY};
+	m6[bl] = m6[br] = 0.99f;
+	tune_moves(m6, t, out);
+	bool fine = true;
+	for (int i = 0; i < EXPRESSIONS; i++)
+		fine = fine && std::isfinite(out[i]) && out[i] >= 0 && out[i] <= 1;
+	CHECK(fine && near(out[jaw], 0.81, 1e-5));
+}
+
+static void test_alive()
+{
+	const int bl = move_of_name("eyeBlinkLeft"), br = move_of_name("eyeBlinkRight"), jaw = move_of_name("jawOpen");
+	float none[EXPRESSIONS] = {}, face[EXPRESSIONS] = {};
+	face[jaw] = 0.6f;
+	const float dt = 1.0f / 60;
+
+	// A breath: in for half of it, out for the other half.
+	{
+		Alive a;
+		AliveOptions o;
+		o.breath = 1;
+		o.breath_time = 4;
+		o.sway = 0;
+		o.eye_moves = false;
+		a.set(o);
+		float most = 0, last = 1, most_at = 0;
+		for (int i = 1; i <= 240; i++) {
+			const AliveOut out = a.step(dt, true, 0, 0, 0, none);
+			if (out.breath > most)
+				most = out.breath, most_at = i * dt;
+			last = out.breath;
+			CHECK(i < 240 || (out.sway_yaw == 0 && out.body_yaw == 0 && out.body_roll == 0));
+		}
+		CHECK(most > 0.999f && near(most_at, 2, 0.05) && last < 0.01f);
+		o.breath = 0.5f;
+		a.set(o);
+		for (int i = 0; i < 120; i++)
+			most = std::max(most, a.step(dt, true, 0, 0, 0, none).breath * 2);
+		CHECK(most <= 1.0001f);
+		o.breath = 0;
+		a.set(o);
+		CHECK(a.step(dt, true, 0, 0, 0, none).breath == 0);
+	}
+
+	// Following you; your last look held a moment when it can't see you,
+	// then easing into idle; back with you in a moment.
+	{
+		Alive a;
+		AliveOptions o;
+		o.sway = 0;
+		o.breath = 0;
+		o.eye_moves = false;
+		a.set(o);
+		AliveOut out = a.step(dt, false, 0, 0, 0, none);
+		CHECK(out.idle == 1); // nothing seen yet: idle
+		for (int i = 0; i < 60; i++)
+			out = a.step(dt, true, 20, -10, 5, face);
+		CHECK(out.idle == 0 && near(out.yaw, 20, 1e-4) && near(out.pitch, -10, 1e-4) && near(out.roll, 5, 1e-4));
+		CHECK(near(out.moves[jaw], 0.6, 1e-6) && out.moves[bl] == 0);
+		for (int i = 0; i < 54; i++) // 0.9 s
+			out = a.step(dt, false, 0, 0, 0, none);
+		CHECK(out.idle == 0 && near(out.yaw, 20, 1e-4) && near(out.moves[jaw], 0.6, 1e-6));
+		for (int i = 0; i < 51; i++) // 1.75 s: halfway through easing
+			out = a.step(dt, false, 0, 0, 0, none);
+		CHECK(near(out.idle, 0.5, 0.03) && near(out.yaw, 10, 0.6) && near(out.moves[jaw], 0.3, 0.02));
+		for (int i = 0; i < 46; i++) // 2.52 s
+			out = a.step(dt, false, 0, 0, 0, none);
+		CHECK(out.idle == 1 && out.yaw == 0 && out.pitch == 0 && out.moves[jaw] == 0);
+		for (int i = 0; i < 18; i++) // 0.3 s
+			out = a.step(dt, true, -15, 0, 0, face);
+		CHECK(out.idle < 0.1f && near(out.yaw, -15 * (1 - out.idle), 1e-3));
+		// Lost again while still coming back: no jump.
+		AliveOut was = out;
+		out = a.step(dt, false, 0, 0, 0, none);
+		CHECK(near(out.idle, was.idle, 1e-6) && near(out.yaw, was.yaw, 0.2));
+	}
+
+	// Idle: its own blinks (3 to 7 seconds apart, now and then twice),
+	// looking about and its eyes' small moves - the same each time from
+	// the same start, and within their ranges.
+	{
+		Alive a, b;
+		int blinks = 0;
+		bool shut = false, same = true, ranged = true;
+		for (int i = 0; i < 60 * 60; i++) {
+			const AliveOut x = a.step(dt, false, 0, 0, 0, none), y = b.step(dt, false, 0, 0, 0, none);
+			same = same && x.moves[bl] == y.moves[bl] && x.eye_yaw == y.eye_yaw && x.sway_yaw == y.sway_yaw &&
+			       x.breath == y.breath;
+			ranged = ranged && x.moves[bl] >= 0 && x.moves[bl] <= 1 && x.moves[bl] == x.moves[br] &&
+				 std::fabs(x.eye_yaw) <= 8 && x.eye_pitch >= -4 && x.eye_pitch <= 2 &&
+				 std::fabs(x.sway_yaw) <= 7.01f && std::fabs(x.sway_pitch) <= 3.51f &&
+				 std::fabs(x.sway_roll) <= 4.01f && std::fabs(x.body_yaw) <= 2.41f &&
+				 std::fabs(x.body_roll) <= 1.61f && x.breath >= 0 && x.breath <= 0.5f;
+			if (!shut && x.moves[bl] > 0.9f)
+				blinks++, shut = true;
+			if (x.moves[bl] < 0.1f)
+				shut = false;
+		}
+		CHECK(same && ranged);
+		std::printf("unit_model: %d blinks in a minute, idle\n", blinks);
+		CHECK(blinks >= 8 && blinks <= 30);
+	}
+
+	// While it sees you: its eyes' small moves are small, and it doesn't
+	// blink by itself - unless asked (a camera that misses blinks).
+	{
+		Alive a;
+		AliveOptions o;
+		a.set(o);
+		int shut = 0;
+		bool small = true;
+		for (int i = 0; i < 30 * 60; i++) {
+			const AliveOut x = a.step(dt, true, 0, 0, 0, none);
+			shut += x.moves[bl] > 0.5f;
+			if (i > 90) // (once it's back with you)
+				small = small && std::fabs(x.eye_yaw) <= 1.501f && x.eye_pitch >= -1.001f &&
+					x.eye_pitch <= 0.501f &&
+					std::fabs(x.sway_yaw) <= 0.81f;
+		}
+		CHECK(shut == 0);
+		CHECK(small);
+		o.auto_blink = true;
+		a.set(o);
+		for (int i = 0; i < 30 * 60; i++)
+			shut += a.step(dt, true, 0, 0, 0, none).moves[bl] > 0.5f;
+		CHECK(shut > 0);
+		// Its eyes' small moves off: back to straight ahead.
+		o.eye_moves = false;
+		a.set(o);
+		AliveOut x;
+		for (int i = 0; i < 60; i++)
+			x = a.step(dt, true, 0, 0, 0, none);
+		CHECK(std::fabs(x.eye_yaw) < 0.01f && std::fabs(x.eye_pitch) < 0.01f);
+		// A frame time that's no number moves nothing on.
+		x = a.step(NAN, true, 0, 0, 0, none);
+		CHECK(std::isfinite(x.breath) && std::isfinite(x.sway_yaw) && std::isfinite(x.eye_yaw));
+	}
+
+	// Its eyes' small moves as the eyes' looks: 15 degrees towards its
+	// left is its left eye half out and its right eye half in.
+	float looks[EXPRESSIONS] = {};
+	add_eye_turn(looks, 15, -12.5f);
+	CHECK(near(looks[move_of_name("eyeLookOutLeft")], 0.5, 1e-6) &&
+	      near(looks[move_of_name("eyeLookInRight")], 0.5, 1e-6) && looks[move_of_name("eyeLookInLeft")] == 0);
+	CHECK(near(looks[move_of_name("eyeLookDownLeft")], 0.5, 1e-6) &&
+	      near(looks[move_of_name("eyeLookDownRight")], 0.5, 1e-6) && looks[move_of_name("eyeLookUpLeft")] == 0);
+	add_eye_turn(looks, -60, 0);
+	CHECK(looks[move_of_name("eyeLookInLeft")] == 1 && looks[move_of_name("eyeLookOutRight")] == 1);
+}
+
+static void test_light()
+{
+	// A picture 64 x 48: the face's box (16-48 across, 8-40 down) lit
+	// brighter on the picture's left than its right, the room dim.
+	constexpr int W = 64, H = 48;
+	std::vector<uint8_t> px(W * H * 4, 0);
+	for (int y = 0; y < H; y++)
+		for (int x = 0; x < W; x++) {
+			const bool in = x >= 16 && x < 48 && y >= 8 && y < 40;
+			const uint8_t v = !in ? 30 : x < 32 ? 200 : 100;
+			uint8_t *p = &px[(y * W + x) * 4];
+			p[0] = p[1] = p[2] = v;
+			p[3] = 255;
+		}
+	Face face;
+	face.found = true;
+	// Its points at twice the picture's size (as the tracker's can be).
+	face.w = W * 2;
+	face.h = H * 2;
+	for (Point &p : face.points)
+		p = {64, 48, 0};
+	face.points[0] = {32, 16, 0};
+	face.points[1] = {96, 80, 0};
+	const Frame frame{px.data(), W, H, W * 4, false};
+	const Light l = light_of(frame, face);
+	CHECK(l.seen && near(l.left, 200 / 255.0, 1e-3) && near(l.right, 100 / 255.0, 1e-3));
+	CHECK(near(l.face, 150 / 255.0, 1e-3) && near(l.room, 30 / 255.0, 1e-3));
+	// Blue first, the same (grey is grey).
+	const Frame bgra{px.data(), W, H, W * 4, true};
+	CHECK(near(light_of(bgra, face).face, l.face, 1e-6));
+	face.found = false;
+	CHECK(!light_of(frame, face).seen);
+	face.found = true;
+	CHECK(!light_of(Frame{}, face).seen);
+}
+
+// A person with a body: its spine and chest under its neck, shoulders,
+// arms out in a T and hands with fingers held straight out, palms down
+// (VRM 1.0's bones). `bent`: its left first finger's knuckle already
+// bent this far towards its palm (degrees), as some files have them.
+struct Body {
+	Person p;
+	int spine, chest, hand[2], index[2][3], middle[2][3], thumb[2][3];
+};
+static Body make_body(float bent = 0)
+{
+	Body o;
+	o.p = make_person(false);
+	Person &p = o.p;
+	Builder &b = p.b;
+	json &bones = b.doc["extensions"]["VRMC_vrm"]["humanoid"]["humanBones"];
+	o.spine = b.node({{"name", "spine"}, {"translation", {0, 0.15f, 0}}});
+	o.chest = b.node({{"name", "chest"}, {"translation", {0, 0.2f, 0}}});
+	b.doc["nodes"][p.neck]["translation"] = {0, 0.15f, 0};
+	b.doc["nodes"][p.hips]["children"] = {o.spine};
+	b.doc["nodes"][o.spine]["children"] = {o.chest};
+	b.doc["nodes"][o.chest]["children"] = {p.neck};
+	bones["spine"] = {{"node", o.spine}};
+	bones["chest"] = {{"node", o.chest}};
+	const float PI = 3.14159265f;
+	for (int side = 0; side < 2; side++) {
+		const float sx = side ? -1.0f : 1.0f;
+		const std::string s = side ? "right" : "left", tag = side ? ".R" : ".L";
+		auto add = [&](int parent, const std::string &name, V3 at) {
+			const int n = b.node({{"name", name + tag}, {"translation", {at.x, at.y, at.z}}});
+			b.doc["nodes"][parent]["children"].push_back(n);
+			return n;
+		};
+		const int shoulder = add(o.chest, "shoulder", {sx * 0.05f, 0.13f, 0});
+		const int upper = add(shoulder, "upper_arm", {sx * 0.05f, 0, 0});
+		const int lower = add(upper, "lower_arm", {sx * 0.25f, 0, 0});
+		const int hand = o.hand[side] = add(lower, "hand", {sx * 0.25f, 0, 0});
+		bones[s + "Shoulder"] = {{"node", shoulder}};
+		bones[s + "UpperArm"] = {{"node", upper}};
+		bones[s + "LowerArm"] = {{"node", lower}};
+		bones[s + "Hand"] = {{"node", hand}};
+		const struct {
+			const char *name;
+			float z;
+		} digits[] = {{"Index", 0.02f}, {"Middle", 0}, {"Ring", -0.02f}, {"Little", -0.04f}};
+		for (const auto &d : digits) {
+			int j[3];
+			j[0] = add(hand, std::string(d.name) + "1", {sx * 0.03f, 0, d.z});
+			j[1] = add(j[0], std::string(d.name) + "2", {sx * 0.02f, 0, 0});
+			j[2] = add(j[1], std::string(d.name) + "3", {sx * 0.02f, 0, 0});
+			const char *joint[3] = {"Proximal", "Intermediate", "Distal"};
+			for (int k = 0; k < 3; k++)
+				bones[s + d.name + joint[k]] = {{"node", j[k]}};
+			if (std::strcmp(d.name, "Index") == 0)
+				std::copy(j, j + 3, o.index[side]);
+			if (std::strcmp(d.name, "Middle") == 0)
+				std::copy(j, j + 3, o.middle[side]);
+		}
+		int *t = o.thumb[side];
+		t[0] = add(hand, "thumb1", {sx * 0.01f, 0, 0.03f});
+		t[1] = add(t[0], "thumb2", {sx * 0.015f, 0, 0.015f});
+		t[2] = add(t[1], "thumb3", {sx * 0.015f, 0, 0.015f});
+		bones[s + "ThumbMetacarpal"] = {{"node", t[0]}};
+		bones[s + "ThumbProximal"] = {{"node", t[1]}};
+		bones[s + "ThumbDistal"] = {{"node", t[2]}};
+	}
+	if (bent != 0) {
+		// Towards its left palm (down) about -z.
+		const Quat q = axis_angle({0, 0, -1}, bent * PI / 180);
+		b.doc["nodes"][o.index[0][0]]["rotation"] = {q.x, q.y, q.z, q.w};
+	}
+	return o;
+}
+
+// How far a joint is bent from the bone before it (degrees), and
+// whether towards its palm.
+static float bend_of(const Rig &rig, int before, int joint, int side, bool *to_palm = nullptr)
+{
+	const float sx = side ? -1.0f : 1.0f;
+	const V3 a = normalized(direction(rig.world()[before], {sx, 0, 0})),
+		 b = normalized(direction(rig.world()[joint], {sx, 0, 0}));
+	if (to_palm)
+		*to_palm = dot(b, normalized(direction(rig.world()[before], {0, -1, 0}))) > 1e-4f;
+	return std::acos(std::min(1.0f, std::max(-1.0f, dot(a, b)))) * 180 / 3.14159265f;
+}
+
+static void test_fingers_and_body()
+{
+	Body body = make_body();
+	auto m = std::make_shared<Model>();
+	CHECK(load(body.p.b.glb(), *m));
+	RigOptions o;
+	o.springs = false;
+	Rig rig(m, o);
+	CHECK(rig.finger_joints() == 30 && rig.has_body());
+	rig.pose(still());
+	// Relaxed (the starting 0.5): each joint half its full curl, towards
+	// the palm, on both hands; the thumb a little.
+	for (int side = 0; side < 2; side++) {
+		bool palm = false;
+		CHECK(near(bend_of(rig, body.hand[side], body.index[side][0], side, &palm), 20, 0.05) && palm);
+		CHECK(near(bend_of(rig, body.index[side][0], body.index[side][1], side, &palm), 30, 0.05) && palm);
+		CHECK(near(bend_of(rig, body.middle[side][1], body.middle[side][2], side, &palm), 21, 0.05) && palm);
+		// (The thumb points out along its own way, between the fingers'
+		// way and the front.)
+		const V3 way{side ? -1.0f : 1.0f, 0, 1};
+		const V3 thumb0 = normalized(direction(rig.world()[body.thumb[side][0]], way)),
+			 hand0 = normalized(direction(rig.world()[body.hand[side]], way));
+		CHECK(near(std::acos(std::min(1.0f, dot(thumb0, hand0))) * 180 / 3.14159265, 7.5, 0.05) &&
+		      dot(thumb0, normalized(direction(rig.world()[body.hand[side]], {0, -1, 0}))) > 0);
+	}
+	// As made, and curled.
+	o.fingers = 0;
+	Rig flat(m, o);
+	flat.pose(still());
+	CHECK(near(bend_of(flat, body.hand[0], body.index[0][0], 0), 0, 0.05) && flat.finger_joints() == 30);
+	o.fingers = 1;
+	Rig curled(m, o);
+	curled.pose(still());
+	CHECK(near(bend_of(curled, body.index[1][0], body.index[1][1], 1), 60, 0.05));
+
+	// A finger its file already bends 30 degrees: relaxed leaves it be;
+	// curled, it's bent only the rest of the way.
+	Body pre = make_body(30);
+	auto mp = std::make_shared<Model>();
+	CHECK(load(pre.p.b.glb(), *mp));
+	o.fingers = 0.5f;
+	Rig relaxed_pre(mp, o);
+	relaxed_pre.pose(still());
+	CHECK(near(bend_of(relaxed_pre, pre.hand[0], pre.index[0][0], 0), 30, 0.05));
+	o.fingers = 1;
+	Rig curled_pre(mp, o);
+	curled_pre.pose(still());
+	CHECK(near(bend_of(curled_pre, pre.hand[0], pre.index[0][0], 0), 40, 0.05));
+
+	// A finger its own animation moves is left to it.
+	{
+		Body an = make_body();
+		Builder &b = an.p.b;
+		b.doc["animations"] = json::array(
+			{{{"name", "Point"},
+			  {"samplers",
+			   {{{"input", b.floats({0}, 1, "SCALAR")}, {"output", b.floats({0, 0, 0, 1}, 4, "VEC4")}}}},
+			  {"channels", {{{"sampler", 0}, {"target", {{"node", an.index[0][0]}, {"path", "rotation"}}}}}}}});
+		auto ma = std::make_shared<Model>();
+		CHECK(load(b.glb(), *ma));
+		RigOptions oa;
+		oa.springs = false;
+		oa.animation = 0;
+		Rig ra(ma, oa);
+		ra.pose(still());
+		CHECK(near(bend_of(ra, an.hand[0], an.index[0][0], 0), 0, 0.05));
+		CHECK(near(bend_of(ra, an.hand[1], an.index[1][0], 1), 20, 0.05));
+	}
+
+	// Its body takes some of your head's turn (40% at most), its head
+	// still turned just as yours.
+	const float PI = 3.14159265f;
+	const Quat turn = axis_angle({0, 1, 0}, 30 * PI / 180);
+	Drive d = still();
+	d.head = turn;
+	d.body_follow = 1;
+	rig.pose(d);
+	const V3 head_front = direction(rig.world()[body.p.head], {0, 0, 1});
+	const V3 chest_front = direction(rig.world()[body.chest], {0, 0, 1});
+	const V3 spine_front = direction(rig.world()[body.spine], {0, 0, 1});
+	CHECK(near3(normalized(head_front), rotate(turn, {0, 0, 1}), 1e-4f));
+	CHECK(near(std::atan2(chest_front.x, chest_front.z) * 180 / PI, 12, 0.05));
+	CHECK(near(std::atan2(spine_front.x, spine_front.z) * 180 / PI, 4.8, 0.05));
+	d.body_follow = 0;
+	rig.pose(d);
+	CHECK(near3(normalized(direction(rig.world()[body.chest], {0, 0, 1})), {0, 0, 1}, 1e-5f));
+	CHECK(near3(normalized(direction(rig.world()[body.p.head], {0, 0, 1})), rotate(turn, {0, 0, 1}), 1e-4f));
+	// Its own sway turns its body, not its head.
+	d = still();
+	d.body_yaw = 2;
+	rig.pose(d);
+	const V3 swayed = direction(rig.world()[body.chest], {0, 0, 1});
+	CHECK(near(std::atan2(swayed.x, swayed.z) * 180 / PI, 2, 0.05));
+	CHECK(near3(normalized(direction(rig.world()[body.p.head], {0, 0, 1})), {0, 0, 1}, 1e-4f));
+
+	// A breath: its chest rises (its head with it) and leans back a
+	// little, its shoulders rise.
+	d = still();
+	rig.pose(d);
+	const V3 head_out = move_of(rig.world()[body.p.head]);
+	const V3 arm_out = move_of(rig.world()[m->bone("leftUpperArm")]),
+		 elbow_out = move_of(rig.world()[m->bone("leftLowerArm")]);
+	d.breath = 1;
+	rig.pose(d);
+	const V3 head_in = move_of(rig.world()[body.p.head]);
+	const V3 arm_in = move_of(rig.world()[m->bone("leftUpperArm")]),
+		 elbow_in = move_of(rig.world()[m->bone("leftLowerArm")]);
+	// (Its height as the rig takes it: what's drawn, here its head.)
+	const float height = std::max(m->high.y - m->low.y, std::max(m->high.x - m->low.x, m->high.z - m->low.z));
+	CHECK(head_in.y - head_out.y > 0.002f * height && head_in.y - head_out.y < 0.006f * height);
+	CHECK(head_in.z < head_out.z); // leaning back
+	// Its shoulder up, its arm still hanging the same way.
+	CHECK(arm_in.y > arm_out.y + 0.0015f);
+	CHECK(near3(normalized(elbow_in - arm_in), normalized(elbow_out - arm_out), 1e-4f));
+
+	// One with no bones grows a little with each breath, from its bottom
+	// - unless it's worn on your head.
+	GlbPart part;
+	std::vector<uint16_t> ix16;
+	cube(part.pos, ix16, {0, 0.5f, 0});
+	part.index.assign(ix16.begin(), ix16.end());
+	auto mc = std::make_shared<Model>();
+	CHECK(load(write_glb({part}), *mc));
+	Rig box(mc, RigOptions());
+	CHECK(box.finger_joints() == 0 && !box.has_body());
+	Drive db = still();
+	db.breath = 1;
+	box.pose(db);
+	float low = 1e9f, high = -1e9f;
+	for (const V3 &v : box.parts()[0].pos)
+		low = std::min(low, v.y), high = std::max(high, v.y);
+	CHECK(near(low, 0, 1e-5) && near(high, 1.012, 1e-5));
+	db.breathe_whole = false;
+	box.pose(db);
+	high = -1e9f;
+	for (const V3 &v : box.parts()[0].pos)
+		high = std::max(high, v.y);
+	CHECK(near(high, 1, 1e-5));
+}
+
 int main()
 {
 	test_write_and_read();
@@ -1919,6 +2432,10 @@ int main()
 	test_set_up();
 	test_obs_camera();
 	test_effect_needs();
+	test_tune();
+	test_alive();
+	test_light();
+	test_fingers_and_body();
 	std::printf("unit_model: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;
 }

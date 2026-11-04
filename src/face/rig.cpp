@@ -155,8 +155,13 @@ int move_id(const char *name)
 	return 0;
 }
 
-// VRM's expressions from your 52 (0 to 1 each). `per_eye`: the character
-// has a blink for each eye, so a wink is one and a blink both.
+// VRM's expressions from your 52 (0 to 1 each, already tuned: alive.hpp's
+// tune_moves - each starts where your face's tuning says and is full where
+// it says). `per_eye`: the character has a blink for each eye, so a wink is
+// one and a blink both. A blink, the mouth's shapes and the eyes' looks
+// follow the tuned moves as they are; the whole-face expressions (happy,
+// angry, sad, surprised) only from half way or so, as a big smile, frown
+// or raised brows - a VRM's "happy" often shuts the eyes too.
 std::map<std::string, float> vrm_values(const float *mv, bool per_eye)
 {
 	static const int blink_l = move_id("eyeBlinkLeft"), blink_r = move_id("eyeBlinkRight"),
@@ -172,7 +177,7 @@ std::map<std::string, float> vrm_values(const float *mv, bool per_eye)
 			 in_r = move_id("eyeLookInRight"), out_l = move_id("eyeLookOutLeft"),
 			 out_r = move_id("eyeLookOutRight");
 	std::map<std::string, float> v;
-	const float l = ramp(mv[blink_l], 0.2f, 0.8f), r = ramp(mv[blink_r], 0.2f, 0.8f);
+	const float l = clamp01(mv[blink_l]), r = clamp01(mv[blink_r]);
 	if (per_eye) {
 		const float both = std::min(l, r);
 		v["blink"] = both;
@@ -183,7 +188,7 @@ std::map<std::string, float> vrm_values(const float *mv, bool per_eye)
 		v["blinkLeft"] = l;
 		v["blinkRight"] = r;
 	}
-	float aa = ramp(mv[jaw], 0.05f, 0.55f), oh = ramp(mv[funnel], 0.1f, 0.6f), ou = ramp(mv[pucker], 0.15f, 0.7f),
+	float aa = clamp01(mv[jaw]), oh = clamp01(mv[funnel]), ou = clamp01(mv[pucker]),
 	      ee = ramp((mv[stretch_l] + mv[stretch_r]) / 2, 0.1f, 0.5f), ih = ee * 0.5f;
 	const float mouth = aa + oh + ou + ee + ih;
 	if (mouth > 1) {
@@ -198,17 +203,17 @@ std::map<std::string, float> vrm_values(const float *mv, bool per_eye)
 	v["ou"] = ou;
 	v["ee"] = ee;
 	v["oh"] = oh;
-	v["happy"] = ramp((mv[smile_l] + mv[smile_r]) / 2, 0.35f, 0.85f);
-	v["angry"] = ramp((mv[brow_down_l] + mv[brow_down_r]) / 2, 0.3f, 0.8f);
+	v["happy"] = ramp((mv[smile_l] + mv[smile_r]) / 2, 0.45f, 1.0f);
+	v["angry"] = ramp((mv[brow_down_l] + mv[brow_down_r]) / 2, 0.3f, 1.0f);
 	v["sad"] = ramp((mv[frown_l] + mv[frown_r]) / 2, 0.3f, 0.8f);
-	v["surprised"] = ramp(std::max(mv[brow_up], (mv[wide_l] + mv[wide_r]) / 2), 0.35f, 0.85f);
+	v["surprised"] = std::max(ramp(mv[brow_up], 0.4f, 1.0f), ramp((mv[wide_l] + mv[wide_r]) / 2, 0.35f, 0.85f));
 	v["relaxed"] = 0;
 	v["neutral"] = 0;
-	v["lookUp"] = ramp((mv[up_l] + mv[up_r]) / 2, 0.1f, 0.7f);
-	v["lookDown"] = ramp((mv[down_l] + mv[down_r]) / 2, 0.1f, 0.7f);
+	v["lookUp"] = clamp01((mv[up_l] + mv[up_r]) / 2);
+	v["lookDown"] = clamp01((mv[down_l] + mv[down_r]) / 2);
 	// Its left is +x (it faces +z): its left eye looking out, its right in.
-	v["lookLeft"] = ramp((mv[out_l] + mv[in_r]) / 2, 0.1f, 0.7f);
-	v["lookRight"] = ramp((mv[in_l] + mv[out_r]) / 2, 0.1f, 0.7f);
+	v["lookLeft"] = clamp01((mv[out_l] + mv[in_r]) / 2);
+	v["lookRight"] = clamp01((mv[in_l] + mv[out_r]) / 2);
 	return v;
 }
 
@@ -358,6 +363,17 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 	}
 	pivot_ = (m.low + m.high) * 0.5f;
 	height_ = std::max(1e-4f, std::max(m.high.y - m.low.y, std::max(m.high.x - m.low.x, m.high.z - m.low.z)));
+	// Its body: what breathes and follows your head.
+	for (const char *name : {"spine", "chest", "upperChest"}) {
+		const int b = m.bone(name);
+		if (b >= 0 && b != head_ && b != neck_)
+			torso_.push_back(b);
+	}
+	shoulder_[0] = m.bone("leftShoulder");
+	shoulder_[1] = m.bone("rightShoulder");
+	upper_arm_[0] = m.bone("leftUpperArm");
+	upper_arm_[1] = m.bone("rightUpperArm");
+	find_fingers();
 
 	// Expressions: the morphs, each only where it moves something.
 	sparse_.resize(m.meshes.size());
@@ -591,6 +607,130 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 	}
 }
 
+// `by` (a turn as the model at rest has it, round the node) on top of
+// the node's own turn (at rest, or as its animation has it now).
+void Rig::turn_in_rest(int node, Quat by)
+{
+	const Quat w = rot_of(rest_world_[node]);
+	r_[node] = r_[node] * (conj(w) * by * w);
+}
+
+// A VRM's fingers, to relax: each joint bends towards its palm, about an
+// axis across its finger, by how far a relaxed hand bends there - more at
+// the middle joint than the knuckle and the tip, more on the little finger
+// than the first (a resting hand's cascade) - less what its file already
+// bends it, so a hand made relaxed isn't curled twice.
+void Rig::find_fingers()
+{
+	const Model &m = *model_;
+	auto at = [this](int n) {
+		return move_of(rest_world_[n]);
+	};
+	// Each joint's bend at a full curl (degrees): knuckle, middle, tip.
+	static const struct {
+		const char *name;
+		float bend[3];
+	} DIGITS[] = {{"Index", {40, 60, 40}},
+		      {"Middle", {45, 65, 42}},
+		      {"Ring", {50, 70, 45}},
+		      {"Little", {55, 75, 48}},
+		      {"Thumb", {15, 25, 30}}};
+	for (int side = 0; side < 2; side++) {
+		const std::string s = side ? "right" : "left";
+		const int hand = m.bone(s + "Hand");
+		if (hand < 0)
+			continue;
+		auto bone = [&](const char *digit, const char *joint) {
+			return m.bone(s + digit + joint);
+		};
+		const int index = bone("Index", "Proximal"), middle = bone("Middle", "Proximal");
+		int little = bone("Little", "Proximal");
+		if (little < 0)
+			little = bone("Ring", "Proximal");
+		const int ahead = middle >= 0 ? middle : index;
+		if (ahead < 0 || index < 0 || little < 0 || index == little)
+			continue;
+		// Its palm's way: across the hand (first finger to little) and
+		// along it (wrist to knuckles) - which way round for each hand.
+		const V3 along = at(ahead) - at(hand), across = at(index) - at(little);
+		const V3 n = cross(along, across);
+		if (length(n) < 1e-9f * std::max(1e-6f, dot(along, along)))
+			continue;
+		const V3 palm = normalized(n) * (side ? -1.0f : 1.0f);
+		for (const auto &digit : DIGITS) {
+			const bool thumb = std::strcmp(digit.name, "Thumb") == 0;
+			// VRM 1.0's thumb: metacarpal, proximal, distal; 0.x's:
+			// proximal, intermediate, distal.
+			int joint[3];
+			if (thumb && bone("Thumb", "Metacarpal") >= 0) {
+				joint[0] = bone("Thumb", "Metacarpal");
+				joint[1] = bone("Thumb", "Proximal");
+				joint[2] = bone("Thumb", "Distal");
+			} else {
+				joint[0] = bone(digit.name, "Proximal");
+				joint[1] = bone(digit.name, "Intermediate");
+				joint[2] = bone(digit.name, "Distal");
+			}
+			if (joint[0] < 0)
+				continue;
+			const V3 way = joint[1] >= 0 ? at(joint[1]) - at(joint[0]) : at(joint[0]) - at(hand);
+			const V3 a = cross(way, palm);
+			if (length(a) < 1e-9f * std::max(1e-6f, dot(way, way)))
+				continue;
+			const V3 axis = normalized(a);
+			// How far its file already bends each joint, about that axis.
+			auto bend = [&axis](V3 from, V3 to) {
+				const V3 f = from - axis * dot(from, axis), t = to - axis * dot(to, axis);
+				if (length(f) < 1e-9f || length(t) < 1e-9f)
+					return 0.0f;
+				return std::atan2(dot(cross(f, t), axis), dot(f, t));
+			};
+			float before = 0;
+			for (int k = 0; k < 3 && joint[k] >= 0; k++) {
+				const int j = joint[k];
+				const V3 in = k == 0 ? at(j) - at(hand) : at(j) - at(joint[k - 1]);
+				int next = k + 1 < 3 ? joint[k + 1] : -1;
+				if (next < 0)
+					for (int c : m.nodes[j].children)
+						if (length(at(c) - at(j)) > 1e-7f) {
+							next = c;
+							break;
+						}
+				float has;
+				if (thumb && k == 0)
+					has = 0; // a thumb's first joint is splayed out from the hand
+				else if (next >= 0)
+					has = bend(in, at(next) - at(j));
+				else
+					has = before * 0.67f; // a tip with nothing after it: as a tip bends with the joint before it
+				has = std::max(-0.35f, has);
+				before = has;
+				Finger f;
+				f.node = j;
+				f.axis = axis;
+				f.most = digit.bend[k] * PI_F / 180;
+				f.has = has;
+				fingers_.push_back(f);
+			}
+		}
+	}
+}
+
+void Rig::curl_fingers()
+{
+	const float c = clamp01(options_.fingers);
+	if (c <= 0)
+		return;
+	for (const Finger &f : fingers_) {
+		// One its own animation turns stays as the animation has it.
+		if (anim_turns_[f.node])
+			continue;
+		const float angle = f.most * c - f.has;
+		if (angle > 1e-4f)
+			turn_in_rest(f.node, axis_angle(f.axis, angle));
+	}
+}
+
 void Rig::settle()
 {
 	settled_ = true;
@@ -649,25 +789,78 @@ void Rig::world_from(int start)
 void Rig::drive_head(const Drive &d)
 {
 	const Quat F = options_.facing;
-	const Quat R = conj(F) * d.head * F; // in the model's own terms
-	auto turn_local = [this](int node, Quat by) {
-		// Its turn (at rest, or as its own animation has it now), then
-		// `by` as the model at rest has it.
-		const Quat w = rot_of(rest_world_[node]);
-		r_[node] = r_[node] * (conj(w) * by * w);
+	// A turn as the facing model has it (x its right... as the picture
+	// shows it, y up, z out of its face) in the model's own terms.
+	auto own = [&F](Quat q) {
+		return conj(F) * q * F;
 	};
+	const Quat R = own(d.head);
+	// A breath: its chest leans back a little (below) and its shoulders
+	// rise (each turned up 3 degrees) - its arms still hanging as they
+	// did, not swung out or forward: they're turned back by as much. Not
+	// a side its animation moves.
+	const float breath = clamp01(d.breath);
+	const Quat lean = own(axis_angle({1, 0, 0}, -2.0f * RAD * breath));
+	const int chest_top = head_ >= 0 && !torso_.empty() ? torso_.back() : -1;
+	for (int side = 0; side < 2 && breath > 0; side++) {
+		const int sh = shoulder_[side], arm = upper_arm_[side];
+		if (arm < 0 || anim_turns_[arm])
+			continue;
+		if (sh >= 0 && !anim_turns_[sh] && model_->nodes[arm].parent == sh) {
+			const Quat shrug = own(axis_angle({0, 0, 1}, (side ? -3.0f : 3.0f) * RAD * breath));
+			turn_in_rest(sh, shrug);
+			turn_in_rest(arm, conj(shrug));
+		}
+		bool under_chest = false;
+		for (int n = model_->nodes[arm].parent; n >= 0 && !under_chest; n = model_->nodes[n].parent)
+			under_chest = n == chest_top;
+		if (under_chest)
+			turn_in_rest(arm, conj(lean));
+	}
 	// (Arms its animation turns are where it has them, down or not.)
 	for (const Arm &a : arms_)
 		if (!anim_turns_[a.node])
-			turn_local(a.node, a.turn);
+			turn_in_rest(a.node, a.turn);
 	if (head_ < 0)
 		return;
+	// Its body: some of your head's turn, its own slow sway, and a breath
+	// (its chest leaning back a little and rising). The neck and head
+	// take the rest, so the head still turns just as yours.
+	Quat torso;
+	if (!torso_.empty()) {
+		const Quat follow = slerp(Quat{}, R, clamp01(d.body_follow) * 0.4f);
+		const Quat sway =
+			own(axis_angle({0, 1, 0}, d.body_yaw * RAD) * axis_angle({0, 0, 1}, d.body_roll * RAD));
+		torso = follow * sway;
+		// The lowest bone takes 40% of the turn, the rest the others.
+		const Quat low = slerp(Quat{}, torso, torso_.size() > 1 ? 0.4f : 1.0f);
+		turn_in_rest(torso_[0], low);
+		if (torso_.size() > 1) {
+			const Quat upper = conj(low) * torso;
+			const size_t n = torso_.size() - 1;
+			Quat done;
+			for (size_t i = 1; i <= n; i++) {
+				const Quat part = i == n ? conj(done) * upper : slerp(Quat{}, upper, 1.0f / (float)n);
+				turn_in_rest(torso_[i], part);
+				done = done * part;
+			}
+		}
+		// The breath on the top of the chest (not part of the turn the
+		// head makes up for: its head rides a breath, as yours does).
+		turn_in_rest(torso_.back(), lean);
+		// ...and rising a little (up to 0.4% of its height: 7 mm on a
+		// person), in its parent's own terms.
+		const int top = torso_.back(), under = model_->nodes[top].parent;
+		if (under >= 0)
+			t_[top] = t_[top] + direction(inverse(rest_world_[under]), {0, 0.004f * height_ * breath, 0});
+	}
+	const Quat rest_of = conj(torso) * R;
 	if (neck_ >= 0 && neck_ != head_) {
-		const Quat rn = slerp(Quat{}, R, options_.neck_share);
-		turn_local(neck_, rn);
-		turn_local(head_, conj(rn) * R);
+		const Quat rn = slerp(Quat{}, rest_of, options_.neck_share);
+		turn_in_rest(neck_, rn);
+		turn_in_rest(head_, conj(rn) * rest_of);
 	} else {
-		turn_local(head_, R);
+		turn_in_rest(head_, rest_of);
 	}
 }
 
@@ -900,10 +1093,19 @@ void Rig::pose(const Drive &d)
 		const Quat F = options_.facing;
 		const Quat R = conj(F) * d.head * F;
 		root_ = d.place * moved(pivot_) * matrix_of(R) * moved(pivot_ * -1);
+		// A breath: it grows a little, up more than across, from its
+		// bottom (up to 1.2% taller).
+		const float b = d.breathe_whole ? clamp01(d.breath) : 0;
+		if (b > 0) {
+			const V3 base{pivot_.x, m.low.y, pivot_.z};
+			root_ = root_ * moved(base) * matrix_of({}, Quat{}, {1 + 0.006f * b, 1 + 0.012f * b, 1 + 0.006f * b}) *
+				moved(base * -1);
+		}
 	} else {
 		root_ = d.place;
 	}
 	drive_head(d);
+	curl_fingers();
 	drive_eyes(d);
 	drive_expressions(d);
 	for (int r : m.roots)

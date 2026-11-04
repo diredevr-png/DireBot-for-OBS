@@ -59,6 +59,15 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // a file of more than one character you pick whose face moves with yours
 // (still_faces); your real eyes and mouth keep to one character.
 //
+// 0.5.0: the face avatar comes alive (face/alive.hpp): your face tuned
+// (where each of the camera's readings starts and where it's full, a
+// linked blink, eyes kept open in a smile), and when you're still it
+// breathes, sways, its eyes make small moves, and when it can't see you
+// it holds your last look and then eases into an idle instead of
+// freezing. A VRM's body follows your head and breathes, and its fingers
+// rest relaxed. FaceGetState also says how lit your camera is and where
+// your face is in it, for DireBot's camera check.
+//
 // Later parts plug in beside these: each gets its own folder under src/,
 // its own vendor requests, and a line in features().
 

@@ -631,19 +631,19 @@ Drawn drawn_face(const float moves[EXPRESSIONS], bool mirror, const Drawn &befor
 	for (int e = 0; e < 2; e++) {
 		const int was = before.eye[e];
 		const float v = blink[e];
-		d.eye[e] = v > (was == EYE_CLOSED ? 0.42f : 0.5f)  ? EYE_CLOSED
-			   : v > (was >= EYE_HALF ? 0.18f : 0.25f) ? EYE_HALF
-								   : EYE_OPEN;
+		d.eye[e] = v > (was == EYE_CLOSED ? 0.5f : 0.6f)  ? EYE_CLOSED
+			   : v > (was >= EYE_HALF ? 0.2f : 0.3f) ? EYE_HALF
+								 : EYE_OPEN;
 	}
 	const float jaw = moves[JAW], funnel = moves[FUNNEL];
 	const float smile = (moves[SMILE_LEFT] + moves[SMILE_RIGHT]) / 2;
 	const int was = before.mouth;
 	const bool was_open = was == MOUTH_OPEN || was == MOUTH_WIDE || was == MOUTH_O;
-	if (funnel > (was == MOUTH_O ? 0.18f : 0.25f) && jaw > 0.05f)
+	if (funnel > (was == MOUTH_O ? 0.25f : 0.35f) && jaw > 0.05f)
 		d.mouth = MOUTH_O;
-	else if (jaw > (was == MOUTH_WIDE ? 0.36f : 0.42f))
+	else if (jaw > (was == MOUTH_WIDE ? 0.55f : 0.65f))
 		d.mouth = MOUTH_WIDE;
-	else if (jaw > (was_open ? 0.08f : 0.12f))
+	else if (jaw > (was_open ? 0.06f : 0.12f))
 		d.mouth = MOUTH_OPEN;
 	else if (smile > (was == MOUTH_SMILE ? 0.28f : 0.35f))
 		d.mouth = MOUTH_SMILE;
