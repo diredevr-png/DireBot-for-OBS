@@ -741,7 +741,10 @@ void Rig::turn_in_rest(int node, Quat by)
 // axis across its finger, by how far a relaxed hand bends there - more at
 // the middle joint than the knuckle and the tip, more on the little finger
 // than the first (a resting hand's cascade) - less what its file already
-// bends it, so a hand made relaxed isn't curled twice.
+// bends it, so a hand made relaxed isn't curled twice. The thumb's first
+// joint drops a little towards the palm; past it, the thumb bends towards
+// the first finger, across the palm, as a thumb's joints do (its nail
+// faces out, not down like the fingers').
 void Rig::find_fingers()
 {
 	const Model &m = *model_;
@@ -800,8 +803,8 @@ void Rig::find_fingers()
 			if (length(a) < 1e-9f * std::max(1e-6f, dot(way, way)))
 				continue;
 			const V3 axis = normalized(a);
-			// How far its file already bends each joint, about that axis.
-			auto bend = [&axis](V3 from, V3 to) {
+			// How far its file already bends a joint, about its axis.
+			auto bend = [](V3 from, V3 to, V3 axis) {
 				const V3 f = from - axis * dot(from, axis), t = to - axis * dot(to, axis);
 				if (length(f) < 1e-9f || length(t) < 1e-9f)
 					return 0.0f;
@@ -818,18 +821,31 @@ void Rig::find_fingers()
 							next = c;
 							break;
 						}
+				// Past the thumb's first joint: about the axis that takes it
+				// (its way at rest) towards the first finger's knuckle,
+				// whichever way round its bones are rolled.
+				V3 joint_axis = axis;
+				if (thumb && k > 0) {
+					const V3 w = next >= 0 ? at(next) - at(j) : at(j) - at(joint[k - 1]);
+					const V3 wn = normalized(w, normalized(way));
+					V3 to = at(index) - at(j);
+					to = to - wn * dot(to, wn);
+					const V3 across_to = cross(wn, to);
+					if (length(to) > 1e-4f * length(way) && length(across_to) > 1e-4f * length(way))
+						joint_axis = normalized(across_to);
+				}
 				float has;
 				if (thumb && k == 0)
 					has = 0; // a thumb's first joint is splayed out from the hand
 				else if (next >= 0)
-					has = bend(in, at(next) - at(j));
+					has = bend(in, at(next) - at(j), joint_axis);
 				else
 					has = before * 0.67f; // a tip with nothing after it: as a tip bends with the joint before it
 				has = std::max(-0.35f, has);
 				before = has;
 				Finger f;
 				f.node = j;
-				f.axis = axis;
+				f.axis = joint_axis;
 				f.most = digit.bend[k] * PI_F / 180;
 				f.has = has;
 				fingers_.push_back(f);

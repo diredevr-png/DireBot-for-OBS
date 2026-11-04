@@ -842,6 +842,9 @@ struct FaceAvatar {
 		struct Mat {
 			std::string name;
 			bool bumps = false, shadows = false, skin = false;
+			// Bumps on tangents worked out (the file had none of its own):
+			// close to what it was made with, but not always the same.
+			bool guessed_tangents = false;
 		};
 		std::vector<Mat> materials;
 		// Each spot (its own left eye, right eye, mouth) on its front
@@ -1684,6 +1687,11 @@ struct FaceAvatar {
 					sm.shadows = mat.occlusion_map.used();
 					st.materials.push_back(sm);
 				}
+				for (const Mesh &mesh : m.meshes)
+					for (const Primitive &p : mesh.parts)
+						if (p.material >= 0 && p.material < (int)st.materials.size() &&
+						    !p.tangent.empty() && !p.own_tangents)
+							st.materials[p.material].guessed_tangents = true;
 			}
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d = st;
@@ -3607,18 +3615,21 @@ struct FaceAvatar {
 			if (!st.problem.empty())
 				model["problem"] = st.problem;
 			json materials = json::array();
-			int bumpy = 0, shaded = 0, skin = 0;
+			int bumpy = 0, shaded = 0, skin = 0, guessed = 0;
 			for (const State3D::Mat &mat : st.materials) {
 				materials.push_back({{"name", mat.name},
 						     {"bumps", mat.bumps},
+						     {"own_tangents", mat.bumps && !mat.guessed_tangents},
 						     {"shadows", mat.shadows},
 						     {"skin", mat.skin}});
 				bumpy += mat.bumps;
+				guessed += mat.guessed_tangents;
 				shaded += mat.shadows;
 				skin += mat.skin;
 			}
 			model["materials"] = materials;
 			model["bump_parts"] = bumpy;
+			model["guessed_tangent_parts"] = guessed;
 			model["shadow_parts"] = shaded;
 			model["skin_parts"] = skin;
 			if (st.rigged) {

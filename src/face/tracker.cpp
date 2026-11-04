@@ -17,6 +17,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include "tracker.hpp"
+#include "files.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -623,7 +624,7 @@ bool Tracker::load(const uint8_t *bytes, size_t size, std::string *problem)
 
 bool Tracker::load_file(const std::string &path, std::string *problem)
 {
-	std::ifstream in(path, std::ios::binary);
+	std::ifstream in(utf8_path(path), std::ios::binary);
 	if (!in)
 		return fail(problem, "the face models file is missing (" + path + ")");
 	std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());

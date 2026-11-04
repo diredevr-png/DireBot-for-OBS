@@ -17,6 +17,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include "model.hpp"
+#include "files.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -150,7 +151,7 @@ std::vector<uint8_t> base64(const std::string &s, size_t from)
 
 bool read_file(const std::string &path, std::vector<uint8_t> &out)
 {
-	std::ifstream f(path, std::ios::binary);
+	std::ifstream f(utf8_path(path), std::ios::binary);
 	if (!f)
 		return false;
 	f.seekg(0, std::ios::end);
@@ -533,9 +534,13 @@ void read_mtoon0(const json &doc, const json &p, Material &mat)
 		mat.normal_map = texture("_BumpMap");
 		mat.normal_scale = std::clamp(num(f, "_BumpScale", 1), -4.0f, 4.0f);
 	}
-	const int cull = (int)num(f, "_CullMode", -1);
-	if (cull == 0)
-		mat.double_sided = true;
+	// Unity's culling, as MToon has it: 0 none (both sides show), 1 its
+	// front (only the back shows), 2 its back.
+	const float cull = num(f, "_CullMode", -1);
+	if (cull == 0 || cull == 1 || cull == 2) {
+		mat.double_sided = cull == 0;
+		mat.inside_only = cull == 1;
+	}
 	mat.queue = index_of(p, "renderQueue", 2000) - 2000;
 }
 
@@ -1292,6 +1297,7 @@ void load_json(Reader &rd, const json &doc, Model &m)
 			}
 			if (!usable)
 				p.tangent = tangents_of(p);
+			p.own_tangents = usable;
 		}
 	if (m.points == 0 && m.meshes.empty())
 		fail("there's nothing to see in it");

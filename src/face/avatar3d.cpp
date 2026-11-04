@@ -17,6 +17,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include "avatar3d.hpp"
+#include "files.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -39,83 +40,8 @@ namespace direbot::face {
 
 namespace {
 
-// Pictures at most this many pixels across on the graphics card.
-constexpr uint32_t MOST_PICTURE = 2048;
 // Drawn twice the size for smooth edges, unless that's past this.
 constexpr uint32_t MOST_DRAWN = 8192;
-
-uint32_t next_power(uint32_t v)
-{
-	uint32_t p = 1;
-	while (p < v && p < MOST_PICTURE)
-		p <<= 1;
-	return p;
-}
-
-// Half the size: each pixel the average of 2 x 2 (colours weighted by how
-// solid they are, so see-through edges don't darken).
-std::vector<uint8_t> halved(const std::vector<uint8_t> &px, uint32_t w, uint32_t h, uint32_t &hw, uint32_t &hh)
-{
-	hw = std::max(1u, w / 2);
-	hh = std::max(1u, h / 2);
-	std::vector<uint8_t> out((size_t)hw * hh * 4);
-	for (uint32_t y = 0; y < hh; y++)
-		for (uint32_t x = 0; x < hw; x++) {
-			float c[3] = {0, 0, 0}, a = 0, plain[3] = {0, 0, 0};
-			int n = 0;
-			for (uint32_t dy = 0; dy < 2; dy++)
-				for (uint32_t dx = 0; dx < 2; dx++) {
-					const uint32_t sx = std::min(w - 1, x * 2 + dx),
-						       sy = std::min(h - 1, y * 2 + dy);
-					const uint8_t *p = &px[((size_t)sy * w + sx) * 4];
-					const float pa = p[3] / 255.0f;
-					for (int k = 0; k < 3; k++) {
-						c[k] += p[k] * pa;
-						plain[k] += p[k];
-					}
-					a += pa;
-					n++;
-				}
-			uint8_t *o = &out[((size_t)y * hw + x) * 4];
-			for (int k = 0; k < 3; k++)
-				o[k] = (uint8_t)std::lround(a > 1e-4f ? c[k] / a : plain[k] / n);
-			o[3] = (uint8_t)std::lround(a / n * 255);
-		}
-	return out;
-}
-
-std::vector<uint8_t> resized(const uint8_t *px, uint32_t w, uint32_t h, uint32_t to)
-{
-	// Halved first while it's over twice the size, then smoothly read.
-	std::vector<uint8_t> cur(px, px + (size_t)w * h * 4);
-	while (w >= to * 2 && h >= to * 2) {
-		uint32_t nw, nh;
-		cur = halved(cur, w, h, nw, nh);
-		w = nw;
-		h = nh;
-	}
-	std::vector<uint8_t> out((size_t)to * to * 4);
-	for (uint32_t y = 0; y < to; y++) {
-		const float fy = std::max(0.0f, (y + 0.5f) * h / to - 0.5f);
-		const uint32_t y0 = std::min(h - 1, (uint32_t)fy), y1 = std::min(h - 1, y0 + 1);
-		const float ty = fy - y0;
-		for (uint32_t x = 0; x < to; x++) {
-			const float fx = std::max(0.0f, (x + 0.5f) * w / to - 0.5f);
-			const uint32_t x0 = std::min(w - 1, (uint32_t)fx), x1 = std::min(w - 1, x0 + 1);
-			const float tx = fx - x0;
-			for (int k = 0; k < 4; k++) {
-				auto at = [&](uint32_t xx, uint32_t yy) {
-					return (float)cur[((size_t)yy * w + xx) * 4 + k];
-				};
-				const float v = (at(x0, y0) * (1 - tx) + at(x1, y0) * tx) * (1 - ty) +
-						(at(x0, y1) * (1 - tx) + at(x1, y1) * tx) * ty;
-				out[((size_t)y * to + x) * 4 + k] =
-					(uint8_t)std::lround(std::min(255.0f, std::max(0.0f, v)));
-			}
-		}
-	}
-	return out;
-}
 
 std::string extension_of(const ModelImage &img)
 {
@@ -149,6 +75,21 @@ matrix4 obs_matrix(const M4 &m)
 	return out;
 }
 
+// The side of a part OBS leaves out, for the sides that show: OBS's names
+// for glTF's back and front as they're drawn here (found by drawing:
+// tests/test_real_face.py's test_one_sided_parts_show_only_their_fronts).
+gs_cull_mode cull_of(const Material &m, float handed)
+{
+	switch (sides_shown(m, handed)) {
+	case Sides::Front:
+		return GS_BACK;
+	case Sides::Back:
+		return GS_FRONT;
+	default:
+		return GS_NEITHER;
+	}
+}
+
 void set_vec4(gs_eparam_t *p, float x, float y, float z, float w)
 {
 	vec4 v;
@@ -164,27 +105,11 @@ void set_vec3(gs_eparam_t *p, const float *c)
 
 } // namespace
 
-ModelPicture picture_from(const uint8_t *rgba, uint32_t w, uint32_t h)
-{
-	ModelPicture pic;
-	if (!rgba || !w || !h)
-		return pic;
-	const uint32_t size = next_power(std::max(w, h));
-	pic.size = size;
-	pic.levels.push_back(resized(rgba, w, h, size));
-	uint32_t s = size;
-	while (s > 1) {
-		uint32_t nw, nh;
-		pic.levels.push_back(halved(pic.levels.back(), s, s, nw, nh));
-		s = nw;
-	}
-	return pic;
-}
-
 std::vector<ModelPicture> read_pictures(const Model &m)
 {
 	static std::atomic<unsigned> counter{0};
 	std::vector<ModelPicture> out(m.images.size());
+	const std::vector<PictureUse> uses = picture_uses(m);
 	std::error_code ec;
 	const std::filesystem::path folder = std::filesystem::temp_directory_path(ec);
 	if (ec)
@@ -206,7 +131,9 @@ std::vector<ModelPicture> read_pictures(const Model &m)
 		}
 		gs_color_format format = GS_UNKNOWN;
 		uint32_t w = 0, h = 0;
-		uint8_t *data = gs_create_texture_file_data(path.string().c_str(), &format, &w, &h);
+		// OBS reads its path as UTF-8 (path.string() is the PC's old code
+		// page on Windows: another file in a folder named in other letters).
+		uint8_t *data = gs_create_texture_file_data(path.u8string().c_str(), &format, &w, &h);
 		std::filesystem::remove(path, ec);
 		if (!data)
 			continue;
@@ -222,7 +149,7 @@ std::vector<ModelPicture> read_pictures(const Model &m)
 				d[2] = bgr ? s[0] : s[2];
 				d[3] = format == GS_BGRX ? 255 : s[3];
 			}
-			out[i] = picture_from(rgba.data(), w, h);
+			out[i] = picture_from(rgba.data(), w, h, uses[i]);
 		}
 		bfree(data);
 	}
@@ -243,11 +170,14 @@ ModelLoader::~ModelLoader()
 
 void ModelLoader::want(const std::string &path, bool again)
 {
+	// The same file changed since (made again in its place): loaded anew.
+	const std::string stamp = file_stamp(path);
 	{
 		std::lock_guard<std::mutex> l(lock_);
-		if (path == asked_ && !again)
+		if (path == asked_ && stamp == stamp_ && !again)
 			return;
 		asked_ = path;
+		stamp_ = stamp;
 		want_ = path;
 		pending_ = true;
 	}
@@ -729,6 +659,8 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 												       : "Draw";
 	};
 	std::vector<size_t> blended;
+	// Outlines with both sides (their near side is left out as they're
+	// drawn), the rest with only the sides their materials show.
 	for (size_t i = 0; i < posed.size(); i++) {
 		const Material &mat = material_of(i);
 		if (mat.outline == Outline::None && (v.outline <= 0 || own_outlines))
@@ -745,7 +677,9 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 		}
 		part_distance_ = distance[i];
 		set_material(mat, v, false, is_skin(i));
+		gs_set_cull_mode(cull_of(mat, posed[i].handed));
 		draw_part(i, posed[i], technique_of(i));
+		gs_set_cull_mode(GS_NEITHER);
 	}
 	std::stable_sort(blended.begin(), blended.end(), [&](size_t a, size_t b) {
 		const int qa = material_of(a).queue, qb = material_of(b).queue;
@@ -756,7 +690,9 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 	for (size_t i : blended) {
 		part_distance_ = distance[i];
 		set_material(material_of(i), v, false, is_skin(i));
+		gs_set_cull_mode(cull_of(material_of(i), posed[i].handed));
 		draw_part(i, posed[i], technique_of(i));
+		gs_set_cull_mode(GS_NEITHER);
 	}
 
 	gs_blend_state_pop();

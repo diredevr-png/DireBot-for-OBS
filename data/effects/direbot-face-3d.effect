@@ -14,7 +14,8 @@
 // Points come already moved by the bones and expressions, in the world;
 // `cam` takes them to the camera's view (x right, y up, looking along -z)
 // for the light. Colours are worked in linear light and written as sRGB,
-// premultiplied.
+// premultiplied - a see-through part's shine, in the glossy look, on top
+// (see shade_point's end).
 
 uniform float4x4 ViewProj;
 uniform float4x4 cam;
@@ -199,6 +200,7 @@ float4 shade_point(float2 uv, float4 vcol, float3 V, float3 N, float3 Ng)
 	// The rim light: round the edge, more where it's seen side on.
 	float3 rim_lit = rim_light.rgb * pow(1.0 - nv, max(rim_light.w, 0.001));
 	float3 col;
+	float3 shine = float3(0.0, 0.0, 0.0);
 	if (look.x > 1.5) {
 		col = base.rgb + glow;
 	} else if (look.x > 0.5) {
@@ -235,13 +237,26 @@ float4 shade_point(float2 uv, float4 vcol, float3 V, float3 N, float3 Ng)
 		float k = (rough + 1.0) * (rough + 1.0) / 8.0;
 		float G = 1.0 / ((nv * (1.0 - k) + k) * (saturate(nl) * (1.0 - k) + k));
 		float3 F = f0 + (float3(1.0, 1.0, 1.0) - f0) * pow(1.0 - saturate(dot(H, V)), 5.0);
-		col = col + D * G * F * saturate(nl) * 0.25 * key_tint;
+		shine = D * G * F * saturate(nl) * 0.25 * key_tint;
 		float3 R = reflect(-V, N);
 		float3 env = lerp(studio(R), float3(0.5, 0.5, 0.52), rough);
 		float3 fe = f0 + (max(float3(1.0 - rough, 1.0 - rough, 1.0 - rough), f0) - f0) * pow(1.0 - nv, 5.0);
-		col = col + env * fe * (1.0 - rough * 0.7) * room_tint * ao;
+		shine = shine + env * fe * (1.0 - rough * 0.7) * room_tint * ao;
 		col = col + rim_lit * ao;
 		col = col + glow;
+		// A see-through part (glTF's BLEND): its own colour shows as much
+		// as it's solid, but the light it reflects as much as it's there
+		// at all - its picture's and points' see-through, not its
+		// material's - so a clear lens, visor or eye's front keeps its
+		// shine, and the empty parts of a hair card or decal gain none.
+		// (Added over its colour as much as that shows, premultiplied:
+		// the light on top of what's behind it.)
+		if (surface.w >= 0.5) {
+			float there = saturate(tex.a * vcol.a) * look.w;
+			float3 shown = col * alpha;
+			return float4(srgb(col) * alpha + (srgb(shown + shine) - srgb(shown)) * there, alpha);
+		}
+		col = col + shine;
 	}
 	return float4(srgb(col) * alpha, alpha);
 }

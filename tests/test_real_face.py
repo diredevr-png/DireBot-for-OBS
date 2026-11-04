@@ -149,7 +149,8 @@ def drawn_picture(path, ovals, size=400):
 
 
 def ball_points(cx, cy, cz, rx, ry, rz, n=24):
-    """A ball's points, their facings and its triangles."""
+    """A ball's points, their facings and its triangles (their fronts
+    out: corners anticlockwise seen from outside, as glTF has them)."""
     pos, nrm, ix = [], [], []
     for i in range(n + 1):
         th = math.pi * i / n
@@ -164,18 +165,21 @@ def ball_points(cx, cy, cz, rx, ry, rz, n=24):
         for j in range(n):
             a = i * (n + 1) + j
             b = a + n + 1
-            ix += [a, b, a + 1, a + 1, b, b + 1]
+            ix += [a, a + 1, b, a + 1, b + 1, b]
     return pos, nrm, ix
 
 
-def write_glb(path, parts, tree=None, animations=None):
+def write_glb(path, parts, tree=None, animations=None, materials_more=None, pictures=None):
     """A plain .glb: one node a part, each (points, facings, triangles,
     colour as linear red/green/blue, roughness) - or, given `tree` (glTF
     nodes, the first the top one, "mesh" naming a part), its parts hung on
     those. `animations`: its own, {name: [(node, path, times, values)]}
-    (values flat, straight between keys)."""
+    (values flat, straight between keys). `materials_more`: more for a
+    part's material, {part: {"doubleSided": True, ...}}. `pictures`: a
+    part's colour picture, {part: (its UVs, PNG bytes)}."""
     blob = bytearray()
     views, accessors, meshes, nodes, materials = [], [], [], [], []
+    images, textures = [], []
 
     def add(data, target=None):
         while len(blob) % 4:
@@ -196,10 +200,21 @@ def write_glb(path, parts, tree=None, animations=None):
         accessors.append({"bufferView": n, "componentType": 5126, "count": len(nrm), "type": "VEC3"})
         t = add(struct.pack("<%dI" % len(ix), *ix), 34963)
         accessors.append({"bufferView": t, "componentType": 5125, "count": len(ix), "type": "SCALAR"})
-        materials.append({"pbrMetallicRoughness": {"baseColorFactor": list(colour) + [1],
-                                                   "metallicFactor": 0, "roughnessFactor": rough}})
-        meshes.append({"primitives": [{"attributes": {"POSITION": 3 * i, "NORMAL": 3 * i + 1},
-                                       "indices": 3 * i + 2, "material": i}]})
+        attributes = {"POSITION": len(accessors) - 3, "NORMAL": len(accessors) - 2}
+        indices = len(accessors) - 1
+        pbr = {"baseColorFactor": list(colour) + [1], "metallicFactor": 0, "roughnessFactor": rough}
+        if i in (pictures or {}):
+            uv, png = pictures[i]
+            u = add(struct.pack("<%df" % (len(uv) * 2), *[c for v in uv for c in v]), 34962)
+            accessors.append({"bufferView": u, "componentType": 5126, "count": len(uv), "type": "VEC2"})
+            attributes["TEXCOORD_0"] = len(accessors) - 1
+            images.append({"bufferView": add(png), "mimeType": "image/png"})
+            textures.append({"source": len(images) - 1})
+            pbr["baseColorTexture"] = {"index": len(textures) - 1}
+        more = dict((materials_more or {}).get(i, {}))
+        pbr.update(more.pop("pbr", {}))
+        materials.append({"pbrMetallicRoughness": pbr, **more})
+        meshes.append({"primitives": [{"attributes": attributes, "indices": indices, "material": i}]})
         nodes.append({"name": "part%d" % i, "mesh": i})
     if tree is not None:
         nodes = tree
@@ -224,6 +239,8 @@ def write_glb(path, parts, tree=None, animations=None):
            "bufferViews": views, "buffers": [{"byteLength": len(blob)}]}
     if anims:
         doc["animations"] = anims
+    if images:
+        doc["images"], doc["textures"] = images, textures
     text = json.dumps(doc).encode()
     text += b" " * (-len(text) % 4)
     while len(blob) % 4:
@@ -863,6 +880,189 @@ def test_3d_characters(run):
         c.disconnect()
 
 
+def hull_character(path, two_sided=False, mirrored=False):
+    """An orange ball in a dark shell a little bigger, the shell turned
+    inside out (its triangles' fronts in): a hand-made outline, an
+    "inverted hull". One-sided, unless `two_sided`; the whole of it
+    mirrored (scaled -1 across), if `mirrored`."""
+    ball = ball_points(0, 0, 0, 0.1, 0.1, 0.1)
+    pos, nrm, ix = ball_points(0, 0, 0, 0.108, 0.108, 0.108)
+    inward = [tuple(-c for c in n) for n in nrm]
+    turned = [ix[t + k] for t in range(0, len(ix), 3) for k in (0, 2, 1)]
+    write_glb(path, [ball + ((0.8, 0.25, 0.04), 0.4), (pos, inward, turned, (0.01, 0.01, 0.01), 0.9)],
+              tree=[{"name": "Character", "children": [1, 2],
+                     **({"scale": [-1, 1, 1]} if mirrored else {})},
+                    {"name": "Ball", "mesh": 0}, {"name": "Shell", "mesh": 1}],
+              materials_more={1: {"doubleSided": True}} if two_sided else None)
+
+
+def test_one_sided_parts_show_only_their_fronts(run):
+    """0.7.0: a part shows only its front unless its material is
+    double-sided, as glTF says - so a hand-made outline (a dark shell
+    turned inside out round a ball) is a dark rim round the ball, not a
+    dark ball; double-sided, it covers the ball; mirrored, it's the same
+    as not; and the outline setting still draws round one-sided parts.
+    A file made again in its place loads anew."""
+    face_png = os.path.join(run.home, "camera.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+    files = {}
+    for name, extra in (("Hull", {}), ("Hull two-sided", {"two_sided": True}),
+                        ("Hull mirrored", {"mirrored": True})):
+        files[name] = os.path.join(run.home, name.replace(" ", "-").lower() + ".glb")
+        hull_character(files[name], **extra)
+    ball = os.path.join(run.home, "ball.glb")
+    ball_character(ball)
+    size = 300
+    common = {"source": "Sides camera", "width": size, "height": size, "size": 100,
+              "mirror": False, "smoothing": 100, "follow_move": 0, "follow_grow": 0,
+              "follow_tilt": 0, "bend": 100, **STILL}
+    avatars = {name: {"model": path} for name, path in files.items()}
+    avatars["Ball plain"] = {"model": ball}
+    avatars["Ball outlined"] = {"model": ball, "outline": 60}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "Sides"})
+        send(c, "CreateInput", {"sceneName": "Sides", "inputName": "Sides camera",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        for name, extra in avatars.items():
+            send(c, "CreateInput", {"sceneName": "Sides", "inputName": name,
+                                    "inputKind": "direbot_face_avatar",
+                                    "inputSettings": {**common, **extra}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Sides"})
+
+        def st(name):
+            return vendor(c, "FaceGetState", {"source": name})
+        for name in avatars:
+            assert wait_for(lambda: st(name)["found"] and st(name)["model"]["shown"], 30, 0.2), st(name)
+        time.sleep(0.5)
+
+        orange = lambda px: px[0] > 120 and px[0] > px[1] + 40 > px[2] + 40  # noqa: E731
+        dark = lambda px: px != (0, 0, 0) and sum(px) < 3 * 50  # noqa: E731
+
+        def across(rows):
+            """The middle row: where it starts and ends, and what's there."""
+            row = rows[size // 2]
+            seen = [x for x, px in enumerate(row) if px != (0, 0, 0)]
+            return seen[0], seen[-1], row
+
+        shots = {name: screenshot(c, name) for name in avatars}
+        for name in ("Hull", "Hull mirrored"):
+            rows = shots[name]
+            first, last, row = across(rows)
+            mid = rows[size // 2][size // 2]
+            # The ball shows through the shell's near side (its back)...
+            assert orange(mid), (name, mid)
+            # ...in a dark rim (the shell's far side, round it).
+            rim = row[first:first + 3] + row[last - 2:last + 1]
+            assert all(dark(px) for px in rim), (name, rim)
+            assert orange(row[first + 12]) and orange(row[last - 12]), (name, row[first + 12])
+        # Both sides: the shell covers it all.
+        rows = shots["Hull two-sided"]
+        first, last, row = across(rows)
+        assert dark(rows[size // 2][size // 2]), rows[size // 2][size // 2]
+        assert all(dark(px) for px in row[first + 2:last - 1:7])
+        # Mirrored, the same picture (a ball's the same either way round).
+        same = sum(1 for a, b in zip(shots["Hull"][size // 2], shots["Hull mirrored"][size // 2])
+                   if max(abs(a[k] - b[k]) for k in range(3)) <= 12)
+        assert same >= size - 4, same
+        # The outline setting: still round the (one-sided) ball, past it.
+        p_first, p_last, _ = across(shots["Ball plain"])
+        o_first, o_last, o_row = across(shots["Ball outlined"])
+        assert o_first < p_first - 1 and o_last > p_last + 1, (p_first, p_last, o_first, o_last)
+        assert dark(o_row[o_first]) and dark(o_row[o_last])
+        assert orange(shots["Ball plain"][size // 2 + 30][size // 2])
+        # Its file made again in its place (as DireBot remakes a starter
+        # character): OBS told the same file loads it anew.
+        hull_character(files["Hull"], two_sided=True)
+        send(c, "SetInputSettings", {"inputName": "Hull", "inputSettings": {"model": files["Hull"]}})
+        assert wait_for(lambda: dark(screenshot(c, "Hull")[size // 2][size // 2]), 10, 0.2)
+        for name in avatars:
+            send(c, "RemoveInput", {"inputName": name})
+        send(c, "RemoveInput", {"inputName": "Sides camera"})
+    finally:
+        c.disconnect()
+
+
+def png_bytes(path, w, h, rows):
+    """A PNG's bytes (with see-through), by way of a file at `path`."""
+    write_png(path, w, h, rows, alpha=True)
+    with open(path, "rb") as f:
+        data = f.read()
+    os.remove(path)
+    return data
+
+
+def test_see_through_parts_keep_their_shine(run):
+    """0.7.0: a see-through part (glTF's BLEND) in the glossy look keeps
+    the light it reflects - a dark visor 15% solid shines as the same
+    visor solid does - while its picture's empty parts stay empty (a
+    half-empty card gains no shine where it's empty)."""
+    face_png = os.path.join(run.home, "camera.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+    dark = ((0.03, 0.03, 0.035), 0.12)
+    glass = {"alphaMode": "BLEND", "pbr": {"baseColorFactor": [0.03, 0.03, 0.035, 0.15]}}
+    files = {}
+    files["Visor"] = os.path.join(run.home, "visor.glb")
+    write_glb(files["Visor"], [ball_points(0, 0, 0, 0.1, 0.1, 0.1) + dark], materials_more={0: glass})
+    files["Visor solid"] = os.path.join(run.home, "visor-solid.glb")
+    write_glb(files["Visor solid"], [ball_points(0, 0, 0, 0.1, 0.1, 0.1) + dark])
+    # A card, its picture's left half grey and its right half empty.
+    half = [bytes((128, 128, 128, 255)) * 8 + bytes((128, 128, 128, 0)) * 8 for _ in range(16)]
+    card = ([(-0.1, -0.1, 0), (0.1, -0.1, 0), (0.1, 0.1, 0), (-0.1, 0.1, 0)], [(0, 0, 1)] * 4,
+            [0, 1, 2, 0, 2, 3], (1, 1, 1), 0.12)
+    files["Card"] = os.path.join(run.home, "card.glb")
+    write_glb(files["Card"], [card], materials_more={0: {"alphaMode": "BLEND"}},
+              pictures={0: ([(0, 1), (1, 1), (1, 0), (0, 0)],
+                            png_bytes(os.path.join(run.home, "half.png"), 16, 16, half))})
+    size = 300
+    common = {"source": "Shine camera", "width": size, "height": size, "size": 100,
+              "mirror": False, "smoothing": 100, "follow_move": 0, "follow_grow": 0,
+              "follow_tilt": 0, "bend": 100, "look": "glossy", "style": "drawn", **STILL}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "Shine"})
+        send(c, "CreateInput", {"sceneName": "Shine", "inputName": "Shine camera",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        for name, path in files.items():
+            send(c, "CreateInput", {"sceneName": "Shine", "inputName": name,
+                                    "inputKind": "direbot_face_avatar",
+                                    "inputSettings": {**common, "model": path}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Shine"})
+
+        def st(name):
+            return vendor(c, "FaceGetState", {"source": name})
+        for name in files:
+            assert wait_for(lambda: st(name)["found"] and st(name)["model"]["shown"], 30, 0.2), st(name)
+        time.sleep(0.5)
+        shots = {name: screenshot(c, name) for name in files}
+
+        def brightest(rows):
+            return max(max(px) for row in rows for px in row)
+        solid, see_through = brightest(shots["Visor solid"]), brightest(shots["Visor"])
+        print(f"visor's shine: {solid} solid, {see_through} 15% solid")
+        assert solid > 200 and see_through > solid * 0.8, (solid, see_through)
+        # ...and the visor itself still mostly see-through: dark, and its
+        # middle no more solid than it is.
+        mid = shots["Visor"][size // 2 + 40][size // 2]
+        assert max(mid) < 60, mid
+
+        # The card fills the picture: its left half grey, its right half
+        # (but for its very edge, where the picture wraps round) empty.
+        rows = shots["Card"]
+        band = range(size // 5, size * 4 // 5)
+        grey = [rows[y][x] for y in band for x in range(size // 10, size * 4 // 10)]
+        empty = [rows[y][x] for y in band for x in range(size * 6 // 10, size * 9 // 10)]
+        assert min(min(px) for px in grey) > 60, min(min(px) for px in grey)
+        assert max(max(px) for px in empty) <= 2, max(max(px) for px in empty)
+        for name in files:
+            send(c, "RemoveInput", {"inputName": name})
+        send(c, "RemoveInput", {"inputName": "Shine camera"})
+    finally:
+        c.disconnect()
+
+
 def test_set_up_characters(run):
     """A 3D character with its set-up (DireBot's "model_setup", as from an
     imported Lens Studio project): your real eyes and mouth drawn on its
@@ -1370,8 +1570,11 @@ def test_lights_detail_maps_soft_skin_views_and_mic(run):
         for name in avatars:
             assert wait_for(lambda: st(name)["found"] and st(name)["model"]["shown"], 30, 0.2), st(name)
         m = st("Bumped")["model"]
-        assert m["materials"] == [{"name": "Skin", "bumps": True, "shadows": True, "skin": True}], m
+        # (0.7.0: its file has no tangents, so they're worked out.)
+        assert m["materials"] == [{"name": "Skin", "bumps": True, "shadows": True, "skin": True,
+                                   "own_tangents": False}], m
         assert m["bump_parts"] == 1 and m["shadow_parts"] == 1 and m["skin_parts"] == 1
+        assert m["guessed_tangent_parts"] == 1
         assert st("Plain")["lights"]["preset"] == "studio" and not st("Plain")["lights"]["detail"]
         night = st("Night")["lights"]
         assert night["preset"] == "night" and night["colour"] == "#7fa0ff" and night["rim"] == 70

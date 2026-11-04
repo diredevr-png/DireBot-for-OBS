@@ -75,7 +75,11 @@ struct Material {
 	TexRef base_map;
 	AlphaMode alpha = AlphaMode::Opaque;
 	float cutoff = 0.5f;
+	// Which sides of its triangles show: glTF's front only (the side its
+	// corners go round anticlockwise), both (doubleSided), or - VRM 0.x's
+	// MToon culling its front - only the back.
 	bool double_sided = false;
+	bool inside_only = false;
 	float metallic = 1, roughness = 1;
 	TexRef metal_map; // glTF: green is roughness, blue is metal
 	float emissive[3] = {0, 0, 0};
@@ -108,6 +112,17 @@ struct Material {
 	float occlusion_strength = 1;
 };
 
+// Which of a part's sides are drawn (glTF's front and back): both, its
+// front, or only its back - each the other way round when the part is
+// mirrored (`handed` -1: its corners go round the other way).
+enum class Sides { Both, Front, Back };
+inline Sides sides_shown(const Material &m, float handed)
+{
+	if (m.double_sided)
+		return Sides::Both;
+	return m.inside_only == (handed < 0) ? Sides::Front : Sides::Back;
+}
+
 // An expression's change to a part: each point moved by this much (and
 // its facing changed) at full strength.
 struct MorphTarget {
@@ -128,6 +143,7 @@ struct Primitive {
 	// -1: up = w * cross(normal, tangent)) - from the file, or worked
 	// out from its UVs (tangents_of).
 	std::vector<float> tangent;
+	bool own_tangents = false; // its tangents are the file's (not worked out)
 };
 // A part's tangents worked out from its points, facings and UVs, as glTF
 // has them (its UVs' v going down the picture, a normal map's green up).

@@ -95,6 +95,7 @@ target_sources(
     src/face/react.cpp
     src/face/voice.cpp
     src/face/setup.cpp
+    src/face/pictures.cpp
     src/face/avatar3d.cpp
     src/face/face-avatar.cpp
     src/face/nn/net.cpp

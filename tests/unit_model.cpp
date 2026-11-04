@@ -10,6 +10,7 @@
 
 #include "../src/face/alive.hpp"
 #include "../src/face/effect-needs.hpp"
+#include "../src/face/files.hpp"
 #include "../src/face/lights.hpp"
 #include "../src/face/model.hpp"
 #include "../src/face/rig.hpp"
@@ -271,6 +272,46 @@ static void test_storage()
 	CHECK(near3(rotate(n.r, {1, 0, 0}), {0, 1, 0}, 1e-5f));
 	// A quarter turn about z then up 2: point (1, 0, 0) lands at (0, 3, 0).
 	CHECK(near(m.high.y, 3, 1e-5));
+}
+
+// A character in a folder (and a file) named in other letters loads (on
+// Windows, C++'s own reading takes the PC's old code page unless told
+// it's UTF-8), and a file made again in its place is seen to have changed.
+static void test_files_named_in_other_letters()
+{
+	std::error_code ec;
+	const std::filesystem::path folder =
+		std::filesystem::temp_directory_path(ec) / utf8_path("direbot Jos\xc3\xa9 \xd0\x9b\xd0\xb8\xd1\x81\xd0\xb0");
+	std::filesystem::create_directories(folder, ec);
+	CHECK(!ec);
+	const std::string path = folder.u8string() + "/Bunny \xc3\x91.glb";
+	auto write = [&](int nodes) {
+		Builder b;
+		std::vector<V3> pos;
+		std::vector<uint16_t> ix;
+		cube(pos, ix);
+		b.doc["meshes"].push_back(
+			{{"primitives", {{{"attributes", {{"POSITION", b.vec3s(pos)}}}, {"indices", b.indices(ix)}}}}});
+		for (int i = 0; i < nodes; i++)
+			b.node({{"mesh", 0}, {"name", "part" + std::to_string(i)}});
+		const std::vector<uint8_t> bytes = b.glb();
+		std::ofstream f(utf8_path(path), std::ios::binary | std::ios::trunc);
+		f.write(reinterpret_cast<const char *>(bytes.data()), (std::streamsize)bytes.size());
+	};
+	CHECK(file_stamp(path).empty());
+	write(1);
+	Model m;
+	std::string why;
+	CHECK(load_model(path, m, &why));
+	CHECK(m.nodes.size() == 1);
+	const std::string first = file_stamp(path);
+	CHECK(!first.empty() && file_stamp(path) == first);
+	write(2);
+	CHECK(file_stamp(path) != first);
+	Model again;
+	CHECK(load_model(path, again, &why) && again.nodes.size() == 2);
+	CHECK(file_stamp("").empty());
+	std::filesystem::remove_all(folder, ec);
 }
 
 // Broken and hostile files fail with words, never a crash.
@@ -723,6 +764,38 @@ static void test_vrm0_reading()
 	}
 	// VRM 0.x's z is the other way round.
 	CHECK(m.colliders.size() == 1 && near3(m.colliders[0].offset, {0, 0, -0.05f}, 1e-6f));
+
+	// Which sides show: MToon's culling (Unity's: 0 none, 1 its front, 2
+	// its back) over glTF's doubleSided; without it, glTF's.
+	{
+		Person q = make_person(true);
+		json &doc = q.b.doc;
+		doc["materials"] = json::array();
+		for (int i = 0; i < 5; i++)
+			doc["materials"].push_back({{"name", "m" + std::to_string(i)}, {"doubleSided", i % 2 == 0}});
+		auto mtoon = [](float cull) {
+			return json{{"shader", "VRM/MToon"}, {"floatProperties", {{"_CullMode", cull}}}};
+		};
+		doc["extensions"]["VRM"]["materialProperties"] = {mtoon(0), mtoon(1), mtoon(2),
+								  {{"shader", "VRM/MToon"}}, mtoon(7)};
+		Model sides;
+		CHECK(load(q.b.glb(), sides));
+		CHECK(sides.materials.size() == 5);
+		if (sides.materials.size() == 5) {
+			// Drawn: both, the back, the front; mirrored, the other one.
+			CHECK(sides_shown(sides.materials[0], 1) == Sides::Both &&
+			      sides_shown(sides.materials[0], -1) == Sides::Both);
+			CHECK(sides_shown(sides.materials[1], 1) == Sides::Back &&
+			      sides_shown(sides.materials[1], -1) == Sides::Front);
+			CHECK(sides_shown(sides.materials[2], 1) == Sides::Front &&
+			      sides_shown(sides.materials[2], -1) == Sides::Back);
+			CHECK(sides.materials[0].double_sided && !sides.materials[0].inside_only);
+			CHECK(!sides.materials[1].double_sided && sides.materials[1].inside_only);
+			CHECK(!sides.materials[2].double_sided && !sides.materials[2].inside_only);
+			CHECK(!sides.materials[3].double_sided && !sides.materials[3].inside_only);
+			CHECK(sides.materials[4].double_sided && !sides.materials[4].inside_only);
+		}
+	}
 }
 
 static Drive still()
@@ -1978,7 +2051,7 @@ static void test_detail_maps()
 		CHECK(mat.normal_map.used() && near(mat.normal_scale, 0.5, 1e-6));
 		CHECK(mat.occlusion_map.used() && near(mat.occlusion_strength, 0.7, 1e-6));
 		const Primitive &p = m.meshes[0].parts[0];
-		CHECK(p.tangent.size() == 16);
+		CHECK(p.tangent.size() == 16 && !p.own_tangents);
 		for (size_t i = 0; i < 4 && p.tangent.size() == 16; i++)
 			CHECK(near(p.tangent[i * 4], 1, 1e-5) && near(p.tangent[i * 4 + 1], 0, 1e-5) &&
 			      near(p.tangent[i * 4 + 2], 0, 1e-5) && p.tangent[i * 4 + 3] == 1);
@@ -1998,6 +2071,7 @@ static void test_detail_maps()
 		const Primitive &p = m.meshes[0].parts[0];
 		CHECK(p.tangent.size() == 16 && near(p.tangent[0], 1, 1e-6) && p.tangent[3] == -1);
 		CHECK(near(p.tangent[9], 1, 1e-6) && p.tangent[11] == 1);
+		CHECK(p.own_tangents);
 	}
 	// Broken ones in the file (no length): worked out instead.
 	{
@@ -2005,12 +2079,14 @@ static void test_detail_maps()
 		CHECK(load(bumpy_square(bumpy, std::vector<float>(16, 0.0f)), m));
 		const Primitive &p = m.meshes[0].parts[0];
 		CHECK(p.tangent.size() == 16 && near(p.tangent[0], 1, 1e-5) && p.tangent[3] == 1);
+		CHECK(!p.own_tangents);
 	}
 	// No normal map: no tangents kept, even the file's.
 	{
 		Model m;
 		CHECK(load(bumpy_square({{"name", "plain"}}, std::vector<float>(16, 1.0f)), m));
 		CHECK(!m.materials[0].normal_map.used() && m.meshes[0].parts[0].tangent.empty());
+		CHECK(!m.meshes[0].parts[0].own_tangents);
 	}
 	// A map on the second UVs (not read): left out.
 	{
@@ -3150,6 +3226,46 @@ static void test_fingers_and_body()
 	Rig curled(m, o);
 	curled.pose(still());
 	CHECK(near(bend_of(curled, body.index[1][0], body.index[1][1], 1), 60, 0.05));
+	// Past its first joint, the thumb bends towards the first finger,
+	// across the palm (about the hand's up, as its first bone carries it),
+	// not down under the hand: its middle joint 12.5 degrees relaxed, 25
+	// curled, its tip nearer the first finger's knuckle.
+	for (int side = 0; side < 2; side++) {
+		auto thumb_bend = [&](const Rig &r, float *across) {
+			const int *t = body.thumb[side];
+			const V3 t0 = move_of(r.world()[t[0]]), t1 = move_of(r.world()[t[1]]),
+				 t2 = move_of(r.world()[t[2]]);
+			const V3 s01 = normalized(t1 - t0), s12 = normalized(t2 - t1);
+			const V3 up = normalized(direction(r.world()[t[0]], {0, 1, 0}));
+			if (across)
+				*across = std::fabs(dot(normalized(cross(s01, s12)), up));
+			return std::acos(std::min(1.0f, dot(s01, s12))) * 180 / 3.14159265f;
+		};
+		auto tip_to_index = [&](const Rig &r) {
+			return length(move_of(r.world()[body.thumb[side][2]]) - move_of(r.world()[body.index[side][0]]));
+		};
+		float across = 0;
+		CHECK(near(thumb_bend(rig, &across), 12.5, 0.05) && across > 0.98f);
+		CHECK(near(thumb_bend(curled, &across), 25, 0.05) && across > 0.98f);
+		CHECK(near(thumb_bend(flat, nullptr), 0, 0.05));
+		CHECK(tip_to_index(rig) < tip_to_index(flat) - 0.002f && tip_to_index(curled) < tip_to_index(rig));
+		// Its bones rolled a quarter turn about their own way (as a VRM's
+		// thumb is, its nail out): the same bend, the same way.
+		Body rolled = make_body();
+		const V3 along = normalized(V3{side ? -1.0f : 1.0f, 0, 1});
+		const Quat roll = axis_angle(along, 3.14159265f / 2);
+		rolled.p.b.doc["nodes"][rolled.thumb[side][0]]["rotation"] = {roll.x, roll.y, roll.z, roll.w};
+		auto mr = std::make_shared<Model>();
+		CHECK(load(rolled.p.b.glb(), *mr));
+		RigOptions ro = o;
+		ro.fingers = 0.5f;
+		Rig rr(mr, ro);
+		rr.pose(still());
+		const int *t = rolled.thumb[side];
+		const V3 r1 = move_of(rr.world()[t[1]]), r2 = move_of(rr.world()[t[2]]);
+		const V3 b1 = move_of(rig.world()[body.thumb[side][1]]), b2 = move_of(rig.world()[body.thumb[side][2]]);
+		CHECK(near3(r1, b1, 1e-5f) && near3(r2, b2, 1e-5f));
+	}
 
 	// A finger its file already bends 30 degrees: relaxed leaves it be;
 	// curled, it's bent only the rest of the way.
@@ -3260,6 +3376,7 @@ int main()
 {
 	test_write_and_read();
 	test_storage();
+	test_files_named_in_other_letters();
 	test_broken();
 	test_vrm1_reading();
 	test_vrm0_reading();

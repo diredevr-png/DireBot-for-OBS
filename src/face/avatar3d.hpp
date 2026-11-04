@@ -42,21 +42,15 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "lights.hpp"
 #include "math3d.hpp"
 #include "model.hpp"
+#include "pictures.hpp"
 #include "rig.hpp"
 
 namespace direbot::face {
 
-// A model's pictures as pixels (red, green, blue, see-through), square
-// and a power of two across, with their smaller copies ("mipmaps") for
-// drawing small without shimmer: read from the file's PNGs and JPEGs by
-// OBS's own reader. On any thread.
-struct ModelPicture {
-	uint32_t size = 0; // 0: unreadable (drawn plain white)
-	std::vector<std::vector<uint8_t>> levels;
-};
+// A model's pictures (pictures.hpp), read from the file's PNGs and JPEGs
+// by OBS's own reader, each shrunk the way its materials use it. On any
+// thread.
 std::vector<ModelPicture> read_pictures(const Model &m);
-// The same from pixels already read (for tests): w x h, 4 bytes a pixel.
-ModelPicture picture_from(const uint8_t *rgba, uint32_t w, uint32_t h);
 
 // A character file loaded on a thread of its own (big VRMs take a moment),
 // so OBS never waits: asked for by path, picked up once it's ready.
@@ -72,7 +66,8 @@ public:
 	~ModelLoader();
 	ModelLoader(const ModelLoader &) = delete;
 	ModelLoader &operator=(const ModelLoader &) = delete;
-	// "" for none. The same path again does nothing (`again`: load it anew).
+	// "" for none. The same path again does nothing, unless the file's
+	// changed since (`again`: load it anew anyway).
 	void want(const std::string &path, bool again = false);
 	// The newest one loaded since the last call, or null.
 	std::shared_ptr<ModelPack> take();
@@ -82,7 +77,7 @@ private:
 	void run();
 	mutable std::mutex lock_;
 	std::condition_variable wake_;
-	std::string want_, asked_;
+	std::string want_, asked_, stamp_;
 	bool pending_ = false, stop_ = false, working_ = false;
 	std::shared_ptr<ModelPack> done_;
 	std::thread thread_;
