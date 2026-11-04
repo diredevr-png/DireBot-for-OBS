@@ -35,11 +35,16 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //   - By your head (a hand on your face, scratching your head, a peace
 //     sign by your eye): its hand goes to the same place by its own head,
 //     whatever its size, so a hand on your cheek is on its cheek.
+//   - Each finger bends about one axis across it, so a fist's middle
+//     joints and tips (curled on round, under the knuckles) bend as far as
+//     yours; a hand the hand model guesses back to front (its fingers bent
+//     back, as no hand bends) is turned the right way round.
 //   - Natural limits on each finger joint, and on how far a wrist bends.
-//   - A part that's lost (out of the picture, or a "ghost" hand) is held
-//     as it was for a moment, then rests (arms down, fingers relaxed);
-//     found again, it's back quickly. A hand must be seen two looks
-//     running before it moves anything.
+//   - A part that's lost (out of sight - an arm's elbow or wrist, as the
+//     page draws them - or a "ghost" hand) is held as it was for a moment,
+//     then rests (arms down, fingers relaxed); found again, it's back
+//     quickly. A hand must be seen two looks running before it moves
+//     anything.
 //   - Calibrate: hold a hand up by your ear, open, palm to the camera.
 //     It learns how your open hand looks (so its fingers open all the
 //     way when yours do) and where your hand is when it's by your ear
@@ -171,7 +176,9 @@ private:
 };
 
 // For tests: each joint's bend in a hand's points (metres, the camera's
-// way), as the solver measures them; `left`: a left hand.
-void finger_bends(const Point *hand, bool left, float bend[5][3]);
+// way), as the solver measures them; `left`: a left hand. True if the hand
+// is the other way round (its fingers bent back on the whole: the hand
+// model's depth a mirror of yours), its bends measured the right way.
+bool finger_bends(const Point *hand, bool left, float bend[5][3]);
 
 } // namespace direbot::face

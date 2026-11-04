@@ -31,8 +31,8 @@ namespace {
 
 constexpr float PI_F = 3.14159265358979f;
 constexpr float DEG = PI_F / 180;
-// A shoulder or wrist the body model thinks is at least this likely in
-// sight is followed.
+// A shoulder, elbow or wrist the body model thinks is at least this likely
+// in sight is followed.
 constexpr float SEEN = 0.5f;
 // An elbow bent less than this is straight (its hinge unknown); more than
 // this, its hinge is sure (radians).
@@ -47,6 +47,9 @@ constexpr float HEAD_LEAST = 0.08f;
 // thumb's root, middle and tip, then a finger's knuckle, middle and tip.
 constexpr float THUMB_LIMITS[3][2] = {{-20, 45}, {-15, 60}, {-15, 80}};
 constexpr float FINGER_LIMITS[3][2] = {{-15, 90}, {0, 110}, {0, 80}};
+// A hand whose fingers bend back this far all told (degrees, each joint of
+// the four fingers) is turned round (finger_bends).
+constexpr float BENT_BACK = 40;
 // A calibration's open hand bends no more than this (degrees), and moves
 // a hand by its head no more than this (head widths).
 constexpr float OPEN_MOST = 30, OFFSET_MOST = 0.6f;
@@ -81,6 +84,17 @@ float flex(V3 a, V3 b, V3 palm)
 	return std::atan2(dot(b, n), dot(b, ah));
 }
 
+// The bend from `a` to `b` about `axis` (unit; radians, + turning by the
+// right hand's rule): both as seen down the axis, so a turn about any other
+// axis (a finger spread sideways) isn't a bend.
+float bend_about(V3 a, V3 b, V3 axis)
+{
+	const V3 f = a - axis * dot(a, axis), t = b - axis * dot(b, axis);
+	if (length(axis) < 0.5f || length(f) < 1e-9f || length(t) < 1e-9f)
+		return 0;
+	return std::atan2(dot(cross(f, t), axis), dot(f, t));
+}
+
 float limit(float v, const float lim[2])
 {
 	return std::min(lim[1] * DEG, std::max(lim[0] * DEG, v));
@@ -101,7 +115,7 @@ bool finite(V3 v)
 
 } // namespace
 
-void finger_bends(const Point *hand, bool left, float bend[5][3])
+bool finger_bends(const Point *hand, bool left, float bend[5][3])
 {
 	V3 p[HAND_POINTS];
 	for (int i = 0; i < HAND_POINTS; i++)
@@ -111,17 +125,38 @@ void finger_bends(const Point *hand, bool left, float bend[5][3])
 	V3 palm = normalized(cross(p[5] - p[0], p[17] - p[0]), {0, 0, 0});
 	if (left)
 		palm = -palm;
+	// Each finger bends about one axis, across it (square to its palm and
+	// the way from the wrist to its knuckle), the same for each joint
+	// however far it's curled: in a fist the middle joint and tip bend on
+	// round, back under the knuckle.
+	float back = 0;
+	for (int f = 1; f < 5; f++) {
+		const int root = 1 + f * 4; // 5, 9, 13, 17
+		const V3 bone[4] = {p[root] - p[0], p[root + 1] - p[root], p[root + 2] - p[root + 1],
+				    p[root + 3] - p[root + 2]};
+		const V3 axis = normalized(cross(bone[0], palm), {0, 0, 0});
+		for (int j = 0; j < 3; j++) {
+			bend[f][j] = bend_about(bone[j], bone[j + 1], axis);
+			back += bend[f][j];
+		}
+	}
+	// Fingers bend towards the palm, hardly ever back. Bent back on the
+	// whole, the hand is the other way round from what it should be: the
+	// hand model's guess of its depth is a mirror of the hand it sees (a
+	// fist from behind, a small hand far off), or it's the other hand.
+	const bool round = back < -BENT_BACK * DEG;
+	if (round) {
+		palm = -palm;
+		for (int f = 1; f < 5; f++)
+			for (int j = 0; j < 3; j++)
+				bend[f][j] = -bend[f][j];
+	}
 	// The thumb: its root bends towards the palm, past it towards the
 	// first finger's knuckle.
 	bend[0][0] = flex(p[1] - p[0], p[2] - p[1], palm);
 	bend[0][1] = flex(p[2] - p[1], p[3] - p[2], p[5] - p[2]);
 	bend[0][2] = flex(p[3] - p[2], p[4] - p[3], p[5] - p[3]);
-	for (int f = 1; f < 5; f++) {
-		const int root = 1 + f * 4; // 5, 9, 13, 17
-		bend[f][0] = flex(p[root] - p[0], p[root + 1] - p[root], palm);
-		bend[f][1] = flex(p[root + 1] - p[root], p[root + 2] - p[root + 1], palm);
-		bend[f][2] = flex(p[root + 2] - p[root + 1], p[root + 3] - p[root + 2], palm);
-	}
+	return round;
 }
 
 void ArmSolver::look(const Body &body)
@@ -177,7 +212,10 @@ void ArmSolver::look(const Body &body)
 		const int S = you ? BODY_RIGHT_SHOULDER : BODY_LEFT_SHOULDER;
 		const int E = you ? BODY_RIGHT_ELBOW : BODY_LEFT_ELBOW;
 		const int W = you ? BODY_RIGHT_WRIST : BODY_LEFT_WRIST;
-		if (!(body.seen[W] >= SEEN) || !ok(E) || !ok(W)) {
+		// Only an arm you can see, its elbow and its wrist (as the page
+		// draws it): the body model guesses where an arm it can't see is -
+		// down by your desk, in your lap - and says it's unsure.
+		if (!(body.seen[E] >= SEEN) || !(body.seen[W] >= SEEN) || !ok(E) || !ok(W)) {
 			lose(sd);
 			continue;
 		}
@@ -216,13 +254,21 @@ void ArmSolver::look(const Body &body)
 		const HandSeen &h = body.hands[you];
 		bool hand = false;
 		if (h.found && options_.fingers) {
-			const V3 along = local(upright(h.world[HAND_MIDDLE]) - upright(h.world[HAND_WRIST]));
-			const V3 side = local(upright(h.world[HAND_INDEX]) - upright(h.world[HAND_LITTLE]));
+			float b[5][3];
+			// The hand turned round (its depth a mirror of yours): its
+			// depth the other way.
+			const bool round = finger_bends(h.world, you == 0, b);
+			auto hand_way = [&](int from, int to) {
+				V3 v = upright(h.world[to]) - upright(h.world[from]);
+				if (round)
+					v.z = -v.z;
+				return local(v);
+			};
+			const V3 along = hand_way(HAND_WRIST, HAND_MIDDLE);
+			const V3 side = hand_way(HAND_LITTLE, HAND_INDEX);
 			if (length(along) > 1e-4f && length(side) > 1e-4f) {
 				t.along = flip(normalized(along));
 				t.across = flip(normalized(side));
-				float b[5][3];
-				finger_bends(h.world, you == 0, b);
 				if (calibrating_ && t.near > 0.3f) {
 					for (int f = 0; f < 5; f++)
 						for (int j = 0; j < 3; j++)

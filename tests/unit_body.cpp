@@ -546,6 +546,30 @@ static void make_hand(Point *p, float bend, bool left, V3 at = {})
 	}
 }
 
+// A hand as make_hand's (a right hand, palm to the camera), each finger's
+// knuckle, middle joint and tip bent `bend` degrees towards its palm (the
+// first finger first), about the axis across it: each finger straight on
+// from its knuckle's way from the wrist.
+static void make_curled_hand(Point *p, const float bend[4][3], bool left)
+{
+	make_hand(p, 0, left);
+	const float lengths[3] = {0.04f, 0.025f, 0.02f};
+	for (int f = 0; f < 4; f++) {
+		const int root = 5 + f * 4;
+		const Point &k = p[root];
+		const V3 knuckle{left ? -k.x : k.x, k.y, k.z};
+		const V3 way = normalized(knuckle);
+		const V3 palm{0, 0, -1};
+		V3 at = knuckle;
+		float a = 0;
+		for (int j = 0; j < 3; j++) {
+			a += bend[f][j] * PI / 180;
+			at = at + (way * std::cos(a) + palm * std::sin(a)) * lengths[j];
+			p[root + 1 + j] = {left ? -at.x : at.x, at.y, at.z};
+		}
+	}
+}
+
 static void test_finger_bends()
 {
 	Point hand[HAND_POINTS];
@@ -559,17 +583,27 @@ static void test_finger_bends()
 				straight = straight && near(bend[f][j], 0, 1e-4);
 		CHECK(straight);
 		// Each finger's middle joint bent 60 degrees towards the palm.
+		// (Measured about the axis across its knuckle's way from the
+		// wrist: a finger not straight on from that way - all but the
+		// middle one here - reads a degree or so off.)
 		make_hand(hand, 60, left);
 		finger_bends(hand, left, bend);
 		for (int f = 1; f < 5; f++) {
 			CHECK(near(bend[f][0], 0, 1e-4));
-			CHECK(near(bend[f][1], 60 * PI / 180, 1e-3));
+			CHECK(near(bend[f][1], 60 * PI / 180, f == 2 ? 1e-3 : 3 * PI / 180));
 			CHECK(near(bend[f][2], 0, 1e-4));
 		}
-		// ...and back (the wrong way): less than nothing.
+		// ...and one bent back (the wrong way): less than nothing.
 		make_hand(hand, -20, left);
-		finger_bends(hand, left, bend);
+		{
+			Point straight[HAND_POINTS];
+			make_hand(straight, 0, left);
+			for (int i : {5, 6, 7, 8, 13, 14, 15, 16, 17, 18, 19, 20})
+				hand[i] = straight[i];
+		}
+		CHECK(!finger_bends(hand, left, bend));
 		CHECK(near(bend[2][1], -20 * PI / 180, 1e-3));
+		CHECK(near(bend[1][1], 0, 1e-4));
 		// A finger spread sideways isn't bent.
 		make_hand(hand, 0, left);
 		hand[HAND_INDEX + 1].x += left ? -0.02f : 0.02f;
@@ -577,6 +611,72 @@ static void test_finger_bends()
 		hand[HAND_INDEX + 3].x += left ? -0.04f : 0.04f;
 		finger_bends(hand, left, bend);
 		CHECK(near(bend[1][0], 0, 1e-4));
+	}
+	// A fist, a finger up (a middle finger), the hand from behind: each
+	// joint as bent, however far the finger curls.
+	struct Pose {
+		float bend[4][3];
+	};
+	const Pose fist{{{80, 100, 70}, {85, 105, 75}, {85, 100, 70}, {75, 95, 65}}};
+	const Pose middle_up{{{80, 100, 70}, {0, 0, 0}, {85, 100, 70}, {75, 95, 65}}};
+	const Pose relaxed{{{10, 15, 5}, {15, 20, 8}, {20, 25, 10}, {25, 30, 12}}};
+	for (const Pose *pose : {&fist, &middle_up, &relaxed})
+		for (int left = 0; left < 2; left++)
+			for (int mirror = 0; mirror < 2; mirror++)
+				for (int wrong = 0; wrong < 2; wrong++) {
+					make_curled_hand(hand, pose->bend, left);
+					// The hand model's depth a mirror of the hand's (as
+					// it guesses a fist from behind, or far off), or the
+					// hand on the other arm: the other way round, its
+					// bends the same.
+					if (mirror)
+						for (Point &q : hand)
+							q.z = -q.z;
+					const bool round = finger_bends(hand, wrong ? !left : left, bend);
+					CHECK(round == (mirror != wrong));
+					for (int f = 1; f < 5; f++)
+						for (int j = 0; j < 3; j++)
+							CHECK(near(bend[f][j], pose->bend[f - 1][j] * PI / 180, 1e-3));
+				}
+	// Google MediaPipe's own hand model (its hand landmarker, through
+	// MediaPipe) on two of its test photos (mediapipe-assets, Apache 2.0):
+	// a right fist, and a right hand pointing up, both their palms to the
+	// camera - in metres, the camera's way.
+	const Point mp_fist[HAND_POINTS] = {
+		{-0.0086f, 0.0817f, 0.0060f},  {0.0272f, 0.0620f, -0.0089f},  {0.0498f, 0.0353f, -0.0168f},
+		{0.0502f, 0.0052f, -0.0289f},  {0.0155f, -0.0062f, -0.0316f}, {0.0292f, -0.0024f, 0.0011f},
+		{0.0346f, -0.0176f, -0.0207f}, {0.0341f, -0.0060f, -0.0257f}, {0.0287f, 0.0112f, -0.0098f},
+		{0.0016f, -0.0048f, 0.0057f},  {0.0105f, -0.0197f, -0.0271f}, {0.0132f, 0.0072f, -0.0349f},
+		{0.0138f, 0.0119f, -0.0042f},  {-0.0199f, -0.0007f, -0.0003f}, {-0.0108f, -0.0085f, -0.0288f},
+		{-0.0054f, 0.0129f, -0.0342f}, {-0.0029f, 0.0219f, -0.0118f}, {-0.0388f, 0.0119f, -0.0076f},
+		{-0.0309f, 0.0011f, -0.0227f}, {-0.0184f, 0.0140f, -0.0328f}, {-0.0243f, 0.0225f, -0.0235f}};
+	const Point mp_pointing[HAND_POINTS] = {
+		{0.0170f, 0.0864f, 0.0360f},   {0.0420f, 0.0567f, 0.0197f},   {0.0504f, 0.0318f, 0.0025f},
+		{0.0433f, 0.0091f, -0.0249f},  {0.0160f, 0.0051f, -0.0369f},  {0.0245f, -0.0135f, 0.0041f},
+		{0.0248f, -0.0414f, -0.0029f}, {0.0258f, -0.0620f, -0.0103f}, {0.0229f, -0.0797f, -0.0317f},
+		{0.0007f, -0.0061f, 0.0049f},  {0.0077f, -0.0170f, -0.0297f}, {0.0176f, 0.0092f, -0.0369f},
+		{0.0145f, 0.0175f, -0.0110f},  {-0.0181f, 0.0062f, -0.0027f}, {-0.0102f, 0.0053f, -0.0346f},
+		{0.0044f, 0.0284f, -0.0329f},  {0.0038f, 0.0360f, -0.0074f},  {-0.0318f, 0.0299f, -0.0089f},
+		{-0.0240f, 0.0216f, -0.0276f}, {-0.0085f, 0.0319f, -0.0323f}, {-0.0129f, 0.0387f, -0.0171f}};
+	for (int mirror = 0; mirror < 2; mirror++) {
+		Point f[HAND_POINTS], up[HAND_POINTS];
+		for (int i = 0; i < HAND_POINTS; i++) {
+			f[i] = {mp_fist[i].x, mp_fist[i].y, mirror ? -mp_fist[i].z : mp_fist[i].z};
+			up[i] = {mp_pointing[i].x, mp_pointing[i].y, mirror ? -mp_pointing[i].z : mp_pointing[i].z};
+		}
+		// Each finger's knuckle and middle joint well bent (40 degrees and
+		// more), its tip bent too (the old measure had a fist's tips bent
+		// back, and from behind every joint: an open hand).
+		CHECK(finger_bends(f, false, bend) == (mirror == 1));
+		for (int k = 1; k < 5; k++) {
+			CHECK(bend[k][0] > 40 * PI / 180 && bend[k][1] > 40 * PI / 180 && bend[k][2] > 30 * PI / 180);
+		}
+		// Pointing up: its first finger straight, the rest curled.
+		CHECK(finger_bends(up, false, bend) == (mirror == 1));
+		for (int j = 0; j < 3; j++)
+			CHECK(std::fabs(bend[1][j]) < 30 * PI / 180);
+		for (int k = 2; k < 5; k++)
+			CHECK(bend[k][0] > 40 * PI / 180 && bend[k][1] > 40 * PI / 180);
 	}
 	// The thumb's root bends towards the palm (in at the camera).
 	make_hand(hand, 0, false);
@@ -768,6 +868,36 @@ static void test_lost_and_found()
 	CHECK(s.now().side[1].weight > 0);
 	settle(s, b, 0.3f);
 	CHECK(s.now().side[1].weight == 1);
+	// Your left elbow out of sight, its wrist in sight (the body model's
+	// guess at an arm down by your desk): not followed; your right arm is.
+	{
+		Body elbow = b;
+		elbow.seen[BODY_LEFT_ELBOW] = 0.2f;
+		ArmSolver a;
+		settle(a, elbow);
+		CHECK(!a.seen().arm[1] && a.seen().arm[0]);
+		CHECK(a.now().side[1].weight == 0 && a.now().side[0].weight == 1);
+		// Its elbow below the picture but in sight (your hand by your face,
+		// sitting close to the camera): followed.
+		Body close = b;
+		close.points[BODY_LEFT_ELBOW] = {400, 530, 0};
+		ArmSolver e;
+		settle(e, close);
+		CHECK(e.seen().arm[1] && e.now().side[1].weight == 1);
+		// Followed, then its elbow out of sight: held, then resting.
+		Body gone = b;
+		gone.seen[BODY_LEFT_ELBOW] = 0.3f;
+		for (int i = 0; i < 6; i++) {
+			e.look(gone);
+			e.step(0.05f);
+		}
+		CHECK(!e.seen().arm[1] && e.now().side[1].weight == 1);
+		for (int i = 0; i < 20; i++) {
+			e.look(gone);
+			e.step(0.05f);
+		}
+		CHECK(e.now().side[1].weight == 0 && e.now().side[0].weight == 1);
+	}
 	// No shoulders: neither arm.
 	Body no_shoulder = b;
 	no_shoulder.seen[BODY_RIGHT_SHOULDER] = 0;
@@ -822,6 +952,38 @@ static void test_hands()
 	// your body's middle) is its right, first finger towards its left.
 	CHECK(s.now().side[1].across.x > 0.99f);
 	CHECK(s.now().side[0].across.x < -0.99f);
+	// Your hands turned towards the camera and to one side, then the same
+	// as the hand model sees them the other way round (its depth a mirror
+	// of yours, as it can guess a fist from behind): the same bends, and
+	// its hands turned the same way - yours, not the mirror's.
+	{
+		Body turned = with_hands(60);
+		const Quat q = axis_angle(normalized(V3{1, 0.5f, 0}), 35 * PI / 180);
+		for (HandSeen &h : turned.hands) {
+			const Point w = h.world[HAND_WRIST];
+			for (Point &p : h.world) {
+				const V3 v = rotate(q, V3{p.x - w.x, p.y - w.y, p.z - w.z});
+				p = {w.x + v.x, w.y + v.y, w.z + v.z};
+			}
+		}
+		Body round = turned;
+		for (HandSeen &h : round.hands)
+			for (Point &p : h.world)
+				p.z = 2 * h.world[HAND_WRIST].z - p.z;
+		ArmSolver a, c;
+		settle(a, turned);
+		settle(c, round);
+		for (int side = 0; side < 2; side++) {
+			const ArmTarget &x = a.now().side[side], &y = c.now().side[side];
+			CHECK(c.seen().hand[side] && y.hand == 1);
+			CHECK(std::fabs(x.along.z) > 0.3f);
+			CHECK(near3(x.along, y.along, 1e-3f) && near3(x.across, y.across, 1e-3f));
+			CHECK(near(y.bend[2][1], 60 * PI / 180, 2e-3));
+			for (int f = 0; f < 5; f++)
+				for (int j = 0; j < 3; j++)
+					CHECK(near(x.bend[f][j], y.bend[f][j], 1e-3));
+		}
+	}
 	// Beyond a joint's limit: no further.
 	Body far = with_hands(150);
 	settle(s, far);
