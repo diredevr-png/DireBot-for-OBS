@@ -46,7 +46,8 @@ uniform float outline_width;
 uniform float4 outline_colour;
 // Down: one texel of the big picture.
 uniform float2 texel;
-// The normal map's strength, the occlusion map's, soft skin (0 to 1), 0.
+// The normal map's strength, the occlusion map's, soft skin (0 to 1),
+// and 1 for a part drawn only from its front (0: both sides, or its back).
 uniform float4 detail;
 // The lights, in the camera's view (src/face/lights.hpp): towards the key
 // light and its colour (linear, times its brightness), the second lamp's,
@@ -261,12 +262,27 @@ float4 shade_point(float2 uv, float4 vcol, float3 V, float3 N, float3 Ng)
 	return float4(srgb(col) * alpha, alpha);
 }
 
+// Its facing at a point, towards the camera. A part drawn on both sides
+// (or only its back) shows back faces: their facing turns round. A part
+// drawn only from its front shows none, so a facing leaning away there is
+// a smooth one just past side-on at its edge: laid side-on instead, as
+// turned round it would light that edge as if it faced the other way (a
+// bright or dark line along its outline). One leaning far away is a file's
+// facings made inside out: turned round, as ever.
+float3 towards_camera(float3 N, float3 V)
+{
+	float nv = dot(N, V);
+	if (nv >= 0.0)
+		return N;
+	if (detail.w > 0.5 && nv > -0.7)
+		return normalize(N - V * nv);
+	return -N;
+}
+
 float4 PSDraw(VertOut v) : TARGET
 {
-	float3 N = normalize(v.vnrm);
 	float3 V = normalize(-v.vpos);
-	if (dot(N, V) < 0.0)
-		N = -N;
+	float3 N = towards_camera(normalize(v.vnrm), V);
 	return shade_point(v.uv, v.col, V, N, N);
 }
 
@@ -277,7 +293,11 @@ float4 PSDrawBumped(BumpOut v) : TARGET
 	float4 bump = normal_map.Sample(wrapSampler, v.uv);
 	float3 Ng = normalize(v.vnrm);
 	float3 V = normalize(-v.vpos);
-	float face = dot(Ng, V) < 0.0 ? -1.0 : 1.0;
+	// Its back (towards_camera turned it round), or an edge laid side-on.
+	float3 Nc = towards_camera(Ng, V);
+	float face = dot(Nc, Ng) < 0.0 ? -1.0 : 1.0;
+	if (face > 0.0)
+		Ng = Nc;
 	float3 T = v.vtan.xyz - Ng * dot(Ng, v.vtan.xyz);
 	float tl = length(T);
 	T = tl > 0.00001 ? T / tl : float3(0.0, 0.0, 0.0);

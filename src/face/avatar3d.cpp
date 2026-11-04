@@ -460,7 +460,7 @@ void Avatar3D::set_lights(const View3D &v)
 	put(p_room_tint, share(l.room_up + l.room_down, studio.room_up + studio.room_down));
 }
 
-void Avatar3D::set_material(const Material &m, const View3D &v, bool outline, bool skin)
+void Avatar3D::set_material(const Material &m, const View3D &v, bool outline, bool skin, bool front_only)
 {
 	// Everything a technique reads, every time: OBS empties them all
 	// when the technique before finishes (see effect-needs.hpp).
@@ -491,7 +491,7 @@ void Avatar3D::set_material(const Material &m, const View3D &v, bool outline, bo
 	gs_effect_set_texture(p_normal_map, detail ? tex(m.normal_map, flat_) : flat_);
 	gs_effect_set_texture(p_occlusion_map, detail && !own_toon ? tex(m.occlusion_map, white_) : white_);
 	set_vec4(p_detail, detail ? m.normal_scale : 0.0f, detail && !own_toon ? m.occlusion_strength : 0.0f,
-		 skin ? std::min(1.0f, std::max(0.0f, v.soft_skin)) : 0.0f, 0.0f);
+		 skin ? std::min(1.0f, std::max(0.0f, v.soft_skin)) : 0.0f, front_only ? 1.0f : 0.0f);
 	set_vec4(p_base, m.base[0], m.base[1], m.base[2], m.base[3]);
 	set_vec3(p_emissive, m.emissive);
 	set_vec4(p_surface, m.metallic, m.roughness, m.alpha == AlphaMode::Mask ? std::max(0.001f, m.cutoff) : 0.0f,
@@ -666,7 +666,7 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 		if (mat.outline == Outline::None && (v.outline <= 0 || own_outlines))
 			continue;
 		part_distance_ = distance[i];
-		set_material(mat, v, true, false);
+		set_material(mat, v, true, false, false);
 		draw_part(i, posed[i], "Outline");
 	}
 	for (size_t i = 0; i < posed.size(); i++) {
@@ -676,7 +676,7 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 			continue;
 		}
 		part_distance_ = distance[i];
-		set_material(mat, v, false, is_skin(i));
+		set_material(mat, v, false, is_skin(i), sides_shown(mat, posed[i].handed) == Sides::Front);
 		gs_set_cull_mode(cull_of(mat, posed[i].handed));
 		draw_part(i, posed[i], technique_of(i));
 		gs_set_cull_mode(GS_NEITHER);
@@ -689,7 +689,8 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 	});
 	for (size_t i : blended) {
 		part_distance_ = distance[i];
-		set_material(material_of(i), v, false, is_skin(i));
+		set_material(material_of(i), v, false, is_skin(i),
+			     sides_shown(material_of(i), posed[i].handed) == Sides::Front);
 		gs_set_cull_mode(cull_of(material_of(i), posed[i].handed));
 		draw_part(i, posed[i], technique_of(i));
 		gs_set_cull_mode(GS_NEITHER);

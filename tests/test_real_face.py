@@ -986,6 +986,88 @@ def test_one_sided_parts_show_only_their_fronts(run):
         c.disconnect()
 
 
+
+def edge_character(path, two_sided=False):
+    """A light grey square facing the camera (20 cm), its facings leaning
+    from straight out at its top to down and away at its bottom - past
+    side-on over its lowest third, as a smooth part's facings lean at its
+    edge. One-sided, unless `two_sided`."""
+    pos = [(-0.1, -0.1, 0), (0.1, -0.1, 0), (0.1, 0.1, 0), (-0.1, 0.1, 0)]
+    down = (0, -0.9, -0.44)
+    k = math.sqrt(sum(c * c for c in down))
+    down = tuple(c / k for c in down)
+    nrm = [down, down, (0, 0, 1), (0, 0, 1)]
+    write_glb(path, [(pos, nrm, [0, 1, 2, 0, 2, 3], (0.6, 0.6, 0.6), 1.0)],
+              materials_more={0: {"doubleSided": True}} if two_sided else None)
+
+
+def test_one_sided_edges_are_lit_side_on(run):
+    """0.8.0: on a one-sided part, a facing leaning away from the camera
+    is a smooth facing just past side-on at its edge (its back faces are
+    never drawn): it's lit side-on, not turned round - turned round, an
+    edge lit from above (under an earlobe, along a raised shoulder) showed
+    a bright line. A two-sided part's back faces still turn round."""
+    face_png = os.path.join(run.home, "camera.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+    one = os.path.join(run.home, "edge.glb")
+    two = os.path.join(run.home, "edge-two-sided.glb")
+    edge_character(one)
+    edge_character(two, two_sided=True)
+    size = 300
+    common = {"source": "Edges camera", "width": size, "height": size, "size": 100,
+              "mirror": False, "smoothing": 100, "follow_move": 0, "follow_grow": 0,
+              "follow_tilt": 0, "bend": 100, "detail_maps": False, "light_preset": "own",
+              "light_side": 0, "light_height": 60, "light_brightness": 100,
+              "room_brightness": 30, "rim_brightness": 0, **STILL}
+    avatars = {"Edge one-sided": one, "Edge two-sided": two}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "Edges"})
+        send(c, "CreateInput", {"sceneName": "Edges", "inputName": "Edges camera",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        for name, path in avatars.items():
+            send(c, "CreateInput", {"sceneName": "Edges", "inputName": name,
+                                    "inputKind": "direbot_face_avatar",
+                                    "inputSettings": {**common, "model": path}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Edges"})
+
+        def st(name):
+            return vendor(c, "FaceGetState", {"source": name})
+        for name in avatars:
+            assert wait_for(lambda: st(name)["found"] and st(name)["model"]["shown"], 30, 0.2), st(name)
+        time.sleep(0.5)
+
+        def down_its_side(name):
+            """Brightness top to bottom, down a line near its left edge
+            (clear of the eyes and mouth drawn on it), its outline left out."""
+            rows = screenshot(c, name)
+            middle = rows[size // 2]
+            seen = [x for x, px in enumerate(middle) if px != (0, 0, 0)]
+            assert len(seen) > size // 4, (name, len(seen))
+            x = seen[0] + (seen[-1] - seen[0]) * 8 // 100
+            ys = [y for y in range(size) if rows[y][x] != (0, 0, 0)]
+            return [sum(rows[y][x]) for y in range(ys[0] + 2, ys[-1] - 1)]
+        one_sided = down_its_side("Edge one-sided")
+        two_sided = down_its_side("Edge two-sided")
+        n = len(one_sided)
+        assert n > 40, n
+        # One-sided: darker the further down (it faces away from the light
+        # above), its lowest rows no brighter than the middle.
+        middle, bottom = one_sided[n * 6 // 10], max(one_sided[n * 9 // 10:])
+        assert bottom <= middle + 12, (middle, bottom, one_sided)
+        # Two-sided: its lowest third is a back seen, turned round to face
+        # up - lit by the light above, brighter than its middle.
+        n2 = len(two_sided)
+        assert n2 > 40, n2
+        middle2, bottom2 = two_sided[n2 * 6 // 10], max(two_sided[n2 * 9 // 10:])
+        assert bottom2 > middle2 + 40, (middle2, bottom2, two_sided)
+        for name in avatars:
+            send(c, "RemoveInput", {"inputName": name})
+        send(c, "RemoveInput", {"inputName": "Edges camera"})
+    finally:
+        c.disconnect()
+
 def png_bytes(path, w, h, rows):
     """A PNG's bytes (with see-through), by way of a file at `path`."""
     write_png(path, w, h, rows, alpha=True)

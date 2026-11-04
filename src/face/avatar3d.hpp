@@ -138,7 +138,9 @@ private:
 	void make_head();
 	void set_camera();
 	void set_lights(const View3D &v);
-	void set_material(const Material &m, const View3D &v, bool outline, bool skin);
+	// front_only: a part drawn only from its front (its edges' facings are
+	// laid side-on, not turned round: see the effect's towards_camera).
+	void set_material(const Material &m, const View3D &v, bool outline, bool skin, bool front_only);
 	void draw_part(size_t i, const Rig::Part &p, const char *technique);
 
 	gs_effect_t *effect_ = nullptr;
