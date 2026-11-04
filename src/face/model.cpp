@@ -375,7 +375,10 @@ struct Reader {
 	{
 		size_t n = 0;
 		const std::vector<double> d = read(a, comps, n);
-		return std::vector<float>(d.begin(), d.end());
+		std::vector<float> out(d.size());
+		for (size_t i = 0; i < d.size(); i++)
+			out[i] = (float)d[i];
+		return out;
 	}
 };
 

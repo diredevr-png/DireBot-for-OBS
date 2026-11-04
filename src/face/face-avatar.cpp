@@ -2065,7 +2065,7 @@ struct FaceAvatar {
 				view_from = view_now;
 				view_to = target;
 				view_shown = want;
-				view_t = look3d.view_glide > 0 ? 0 : 1;
+				view_t = look3d.view_glide > 0 ? 0.0f : 1.0f;
 			}
 			view_t = std::min(1.0f, view_t + (look3d.view_glide > 0 ? frame_dt / look3d.view_glide : 1));
 			// Eased in and out (smootherstep).
