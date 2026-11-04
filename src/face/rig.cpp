@@ -1391,6 +1391,46 @@ void Rig::world_from(int start)
 	}
 }
 
+// Its bones that follow others (VRM's node constraints), each after those
+// it waits on (Model::constraints is in that order), from where it rests -
+// as the VRM spec's own steps say (and pixiv's three-vrm, MIT licence,
+// does it: its steps as a recipe, no code copied). An aim is worked out in
+// the space its parent puts it in, so a parent grown more one way than
+// another still points it right.
+void Rig::apply_constraints()
+{
+	const Model &m = *model_;
+	for (const Constraint &c : m.constraints) {
+		const Quat dst_rest = m.nodes[c.node].r;
+		const Quat src_rest = m.nodes[c.source].r;
+		Quat target;
+		if (c.kind == Constraint::Aim) {
+			const int p = m.nodes[c.node].parent;
+			const M4 &pw = p >= 0 ? world_[p] : root_;
+			// Where its source is, as its parent sees it.
+			const V3 to = point(inverse(pw), move_of(world_[c.source])) - t_[c.node];
+			if (!(dot(to, to) > 1e-16f) || !std::isfinite(to.x + to.y + to.z))
+				continue;
+			target = turn_between(rotate(dst_rest, c.axis), to) * dst_rest;
+		} else {
+			// Its source's turn since it rested.
+			const Quat delta = conj(src_rest) * r_[c.source];
+			if (c.kind == Constraint::Rotation) {
+				target = dst_rest * delta;
+			} else {
+				// That turn as it rests (its parent's space), then as this
+				// one rests; only what's round its axis kept - the least
+				// turn bringing its axis back taken off.
+				const Quat in_dst = conj(dst_rest) * src_rest * delta * conj(src_rest) * dst_rest;
+				target = turn_between(rotate(in_dst, c.axis), c.axis) * in_dst;
+				target = dst_rest * target;
+			}
+		}
+		r_[c.node] = normalized(slerp(dst_rest, normalized(target), c.weight));
+		world_from(c.node);
+	}
+}
+
 void Rig::drive_head(const Drive &d)
 {
 	const Quat F = options_.facing;
@@ -1799,6 +1839,8 @@ void Rig::pose(const Drive &d)
 	for (size_t i = 0; i < m.nodes.size(); i++)
 		if (m.nodes[i].parent < 0 && std::find(m.roots.begin(), m.roots.end(), (int)i) == m.roots.end())
 			world_from((int)i);
+	// Then the bones that follow others, before anything swings from them.
+	apply_constraints();
 
 	const float scale = scale_of(d.place);
 	const V3 root_at = move_of(root_);

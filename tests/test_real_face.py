@@ -1942,6 +1942,7 @@ def test_reactions_on_cue(run):
 BODY = os.path.join(HERE, "tests", "data", "body")
 ARM_GREEN = (0.05, 0.6, 0.08)
 HAND_RED = (0.8, 0.02, 0.02)
+FOLLOWER_CYAN = (0.02, 0.55, 0.55)
 
 
 def body_camera(path):
@@ -1954,7 +1955,9 @@ def body_camera(path):
 def arms_character(path, vrm=True):
     """A figure standing in a T, facing the camera: an orange ball head, a
     blue body, green arms and red hands, each part hung on its own bone (so
-    it moves with it); a VRM 1.0 with those bones, unless `vrm` is False."""
+    it moves with it); a VRM 1.0 with those bones, unless `vrm` is False.
+    Beside its body, under its left arm, a cyan ball on a bone that copies
+    its left upper arm's turn (VRM's node constraints, from 0.8.0)."""
     parts = [ball_points(0, 0.1, 0, 0.1, 0.11, 0.1) + ((0.8, 0.25, 0.04), 0.4),
              ball_points(0, 0.1, 0, 0.14, 0.2, 0.08) + ((0.05, 0.1, 0.7), 0.5)]
     tree = [{"name": "hips", "translation": [0, 1, 0], "children": [1]},
@@ -1977,9 +1980,15 @@ def arms_character(path, vrm=True):
                  {"name": side + "Hand", "translation": [sx * 0.24, 0, 0], "mesh": mesh + 2}]
         for k, bone in enumerate(("Shoulder", "UpperArm", "LowerArm", "Hand")):
             bones[side + bone] = first + k
-    top = {}
+    parts.append(ball_points(0, 0.2, 0, 0.04, 0.04, 0.04) + (FOLLOWER_CYAN, 0.5))
+    tree[2]["children"].append(len(tree))
+    tree.append({"name": "follower", "translation": [0.35, 0, 0], "mesh": len(parts) - 1,
+                 "extensions": {"VRMC_node_constraint": {
+                     "specVersion": "1.0",
+                     "constraint": {"rotation": {"source": bones["leftUpperArm"], "weight": 1}}}}})
+    top = {"extensionsUsed": ["VRMC_node_constraint"]}
     if vrm:
-        top = {"extensionsUsed": ["VRMC_vrm"],
+        top = {"extensionsUsed": ["VRMC_vrm", "VRMC_node_constraint"],
                 "extensions": {"VRMC_vrm": {
                     "specVersion": "1.0",
                     "meta": {"name": "Arms", "authors": ["DireBot"], "avatarPermission": "everyone"},
@@ -1995,7 +2004,8 @@ def test_hands_and_arms_follow_you(run):
     what it follows and what of you the camera sees (for DireBot's camera
     check), and your body's points; calibrating with no hand up gives up
     and says so; forgetting it clears the source's own; a character that
-    can't follow says why; light mode looks fewer times."""
+    can't follow says why; light mode looks fewer times. A bone copying its
+    arm's turn (VRM's node constraints) goes round with it."""
     camera = os.path.join(run.home, "astronaut.png")
     body_camera(camera)
     figure = os.path.join(run.home, "arms.vrm")
@@ -2018,6 +2028,7 @@ def test_hands_and_arms_follow_you(run):
         send(c, "SetInputSettings", {"inputName": name, "inputSettings": settings})
     green = lambda px: px[1] > 90 and px[0] < 70 and px[2] < 70  # noqa: E731
     red = lambda px: px[0] > 120 and px[1] < 50 and px[2] < 50  # noqa: E731
+    cyan = lambda px: px[1] > 100 and px[2] > 100 and px[0] < 100 and abs(px[1] - px[2]) < 70  # noqa: E731
     try:
         send(c, "CreateScene", {"sceneName": "Hands and arms"})
         send(c, "CreateInput", {"sceneName": "Hands and arms", "inputName": "Arms camera",
@@ -2041,6 +2052,12 @@ def test_hands_and_arms_follow_you(run):
         _, ry0, rn0 = middle_of(rest, red)
         assert gn0 > 200 and rn0 > 20, (gn0, rn0)
         spread0 = sum(abs(x - size / 2) for row in rest for x, px in enumerate(row) if red(px)) / rn0
+        # Its bone copying its left upper arm's turn (hanging by its side).
+        model = st()["model"]
+        assert model["following_bones"] == 1 and model["following_bones_left_out"] == 0, model
+        assert st("Arms plain")["model"]["following_bones"] == 1
+        cx0, cy0, cn0 = middle_of(rest, cyan)
+        assert cn0 > 30, cn0
 
         # On: the body models load, it finds you and follows both arms.
         for name in ("Arms", "Arms plain", "Arms worn"):
@@ -2084,6 +2101,9 @@ def test_hands_and_arms_follow_you(run):
         spread1 = sum(abs(x - size / 2) for row in follow for x, px in enumerate(row) if red(px)) / rn1
         assert ry1 < ry0 - 0.04 * size, (ry0, ry1)
         assert spread1 < 0.6 * spread0, (spread0, spread1)
+        # The ball copying its upper arm's turn has gone round with it.
+        cx1, cy1, cn1 = middle_of(follow, cyan)
+        assert cn1 > 30 and math.hypot(cx1 - cx0, cy1 - cy0) > 0.02 * size, (cx0, cy0, cx1, cy1, cn1)
 
         # Ones that can't follow say why; the camera isn't looked at for them.
         p = arms("Arms plain")
@@ -2129,6 +2149,8 @@ def test_hands_and_arms_follow_you(run):
         keep_shot(back, "arms-back")
         gx2, gy2, gn2 = middle_of(back, green)
         assert abs(gy2 - gy0) < 0.02 * size and abs(gx2 - gx0) < 0.02 * size, (gx0, gy0, gx2, gy2)
+        cx2, cy2, _ = middle_of(back, cyan)
+        assert abs(cy2 - cy0) < 0.02 * size and abs(cx2 - cx0) < 0.02 * size, (cx0, cy0, cx2, cy2)
         for name in ("Arms", "Arms plain", "Arms worn"):
             send(c, "RemoveInput", {"inputName": name})
     finally:

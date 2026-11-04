@@ -941,6 +941,143 @@ void read_nodes(const json &doc, Model &m)
 	}
 }
 
+// The most bones following others it reads (a character has a few dozen
+// at most), so a hostile file can't slow every frame.
+constexpr size_t MOST_CONSTRAINTS = 1024;
+
+// Its bones that follow others (VRMC_node_constraint 1.0, or its beta),
+// in the order they're worked out: each after those it waits on. A twist
+// bone or a copied turn waits on its source's own turn; one aiming at its
+// source waits on everything above its source and above itself (where
+// they are). One following itself, caught in a loop or waiting on one, of
+// a version or kind not known, or pointing at no bone, is left out.
+void read_constraints(const json &doc, Model &m)
+{
+	const size_t count = m.nodes.size();
+	const json &nodes = list(doc, "nodes");
+	std::vector<Constraint> found;
+	std::vector<int> on(count, -1); // a node's constraint, if it has one
+	int left_out = 0;
+	for (size_t i = 0; i < nodes.size() && i < count; i++) {
+		const json &ext = field(field(nodes[i], "extensions"), "VRMC_node_constraint");
+		if (!ext.is_object())
+			continue;
+		const std::string version = text(ext, "specVersion");
+		const json &c = field(ext, "constraint");
+		const json &roll = field(c, "roll"), &aim = field(c, "aim"), &rotation = field(c, "rotation");
+		Constraint k;
+		k.node = (int)i;
+		bool ok = version == "1.0" || version == "1.0-beta";
+		const json *def = &rotation;
+		if (roll.is_object()) {
+			// (Its axis is needed; without one, X - as three-vrm has it.)
+			k.kind = Constraint::Roll;
+			def = &roll;
+			const std::string a = text(roll, "rollAxis");
+			if (a == "Y")
+				k.axis = {0, 1, 0};
+			else if (a == "Z")
+				k.axis = {0, 0, 1};
+			else
+				ok = ok && (a == "X" || a.empty());
+		} else if (aim.is_object()) {
+			k.kind = Constraint::Aim;
+			def = &aim;
+			const std::string a = text(aim, "aimAxis");
+			const char *names[6] = {"PositiveX", "NegativeX", "PositiveY", "NegativeY", "PositiveZ", "NegativeZ"};
+			const V3 axes[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+			bool known = a.empty();
+			for (int j = 0; j < 6; j++)
+				if (a == names[j]) {
+					k.axis = axes[j];
+					known = true;
+				}
+			ok = ok && known;
+		} else if (rotation.is_object()) {
+			k.kind = Constraint::Rotation;
+		} else {
+			ok = false;
+		}
+		k.source = index_of(*def, "source");
+		k.weight = std::clamp(num(*def, "weight", 1), 0.0f, 1.0f);
+		if (!ok || k.source < 0 || k.source >= (int)count || k.source == (int)i ||
+		    found.size() >= MOST_CONSTRAINTS) {
+			left_out++;
+			continue;
+		}
+		on[i] = (int)found.size();
+		found.push_back(k);
+	}
+	if (found.empty()) {
+		m.constraints_left_out = left_out;
+		return;
+	}
+	// The nearest node above each that has one (-1: none), parents first.
+	std::vector<int> above(count, -1), queue;
+	for (size_t i = 0; i < count; i++)
+		if (m.nodes[i].parent < 0)
+			queue.push_back((int)i);
+	for (size_t q = 0; q < queue.size(); q++) {
+		const int p = queue[q];
+		for (int c : m.nodes[p].children) {
+			above[c] = on[p] >= 0 ? p : above[p];
+			queue.push_back(c);
+		}
+	}
+	// What each waits on.
+	std::vector<std::vector<int>> waits(found.size());
+	for (size_t k = 0; k < found.size(); k++) {
+		const Constraint &c = found[k];
+		auto with = [&](int node) {
+			for (int n = node; n >= 0; n = above[n])
+				if (on[n] >= 0)
+					waits[k].push_back(on[n]);
+		};
+		if (c.kind == Constraint::Aim) {
+			with(c.source);
+			with(m.nodes[c.node].parent);
+		} else if (on[c.source] >= 0) {
+			waits[k].push_back(on[c.source]);
+		}
+	}
+	// Worked out after what they wait on (a walk without recursion, so a
+	// long line of them can't run out of stack). 0 not seen, 1 being
+	// looked at, 2 fine, 3 left out.
+	std::vector<char> state(found.size(), 0), looped(found.size(), 0);
+	std::vector<int> order;
+	for (size_t start = 0; start < found.size(); start++) {
+		if (state[start])
+			continue;
+		std::vector<std::pair<int, size_t>> stack{{(int)start, 0}};
+		state[start] = 1;
+		while (!stack.empty()) {
+			const int k = stack.back().first;
+			if (stack.back().second < waits[k].size()) {
+				const int w = waits[k][stack.back().second++];
+				if (state[w] == 0) {
+					state[w] = 1;
+					stack.push_back({w, 0});
+				} else if (state[w] == 1) {
+					looped[k] = 1;
+				}
+				continue;
+			}
+			bool fine = !looped[k];
+			for (int w : waits[k])
+				fine = fine && state[w] == 2;
+			state[k] = fine ? 2 : 3;
+			if (fine)
+				order.push_back(k);
+			else
+				left_out++;
+			stack.pop_back();
+		}
+	}
+	for (int k : order)
+		m.constraints.push_back(found[k]);
+	m.constraints_left_out = left_out;
+}
+
 void read_meshes(Reader &rd, const json &doc, Model &m)
 {
 	size_t points = 0, indices = 0;
@@ -1270,6 +1407,7 @@ void load_json(Reader &rd, const json &doc, Model &m)
 	for (const json &mj : list(doc, "materials"))
 		m.materials.push_back(read_material(doc, mj));
 	read_nodes(doc, m);
+	read_constraints(doc, m);
 	read_meshes(rd, doc, m);
 	read_skins(rd, doc, m);
 	read_animations(rd, doc, m);

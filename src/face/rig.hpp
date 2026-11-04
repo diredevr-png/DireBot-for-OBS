@@ -31,6 +31,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //     expressions (blink, "aa", happy...) and the usual names other
 //     tools give them ("Blink", "A", "Smile", "まばたき"...) are worked
 //     out from yours. Your eyes' looks turn a VRM's eyes.
+//   - Its bones that follow others (VRM's node constraints): twist bones
+//     turning with its arms, sleeves aiming at its elbows... as its file
+//     says, once everything else has moved it and before it swings.
 //   - Swinging parts: VRM's spring bones as VRM says they move, bumping
 //     into its colliders; a character's dangly parts (a chain of
 //     links, a doll's ears and legs) swing, each hanging from
@@ -207,6 +210,9 @@ public:
 	// How many of its finger joints relax (RigOptions::fingers), and
 	// whether it has a body that breathes and follows your head.
 	int finger_joints() const { return (int)fingers_.size(); }
+	// How many of its bones follow others (VRM's node constraints: twist
+	// bones, sleeves...).
+	int following_bones() const { return (int)model_->constraints.size(); }
 	bool has_body() const { return !torso_.empty(); }
 	bool auto_chain() const { return auto_chain_; }
 	int upright_parts() const { return (int)upright_.size(); }
@@ -272,6 +278,7 @@ private:
 	};
 
 	void world_from(int node);
+	void apply_constraints();
 	void turn_in_rest(int node, Quat by);
 	void find_fingers();
 	void curl_fingers(const Drive &d);

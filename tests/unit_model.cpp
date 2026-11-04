@@ -3569,6 +3569,241 @@ static void test_fingers_and_body()
 	CHECK(near(high, 1, 1e-5));
 }
 
+// --- Bones that follow others (VRMC_node_constraint) ---------------------
+
+// Whether two turns are the same (to `by` radians).
+static bool same_turn(Quat a, Quat b, float by = 1e-3f)
+{
+	const float c = std::fabs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w);
+	return 2 * std::acos(std::min(1.0f, c)) <= by;
+}
+// A node's own turn as the rig has it (from its parent's world).
+static Quat own_turn(const Rig &rig, int node)
+{
+	const int p = rig.model().nodes[node].parent;
+	const M4 local = p >= 0 ? inverse(rig.world()[p]) * rig.world()[node] : rig.world()[node];
+	return quat_of(local);
+}
+static json follows(const char *kind, int source, json more = json::object(), const char *version = "1.0")
+{
+	more["source"] = source;
+	return {{"VRMC_node_constraint", {{"specVersion", version}, {"constraint", {{kind, more}}}}}};
+}
+
+// A node under `parent`, at `at`.
+static int add_to(Builder &b, int parent, const std::string &name, V3 at = {})
+{
+	const int i = b.node({{"name", name}, {"translation", {at.x, at.y, at.z}}});
+	b.doc["nodes"][parent]["children"].push_back(i);
+	return i;
+}
+
+static void test_bones_that_follow()
+{
+	const float PI = 3.14159265f;
+	const float D = PI / 180;
+	Figure body = make_body();
+	Builder &b = body.p.b;
+	json &bones = b.doc["extensions"]["VRMC_vrm"]["humanoid"]["humanBones"];
+	const int hand = body.hand[0];
+	const int lower = bones["leftLowerArm"]["node"].get<int>();
+	const int upper = bones["leftUpperArm"]["node"].get<int>();
+	const int shoulder = bones["leftShoulder"]["node"].get<int>();
+	auto quat = [](Quat q) { return json::array({q.x, q.y, q.z, q.w}); };
+	auto add = [&](int parent, const char *name, V3 at, json more = json::object()) {
+		json n = {{"name", name}, {"translation", {at.x, at.y, at.z}}};
+		n.update(more);
+		const int i = b.node(n);
+		b.doc["nodes"][parent]["children"].push_back(i);
+		return i;
+	};
+	// Its hand rests turned (its own z along its forearm), and its forearm
+	// twist bone rests turned too (its own -y along its forearm): half its
+	// hand's twist, worked out through both.
+	const Quat hand_rest = axis_angle({0, 1, 0}, 90 * D), twist_rest = axis_angle({0, 0, 1}, 90 * D);
+	b.doc["nodes"][hand]["rotation"] = quat(hand_rest);
+	const int twist = add(lower, "forearm_twist.L", {0.125f, 0, 0},
+			      {{"rotation", quat(twist_rest)},
+			       {"extensions", follows("roll", hand, {{"rollAxis", "Y"}, {"weight", 0.5}})}});
+	// A roll with no axis (X, as three-vrm has it), of the beta's version.
+	const int plain_roll = add(lower, "plain_roll", {0.1f, 0, 0},
+				   {{"extensions", follows("roll", hand, json::object(), "1.0-beta")}});
+	// A second arm copying its upper arm's turn, and one copying half of
+	// that - first in the file, so it must be worked out after.
+	const int sub2 = add(body.chest, "sub2", {-0.1f, 0.1f, 0});
+	const Quat sub_rest = axis_angle({0, 0, 1}, 45 * D);
+	const int sub = add(body.chest, "sub_arm", {0.1f, 0.1f, 0},
+			    {{"rotation", quat(sub_rest)}, {"extensions", follows("rotation", upper)}});
+	b.doc["nodes"][sub2]["extensions"] = follows("rotation", sub, {{"weight", 0.5}});
+	const int sub_tip = add(sub, "sub_tip", {0.2f, 0, 0});
+	// Weights kept from 0 to 1.
+	const int heavy = add(body.chest, "heavy", {0, 0.05f, 0}, {{"extensions", follows("rotation", upper, {{"weight", 3}})}});
+	const int light = add(body.chest, "light", {0, 0.05f, 0}, {{"extensions", follows("rotation", upper, {{"weight", -2}})}});
+	// Something aiming at its second arm's tip, first in the file: it waits
+	// on its source's parents. A sleeve aiming at its elbow, under a part
+	// grown twice as tall as it's wide.
+	const int pointer = add(body.p.hips, "pointer", {0, 0.3f, 0.2f});
+	b.doc["nodes"][pointer]["extensions"] = follows("aim", sub_tip, {{"aimAxis", "PositiveX"}});
+	const int sleeve_root = add(shoulder, "sleeve_root", {0.05f, 0, 0}, {{"scale", {1, 2, 1}}});
+	const int sleeve = add(sleeve_root, "sleeve", {0, 0, 0},
+			       {{"extensions", follows("aim", lower, {{"aimAxis", "PositiveX"}})}});
+	// Left out: one following itself, two following each other and one
+	// waiting on them, an unknown version, roll axis or aim axis, no such
+	// source, no constraint, and an aim at its own child.
+	const int self = add(body.chest, "self", {}), loop_a = add(body.chest, "loop_a", {}),
+		  loop_b = add(body.chest, "loop_b", {}), waiter = add(body.chest, "waiter", {});
+	b.doc["nodes"][self]["extensions"] = follows("rotation", self);
+	b.doc["nodes"][loop_a]["extensions"] = follows("rotation", loop_b);
+	b.doc["nodes"][loop_b]["extensions"] = follows("rotation", loop_a);
+	b.doc["nodes"][waiter]["extensions"] = follows("rotation", loop_a);
+	add(body.chest, "v2", {}, {{"extensions", follows("rotation", upper, json::object(), "2.0")}});
+	add(body.chest, "axis_w", {}, {{"extensions", follows("roll", hand, {{"rollAxis", "W"}})}});
+	add(body.chest, "aim_up", {}, {{"extensions", follows("aim", hand, {{"aimAxis", "Up"}})}});
+	add(body.chest, "nowhere", {}, {{"extensions", follows("rotation", 99999)}});
+	add(body.chest, "empty", {},
+	    {{"extensions", {{"VRMC_node_constraint", {{"specVersion", "1.0"}, {"constraint", json::object()}}}}}});
+	const int aimer = add(body.chest, "aimer", {});
+	const int aimer_child = add(aimer, "aimer_child", {0.1f, 0.1f, 0});
+	b.doc["nodes"][aimer]["extensions"] = follows("aim", aimer_child);
+	// Its upper arm and hand posed by its own animation: the arm swung
+	// out and forwards, the hand twisted 60 degrees round its forearm and
+	// bent 30 degrees up at the wrist.
+	const Quat arm = normalized(axis_angle({0, 0, 1}, -50 * D) * axis_angle({0, 1, 0}, 40 * D));
+	const Quat hand_turn = normalized(axis_angle({0, 0, 1}, 30 * D) * axis_angle({1, 0, 0}, 60 * D) * hand_rest);
+	b.doc["animations"] = json::array(
+		{{{"name", "Pose"},
+		  {"samplers",
+		   {{{"input", b.floats({0}, 1, "SCALAR")}, {"output", b.floats({arm.x, arm.y, arm.z, arm.w}, 4, "VEC4")}},
+		    {{"input", b.floats({0}, 1, "SCALAR")},
+		     {"output", b.floats({hand_turn.x, hand_turn.y, hand_turn.z, hand_turn.w}, 4, "VEC4")}}}},
+		  {"channels",
+		   {{{"sampler", 0}, {"target", {{"node", upper}, {"path", "rotation"}}}},
+		    {{"sampler", 1}, {"target", {{"node", hand}, {"path", "rotation"}}}}}}}});
+
+	auto m = std::make_shared<Model>();
+	std::string why;
+	CHECK(load(b.glb(), *m, &why));
+	CHECK(m->constraints.size() == 8);
+	CHECK(m->constraints_left_out == 10);
+	auto place = [&](int node) {
+		for (size_t i = 0; i < m->constraints.size(); i++)
+			if (m->constraints[i].node == node)
+				return (int)i;
+		return -1;
+	};
+	for (int n : {twist, plain_roll, sub, sub2, heavy, light, pointer, sleeve})
+		CHECK(place(n) >= 0);
+	for (int n : {self, loop_a, loop_b, waiter, aimer})
+		CHECK(place(n) < 0);
+	CHECK(place(sub) < place(sub2) && place(sub) < place(pointer));
+	if (place(twist) < 0 || place(heavy) < 0 || place(light) < 0 || place(plain_roll) < 0)
+		return;
+	const Constraint &tc = m->constraints[place(twist)];
+	CHECK(tc.kind == Constraint::Roll && tc.source == hand && near3(tc.axis, {0, 1, 0}, 0) && near(tc.weight, 0.5, 1e-6));
+	CHECK(near3(m->constraints[place(plain_roll)].axis, {1, 0, 0}, 0));
+	CHECK(m->constraints[place(heavy)].weight == 1 && m->constraints[place(light)].weight == 0);
+	CHECK(m->constraints[place(pointer)].kind == Constraint::Aim);
+
+	RigOptions o;
+	o.arms_down = false;
+	o.fingers = 0;
+	o.animation = animation_named(*m, "Pose");
+	Rig rig(m, o);
+	CHECK(rig.following_bones() == 8);
+	Drive d = still();
+	d.dt = 0;
+	rig.pose(d);
+	// Twist: half the hand's 60 degrees round its forearm (x), none of its
+	// bend - however each rests.
+	CHECK(same_turn(own_turn(rig, twist), axis_angle({1, 0, 0}, 30 * D) * twist_rest));
+	CHECK(same_turn(own_turn(rig, plain_roll), axis_angle({1, 0, 0}, 60 * D)));
+	// Copied turns, in their own spaces; a copy of a copy, half of it.
+	CHECK(same_turn(own_turn(rig, sub), sub_rest * arm));
+	CHECK(same_turn(own_turn(rig, sub2), slerp(Quat{}, arm, 0.5f)));
+	CHECK(same_turn(own_turn(rig, heavy), arm));
+	CHECK(same_turn(own_turn(rig, light), Quat{}));
+	// Aims: its x straight at its source, even under a part grown unevenly.
+	auto at = [&](int n) { return move_of(rig.world()[n]); };
+	auto x_of = [&](int n) { return normalized(direction(rig.world()[n], {1, 0, 0})); };
+	CHECK(near3(x_of(sleeve), normalized(at(lower) - at(sleeve)), 1e-4f));
+	CHECK(near3(x_of(pointer), normalized(at(sub_tip) - at(pointer)), 1e-4f));
+	// The arm really moved, so that means something.
+	CHECK(dot(normalized(at(lower) - at(upper)), {1, 0, 0}) < 0.7f);
+	// Worked out from where they rest every frame, not on top of last time.
+	const Quat once = own_turn(rig, twist);
+	d.dt = 1.0f / 60;
+	for (int i = 0; i < 5; i++)
+		rig.pose(d);
+	CHECK(same_turn(own_turn(rig, twist), once));
+	CHECK(near3(x_of(sleeve), normalized(at(lower) - at(sleeve)), 1e-4f));
+
+	// A long line of them, each following the next: worked out from the
+	// last back (no stack used up). Past 1024 the rest are left out, so the
+	// 1025th is free - turned by its own animation, and all before it with
+	// it.
+	Person lp = make_person(false);
+	Builder &line = lp.b;
+	const int LINE = 1030, first = (int)line.doc["nodes"].size();
+	for (int i = 0; i < LINE; i++)
+		add_to(line, lp.hips, "n" + std::to_string(i));
+	for (int i = 0; i < LINE - 1; i++)
+		line.doc["nodes"][first + i]["extensions"] = follows("rotation", first + i + 1);
+	const Quat spin = axis_angle({0, 1, 0}, 20 * D);
+	line.doc["animations"] = json::array(
+		{{{"samplers",
+		   {{{"input", line.floats({0}, 1, "SCALAR")},
+		     {"output", line.floats({spin.x, spin.y, spin.z, spin.w}, 4, "VEC4")}}}},
+		  {"channels", {{{"sampler", 0}, {"target", {{"node", first + 1024}, {"path", "rotation"}}}}}}}});
+	auto lm = std::make_shared<Model>();
+	CHECK(load(line.glb(), *lm, &why));
+	CHECK(lm->constraints.size() == 1024 && lm->constraints_left_out == LINE - 1 - 1024);
+	if (lm->constraints.size() != 1024)
+		return;
+	CHECK(lm->constraints.front().node == first + 1023 && lm->constraints.back().node == first);
+	RigOptions lo;
+	lo.animation = 0;
+	Rig lrig(lm, lo);
+	lrig.pose(d);
+	CHECK(same_turn(own_turn(lrig, first), spin) && same_turn(own_turn(lrig, first + 500), spin));
+
+	// Before anything swings: a bone aiming at a point that moves (round
+	// it, over a second) swings its swinging tip about - the tip, left
+	// where it was, lags behind it.
+	Person sp = make_person(false);
+	Builder &sb = sp.b;
+	const int goal = add_to(sb, sp.hips, "goal", {0.3f, 0, 0});
+	const int aimed = add_to(sb, sp.hips, "aimed", {0, 0, 0});
+	sb.doc["nodes"][aimed]["extensions"] = follows("aim", goal, {{"aimAxis", "PositiveX"}});
+	const int tip = add_to(sb, aimed, "tip", {0.1f, 0, 0});
+	add_to(sb, tip, "tip_end", {0.1f, 0, 0});
+	sb.doc["extensions"]["VRMC_springBone"]["springs"].push_back(
+		{{"name", "tip"},
+		 {"joints",
+		  {{{"node", tip}, {"stiffness", 0.0}, {"gravityPower", 0.0}, {"dragForce", 0.0}}, {{"node", tip + 1}}}}});
+	sb.doc["animations"] = json::array(
+		{{{"samplers",
+		   {{{"input", sb.floats({0, 1}, 1, "SCALAR")},
+		     {"output", sb.floats({0.3f, 0, 0, 0, 0, 0.3f}, 3, "VEC3")}}}},
+		  {"channels", {{{"sampler", 0}, {"target", {{"node", goal}, {"path", "translation"}}}}}}}});
+	auto smod = std::make_shared<Model>();
+	CHECK(load(sb.glb(), *smod, &why));
+	RigOptions so;
+	so.animation = 0;
+	Rig srig(smod, so);
+	Drive sd = still();
+	sd.dt = 0;
+	srig.pose(sd);
+	auto x_in = [](const Rig &r, int n) { return normalized(direction(r.world()[n], {1, 0, 0})); };
+	CHECK(near3(x_in(srig, tip), x_in(srig, aimed), 1e-4f));
+	sd.dt = 1.0f / 60;
+	for (int i = 0; i < 30; i++)
+		srig.pose(sd);
+	const V3 aim_now = x_in(srig, aimed);
+	CHECK(near3(aim_now, normalized(move_of(srig.world()[goal]) - move_of(srig.world()[aimed])), 1e-4f));
+	CHECK(dot(aim_now, {1, 0, 0}) < 0.9f);         // it has swung
+	CHECK(dot(x_in(srig, tip), aim_now) < 0.996f); // its tip more than 5 degrees behind
+}
+
 int main()
 {
 	test_write_and_read();
@@ -3607,6 +3842,7 @@ int main()
 	test_own_move_once();
 	test_faces_on_cue();
 	test_knocked_and_head();
+	test_bones_that_follow();
 	std::printf("unit_model: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;
 }

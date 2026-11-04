@@ -27,7 +27,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // "MToon") and the pictures as the file has them (PNG or JPEG, turned
 // into textures by OBS). From VRM too: which bone is the head, neck and
 // eyes, the expressions (blink, "aa", happy...) and the swinging parts
-// (spring bones) with what they bump into. And its own animations
+// (spring bones) with what they bump into; its bones that follow others
+// (VRM's node constraints: twist bones, sleeves). And its own animations
 // (moves, turns and sizes; not its expressions' strengths), and VRM
 // animation files (.vrma) for any VRM.
 //
@@ -214,6 +215,23 @@ struct Collider {
 	bool capsule = false;
 };
 
+// A bone that follows another (VRM's node constraints,
+// VRMC_node_constraint 1.0): `node` turns `weight` (0 to 1) of the way
+// from how it rests to where `source` takes it -
+//   - Roll (twist bones): only round its own `axis` (x, y or z), as much
+//     as `source` has turned round it since it rested;
+//   - Aim (a sleeve): turned the least it takes for its `axis` (+ or -
+//     x, y or z) to point at `source`;
+//   - Rotation (a second arm): turned as `source` has turned since it
+//     rested, in its own space.
+struct Constraint {
+	enum Kind { Roll, Aim, Rotation };
+	Kind kind = Rotation;
+	int node = -1, source = -1;
+	V3 axis{1, 0, 0};
+	float weight = 1;
+};
+
 // VRM's eye looks: up to how many degrees the eyes turn (bone looks) or
 // how strong the look expressions get, for a look `in` degrees.
 struct LookRange {
@@ -269,6 +287,12 @@ struct Model {
 	LookRange look_in, look_out, look_up, look_down;
 	std::vector<Spring> springs;
 	std::vector<Collider> colliders;
+	// Its bones that follow others, in the order they're worked out (each
+	// after those it waits on); and how many the file has that can't be
+	// (one following itself, or caught in a loop of them, or waiting on
+	// one that is: left out, as the spec says no file should have them).
+	std::vector<Constraint> constraints;
+	int constraints_left_out = 0;
 	std::vector<Animation> animations;
 	// Which way it faces as it is: VRM 1.0 and glTF along +z, VRM 0.x -z.
 	bool faces_back = false;

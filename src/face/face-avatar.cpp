@@ -1052,6 +1052,9 @@ struct FaceAvatar {
 		// and follows your head.
 		int fingers = 0;
 		bool body = false;
+		// Its bones that follow others (VRM's node constraints: twist
+		// bones...), and how many its file has that can't be.
+		int following = 0, following_left_out = 0;
 		// Its own animations' names (and lengths, seconds), and the one
 		// playing ("" none).
 		std::vector<std::string> animations;
@@ -1995,6 +1998,8 @@ struct FaceAvatar {
 			state3d.upright = rig->upright_parts();
 			state3d.set_up = !look3d.setup->empty();
 			state3d.fingers = rig->finger_joints();
+			state3d.following = rig->following_bones();
+			state3d.following_left_out = model_now->constraints_left_out;
 			state3d.body = rig->has_body();
 			react_state.faces = rig->faces();
 			react_state.shapes = rig->shapes();
@@ -4002,6 +4007,8 @@ struct FaceAvatar {
 				      {"arkit_parts", st.arkit},
 				      {"set_up", st.set_up},
 				      {"finger_joints", st.fingers},
+				      {"following_bones", st.following},
+				      {"following_bones_left_out", st.following_left_out},
 				      {"body", st.body},
 				      {"upright_parts", st.upright},
 				      {"cards", st.cards},
