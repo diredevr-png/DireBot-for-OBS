@@ -134,6 +134,34 @@ you as soon as it sees you; `auto_blink` makes it blink by itself while it
 sees you too. A VRM's chest and shoulders rise with each breath and its
 body takes some of your head's turn (`body_follow` 0-100); a 3D character
 with no bones grows a touch with each breath, and a 2D one rises.
+
+**The mouth from your mic, lights you choose, and camera views (0.6.0).**
+Its mouth moves from your mic as well as your camera (`mouth_from`:
+`camera`, `mic` or `both` - in both, the camera's mouth until you talk,
+then the mic's): it listens to the mic you pick in OBS (`mic`, a source's
+name; empty, your first mic) and finds the vowel you're saying - A, I,
+U, E or O, the mouth shapes every VRM has - from where the voice's two
+lowest resonances are, and how loud it is: the mouth starts to open at
+`mic_start` dB and is open all the way at `mic_full` dB (a gate below
+that), times `mic_amount` (0-200%). OBS's own mute and volume count, as
+its meter shows them. An "s" or a click opens it a little, teeth
+together. "Say each vowel" (`FaceMicCalibrate`) listens to you say each
+for a moment and keeps where your own voice puts them (`mic_profile`).
+The lights on a 3D character (`light_preset`: `studio` - as it always
+was - `daylight`, `cozy`, `night`, `neon`, or `own`: `light_side` and
+`light_height` in degrees, `light_colour` and `light_brightness`, the
+room's `room_colour` and `room_brightness`, a rim light's `rim_colour` and
+`rim_brightness`) sit where your camera is, so every camera view is lit
+the same, and your real eyes and mouth on it take its light. Its file's
+normal maps (bumps and creases) and occlusion maps (shadows in folds) are
+drawn (`detail_maps`; its own tangents, or worked out); `soft_skin`
+(0-100%) lets light reach round into the shadow side of its skin, warmer -
+on the materials named like skin (`skin`, `face`, `body`, `head`, but not
+its eyes, hair, teeth or clothes), or the ones `skin_parts` names, a name
+a line. Up to three saved camera views (`views`, JSON: `name`, `yaw` and
+`pitch` in degrees round it, `zoom` (1 as framed), `x` and `y` - shares of
+the picture to move it) - `view` shows one (`1`-`3`, or `main`), gliding
+there in `view_glide` ms.
 Your real
 eyes and mouth go on its face too, soft-edged and in its skin's colour,
 turning half as far as it does, while its own stay still under them (or
@@ -210,7 +238,8 @@ The add-on's own requests go through `CallVendorRequest` with
 | `RecordSetOptions` `{options}` | saves them (the same shape as `options` above); answers the state |
 | `RecordStart` / `RecordStop` | the state, plus `note` when some couldn't start, or `error` in words when none could. The `RecordChanged` vendor event sends the state whenever it changes |
 | `FaceSet` `{source, clear?}` | "Set": the next looks that find the face are its rest, kept in the source's `rest` setting (`setting` while it's taking them); `clear` forgets it. `ok`, or `error` in words (for one, the face avatar isn't shown) |
-| `FaceGetState` `{source, points?}` | `camera`, `ready`, `showing`, `found`, `presence` (0-1), `set`, `setting`, `turn` (`yaw`, `pitch`, `roll` in degrees, since "Set"), `turned` (-1, 0, 1), `moves` (the 51 expressions, 0-1 since "Set", ARKit's names), `parts` (first eye, second eye, mouth: `x`, `y`, `w`, `h` shares of the camera's picture), `shown`, `holding`, `looks_per_second`, `ms`, `problem`; with `points`, the 478 `points` (`x`, `y` shares); with a 3D character, `model`: `file`, `loaded`, `loading`, `shown`, `kind` (`gltf`, `vrm0`, `vrm1`), `title`, `author`, `points`, `triangles`, `springs`, `animations` (its own animations: `name` each), `animation` (the one playing, or ""), `swinging_chain`, `arkit_parts`, `blinks` and `talks` (once it's rigged: whether its own blink and mouth shapes move its face enough to see, at least 0.1% of its height; tiny marker shapes don't count), `set_up` (it has a set-up), `upright_parts`, `cards` (your eyes and mouth drawn on it last frame, 0-3), `outfit_layers` (outfit pictures drawn on it last frame), `spots` (`left_eye`, `right_eye`, `mouth`: `x`, `y`, `w`, `h` shares of its picture from the front, `from` where it found them: `expressions`, `eye bones`, `set up`, `guessed`), `expressions` (VRM's, 0-1), `yaw`, `pitch`, `x`, `y` (its middle in the picture, pixels), `finger_joints` (the finger joints it curls), `body` (it has a spine or chest that breathes and follows your head), `problem` in words when it couldn't be read. Always (0.5.0): `tune`: `reading` and `shows` (each tune group, 0-1: what the camera reads and what the character shows from it) and `reading_peak`, `shows_peak` (the same, held at their highest for 0.6 s); `alive`: `idle` (0 following you to 1 idle), `breath` (0-1); `camera_check`: `seen`, `box` (`x`, `y`, `w`, `h`: your face in the camera's picture, shares of it), `facing` (`yaw`, `pitch`, `roll`: which way you face the camera itself, degrees, not since "Set"), `light` (`face`, `left`, `right` - each side of your face as the picture shows it - and `room`, the rest of the picture: 0 black to 1 white), `camera_width`, `camera_height` |
+| `FaceGetState` `{source, points?}` | `camera`, `ready`, `showing`, `found`, `presence` (0-1), `set`, `setting`, `turn` (`yaw`, `pitch`, `roll` in degrees, since "Set"), `turned` (-1, 0, 1), `moves` (the 51 expressions, 0-1 since "Set", ARKit's names), `parts` (first eye, second eye, mouth: `x`, `y`, `w`, `h` shares of the camera's picture), `shown`, `holding`, `looks_per_second`, `ms`, `problem`; with `points`, the 478 `points` (`x`, `y` shares); with a 3D character, `model`: `file`, `loaded`, `loading`, `shown`, `kind` (`gltf`, `vrm0`, `vrm1`), `title`, `author`, `points`, `triangles`, `springs`, `animations` (its own animations: `name` each), `animation` (the one playing, or ""), `swinging_chain`, `arkit_parts`, `blinks` and `talks` (once it's rigged: whether its own blink and mouth shapes move its face enough to see, at least 0.1% of its height; tiny marker shapes don't count), `set_up` (it has a set-up), `upright_parts`, `cards` (your eyes and mouth drawn on it last frame, 0-3), `outfit_layers` (outfit pictures drawn on it last frame), `spots` (`left_eye`, `right_eye`, `mouth`: `x`, `y`, `w`, `h` shares of its picture from the front, `from` where it found them: `expressions`, `eye bones`, `set up`, `guessed`), `expressions` (VRM's, 0-1), `yaw`, `pitch`, `x`, `y` (its middle in the picture, pixels), `finger_joints` (the finger joints it curls), `body` (it has a spine or chest that breathes and follows your head), `problem` in words when it couldn't be read. Always (0.5.0): `tune`: `reading` and `shows` (each tune group, 0-1: what the camera reads and what the character shows from it) and `reading_peak`, `shows_peak` (the same, held at their highest for 0.6 s); `alive`: `idle` (0 following you to 1 idle), `breath` (0-1); `camera_check`: `seen`, `box` (`x`, `y`, `w`, `h`: your face in the camera's picture, shares of it), `facing` (`yaw`, `pitch`, `roll`: which way you face the camera itself, degrees, not since "Set"), `light` (`face`, `left`, `right` - each side of your face as the picture shows it - and `room`, the rest of the picture: 0 black to 1 white), `camera_width`, `camera_height`. Always (0.6.0): `mic`: `from`, `mic` (as set), `found`, `listening_to` (the mic it hears), `hearing`, `muted`, `level` and `peak` (dB), `start`, `full`, `heard` (louder than the start), `voiced`, `talking`, `open` (0-1), `share` (how much of its mouth is the mic's, 0-1), `vowels` (`a`, `i`, `u`, `e`, `o`: 0-1), `f1`, `f2` (Hz), `own_voice` (a saved "say each vowel"), `calibration` (`running`, `vowel`, `number`, `listening`, `left` seconds, `done`, and once done `heard` per vowel and `own`); `lights`: `preset`, `side`, `height`, `colour`, `brightness`, `room_colour`, `room`, `rim_colour`, `rim`, `detail`, `soft_skin`; `camera_view`: `view` (the one asked for), `showing`, `gliding`, `views` (`name`, `yaw`, `pitch`, `zoom`, `x`, `y`); and in `model`: `materials` (`name`, `bumps`, `shadows`, `skin` each), `bump_parts`, `shadow_parts`, `skin_parts` |
+| `FaceMicCalibrate` `{source, do}` | "Say each vowel": `do` `start` (it asks for each vowel in turn - follow `mic.calibration` in `FaceGetState` - and saves your voice's places in `mic_profile` when it's done), `stop`, or `forget` (back to the usual places). `ok`, or `error` in words (no mic found, or its mouth is from the camera only) |
 | `FaceModelFront` `{source, width?, close?}` | its 3D character straight from the front as it's made: `width`, `height`, `rgba` (base64, plain colour), `box` (`left`, `top`, `width`, `height` in the model), `region` (`x`, `y`, `w`, `h`: the part of the box drawn, as shares of it), `spots` (as in `FaceGetState`) - its front picture, which spots and outfit places are shares of. `close`: just the part round its face, for its eyes and mouth up close (`spots` are still shares of the whole box) |
 | `GetUsage` | `measuring` (first 3 seconds), `fps`, `fps_now`, `frame_ms`, `frame_budget_ms`, `frames`, `frames_lagged`, `encoded`, `encoded_skipped`, `cpu`, `memory_mb`, `stream_frames`, `stream_dropped`, and `sources`: per input and filter `name`, `uuid`, `kind`, `type`, `active`, `showing`, `measured`, `tick_ms`, `render_ms`, `gpu_ms` (+ `_max_ms`), `fps_in`/`fps_shown` for cameras and media, `parent`/`enabled` for filters (and `own_ms`/`own_gpu_ms`: a filter's time takes in what it draws on, so this is its own part), and `hints` (browser size/fps/"shut down when hidden", whether it shows a page on this PC and its port, a short fingerprint of a camera to spot the same one added twice) |
 
@@ -282,6 +311,12 @@ requests and a line in `features`.
 ## Licence
 
 GPL-2.0-or-later, like OBS. See LICENSE.
+
+The mouth from your mic is our own code; its first steps (bringing the
+sound down to a lower rate and looking at it 10 ms at a time) follow
+uLipSync's (Hecomi, MIT licence) as a recipe, with no code copied. Its
+vowels' starting places are the averages Hillenbrand et al. measured
+(J. Acoust. Soc. Am. 97, 1995).
 
 `data/face/face_landmarker.task` is Google's MediaPipe Face Landmarker,
 unchanged: Copyright The MediaPipe Authors, under the Apache License 2.0

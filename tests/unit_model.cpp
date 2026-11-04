@@ -10,6 +10,7 @@
 
 #include "../src/face/alive.hpp"
 #include "../src/face/effect-needs.hpp"
+#include "../src/face/lights.hpp"
 #include "../src/face/model.hpp"
 #include "../src/face/rig.hpp"
 
@@ -809,6 +810,33 @@ static void test_expressions()
 	CHECK(near(rig.expression_values().at("happy"), 1, 1e-5));
 	CHECK(near(rig.weights()[0][2], 0.5, 1e-5)); // happy at its bind's 0.5
 	CHECK(near(rig.weights()[0][1], 0, 1e-5));   // no blink
+	// The mouth from your mic (voice.hpp): all the mic's, an A heard -
+	// aa as loud as it's heard whatever your camera's mouth does, and
+	// the ARKit-named jawOpen as mic_into_moves opens it for an A.
+	d = still();
+	d.moves[move_of_name("jawOpen")] = 0.8f;
+	d.mic.vowel[VOWEL_A] = 0.6f;
+	d.mic.share = 1;
+	rig.pose(d);
+	CHECK(near(rig.expression_values().at("aa"), 0.6, 1e-5));
+	CHECK(near(rig.weights()[0][0], 0.6, 1e-5));
+	CHECK(near(rig.weights()[0][3], 0.75 * 0.6, 1e-5));
+	// Half the mic's, half the camera's.
+	d.mic.share = 0.5f;
+	rig.pose(d);
+	CHECK(near(rig.expression_values().at("aa"), 0.7, 1e-5));
+	CHECK(near(rig.weights()[0][3], 0.8 + (0.45 - 0.8) * 0.5, 1e-5));
+	// An O heard: aa shuts (oh isn't bound on this one), its jaw half open.
+	d.mic = MicMouth();
+	d.mic.vowel[VOWEL_O] = 1;
+	d.mic.share = 1;
+	rig.pose(d);
+	CHECK(near(rig.expression_values().at("aa"), 0, 1e-5));
+	CHECK(near(rig.weights()[0][3], 0.5, 1e-5));
+	// None of it the mic's: the camera's mouth, as before.
+	d.mic.share = 0;
+	rig.pose(d);
+	CHECK(near(rig.weights()[0][0], 0.8, 1e-5) && near(rig.weights()[0][3], 0.8, 1e-5));
 	// Expressions off: nothing moves.
 	d.expressions = false;
 	rig.pose(d);
@@ -1903,6 +1931,336 @@ static void test_effect_needs()
 }
 
 
+// --- Detail maps, lights, soft skin, camera views ---------------------------
+
+// A square facing +z (x 0 to 1, y 0 to 1), its picture the right way up
+// (glTF: v down the picture), with a normal map (and an occlusion map),
+// as `materials` says; `tangents` in the file if given.
+static std::vector<uint8_t> bumpy_square(const json &material, const std::vector<float> &tangents = {},
+					 bool mirrored_uv = false, json extra_material = json())
+{
+	Builder b;
+	const std::vector<V3> pos = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0}};
+	const std::vector<V3> normal(4, V3{0, 0, 1});
+	std::vector<float> uv = {0, 1, 1, 1, 0, 0, 1, 0};
+	if (mirrored_uv)
+		for (size_t i = 0; i < uv.size(); i += 2)
+			uv[i] = 1 - uv[i];
+	const std::vector<uint16_t> ix = {0, 1, 2, 2, 1, 3};
+	json attr = {{"POSITION", b.vec3s(pos)}, {"NORMAL", b.vec3s(normal)}, {"TEXCOORD_0", b.floats(uv, 2, "VEC2")}};
+	if (!tangents.empty())
+		attr["TANGENT"] = b.floats(tangents, 4, "VEC4");
+	json prims = json::array({{{"attributes", attr}, {"indices", b.indices(ix)}, {"material", 0}}});
+	if (!extra_material.is_null())
+		prims.push_back({{"attributes", attr}, {"indices", b.indices(ix)}, {"material", 1}});
+	b.doc["meshes"].push_back({{"primitives", prims}});
+	b.doc["materials"].push_back(material);
+	if (!extra_material.is_null())
+		b.doc["materials"].push_back(extra_material);
+	b.doc["images"].push_back({{"uri", "data:image/png;base64,"}});
+	b.doc["textures"].push_back({{"source", 0}});
+	b.node({{"name", "square"}, {"mesh", 0}});
+	return b.glb();
+}
+
+static void test_detail_maps()
+{
+	const json bumpy = {{"name", "Skin"},
+			    {"normalTexture", {{"index", 0}, {"scale", 0.5}}},
+			    {"occlusionTexture", {{"index", 0}, {"strength", 0.7}}}};
+	// Read from the material, its tangents worked out from its UVs: its
+	// picture's right along +x, its up along +y (w 1).
+	{
+		Model m;
+		CHECK(load(bumpy_square(bumpy), m));
+		const Material &mat = m.materials[0];
+		CHECK(mat.normal_map.used() && near(mat.normal_scale, 0.5, 1e-6));
+		CHECK(mat.occlusion_map.used() && near(mat.occlusion_strength, 0.7, 1e-6));
+		const Primitive &p = m.meshes[0].parts[0];
+		CHECK(p.tangent.size() == 16);
+		for (size_t i = 0; i < 4 && p.tangent.size() == 16; i++)
+			CHECK(near(p.tangent[i * 4], 1, 1e-5) && near(p.tangent[i * 4 + 1], 0, 1e-5) &&
+			      near(p.tangent[i * 4 + 2], 0, 1e-5) && p.tangent[i * 4 + 3] == 1);
+	}
+	// The picture flipped left to right: its right along -x, its up still
+	// +y - so w is -1.
+	{
+		Model m;
+		CHECK(load(bumpy_square(bumpy, {}, true), m));
+		const Primitive &p = m.meshes[0].parts[0];
+		CHECK(p.tangent.size() == 16 && near(p.tangent[0], -1, 1e-5) && p.tangent[3] == -1);
+	}
+	// The file's own tangents, squared up (1 long, w 1 or -1).
+	{
+		Model m;
+		CHECK(load(bumpy_square(bumpy, {2, 0, 0, -3, 2, 0, 0, -3, 0, 3, 0, 0.5f, 0, 3, 0, 0.5f}), m));
+		const Primitive &p = m.meshes[0].parts[0];
+		CHECK(p.tangent.size() == 16 && near(p.tangent[0], 1, 1e-6) && p.tangent[3] == -1);
+		CHECK(near(p.tangent[9], 1, 1e-6) && p.tangent[11] == 1);
+	}
+	// Broken ones in the file (no length): worked out instead.
+	{
+		Model m;
+		CHECK(load(bumpy_square(bumpy, std::vector<float>(16, 0.0f)), m));
+		const Primitive &p = m.meshes[0].parts[0];
+		CHECK(p.tangent.size() == 16 && near(p.tangent[0], 1, 1e-5) && p.tangent[3] == 1);
+	}
+	// No normal map: no tangents kept, even the file's.
+	{
+		Model m;
+		CHECK(load(bumpy_square({{"name", "plain"}}, std::vector<float>(16, 1.0f)), m));
+		CHECK(!m.materials[0].normal_map.used() && m.meshes[0].parts[0].tangent.empty());
+	}
+	// A map on the second UVs (not read): left out.
+	{
+		Model m;
+		CHECK(load(bumpy_square({{"normalTexture", {{"index", 0}, {"texCoord", 1}}},
+					 {"occlusionTexture", {{"index", 0}, {"texCoord", 1}}}}),
+			   m));
+		CHECK(!m.materials[0].normal_map.used() && !m.materials[0].occlusion_map.used());
+		CHECK(m.meshes[0].parts[0].tangent.empty());
+	}
+	// A silly strength: kept sensible.
+	{
+		Model m;
+		CHECK(load(bumpy_square({{"normalTexture", {{"index", 0}, {"scale", 1e9}}},
+					 {"occlusionTexture", {{"index", 0}, {"strength", -5}}}}),
+			   m));
+		CHECK(near(m.materials[0].normal_scale, 4, 1e-6) && near(m.materials[0].occlusion_strength, 0, 1e-6));
+	}
+	// Posed: turned with its node, and a mirrored node's up the other way.
+	{
+		Model m;
+		CHECK(load(bumpy_square(bumpy), m));
+		m.nodes[0].r = axis_angle({0, 0, 1}, 3.14159265f / 2);
+		RigOptions o;
+		o.springs = false;
+		auto model = std::make_shared<Model>(m);
+		Rig rig(model, o);
+		rig.pose(still());
+		const Rig::Part &part = rig.parts()[0];
+		CHECK(part.tangent.size() == 4 && near3(part.tangent[0], {0, 1, 0}, 1e-4f) && part.handed == 1);
+		Model mm;
+		CHECK(load(bumpy_square(bumpy), mm));
+		mm.nodes[0].s = {-1, 1, 1};
+		Rig mirrored(std::make_shared<Model>(mm), o);
+		mirrored.pose(still());
+		CHECK(mirrored.parts()[0].handed == -1 && near3(mirrored.parts()[0].tangent[0], {-1, 0, 0}, 1e-4f));
+		// A part without a normal map: no tangents posed.
+		Model plain;
+		CHECK(load(bumpy_square({{"name", "plain"}}), plain));
+		Rig r2(std::make_shared<Model>(plain), o);
+		r2.pose(still());
+		CHECK(r2.parts()[0].tangent.empty());
+	}
+	// VRM 1.0's MToon keeps glTF's normal map.
+	{
+		json mtoon = bumpy;
+		mtoon["extensions"] = {{"VRMC_materials_mtoon", {{"specVersion", "1.0"}}}};
+		Model m;
+		CHECK(load(bumpy_square(mtoon), m));
+		CHECK(m.materials[0].shading == Shading::Toon && m.materials[0].normal_map.used());
+		CHECK(m.meshes[0].parts[0].tangent.size() == 16);
+	}
+	// Two materials on one part's points: tangents only where it's bumpy.
+	{
+		Model m;
+		CHECK(load(bumpy_square(bumpy, {}, false, {{"name", "Shirt"}}), m));
+		CHECK(m.meshes[0].parts.size() == 2 && m.meshes[0].parts[0].tangent.size() == 16 &&
+		      m.meshes[0].parts[1].tangent.empty());
+	}
+	// Worked out on a curved part (a box): square to each facing.
+	{
+		Primitive p;
+		std::vector<uint16_t> ix16;
+		cube(p.pos, ix16);
+		p.index.assign(ix16.begin(), ix16.end());
+		for (const V3 &v : p.pos)
+			p.uv.insert(p.uv.end(), {v.x + 0.5f, 0.5f - v.y});
+		p.normal.assign(p.pos.size(), V3{});
+		for (size_t i = 0; i < p.pos.size(); i++)
+			p.normal[i] = normalized(p.pos[i], {0, 0, 1});
+		const std::vector<float> t = tangents_of(p);
+		CHECK(t.size() == p.pos.size() * 4);
+		bool square = true, finite = true;
+		for (size_t i = 0; i < p.pos.size() && t.size() == p.pos.size() * 4; i++) {
+			const V3 tv{t[i * 4], t[i * 4 + 1], t[i * 4 + 2]};
+			square = square && std::fabs(dot(tv, p.normal[i])) < 1e-4f && near(length(tv), 1, 1e-4);
+			finite = finite && std::isfinite(tv.x + tv.y + tv.z) && (t[i * 4 + 3] == 1 || t[i * 4 + 3] == -1);
+		}
+		CHECK(square && finite);
+		// No UVs: none.
+		p.uv.clear();
+		CHECK(tangents_of(p).empty());
+	}
+}
+
+static void test_lights()
+{
+	// The studio: exactly the lights it always had.
+	const Lights studio = preset_lights(LIGHTS_STUDIO), plain;
+	CHECK(near3(studio.key_dir, {-0.45f, 0.6f, 0.66f}, 0) && near3(studio.key, {1.05f, 1.029f, 0.9975f}, 0));
+	CHECK(near3(studio.fill, {0.2475f, 0.261f, 0.2925f}, 0) && near3(studio.room_up, {0.42f, 0.43f, 0.46f}, 0));
+	CHECK(near3(studio.room_down, {0.16f, 0.15f, 0.15f}, 0) && near3(studio.rim, {0, 0, 0}, 0));
+	CHECK(near3(plain.key, studio.key, 0));
+	// Your camera's eyes and mouth on it: as they always were in the
+	// studio; darker and bluer at night; pinker in neon; brighter with
+	// the light doubled; never past three times.
+	const V3 front = front_light(studio), night_front = front_light(preset_lights(LIGHTS_NIGHT));
+	CHECK(front.x == 1 && front.y == 1 && front.z == 1);
+	CHECK(night_front.x < 0.6f && night_front.z > night_front.x * 1.5f);
+	const V3 neon_front = front_light(preset_lights(LIGHTS_NEON));
+	CHECK(neon_front.x > neon_front.y * 1.3f);
+	LightTerms doubled = preset_terms(LIGHTS_STUDIO);
+	doubled.brightness = 200;
+	doubled.room = 210;
+	const V3 bright_front = front_light(lights_of(doubled));
+	CHECK(bright_front.x > 1.9f && bright_front.x < 2.1f);
+	doubled.brightness = doubled.room = 300;
+	Lights blinding = lights_of(doubled);
+	blinding.key = blinding.key * 10;
+	CHECK(front_light(blinding).x == 3);
+	// Its plain terms make lights very close to it ("make my own" from
+	// the studio changes nothing you'd see).
+	const Lights own_studio = lights_of(preset_terms(LIGHTS_STUDIO));
+	CHECK(dot(normalized(own_studio.key_dir, {}), normalized(studio.key_dir, {})) > std::cos(1.0f * 3.14159265f / 180));
+	CHECK(near3(own_studio.key, studio.key, 0.005f) && near3(own_studio.room_up, studio.room_up, 0.005f));
+	CHECK(near3(own_studio.fill, studio.fill, 0.005f) && near3(own_studio.room_down, studio.room_down, 0.005f));
+	CHECK(length(own_studio.rim) == 0);
+	// Each set by its name; an unknown name is the studio.
+	for (int i = 0; i < LIGHT_PRESETS; i++)
+		CHECK(light_preset_of(LIGHT_PRESET_NAMES[i]) == i);
+	CHECK(light_preset_of("") == LIGHTS_STUDIO && light_preset_of("disco") == LIGHTS_STUDIO);
+	// The ready-made sets: sensible numbers, each its own look.
+	auto brightness = [](V3 c) { return c.x + c.y + c.z; };
+	for (int i = LIGHTS_DAYLIGHT; i <= LIGHTS_NEON; i++) {
+		const Lights l = preset_lights(i);
+		bool fine = true;
+		for (const V3 &c : {l.key, l.fill, l.room_up, l.room_down, l.rim, l.key_dir})
+			fine = fine && std::isfinite(c.x + c.y + c.z);
+		for (const V3 &c : {l.key, l.fill, l.room_up, l.room_down, l.rim})
+			fine = fine && c.x >= 0 && c.y >= 0 && c.z >= 0;
+		CHECK(fine && length(l.key_dir) > 0.99f && l.key_dir.z > 0); // from in front
+		CHECK(!near3(l.key, studio.key, 0.05f));
+	}
+	const Lights night = preset_lights(LIGHTS_NIGHT), cozy = preset_lights(LIGHTS_COZY),
+		     day = preset_lights(LIGHTS_DAYLIGHT), neon = preset_lights(LIGHTS_NEON);
+	CHECK(brightness(night.key) < brightness(studio.key) * 0.6f && night.key.z > night.key.x); // dim, blue
+	CHECK(brightness(night.room_up) < brightness(studio.room_up) * 0.4f);
+	CHECK(cozy.key.x > cozy.key.z * 2); // warm
+	CHECK(day.key_dir.x > 0 && cozy.key_dir.x < 0);
+	CHECK(neon.rim.z > neon.rim.x && neon.key.x > neon.key.y); // pink light, a cyan edge
+	CHECK(length(day.rim) > 0 && length(neon.rim) > length(day.rim));
+	// Own terms: the way, colour and brightness as given.
+	LightTerms t;
+	t.side = 90;
+	t.height = 0;
+	t.colour = 0xFF0000;
+	t.brightness = 200;
+	t.rim = 0;
+	const Lights red = lights_of(t);
+	CHECK(near3(red.key_dir, {1, 0, 0}, 1e-5f) && near3(red.key, {2.1f, 0, 0}, 1e-5f));
+	CHECK(red.fill_dir.x < 0); // the second lamp from the other side
+	t.side = 9999;
+	t.brightness = -50;
+	const Lights silly = lights_of(t);
+	CHECK(std::isfinite(silly.key_dir.x) && silly.key.x == 0);
+	CHECK(colour_text(0xFFB066) == "#ffb066" && colour_text(0) == "#000000");
+}
+
+static void test_skin_parts()
+{
+	Model m;
+	for (const char *name : {"Face_00_SKIN", "Body_00_SKIN", "EyeWhite_00_EYE", "HairBack_00_HAIR", "Wolf3D_Body",
+				 "Shirt", "Head", "Headphones", "Bodysuit", "FaceBrow", "Material.001"}) {
+		Material mat;
+		mat.name = name;
+		m.materials.push_back(mat);
+	}
+	const std::vector<bool> guess = skin_materials(m, "");
+	const std::vector<bool> want = {true, true, false, false, true, false, true, false, false, false, false};
+	CHECK(guess == want);
+	// Named ones only (any case, a name a line).
+	const std::vector<bool> named = skin_materials(m, " shirt \r\nMATERIAL.001\n\n");
+	CHECK(named == std::vector<bool>({false, false, false, false, false, true, false, false, false, false, true}));
+	CHECK(skin_materials(Model(), "").empty());
+}
+
+static void test_camera_views()
+{
+	Person p = make_person(false);
+	auto m = std::make_shared<Model>();
+	CHECK(load(p.b.glb(), *m));
+	const Quat facing;
+	const Framing base = frame_own_spot(*m, facing, 1000, 1000, 0.8f, false, 0, 0, 1);
+	// As it's framed: nothing changes.
+	{
+		Framing f = base;
+		view_own_spot(f, CameraView());
+		CHECK(near(f.fov, base.fov, 1e-6) && near(f.seen_w, base.seen_w, 1e-6));
+		CHECK(near3(point(f.view, {0.3f, 0.2f, 0.1f}), point(base.view, {0.3f, 0.2f, 0.1f}), 1e-5f));
+	}
+	// Twice as close: half as much of the world seen, a narrower view.
+	{
+		Framing f = base;
+		CameraView v;
+		v.zoom = 2;
+		view_own_spot(f, v);
+		CHECK(near(f.seen_w, base.seen_w / 2, 1e-5) && near(f.seen_h, base.seen_h / 2, 1e-5));
+		CHECK(near(std::tan(f.fov / 2), std::tan(base.fov / 2) / 2, 1e-5));
+	}
+	// Gone round to the picture's right a quarter: its left side (the
+	// world's +x) faces the camera.
+	{
+		Framing f = base;
+		CameraView v;
+		v.yaw = 90;
+		view_own_spot(f, v);
+		const V3 side = point(f.view, {0.5f, 0, 0}), middle = point(f.view, {0, 0, 0});
+		CHECK(near(side.z - middle.z, 0.5, 1e-4) && near(side.x - middle.x, 0, 1e-4));
+		// Moving with you now moves it across the picture still.
+		const V3 before = point(f.view, point(f.place, {0, 0, 0}));
+		move_own_spot(f, 0.1f, 0);
+		const V3 after = point(f.view, point(f.place, {0, 0, 0}));
+		CHECK(near(after.x - before.x, 0.1 * f.seen_w, 1e-4) && near(after.z - before.z, 0, 1e-4));
+	}
+	// From above: the top of it nearer the camera.
+	{
+		Framing f = base;
+		CameraView v;
+		v.pitch = 30;
+		view_own_spot(f, v);
+		CHECK(point(f.view, {0, 0.5f, 0}).z > point(f.view, {0, -0.5f, 0}).z);
+	}
+	// Sat further right and down in the picture.
+	{
+		Framing f = base;
+		CameraView v;
+		v.x = 0.25f;
+		v.y = 0.1f;
+		v.zoom = 1.5f;
+		view_own_spot(f, v);
+		const V3 c = point(f.view, {0, 0, 0});
+		CHECK(near(c.x, 0.25 * f.seen_w, 1e-4) && near(c.y, -0.1 * f.seen_h, 1e-4));
+	}
+	// Kept sensible, and gliding between two.
+	{
+		CameraView silly;
+		silly.yaw = 500;
+		silly.pitch = -90;
+		silly.zoom = 0;
+		silly.x = std::nanf("");
+		const CameraView s = sensible_view(silly);
+		CHECK(s.yaw == 120 && s.pitch == -45 && near(s.zoom, 0.3, 1e-6) && s.x == 0);
+		CameraView a, b;
+		b.yaw = 40;
+		b.zoom = 4;
+		const CameraView half = view_between(a, b, 0.5f);
+		CHECK(near(half.yaw, 20, 1e-5) && near(half.zoom, 2, 1e-4)); // growing evenly: 1, 2, 4
+		CHECK(near(view_between(a, b, 1).zoom, 4, 1e-5) && near(view_between(a, b, -1).yaw, 0, 1e-6));
+	}
+}
+
 // --- Tune your face, alive when you're still, the camera check ---------------
 
 static void test_tune()
@@ -2432,6 +2790,10 @@ int main()
 	test_set_up();
 	test_obs_camera();
 	test_effect_needs();
+	test_detail_maps();
+	test_lights();
+	test_skin_parts();
+	test_camera_views();
 	test_tune();
 	test_alive();
 	test_light();

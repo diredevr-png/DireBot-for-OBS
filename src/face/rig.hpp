@@ -56,6 +56,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "model.hpp"
 #include "setup.hpp"
 #include "tracker.hpp"
+#include "voice.hpp"
 
 namespace direbot::face {
 
@@ -119,6 +120,11 @@ struct Drive {
 	float body_follow = 0;
 	float body_yaw = 0, body_roll = 0;
 	bool breathe_whole = true;
+	// The mouth from your mic (voice.hpp): its vowels take over the
+	// mouth's shapes as much as `mic.share` - VRM's A I U E O as they
+	// are, ARKit-named shapes through mic_into_moves. `moves` stay the
+	// camera's.
+	MicMouth mic;
 };
 
 class Rig {
@@ -137,6 +143,11 @@ public:
 		int node = -1, part = -1;
 		const Primitive *prim = nullptr;
 		std::vector<V3> pos, normal; // in the world
+		// The way its picture's right is, in the world, for a part with a
+		// normal map (empty: none); which way its up is: prim->tangent's w,
+		// times `handed` (-1 for a part mirrored by its node or bones).
+		std::vector<V3> tangent;
+		float handed = 1;
 	};
 	const std::vector<Part> &parts() const { return parts_; }
 	const std::vector<M4> &world() const { return world_; }
@@ -276,8 +287,11 @@ struct Framing {
 	V3 pivot;              // what it turns round, whole (model space)
 	bool has_pivot = false;
 	M4 upright; // the model -> the world, your head held straight (Drive::upright)
-	// In its own spot: the picture's width and height in the world.
+	// In its own spot: the picture's width and height in the world, and
+	// the world's ways that are its right and up (a camera view turns
+	// them).
 	float seen_w = 1, seen_h = 1;
+	V3 right{1, 0, 0}, up{0, 1, 0};
 };
 
 // In its own spot: the picture `w` x `h`, the character `size` of it
@@ -288,6 +302,22 @@ Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, floa
 		       float grow);
 // Moves it on in its spot by `dx`, `dy` more (shares of the picture).
 void move_own_spot(Framing &f, float dx, float dy);
+
+// A saved camera view of it in its own spot: the camera gone round it
+// (`yaw`, degrees, + to the picture's right, so you see more of its left
+// side) and up (`pitch`, + looking down on it), closer (`zoom`: 1 as it's
+// framed, 2 twice as big) and where it sits in the picture (`x`, `y`:
+// shares of the picture, + right and down). The default is as it's framed.
+struct CameraView {
+	float yaw = 0, pitch = 0, zoom = 1, x = 0, y = 0;
+};
+// Each kept sensible (yaw -120 to 120, pitch -45 to 60, zoom 0.3 to 4,
+// x and y -0.5 to 0.5).
+CameraView sensible_view(const CameraView &v);
+// A share `t` (0 to 1) of the way from `a` to `b`.
+CameraView view_between(const CameraView &a, const CameraView &b, float t);
+// The framing seen from the camera view (before move_own_spot).
+void view_own_spot(Framing &f, const CameraView &v);
 
 // Worn on your head: where it sits on it (centimetres from the middle of
 // your head - MediaPipe's face at rest - x right, y up, z out of your

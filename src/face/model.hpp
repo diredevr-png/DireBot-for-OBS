@@ -97,6 +97,14 @@ struct Material {
 	float outline_colour[3] = {0, 0, 0};
 	float outline_mix = 1; // how much the outline takes the light
 	int queue = 0;         // VRM's draw order among see-through parts
+	// Detail pictures (glTF's normal and occlusion textures, on the
+	// part's first UVs): small bumps and dents the light picks out (and
+	// how strongly), and how shut-in each spot is from the room's light
+	// (and how much that counts).
+	TexRef normal_map;
+	float normal_scale = 1;
+	TexRef occlusion_map;
+	float occlusion_strength = 1;
 };
 
 // An expression's change to a part: each point moved by this much (and
@@ -114,7 +122,15 @@ struct Primitive {
 	std::vector<uint32_t> index;  // 3 a triangle
 	std::vector<MorphTarget> morphs;
 	int material = -1; // -1: plain white
+	// 4 a point, only on a part with a normal map (empty: none): the way
+	// its picture's right is (x y z), and which way its up is (w, 1 or
+	// -1: up = w * cross(normal, tangent)) - from the file, or worked
+	// out from its UVs (tangents_of).
+	std::vector<float> tangent;
 };
+// A part's tangents worked out from its points, facings and UVs, as glTF
+// has them (its UVs' v going down the picture, a normal map's green up).
+std::vector<float> tangents_of(const Primitive &p);
 
 struct Mesh {
 	std::string name;
@@ -265,6 +281,12 @@ std::vector<std::vector<int>> hanging_chains(const Model &m, const Skin &skin);
 // Whether a skin's bones are named as a person's are (hips, spine,
 // arms, legs...): its arms and fingers mustn't dangle.
 bool person_skeleton(const Model &m, const Skin &skin);
+
+// Which of its materials are skin, for soft skin: the ones named in
+// `names` (a name a line, any case), or with none named, the ones whose
+// names say so ("skin", "face", "body" or "head" in them) - never eyes,
+// hair, brows, lashes, teeth, a tongue or clothes.
+std::vector<bool> skin_materials(const Model &m, const std::string &names);
 
 // Every node's place in the model at rest (world matrices).
 std::vector<M4> rest_world(const Model &m);

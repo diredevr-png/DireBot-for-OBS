@@ -52,7 +52,7 @@ sources=(
 	src/follow/tracker.cpp src/follow/follow-cam.cpp
 	src/record/rules.cpp src/record/record.cpp src/moves/plan.cpp src/moves/move-transition.cpp
 	src/filters/blur-filter.cpp src/face/tracker.cpp src/face/pose.cpp src/face/avatar2d.cpp
-	src/face/model.cpp src/face/rig.cpp src/face/alive.cpp src/face/setup.cpp src/face/avatar3d.cpp src/face/face-avatar.cpp
+	src/face/model.cpp src/face/rig.cpp src/face/alive.cpp src/face/voice.cpp src/face/setup.cpp src/face/avatar3d.cpp src/face/face-avatar.cpp
 	src/face/nn/net.cpp src/face/nn/kernels.cpp src/face/nn/kernels-sse2.cpp src/face/nn/kernels-avx2.cpp
 	src/vertical/rules.cpp src/vertical/options.cpp src/vertical/canvas.cpp src/vertical/outputs.cpp
 	src/vertical/settings.cpp src/vertical/vertical.cpp

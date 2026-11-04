@@ -1,7 +1,11 @@
 // DireBot Face Avatar, 3D characters (src/face/avatar3d.cpp):
 //   Draw     a part of the character: its colour and pictures, lit glossy
 //            (shine and reflections), as a cartoon (VRM's MToon: a shadow
-//            colour, a rim of light) or flat
+//            colour, a rim of light) or flat - by the lights chosen
+//            (src/face/lights.hpp), its occlusion map shading what the
+//            room's light can't reach, soft skin letting light in a little
+//   DrawBumped  the same, with a normal map's small bumps (its points
+//            carry tangents for it)
 //   Outline  a cartoon outline: the part pushed out along its facing, only
 //            its far side drawn, so it shows round the edge
 //   Hidden   the hidden head shape: only depth, so what's behind your
@@ -20,6 +24,8 @@ uniform texture2d emissive_map;
 uniform texture2d matcap_map;
 uniform texture2d metal_map;
 uniform texture2d image;
+uniform texture2d normal_map;
+uniform texture2d occlusion_map;
 // Base colour (linear, with its see-through), emissive glow.
 uniform float4 base_colour;
 uniform float3 emissive;
@@ -39,6 +45,22 @@ uniform float outline_width;
 uniform float4 outline_colour;
 // Down: one texel of the big picture.
 uniform float2 texel;
+// The normal map's strength, the occlusion map's, soft skin (0 to 1), 0.
+uniform float4 detail;
+// The lights, in the camera's view (src/face/lights.hpp): towards the key
+// light and its colour (linear, times its brightness), the second lamp's,
+// the room's light from above and below, a rim light (its colour, and how
+// close to the edge it stays), and the key light and the room as shares
+// of the studio's (1 in the studio) for shine, reflections and cartoons.
+uniform float3 key_dir;
+uniform float3 key_colour;
+uniform float3 fill_dir;
+uniform float3 fill_colour;
+uniform float3 room_up;
+uniform float3 room_down;
+uniform float4 rim_light;
+uniform float3 key_tint;
+uniform float3 room_tint;
 
 sampler_state wrapSampler {
 	Filter    = Linear;
@@ -67,6 +89,25 @@ struct VertOut {
 	float3 vnrm : TEXCOORD2;
 };
 
+// A part with a normal map: its tangents too (xyz the way its picture's
+// right is, w which way its up is).
+struct BumpIn {
+	float4 pos  : POSITION;
+	float4 norm : NORMAL;
+	float4 col  : COLOR;
+	float4 tang : TANGENT;
+	float2 uv   : TEXCOORD0;
+};
+
+struct BumpOut {
+	float4 pos  : POSITION;
+	float4 col  : COLOR;
+	float2 uv   : TEXCOORD0;
+	float3 vpos : TEXCOORD1;
+	float3 vnrm : TEXCOORD2;
+	float4 vtan : TEXCOORD3;
+};
+
 VertOut VSDraw(VertIn v)
 {
 	VertOut o;
@@ -75,6 +116,18 @@ VertOut VSDraw(VertIn v)
 	o.uv = v.uv * uv_place.zw + uv_place.xy;
 	o.vpos = mul(float4(v.pos.xyz, 1.0), cam).xyz;
 	o.vnrm = mul(float4(v.norm.xyz, 0.0), cam).xyz;
+	return o;
+}
+
+BumpOut VSBumped(BumpIn v)
+{
+	BumpOut o;
+	o.pos = mul(float4(v.pos.xyz, 1.0), ViewProj);
+	o.col = v.col;
+	o.uv = v.uv * uv_place.zw + uv_place.xy;
+	o.vpos = mul(float4(v.pos.xyz, 1.0), cam).xyz;
+	o.vnrm = mul(float4(v.norm.xyz, 0.0), cam).xyz;
+	o.vtan = float4(mul(float4(v.tang.xyz, 0.0), cam).xyz, v.tang.w);
 	return o;
 }
 
@@ -110,21 +163,28 @@ float3 studio(float3 r)
 	return c + float3(1.6, 1.6, 1.6) * window;
 }
 
-float4 PSDraw(VertOut v) : TARGET
+// Light that reaches a point whose facing is `nl` towards it: all of it
+// facing it, none facing away - or, soft skin, a little round the edge
+// too, red the furthest (light that went in under the skin).
+float3 reaching(float nl, float3 soft)
+{
+	return saturate((float3(nl, nl, nl) + soft) / (float3(1.0, 1.0, 1.0) + soft));
+}
+
+// A point of a part: its colour and pictures at `uv`, facing `N` (its
+// normal map's bumps in it) on a part facing `Ng`, seen from `V`, lit.
+float4 shade_point(float2 uv, float4 vcol, float3 V, float3 N, float3 Ng)
 {
 	// Every picture is read first, the same way at every point.
-	float4 tex = base_map.Sample(wrapSampler, v.uv);
-	float4 shade_tex = shade_map.Sample(wrapSampler, v.uv);
-	float4 glow_tex = emissive_map.Sample(wrapSampler, v.uv);
-	float4 mr = metal_map.Sample(wrapSampler, v.uv);
-	float3 N = normalize(v.vnrm);
-	float3 V = normalize(-v.vpos);
-	if (dot(N, V) < 0.0)
-		N = -N;
+	float4 tex = base_map.Sample(wrapSampler, uv);
+	float4 shade_tex = shade_map.Sample(wrapSampler, uv);
+	float4 glow_tex = emissive_map.Sample(wrapSampler, uv);
+	float4 mr = metal_map.Sample(wrapSampler, uv);
+	float4 occ = occlusion_map.Sample(wrapSampler, uv);
 	float2 cap_uv = float2(N.x * 0.5 + 0.5, 0.5 - N.y * 0.5);
 	float4 cap = matcap_map.Sample(clampSampler, cap_uv);
 
-	float4 base = base_colour * float4(lin(tex.rgb), tex.a) * float4(lin(v.col.rgb), v.col.a);
+	float4 base = base_colour * float4(lin(tex.rgb), tex.a) * float4(lin(vcol.rgb), vcol.a);
 	float alpha = base.a * look.w;
 	if (surface.z > 0.0 && base.a < surface.z)
 		discard;
@@ -132,10 +192,12 @@ float4 PSDraw(VertOut v) : TARGET
 		alpha = look.w;
 	float3 glow = emissive * lin(glow_tex.rgb);
 
-	float3 L = normalize(float3(-0.45, 0.6, 0.66));
-	float3 L2 = normalize(float3(0.7, 0.15, 0.7));
+	float3 L = key_dir;
+	float3 L2 = fill_dir;
 	float nl = dot(N, L);
 	float nv = saturate(dot(N, V));
+	// The rim light: round the edge, more where it's seen side on.
+	float3 rim_lit = rim_light.rgb * pow(1.0 - nv, max(rim_light.w, 0.001));
 	float3 col;
 	if (look.x > 1.5) {
 		col = base.rgb + glow;
@@ -144,22 +206,28 @@ float4 PSDraw(VertOut v) : TARGET
 		float s = nl + toon.x;
 		float t = saturate((s - (-1.0 + toon.y)) / max(0.0001, 2.0 - 2.0 * toon.y));
 		float3 shade = shade_colour * lin(shade_tex.rgb);
-		col = lerp(shade, base.rgb, t);
-		col = col + base.rgb * 0.12;
+		col = lerp(shade, base.rgb, t) * key_tint;
+		col = col + base.rgb * 0.12 * room_tint;
 		float rim = pow(saturate(1.0 - nv + toon.w), max(toon.z, 0.001));
-		col = col + rim_colour * rim * lerp(1.0, saturate(t + 0.3), look.y);
+		col = col + (rim_colour * rim + rim_lit) * lerp(1.0, saturate(t + 0.3), look.y);
 		col = col + matcap_colour * lin(cap.rgb) * look.z;
 		col = col + glow;
 	} else {
-		// Glossy: light from two lamps, shine, and the studio reflected.
+		// Glossy: light from two lamps and the room, shine, and the
+		// studio reflected; what the room can't reach (its occlusion
+		// map) shaded. Soft skin: light from round the edge too, the
+		// bumps softer under it.
+		float ao = lerp(1.0, occ.r, detail.y);
 		float metal = saturate(surface.x * mr.b);
 		float rough = saturate(surface.y * mr.g);
 		float a = max(rough * rough, 0.003);
 		float3 f0 = lerp(float3(0.04, 0.04, 0.04), base.rgb, metal);
 		float3 diffuse = base.rgb * (1.0 - metal);
-		float3 ambient = lerp(float3(0.16, 0.15, 0.15), float3(0.42, 0.43, 0.46), N.y * 0.5 + 0.5);
-		col = diffuse * (ambient + float3(1.0, 0.98, 0.95) * saturate(nl) * 1.05 +
-				 float3(0.55, 0.58, 0.65) * saturate(dot(N, L2)) * 0.45);
+		float3 ambient = lerp(room_down, room_up, N.y * 0.5 + 0.5) * ao;
+		float3 soft = float3(0.5, 0.3, 0.22) * detail.z;
+		float3 Nd = normalize(lerp(N, Ng, detail.z * 0.5));
+		col = diffuse * (ambient + key_colour * reaching(dot(Nd, L), soft) +
+				 fill_colour * reaching(dot(Nd, L2), soft));
 		float3 H = normalize(L + V);
 		float nh = saturate(dot(N, H));
 		float d = nh * nh * (a * a - 1.0) + 1.0;
@@ -167,14 +235,45 @@ float4 PSDraw(VertOut v) : TARGET
 		float k = (rough + 1.0) * (rough + 1.0) / 8.0;
 		float G = 1.0 / ((nv * (1.0 - k) + k) * (saturate(nl) * (1.0 - k) + k));
 		float3 F = f0 + (float3(1.0, 1.0, 1.0) - f0) * pow(1.0 - saturate(dot(H, V)), 5.0);
-		col = col + D * G * F * saturate(nl) * 0.25;
+		col = col + D * G * F * saturate(nl) * 0.25 * key_tint;
 		float3 R = reflect(-V, N);
 		float3 env = lerp(studio(R), float3(0.5, 0.5, 0.52), rough);
 		float3 fe = f0 + (max(float3(1.0 - rough, 1.0 - rough, 1.0 - rough), f0) - f0) * pow(1.0 - nv, 5.0);
-		col = col + env * fe * (1.0 - rough * 0.7);
+		col = col + env * fe * (1.0 - rough * 0.7) * room_tint * ao;
+		col = col + rim_lit * ao;
 		col = col + glow;
 	}
 	return float4(srgb(col) * alpha, alpha);
+}
+
+float4 PSDraw(VertOut v) : TARGET
+{
+	float3 N = normalize(v.vnrm);
+	float3 V = normalize(-v.vpos);
+	if (dot(N, V) < 0.0)
+		N = -N;
+	return shade_point(v.uv, v.col, V, N, N);
+}
+
+float4 PSDrawBumped(BumpOut v) : TARGET
+{
+	// glTF's normal maps: red the picture's right, green its up, blue
+	// straight out; strength scales right and up.
+	float4 bump = normal_map.Sample(wrapSampler, v.uv);
+	float3 Ng = normalize(v.vnrm);
+	float3 V = normalize(-v.vpos);
+	float face = dot(Ng, V) < 0.0 ? -1.0 : 1.0;
+	float3 T = v.vtan.xyz - Ng * dot(Ng, v.vtan.xyz);
+	float tl = length(T);
+	T = tl > 0.00001 ? T / tl : float3(0.0, 0.0, 0.0);
+	float3 B = cross(Ng, T) * (v.vtan.w < 0.0 ? -1.0 : 1.0);
+	float3 n = bump.xyz * 2.0 - float3(1.0, 1.0, 1.0);
+	n.xy = n.xy * detail.x;
+	float3 N = T * n.x + B * n.y + Ng * max(n.z, 0.0);
+	float len = length(N);
+	N = len > 0.00001 ? N / len : Ng;
+	// Its back (seen from behind): the whole facing turned round.
+	return shade_point(v.uv, v.col, V, N * face, Ng * face);
 }
 
 float4 PSOutline(VertOut v) : TARGET
@@ -188,7 +287,7 @@ float4 PSOutline(VertOut v) : TARGET
 	if (surface.z > 0.0 && base_colour.a * tex.a < surface.z)
 		discard;
 	float3 c = outline_colour.rgb;
-	float3 lit = c * lerp(1.0, 0.85, outline_colour.a);
+	float3 lit = c * lerp(float3(1.0, 1.0, 1.0), key_tint * 0.85, outline_colour.a);
 	return float4(srgb(lit) * look.w, look.w);
 }
 
@@ -228,6 +327,15 @@ technique Draw
 	{
 		vertex_shader = VSDraw(v);
 		pixel_shader  = PSDraw(v);
+	}
+}
+
+technique DrawBumped
+{
+	pass
+	{
+		vertex_shader = VSBumped(v);
+		pixel_shader  = PSDrawBumped(v);
 	}
 }
 

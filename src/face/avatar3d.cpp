@@ -336,13 +336,27 @@ Avatar3D::Avatar3D()
 		p_outline_width = param("outline_width");
 		p_outline_colour = param("outline_colour");
 		p_texel = param("texel");
+		p_normal_map = param("normal_map");
+		p_occlusion_map = param("occlusion_map");
+		p_detail = param("detail");
+		p_key_dir = param("key_dir");
+		p_key_colour = param("key_colour");
+		p_fill_dir = param("fill_dir");
+		p_fill_colour = param("fill_colour");
+		p_room_up = param("room_up");
+		p_room_down = param("room_down");
+		p_rim_light = param("rim_light");
+		p_key_tint = param("key_tint");
+		p_room_tint = param("room_tint");
 		check_.load(effect_, "3D", face_3d_needs());
 	}
-	const uint32_t white = 0xFFFFFFFF, black = 0xFF000000;
-	const uint8_t *w = reinterpret_cast<const uint8_t *>(&white);
-	const uint8_t *b = reinterpret_cast<const uint8_t *>(&black);
+	// Plain pictures for a part without its own: white, black, and a
+	// normal map with no bumps (straight out: 128, 128, 255).
+	const uint8_t white[4] = {255, 255, 255, 255}, black[4] = {0, 0, 0, 255}, flat[4] = {128, 128, 255, 255};
+	const uint8_t *w = white, *b = black, *f = flat;
 	white_ = gs_texture_create(1, 1, GS_RGBA, 1, &w, 0);
 	black_ = gs_texture_create(1, 1, GS_RGBA, 1, &b, 0);
+	flat_ = gs_texture_create(1, 1, GS_RGBA, 1, &f, 0);
 	make_head();
 }
 
@@ -353,6 +367,7 @@ Avatar3D::~Avatar3D()
 	gs_indexbuffer_destroy(head_.ib);
 	gs_texture_destroy(white_);
 	gs_texture_destroy(black_);
+	gs_texture_destroy(flat_);
 	gs_texrender_destroy(scene_);
 	gs_texrender_destroy(out_);
 	gs_effect_destroy(effect_);
@@ -373,14 +388,17 @@ void Avatar3D::clear()
 
 namespace {
 
-// A buffer of `n` points; a still one (not `dynamic`) is filled from
-// `points` now, as OBS keeps no copy of it to change later.
-gs_vertbuffer_t *make_vb(size_t n, bool dynamic, const V3 *points = nullptr)
+// A buffer of `n` points (with tangents: `tangents`); a still one (not
+// `dynamic`) is filled from `points` now, as OBS keeps no copy of it to
+// change later.
+gs_vertbuffer_t *make_vb(size_t n, bool dynamic, const V3 *points = nullptr, bool tangents = false)
 {
 	gs_vb_data *vb = gs_vbdata_create();
 	vb->num = n;
 	vb->points = static_cast<vec3 *>(bzalloc(sizeof(vec3) * n));
 	vb->normals = static_cast<vec3 *>(bzalloc(sizeof(vec3) * n));
+	if (tangents)
+		vb->tangents = static_cast<vec3 *>(bzalloc(sizeof(vec3) * n));
 	for (size_t i = 0; points && i < n; i++) {
 		vec3_set(&vb->points[i], points[i].x, points[i].y, points[i].z);
 		vec3_set(&vb->normals[i], 0, 0, 1);
@@ -453,8 +471,9 @@ void Avatar3D::set(std::shared_ptr<const Model> model, std::vector<ModelPicture>
 		for (const Primitive &p : m.meshes[node.mesh].parts) {
 			Part part;
 			part.points = p.pos.size();
+			part.bumped = p.tangent.size() == part.points * 4;
 			if (part.points && !p.index.empty()) {
-				part.vb = make_vb(part.points, true);
+				part.vb = make_vb(part.points, true, nullptr, part.bumped);
 				part.ib = make_ib(p.index);
 			}
 			if (part.vb) {
@@ -470,6 +489,9 @@ void Avatar3D::set(std::shared_ptr<const Model> model, std::vector<ModelPicture>
 						srgb_bytes(&p.colour[i * 4], c);
 					std::memcpy(&d->colors[i], c, 4);
 				}
+				// Its colours and UVs sent now, once (drawing sends only
+				// what moves).
+				gs_vertexbuffer_flush(part.vb);
 			}
 			parts_.push_back(part);
 		}
@@ -484,11 +506,36 @@ void Avatar3D::set_camera()
 	gs_effect_set_matrix4(p_cam, &cam);
 }
 
-void Avatar3D::set_material(const Material &m, const View3D &v, bool outline)
+// The lights (lights.hpp), as the effect has them.
+void Avatar3D::set_lights(const View3D &v)
+{
+	const Lights &l = v.lights;
+	const Lights studio;
+	auto put = [](gs_eparam_t *p, V3 c) {
+		vec3 x;
+		vec3_set(&x, c.x, c.y, c.z);
+		gs_effect_set_vec3(p, &x);
+	};
+	auto share = [](V3 a, V3 b) {
+		return V3{b.x > 0 ? a.x / b.x : 1, b.y > 0 ? a.y / b.y : 1, b.z > 0 ? a.z / b.z : 1};
+	};
+	put(p_key_dir, normalized(l.key_dir, {0, 0, 1}));
+	put(p_key_colour, l.key);
+	put(p_fill_dir, normalized(l.fill_dir, {0, 0, 1}));
+	put(p_fill_colour, l.fill);
+	put(p_room_up, l.room_up);
+	put(p_room_down, l.room_down);
+	set_vec4(p_rim_light, l.rim.x, l.rim.y, l.rim.z, std::max(0.1f, l.rim_edge));
+	put(p_key_tint, share(l.key, studio.key));
+	put(p_room_tint, share(l.room_up + l.room_down, studio.room_up + studio.room_down));
+}
+
+void Avatar3D::set_material(const Material &m, const View3D &v, bool outline, bool skin)
 {
 	// Everything a technique reads, every time: OBS empties them all
 	// when the technique before finishes (see effect-needs.hpp).
 	set_camera();
+	set_lights(v);
 	auto tex = [this](const TexRef &r, gs_texture_t *none) {
 		if (r.image >= 0 && r.image < (int)textures_.size() && textures_[r.image])
 			return textures_[r.image];
@@ -509,6 +556,12 @@ void Avatar3D::set_material(const Material &m, const View3D &v, bool outline)
 	gs_texture_t *cap = own_toon ? tex(m.matcap_map, nullptr) : nullptr;
 	gs_effect_set_texture(p_matcap_map, cap ? cap : black_);
 	gs_effect_set_texture(p_metal_map, tex(m.metal_map, white_));
+	// Its detail pictures (VRM's MToon has no occlusion).
+	const bool detail = v.detail && mode != 2;
+	gs_effect_set_texture(p_normal_map, detail ? tex(m.normal_map, flat_) : flat_);
+	gs_effect_set_texture(p_occlusion_map, detail && !own_toon ? tex(m.occlusion_map, white_) : white_);
+	set_vec4(p_detail, detail ? m.normal_scale : 0.0f, detail && !own_toon ? m.occlusion_strength : 0.0f,
+		 skin ? std::min(1.0f, std::max(0.0f, v.soft_skin)) : 0.0f, 0.0f);
 	set_vec4(p_base, m.base[0], m.base[1], m.base[2], m.base[3]);
 	set_vec3(p_emissive, m.emissive);
 	set_vec4(p_surface, m.metallic, m.roughness, m.alpha == AlphaMode::Mask ? std::max(0.001f, m.cutoff) : 0.0f,
@@ -573,7 +626,20 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 			vec3_set(&d->points[k], p.pos[k].x, p.pos[k].y, p.pos[k].z);
 			vec3_set(&d->normals[k], p.normal[k].x, p.normal[k].y, p.normal[k].z);
 		}
-		gs_vertexbuffer_flush(part.vb);
+		const bool tangents = part.bumped && d->tangents && p.tangent.size() == part.points;
+		if (tangents)
+			for (size_t k = 0; k < part.points; k++) {
+				vec3_set(&d->tangents[k], p.tangent[k].x, p.tangent[k].y, p.tangent[k].z);
+				// Which way its up is, in the fourth number.
+				d->tangents[k].w = p.prim->tangent[k * 4 + 3] * p.handed;
+			}
+		// Only what moves: its colours and UVs stay as they were sent.
+		gs_vb_data moved = {};
+		moved.num = d->num;
+		moved.points = d->points;
+		moved.normals = d->normals;
+		moved.tangents = tangents ? d->tangents : nullptr;
+		gs_vertexbuffer_flush_direct(part.vb, &moved);
 	}
 
 	const uint32_t k = v.smooth && v.w * 2 <= MOST_DRAWN && v.h * 2 <= MOST_DRAWN ? 2 : 1;
@@ -652,13 +718,23 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 	bool own_outlines = false;
 	for (const Material &mat : m.materials)
 		own_outlines = own_outlines || mat.outline != Outline::None;
+	auto is_skin = [&](size_t i) {
+		const int mi = posed[i].prim->material;
+		return v.skin && mi >= 0 && mi < (int)v.skin->size() && (*v.skin)[mi];
+	};
+	// With its normal map's bumps where it has one (not flat colours).
+	auto technique_of = [&](size_t i) {
+		const bool flat_look = v.look == 3 || (v.look == 0 && material_of(i).shading == Shading::Unlit);
+		return parts_[i].bumped && v.detail && !flat_look && material_of(i).normal_map.used() ? "DrawBumped"
+												       : "Draw";
+	};
 	std::vector<size_t> blended;
 	for (size_t i = 0; i < posed.size(); i++) {
 		const Material &mat = material_of(i);
 		if (mat.outline == Outline::None && (v.outline <= 0 || own_outlines))
 			continue;
 		part_distance_ = distance[i];
-		set_material(mat, v, true);
+		set_material(mat, v, true, false);
 		draw_part(i, posed[i], "Outline");
 	}
 	for (size_t i = 0; i < posed.size(); i++) {
@@ -668,8 +744,8 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 			continue;
 		}
 		part_distance_ = distance[i];
-		set_material(mat, v, false);
-		draw_part(i, posed[i], "Draw");
+		set_material(mat, v, false, is_skin(i));
+		draw_part(i, posed[i], technique_of(i));
 	}
 	std::stable_sort(blended.begin(), blended.end(), [&](size_t a, size_t b) {
 		const int qa = material_of(a).queue, qb = material_of(b).queue;
@@ -679,8 +755,8 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 	});
 	for (size_t i : blended) {
 		part_distance_ = distance[i];
-		set_material(material_of(i), v, false);
-		draw_part(i, posed[i], "Draw");
+		set_material(material_of(i), v, false, is_skin(i));
+		draw_part(i, posed[i], technique_of(i));
 	}
 
 	gs_blend_state_pop();

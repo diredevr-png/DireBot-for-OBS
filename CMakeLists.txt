@@ -92,6 +92,7 @@ target_sources(
     src/face/model.cpp
     src/face/rig.cpp
     src/face/alive.cpp
+    src/face/voice.cpp
     src/face/setup.cpp
     src/face/avatar3d.cpp
     src/face/face-avatar.cpp

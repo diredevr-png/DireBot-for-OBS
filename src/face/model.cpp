@@ -414,6 +414,9 @@ TexRef tex_ref(const json &doc, const json &info)
 	TexRef r;
 	if (!info.is_object())
 		return r;
+	// Only pictures on the first UVs (the only ones read).
+	if (index_of(info, "texCoord", 0) != 0)
+		return r;
 	const json &textures = list(doc, "textures");
 	const int t = index_of(info, "index");
 	if (t < 0 || t >= (int)textures.size())
@@ -526,6 +529,10 @@ void read_mtoon0(const json &doc, const json &p, Material &mat)
 	else if (blend >= 2)
 		mat.alpha = AlphaMode::Blend;
 	mat.cutoff = num(f, "_Cutoff", mat.cutoff);
+	if (texture("_BumpMap").used()) {
+		mat.normal_map = texture("_BumpMap");
+		mat.normal_scale = std::clamp(num(f, "_BumpScale", 1), -4.0f, 4.0f);
+	}
 	const int cull = (int)num(f, "_CullMode", -1);
 	if (cull == 0)
 		mat.double_sided = true;
@@ -544,6 +551,10 @@ Material read_material(const json &doc, const json &m)
 	mat.metal_map = tex_ref(doc, field(pbr, "metallicRoughnessTexture"));
 	numbers(m, "emissiveFactor", mat.emissive, 3);
 	mat.emissive_map = tex_ref(doc, field(m, "emissiveTexture"));
+	mat.normal_map = tex_ref(doc, field(m, "normalTexture"));
+	mat.normal_scale = std::clamp(num(field(m, "normalTexture"), "scale", 1), -4.0f, 4.0f);
+	mat.occlusion_map = tex_ref(doc, field(m, "occlusionTexture"));
+	mat.occlusion_strength = std::clamp(num(field(m, "occlusionTexture"), "strength", 1), 0.0f, 1.0f);
 	const std::string alpha = text(m, "alphaMode");
 	mat.alpha = alpha == "MASK" ? AlphaMode::Mask : alpha == "BLEND" ? AlphaMode::Blend : AlphaMode::Opaque;
 	mat.cutoff = num(m, "alphaCutoff", 0.5f);
@@ -963,6 +974,12 @@ void read_meshes(Reader &rd, const json &doc, Model &m)
 				if (p.uv.size() != n * 2)
 					fail("the file is damaged (its parts don't add up)");
 			}
+			if (index_of(attr, "TANGENT") >= 0) {
+				// Kept only if its material has a normal map (finish_tangents).
+				p.tangent = rd.floats(index_of(attr, "TANGENT"), 4);
+				if (p.tangent.size() != n * 4)
+					p.tangent.clear();
+			}
 			if (index_of(attr, "COLOR_0") >= 0) {
 				size_t cn = 0;
 				const std::vector<double> c = rd.read(index_of(attr, "COLOR_0"), 0, cn);
@@ -1240,6 +1257,27 @@ void load_json(Reader &rd, const json &doc, Model &m)
 		read_vrm1(doc, field(ext, "VRMC_vrm"), m);
 	else if (field(ext, "VRM").is_object())
 		read_vrm0(doc, field(ext, "VRM"), m);
+	// Tangents for the parts with a normal map (a VRM 0.x's are known only
+	// now), worked out where the file has none; none for the rest.
+	for (Mesh &mesh : m.meshes)
+		for (Primitive &p : mesh.parts) {
+			const bool bumpy = p.material >= 0 && p.material < (int)m.materials.size() &&
+					   m.materials[p.material].normal_map.used() && !p.uv.empty();
+			if (!bumpy) {
+				std::vector<float>().swap(p.tangent);
+				continue;
+			}
+			bool usable = !p.tangent.empty();
+			for (size_t i = 0; usable && i < p.pos.size(); i++) {
+				float *t = &p.tangent[i * 4];
+				const V3 v{t[0], t[1], t[2]};
+				usable = std::isfinite(v.x + v.y + v.z + t[3]) && length(v) > 1e-6f;
+				const V3 u = normalized(v, {1, 0, 0});
+				t[0] = u.x, t[1] = u.y, t[2] = u.z, t[3] = t[3] < 0 ? -1.0f : 1.0f;
+			}
+			if (!usable)
+				p.tangent = tangents_of(p);
+		}
 	if (m.points == 0 && m.meshes.empty())
 		fail("there's nothing to see in it");
 	measure(m);
@@ -1253,6 +1291,91 @@ uint32_t u32(const uint8_t *p)
 }
 
 } // namespace
+
+std::vector<bool> skin_materials(const Model &m, const std::string &names)
+{
+	std::vector<bool> out(m.materials.size(), false);
+	std::vector<std::string> wanted;
+	std::string line;
+	for (size_t i = 0; i <= names.size(); i++) {
+		if (i == names.size() || names[i] == '\n' || names[i] == '\r') {
+			const size_t a = line.find_first_not_of(" \t"), b = line.find_last_not_of(" \t");
+			if (a != std::string::npos)
+				wanted.push_back(lower(line.substr(a, b - a + 1)));
+			line.clear();
+		} else {
+			line += names[i];
+		}
+	}
+	if (!wanted.empty()) {
+		for (size_t i = 0; i < out.size(); i++)
+			out[i] = std::find(wanted.begin(), wanted.end(), lower(m.materials[i].name)) != wanted.end();
+		return out;
+	}
+	auto has = [](const std::string &name, std::initializer_list<const char *> words) {
+		for (const char *w : words)
+			if (name.find(w) != std::string::npos)
+				return true;
+		return false;
+	};
+	static const std::initializer_list<const char *> NOT = {
+		"eye",  "iris",  "pupil", "hair", "brow", "lash",  "teeth", "tooth", "tongue", "mouth_in", "cloth",
+		"shirt", "pant", "dress", "shoe", "boot", "glove", "hat",   "cap",   "jacket", "coat",     "skirt",
+		"sock",  "armor", "armour", "helmet", "glass", "mask", "beard", "mustache", "moustache", "suit",
+		"phone", "band", "wear"};
+	for (size_t i = 0; i < out.size(); i++) {
+		const std::string name = lower(m.materials[i].name);
+		out[i] = has(name, {"skin", "face", "body", "head"}) && !has(name, NOT);
+	}
+	return out;
+}
+
+std::vector<float> tangents_of(const Primitive &p)
+{
+	const size_t n = p.pos.size();
+	if (p.uv.size() != n * 2 || p.normal.size() != n)
+		return {};
+	// Each triangle's way along its picture's u (right) and v (down),
+	// added up at its corners (Lengyel's way)...
+	std::vector<V3> along_u(n), along_v(n);
+	for (size_t i = 0; i + 2 < p.index.size(); i += 3) {
+		const uint32_t a = p.index[i], b = p.index[i + 1], c = p.index[i + 2];
+		if (a >= n || b >= n || c >= n)
+			continue;
+		const V3 e1 = p.pos[b] - p.pos[a], e2 = p.pos[c] - p.pos[a];
+		const float du1 = p.uv[b * 2] - p.uv[a * 2], dv1 = p.uv[b * 2 + 1] - p.uv[a * 2 + 1];
+		const float du2 = p.uv[c * 2] - p.uv[a * 2], dv2 = p.uv[c * 2 + 1] - p.uv[a * 2 + 1];
+		const float det = du1 * dv2 - du2 * dv1;
+		if (!std::isfinite(det) || std::fabs(det) < 1e-12f)
+			continue;
+		const float r = 1 / det;
+		const V3 u = (e1 * dv2 - e2 * dv1) * r, v = (e2 * du1 - e1 * du2) * r;
+		if (!std::isfinite(u.x + u.y + u.z + v.x + v.y + v.z))
+			continue;
+		for (uint32_t k : {a, b, c}) {
+			along_u[k] = along_u[k] + u;
+			along_v[k] = along_v[k] + v;
+		}
+	}
+	// ...flattened onto each point's facing. A glTF picture's v runs down
+	// it and its normal map's green up, so up is against v.
+	std::vector<float> out(n * 4);
+	for (size_t i = 0; i < n; i++) {
+		const V3 nn = p.normal[i];
+		V3 t = along_u[i] - nn * dot(nn, along_u[i]);
+		if (length(t) < 1e-9f) {
+			// No way along the picture here: any way across its facing.
+			t = cross(std::fabs(nn.y) < 0.9f ? V3{0, 1, 0} : V3{1, 0, 0}, nn);
+		}
+		t = normalized(t, {1, 0, 0});
+		const float w = dot(cross(nn, t), along_v[i] * -1.0f) < 0 ? -1.0f : 1.0f;
+		out[i * 4] = t.x;
+		out[i * 4 + 1] = t.y;
+		out[i * 4 + 2] = t.z;
+		out[i * 4 + 3] = w;
+	}
+	return out;
+}
 
 bool load_model(const uint8_t *bytes, size_t size, const std::string &folder, Model &out, std::string *problem)
 {

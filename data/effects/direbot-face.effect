@@ -57,6 +57,9 @@ uniform float2 body_across;
 uniform float2 body_down;
 uniform float4 ring;
 uniform float ring_on;
+// The character's light on the card (each colour, 1: the studio's), so
+// your eyes and mouth sit in its light.
+uniform float3 card_light;
 
 sampler_state textureSampler {
 	Filter    = Linear;
@@ -197,7 +200,7 @@ float4 PSCard(VertData v_in) : TARGET
 	float m = mask_map.Sample(textureSampler, float2(mx, my)).r;
 	float2 on_body = body_origin + body_across * v_in.uv.x + body_down * v_in.uv.y;
 	m = m * body_map.Sample(textureSampler, on_body).a;
-	float3 rgb = c.rgb;
+	float3 rgb = c.rgb * card_light;
 	if (skin_amount > 0.0) {
 		float3 target = target_lab;
 		float use = 1.0;
@@ -217,8 +220,15 @@ float4 PSCard(VertData v_in) : TARGET
 		}
 		float in_line = mask_map.Sample(textureSampler, float2(mx, my + 0.5)).r;
 		float w = saturate(skin_amount) * (1.0 - in_line) * use;
-		float3 lab = lab_of(rgb);
-		float3 turned = rgb_of(float3(target.x + (lab.x - skin_lab.x) * 0.9, target.y, target.z));
+		// (From the camera's own colour: the ring's is lit already, a
+		// colour picked isn't. Its shading as a dimmer light leaves it:
+		// lightness differences shrink with the cube root of the light.)
+		float3 lab = lab_of(c.rgb);
+		float dim = pow(max(dot(pow(card_light, float3(2.2, 2.2, 2.2)), float3(0.2126, 0.7152, 0.0722)), 0.0001),
+				1.0 / 3.0);
+		float3 turned = rgb_of(float3(target.x + (lab.x - skin_lab.x) * 0.9 * dim, target.y, target.z));
+		if (ring_on <= 0.5)
+			turned = turned * card_light;
 		rgb = lerp(rgb, turned, w);
 	}
 	return float4(rgb, m * opacity);

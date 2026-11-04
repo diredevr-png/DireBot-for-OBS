@@ -42,9 +42,17 @@ inline const std::vector<EffectNeeds> &face_3d_needs()
 	static const std::vector<EffectNeeds> needs = {
 		{"Draw",
 		 {"cam", "uv_place", "base_map", "shade_map", "emissive_map", "metal_map", "matcap_map", "base_colour",
-		  "look", "surface", "emissive", "toon", "shade_colour", "rim_colour", "matcap_colour"}},
+		  "look", "surface", "emissive", "toon", "shade_colour", "rim_colour", "matcap_colour", "occlusion_map",
+		  "detail", "key_dir", "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light",
+		  "key_tint", "room_tint"}},
+		{"DrawBumped",
+		 {"cam", "uv_place", "base_map", "shade_map", "emissive_map", "metal_map", "matcap_map", "base_colour",
+		  "look", "surface", "emissive", "toon", "shade_colour", "rim_colour", "matcap_colour", "occlusion_map",
+		  "detail", "key_dir", "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light",
+		  "key_tint", "room_tint", "normal_map"}},
 		{"Outline",
-		 {"cam", "uv_place", "outline_width", "base_map", "surface", "base_colour", "outline_colour", "look"}},
+		 {"cam", "uv_place", "outline_width", "base_map", "surface", "base_colour", "outline_colour", "look",
+		  "key_tint"}},
 		{"Hidden", {"cam", "uv_place"}},
 		{"Down", {"image", "texel"}},
 	};
@@ -62,7 +70,7 @@ inline const std::vector<EffectNeeds> &face_2d_needs()
 		{"Card",
 		 {"image", "mask_map", "body_map", "opacity", "origin", "across", "down", "mask_place", "mask_rows",
 		  "body_origin", "body_across", "body_down", "ring", "ring_on", "skin_lab", "target_lab",
-		  "skin_amount"}},
+		  "skin_amount", "card_light"}},
 		{"Camera", {"image", "flip"}},
 	};
 	return needs;

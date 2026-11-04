@@ -20,6 +20,7 @@ import shutil
 import struct
 import threading
 import time
+import wave
 import zlib
 
 import pytest
@@ -1207,6 +1208,260 @@ def test_alive_when_still_tuning_and_camera_check(run):
         assert wait_for(lambda: st()["alive"]["idle"] == 0, 2, 0.05), st()["alive"]
         send(c, "RemoveScene", {"sceneName": "Alive"})
         send(c, "RemoveScene", {"sceneName": "Alive camera"})
+    finally:
+        c.disconnect()
+
+
+def vowel_wav(path, formants, f0=120, seconds=2, rate=48000, level_db=-24):
+    """A made-up vowel, the way tests/unit_voice.cpp makes one: a buzz at
+    `f0` softened as a throat softens it, through resonances at its
+    formants, out of the lips - `level_db` loud (RMS, dBFS)."""
+    n = int(rate * seconds)
+    x = [0.0] * n
+    phase = 0.0
+    for i in range(n):
+        phase += f0 * (1 + 0.01 * math.sin(2 * math.pi * 5 * i / rate)) / rate
+        if phase >= 1:
+            phase -= 1
+            x[i] = 1.0
+    a = math.exp(-2 * math.pi * 150 / rate)
+    y1 = y2 = 0.0
+    for i in range(n):
+        y1 = (1 - a) * x[i] + a * y1
+        y2 = (1 - a) * y1 + a * y2
+        x[i] = y2
+    fs = list(formants) + [2600, 3500, 4500][len(formants) - 2:]
+    for f, bw in zip(fs[:5], (70, 100, 130, 170, 220)):
+        t = 1 / rate
+        c = -math.exp(-2 * math.pi * bw * t)
+        b = 2 * math.exp(-math.pi * bw * t) * math.cos(2 * math.pi * f * t)
+        g = 1 - b - c
+        p1 = p2 = 0.0
+        for i in range(n):
+            y = g * x[i] + b * p1 + c * p2
+            p2, p1 = p1, y
+            x[i] = y
+    prev = 0.0
+    for i in range(n):
+        x[i], prev = x[i] - prev, x[i]
+    rms = math.sqrt(sum(v * v for v in x) / n) or 1
+    k = 10 ** (level_db / 20) / rms
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", max(-32767, min(32767, int(v * k * 32767))))
+                               for v in x))
+
+
+def detail_ball(path, size=64):
+    """An orange ball 20 cm across with a skin's material ("Skin"): its
+    own picture coordinates, a normal map of bands across it (each 8
+    pixels, its bumps tilted up then down) and an occlusion map half
+    dark - embedded in the .glb, as a character's are."""
+    pos, nrm, ix = ball_points(0, 0, 0, 0.1, 0.1, 0.1)
+    n = 24
+    uv = [(j / n, i / n) for i in range(n + 1) for j in range(n + 1)]
+    up, down = bytes((128, 204, 230, 255)), bytes((128, 51, 230, 255))
+    bumps = [(up if (y // 8) % 2 == 0 else down) * size for y in range(size)]
+    shade = [bytes((90, 90, 90, 255)) * size for _ in range(size)]
+    pictures = []
+    for name, rows in (("bumps.png", bumps), ("shade.png", shade)):
+        p = path + "." + name
+        write_png(p, size, size, rows, alpha=True)
+        with open(p, "rb") as f:
+            pictures.append(f.read())
+        os.remove(p)
+    blob = bytearray()
+    views = []
+
+    def add(data, target=None):
+        while len(blob) % 4:
+            blob.append(0)
+        views.append({"buffer": 0, "byteOffset": len(blob), "byteLength": len(data)})
+        if target:
+            views[-1]["target"] = target
+        blob.extend(data)
+        return len(views) - 1
+
+    accessors = [
+        {"bufferView": add(struct.pack("<%df" % (len(pos) * 3), *[c for v in pos for c in v]), 34962),
+         "componentType": 5126, "count": len(pos), "type": "VEC3",
+         "min": [min(v[k] for v in pos) for k in range(3)],
+         "max": [max(v[k] for v in pos) for k in range(3)]},
+        {"bufferView": add(struct.pack("<%df" % (len(nrm) * 3), *[c for v in nrm for c in v]), 34962),
+         "componentType": 5126, "count": len(nrm), "type": "VEC3"},
+        {"bufferView": add(struct.pack("<%df" % (len(uv) * 2), *[c for v in uv for c in v]), 34962),
+         "componentType": 5126, "count": len(uv), "type": "VEC2"},
+        {"bufferView": add(struct.pack("<%dI" % len(ix), *ix), 34963),
+         "componentType": 5125, "count": len(ix), "type": "SCALAR"},
+    ]
+    images = [{"bufferView": add(data), "mimeType": "image/png"} for data in pictures]
+    doc = {"asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
+           "nodes": [{"name": "Head", "mesh": 0}],
+           "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2},
+                                       "indices": 3, "material": 0}]}],
+           "materials": [{"name": "Skin",
+                          "pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.25, 0.04, 1],
+                                                   "metallicFactor": 0, "roughnessFactor": 0.6},
+                          "normalTexture": {"index": 0},
+                          "occlusionTexture": {"index": 1}}],
+           "textures": [{"source": 0}, {"source": 1}], "images": images,
+           "accessors": accessors, "bufferViews": views, "buffers": [{"byteLength": len(blob)}]}
+    text = json.dumps(doc).encode()
+    text += b" " * (-len(text) % 4)
+    while len(blob) % 4:
+        blob.append(0)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(text) + 8 + len(blob)))
+        f.write(struct.pack("<II", len(text), 0x4E4F534A) + text)
+        f.write(struct.pack("<II", len(blob), 0x004E4942) + bytes(blob))
+
+
+def test_lights_detail_maps_soft_skin_views_and_mic(run):
+    """0.6.0: the lights you pick (a ready-made set, or your own) light it
+    differently; a character's normal and occlusion maps are drawn; soft
+    skin on its skin softens the shadow side; a saved camera view frames
+    it closer and glides back; and its mouth moves from a mic in OBS (a
+    vowel played into it), with "say each vowel" starting, stopping and
+    saying in words when there's no mic."""
+    face_png = os.path.join(run.home, "camera.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+    ball = os.path.join(run.home, "detail.glb")
+    detail_ball(ball)
+    ah = os.path.join(run.home, "ah.wav")
+    vowel_wav(ah, (768, 1333, 2522))      # a man's "a" (Hillenbrand et al.)
+    size = 300
+    common = {"source": "Lights camera", "width": size, "height": size, "size": 100,
+              "mirror": False, "smoothing": 100, "follow_move": 0, "follow_grow": 0,
+              "follow_tilt": 0, "bend": 100, "model": ball, "mouth_from": "camera", **STILL}
+    close_up = json.dumps([{"name": "Close-up", "zoom": 2.0},
+                           {"name": "Side", "yaw": 35}])
+    avatars = {
+        "Plain": {"detail_maps": False},
+        "Bumped": {},
+        "Night": {"detail_maps": False, "light_preset": "night"},
+        "Neon": {"detail_maps": False, "light_preset": "neon"},
+        "Own lights": {"detail_maps": False, "light_preset": "own", "light_side": 60,
+                       "light_height": 0},
+        "Soft": {"detail_maps": False, "soft_skin": 100},
+        "Viewed": {"detail_maps": False, "views": close_up, "view": "1", "view_glide": 300},
+        "Mic mouth": {"detail_maps": False, "mouth_from": "mic", "mic": "Test mic"},
+        "No mic": {"detail_maps": False, "mouth_from": "mic", "mic": "Nothing called this"},
+    }
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "Lights"})
+        send(c, "CreateInput", {"sceneName": "Lights", "inputName": "Lights camera",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        send(c, "CreateInput", {"sceneName": "Lights", "inputName": "Test mic",
+                                "inputKind": "ffmpeg_source",
+                                "inputSettings": {"local_file": ah, "is_local_file": True,
+                                                  "looping": True}})
+        for name, extra in avatars.items():
+            send(c, "CreateInput", {"sceneName": "Lights", "inputName": name,
+                                    "inputKind": "direbot_face_avatar",
+                                    "inputSettings": {**common, **extra}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Lights"})
+
+        def st(name):
+            return vendor(c, "FaceGetState", {"source": name})
+        for name in avatars:
+            assert wait_for(lambda: st(name)["found"] and st(name)["model"]["shown"], 30, 0.2), st(name)
+        m = st("Bumped")["model"]
+        assert m["materials"] == [{"name": "Skin", "bumps": True, "shadows": True, "skin": True}], m
+        assert m["bump_parts"] == 1 and m["shadow_parts"] == 1 and m["skin_parts"] == 1
+        assert st("Plain")["lights"]["preset"] == "studio" and not st("Plain")["lights"]["detail"]
+        night = st("Night")["lights"]
+        assert night["preset"] == "night" and night["colour"] == "#7fa0ff" and night["rim"] == 70
+        own = st("Own lights")["lights"]
+        assert own["preset"] == "own" and own["side"] == 60 and own["height"] == 0
+        assert st("Soft")["lights"]["soft_skin"] == 100
+        time.sleep(1.0)
+        orange = lambda px: px[0] > 60 and px[0] > px[2] + 20  # noqa: E731
+
+        def ball_pixels(rows):
+            return [(x, y) for y in range(size) for x in range(size) if rows[y][x] != (0, 0, 0)]
+
+        def mean(rows, spots):
+            return [sum(rows[y][x][k] for x, y in spots) / max(1, len(spots)) for k in range(3)]
+        plain = screenshot(c, "Plain")
+        spots = ball_pixels(plain)
+        assert len(spots) > 10000, len(spots)
+        pm = mean(plain, spots)
+        assert pm[0] > pm[1] > pm[2], pm                  # orange, as ever
+
+        # Its normal map: bands of light and shade across it, top to
+        # bottom (each band's bumps face up, then down); its occlusion
+        # map: the room's light darker.
+        # (Down its left side, clear of the eyes and mouth drawn on it.)
+        bumped = screenshot(c, "Bumped")
+        bx = size // 2 - 80
+        column = [sum(bumped[y][bx]) - sum(plain[y][bx]) for y in range(size)
+                  if plain[y][bx] != (0, 0, 0)]
+        middle = sorted(column)[len(column) // 2]
+        bands = [d > middle for d in column]
+        turns = sum(1 for a, b in zip(bands, bands[1:]) if a != b)
+        print("bumped minus plain, down the ball:", column[::6], turns)
+        assert turns >= 5 and max(column) - min(column) > 100, column
+        assert sum(mean(bumped, spots)) < sum(pm) - 5
+
+        # Night: darker and bluer; neon: pinker and bluer; your own (the
+        # light level, on the picture's right): the right side lit.
+        nm = mean(screenshot(c, "Night"), spots)
+        assert sum(nm) < sum(pm) - 60 and nm[2] / max(1, nm[0]) > pm[2] / pm[0] + 0.3, (nm, pm)
+        neon = mean(screenshot(c, "Neon"), spots)
+        assert neon[1] / max(1, neon[0]) < pm[1] / pm[0] - 0.1, (neon, pm)
+        assert neon[2] / max(1, neon[0]) > pm[2] / pm[0] + 0.15, (neon, pm)
+        own_rows = screenshot(c, "Own lights")
+        left = [(x, y) for x, y in spots if x < size // 2 - 40]
+        right = [(x, y) for x, y in spots if x > size // 2 + 40]
+        assert sum(mean(own_rows, right)) > sum(mean(own_rows, left)) + 60
+        assert sum(mean(plain, left)) > sum(mean(plain, right))      # the studio's: from the left
+
+        # Soft skin: light reaching round into the shadow side, warmer.
+        soft = screenshot(c, "Soft")
+        shadow = [(x, y) for x, y in spots if x > size // 2 + 30 and y > size // 2 + 30]
+        sm, ps = mean(soft, shadow), mean(plain, shadow)
+        assert sm[0] > ps[0] + 3, (sm, ps)
+
+        # A saved view: closer (the ball bigger), then back to the main
+        # view, gliding.
+        cv = st("Viewed")["camera_view"]
+        assert cv["view"] == "1" and [v["name"] for v in cv["views"]] == ["Close-up", "Side"]
+        assert wait_for(lambda: not st("Viewed")["camera_view"]["gliding"], 5, 0.1)
+        near = len(ball_pixels(screenshot(c, "Viewed")))
+        assert near > size * size * 0.97, (near, len(spots))    # twice as close: it fills it
+        send(c, "SetInputSettings", {"inputName": "Viewed", "inputSettings": {"view": "main"}})
+        assert wait_for(lambda: st("Viewed")["camera_view"]["gliding"], 2, 0.02)
+        assert wait_for(lambda: not st("Viewed")["camera_view"]["gliding"], 5, 0.1)
+        assert st("Viewed")["camera_view"]["showing"] == "main"
+        back = len(ball_pixels(screenshot(c, "Viewed")))
+        assert abs(back - len(spots)) < len(spots) * 0.05, (back, len(spots))
+
+        # The mouth from the mic: it hears the "a" and opens.
+        def mic(name):
+            return st(name)["mic"]
+        assert wait_for(lambda: mic("Mic mouth")["hearing"] and mic("Mic mouth")["voiced"], 10, 0.1), \
+            mic("Mic mouth")
+        heard = mic("Mic mouth")
+        print("the mic's mouth:", heard)
+        assert heard["found"] and heard["listening_to"] == "Test mic" and heard["from"] == "mic"
+        assert -40 < heard["level"] < -10, heard
+        assert wait_for(lambda: mic("Mic mouth")["share"] > 0.9, 5, 0.1), mic("Mic mouth")
+        assert max(heard["vowels"], key=heard["vowels"].get) == "a", heard["vowels"]
+        assert heard["open"] > 0.3
+        assert st("Plain")["mic"]["share"] == 0          # its mouth from the camera
+        assert vendor(c, "FaceMicCalibrate", {"source": "Mic mouth", "do": "start"})["ok"]
+        assert wait_for(lambda: mic("Mic mouth")["calibration"]["running"], 3, 0.05)
+        assert vendor(c, "FaceMicCalibrate", {"source": "Mic mouth", "do": "stop"})["ok"]
+        assert wait_for(lambda: not mic("Mic mouth")["calibration"]["running"], 3, 0.05)
+        none = vendor(c, "FaceMicCalibrate", {"source": "No mic", "do": "start"})
+        assert not none["ok"] and "mic" in none["error"], none
+        assert not mic("No mic")["found"]
+        for name in list(avatars) + ["Test mic", "Lights camera"]:
+            send(c, "RemoveInput", {"inputName": name})
     finally:
         c.disconnect()
 

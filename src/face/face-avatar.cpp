@@ -51,6 +51,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "model.hpp"
 #include "rig.hpp"
 #include "tracker.hpp"
+#include "voice.hpp"
 
 namespace direbot::face {
 
@@ -562,6 +563,54 @@ std::string models_path()
 }
 
 void save_rest_task(void *param);
+void save_profile_task(void *param);
+
+// Where its mouth comes from: your camera, your mic, or both - the mic
+// while you talk, the camera between (smiles, a mouth held open).
+enum MouthFrom { MOUTH_FROM_CAMERA, MOUTH_FROM_MIC, MOUTH_FROM_BOTH };
+// Saved camera views at most.
+constexpr size_t MOST_VIEWS = 3;
+// How quickly the mic takes the mouth over, and gives it back (seconds).
+constexpr float MIC_TAKE = 0.08f, MIC_GIVE = 0.2f;
+// The page asking how the mic sounds keeps it listening this long
+// (otherwise it listens only while the avatar's shown).
+constexpr uint64_t LISTEN_NS = 3'000'000'000ULL;
+
+bool ends_with(const char *s, const char *end)
+{
+	const size_t n = std::strlen(s), m = std::strlen(end);
+	return n >= m && std::strcmp(s + n - m, end) == 0;
+}
+
+bool is_audio(obs_source_t *s)
+{
+	return s && obs_source_get_type(s) == OBS_SOURCE_TYPE_INPUT &&
+	       (obs_source_get_output_flags(s) & OBS_SOURCE_AUDIO) != 0 &&
+	       std::strcmp(obs_source_get_unversioned_id(s), SOURCE_ID) != 0;
+}
+
+// The mic "" means: OBS's own Mic/Aux (Settings > Audio, the first one
+// set), or else the first mic source in OBS - with a reference to release.
+obs_source_t *default_mic()
+{
+	for (uint32_t channel = 3; channel <= 6; channel++) {
+		obs_source_t *s = obs_get_output_source(channel);
+		if (is_audio(s))
+			return s;
+		obs_source_release(s);
+	}
+	obs_source_t *first = nullptr;
+	obs_enum_sources(
+		[](void *param, obs_source_t *s) {
+			const char *id = obs_source_get_unversioned_id(s);
+			if (!id || !ends_with(id, "_input_capture") || !is_audio(s))
+				return true;
+			*static_cast<obs_source_t **>(param) = obs_source_get_ref(s);
+			return false;
+		},
+		&first);
+	return first;
+}
 
 struct FaceAvatar {
 	obs_source_t *self = nullptr;
@@ -625,6 +674,20 @@ struct FaceAvatar {
 		bool hide = true, smooth = true;
 		float fingers = 0.5f; // its fingers: 0 as made, 0.5 relaxed, 1 curled (RigOptions)
 		WornPlace place;
+		// Its lights (lights.hpp): a ready-made set or its own, and the
+		// same in plain terms for the page; its normal and occlusion maps
+		// used; soft skin on the parts that are skin (skin_materials).
+		int light_preset = LIGHTS_STUDIO;
+		LightTerms light_terms;
+		Lights lights;
+		bool detail = true;
+		float soft_skin = 0;
+		std::string skin_parts;
+		// Its saved camera views (up to MOST_VIEWS), the one shown (-1 as
+		// it's framed) and how long it glides from one to the next.
+		std::vector<std::pair<std::string, CameraView>> views;
+		int view = -1;
+		float view_glide = 0.6f;
 		// Its set-up (DireBot's "model_setup": an imported Lens Studio
 		// project, spots dragged into place), and as text, to see changes.
 		std::shared_ptr<const CharacterSetup> setup = std::make_shared<CharacterSetup>();
@@ -714,7 +777,7 @@ struct FaceAvatar {
 		    *p_body_map = nullptr, *p_body_place = nullptr, *p_inside = nullptr, *p_depth_map = nullptr,
 		    *p_char_px = nullptr, *p_pivot = nullptr, *p_turn_k = nullptr, *p_cell = nullptr, *p_pad = nullptr,
 		    *p_flip = nullptr, *p_body_origin = nullptr, *p_body_across = nullptr, *p_body_down = nullptr,
-		    *p_ring = nullptr, *p_ring_on = nullptr;
+		    *p_ring = nullptr, *p_ring_on = nullptr, *p_card_light = nullptr;
 	EffectCheck check;
 	bool drawing = false, drawn = false, have_out = false;
 	std::vector<uint8_t> mask_bytes;
@@ -766,6 +829,13 @@ struct FaceAvatar {
 		// Its own animations' names, and the one playing ("" none).
 		std::vector<std::string> animations;
 		std::string animation;
+		// Its materials: each one's name, whether it has a normal map
+		// ("bumps") and an occlusion map, and whether it counts as skin.
+		struct Mat {
+			std::string name;
+			bool bumps = false, shadows = false, skin = false;
+		};
+		std::vector<Mat> materials;
 		// Each spot (its own left eye, right eye, mouth) on its front
 		// picture (shares of FaceSpots::box) and how it was found.
 		float spot[3][4] = {};
@@ -774,6 +844,33 @@ struct FaceAvatar {
 		std::map<std::string, float> values;
 	};
 	State3D state3d;
+	// The mouth from your mic (voice.hpp): its sound comes in on OBS's
+	// audio thread (heard), the mouth is worked out on the graphics one.
+	Voice voice;
+	std::mutex mic_lock, mic_find_lock;
+	std::string mic_name;             // "" OBS's own Mic/Aux (default_mic)
+	obs_weak_source_t *mic = nullptr; // the one it listens to (under mic_lock)
+	std::string mic_found;            // its name (under mic_lock)
+	std::atomic<int> mouth_from{MOUTH_FROM_BOTH};
+	// Listening while it's shown, or till then (the page's level bar).
+	std::atomic<uint64_t> listen_until{0};
+	std::string profile_seen; // "mic_profile" as last read or saved (under lock)
+	float since_mic_find = 0;
+	MicMouth mic_now; // graphics thread
+	// The camera view gliding from one to the next, and which materials
+	// are skin (graphics thread).
+	CameraView view_from, view_to, view_now;
+	float view_t = 1;
+	int view_shown = -1;
+	bool view_started = false;
+	int view_shown_state = -1; // ...for FaceGetState (under state_lock)
+	bool view_gliding_state = false;
+	std::vector<bool> skin_now;
+	std::string skin_key;
+	// ...and how it sounds, for FaceGetState (under state_lock).
+	VoiceOut voice_state;
+	Calibration cal_state;
+	float mic_share_state = 0;
 
 	explicit FaceAvatar(obs_source_t *source)
 		: self(source),
@@ -821,6 +918,7 @@ struct FaceAvatar {
 			p_body_down = param("body_down");
 			p_ring = param("ring");
 			p_ring_on = param("ring_on");
+			p_card_light = param("card_light");
 			check.load(effect, "2D", face_2d_needs());
 			const float zero = 0;
 			const uint8_t *zero_data = reinterpret_cast<const uint8_t *>(&zero);
@@ -835,6 +933,13 @@ struct FaceAvatar {
 
 	~FaceAvatar()
 	{
+		// Not listening any more (OBS waits for a sound under way first).
+		obs_source_t *m = get_mic();
+		if (m) {
+			obs_source_remove_audio_capture_callback(m, heard, this);
+			obs_source_release(m);
+		}
+		obs_weak_source_release(mic);
 		worker.stop();
 		obs_enter_graphics();
 		avatar3d.reset();
@@ -890,6 +995,97 @@ struct FaceAvatar {
 		}
 		obs_source_release(old);
 		obs_source_release(found);
+	}
+
+	// Listening at least this much longer (ns), shown or not.
+	void listen_for(uint64_t ns)
+	{
+		const uint64_t want = os_gettime_ns() + ns;
+		uint64_t now = listen_until.load();
+		while (now < want && !listen_until.compare_exchange_weak(now, want)) {
+		}
+	}
+
+	obs_source_t *get_mic()
+	{
+		std::lock_guard<std::mutex> l(mic_lock);
+		return mic ? obs_weak_source_get_source(mic) : nullptr;
+	}
+
+	// The mic's sound, on OBS's audio thread: only while it's shown, or
+	// the page is showing how it sounds. As loud as OBS's own meter has
+	// it (after its volume slider).
+	static void heard(void *param, obs_source_t *source, const audio_data *data, bool muted)
+	{
+		auto *f = static_cast<FaceAvatar *>(param);
+		if (!data || !data->frames)
+			return;
+		if (!obs_source_showing(f->self) && os_gettime_ns() > f->listen_until.load())
+			return;
+		audio_t *audio = obs_get_audio();
+		if (!audio)
+			return;
+		const size_t channels = std::min<size_t>(audio_output_get_channels(audio), MAX_AV_PLANES);
+		const float *planes[MAX_AV_PLANES] = {};
+		for (size_t c = 0; c < channels; c++)
+			planes[c] = reinterpret_cast<const float *>(data->data[c]);
+		f->voice.feed(planes, (int)channels, data->frames, audio_output_get_sample_rate(audio), muted,
+			      obs_source_get_volume(source));
+	}
+
+	// The mic by its name ("" OBS's own Mic/Aux), listened to while its
+	// mouth is from the mic (or both).
+	void find_mic()
+	{
+		std::lock_guard<std::mutex> finding(mic_find_lock);
+		std::string name;
+		{
+			std::lock_guard<std::mutex> l(mic_lock);
+			name = mic_name;
+		}
+		obs_source_t *found = nullptr;
+		if (mouth_from != MOUTH_FROM_CAMERA) {
+			found = name.empty() ? default_mic() : obs_get_source_by_name(name.c_str());
+			if (found && !is_audio(found)) {
+				obs_source_release(found);
+				found = nullptr;
+			}
+		}
+		obs_source_t *old = get_mic();
+		if (old != found) {
+			if (old)
+				obs_source_remove_audio_capture_callback(old, heard, this);
+			voice.forget();
+			if (found)
+				obs_source_add_audio_capture_callback(found, heard, this);
+			std::lock_guard<std::mutex> l(mic_lock);
+			obs_weak_source_release(mic);
+			mic = found ? obs_source_get_weak_source(found) : nullptr;
+			mic_found = found ? obs_source_get_name(found) : "";
+		}
+		obs_source_release(old);
+		obs_source_release(found);
+	}
+
+	// "Say each vowel" is done: its places saved in the settings
+	// (save_profile_task, on the UI thread)...
+	void profile_saved(const std::string &text)
+	{
+		std::lock_guard<std::mutex> l(lock);
+		profile_seen = text;
+	}
+
+	// ...or forgotten: the usual places again.
+	void forget_voice()
+	{
+		VoiceOptions o = voice.options();
+		o.profile = VoiceProfile();
+		voice.stop_calibrating();
+		voice.set(o);
+		obs_data_t *settings = obs_source_get_settings(self);
+		obs_data_set_string(settings, "mic_profile", "");
+		obs_data_release(settings);
+		profile_saved("");
 	}
 
 	// Is the picture read back (`line` bytes a row) the one that went to
@@ -1409,6 +1605,7 @@ struct FaceAvatar {
 			model_now = pack->model;
 			rig.reset();
 			rig_key.clear();
+			skin_key.clear();
 			have_worn_pose = false;
 			State3D st;
 			st.file = pack->path;
@@ -1423,6 +1620,13 @@ struct FaceAvatar {
 				st.triangles = m.triangles;
 				for (const Animation &a : m.animations)
 					st.animations.push_back(a.name);
+				for (const Material &mat : m.materials) {
+					State3D::Mat sm;
+					sm.name = mat.name;
+					sm.bumps = mat.normal_map.used();
+					sm.shadows = mat.occlusion_map.used();
+					st.materials.push_back(sm);
+				}
 			}
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d = st;
@@ -1527,8 +1731,34 @@ struct FaceAvatar {
 				mix(clampf(std::pow(std::max(0.05f, g.scale), follow_grow), 0.6f, 1.6f), 1, a.idle);
 			const bool head = look3d.framing == 2 || (look3d.framing == 0 && m.is_vrm());
 			// Moved in proportion to its size: its eye gap (its spots), as
-			// it's framed.
+			// it's framed - seen from the camera view, gliding to a new one.
 			f = frame_own_spot(m, facing, w, h, size, head, 0, 0, grow);
+			const int want = look3d.view >= 0 && look3d.view < (int)look3d.views.size() ? look3d.view : -1;
+			const CameraView target = want >= 0 ? look3d.views[want].second : CameraView();
+			if (!view_started) { // the first picture: straight there, no glide
+				view_from = view_to = view_now = target;
+				view_shown = want;
+				view_t = 1;
+				view_started = true;
+			}
+			const bool same = target.yaw == view_to.yaw && target.pitch == view_to.pitch &&
+					  target.zoom == view_to.zoom && target.x == view_to.x && target.y == view_to.y;
+			if (!same || want != view_shown) {
+				view_from = view_now;
+				view_to = target;
+				view_shown = want;
+				view_t = look3d.view_glide > 0 ? 0 : 1;
+			}
+			view_t = std::min(1.0f, view_t + (look3d.view_glide > 0 ? frame_dt / look3d.view_glide : 1));
+			// Eased in and out (smootherstep).
+			const float e = view_t * view_t * view_t * (view_t * (view_t * 6 - 15) + 10);
+			view_now = view_between(view_from, view_to, e);
+			view_own_spot(f, view_now);
+			{
+				std::lock_guard<std::mutex> l(state_lock);
+				view_shown_state = view_shown;
+				view_gliding_state = view_t < 1;
+			}
 			const float its_gap = length(spots3d.spot[0].at - spots3d.spot[1].at) * f.world_scale;
 			float dx = 0, dy = 0;
 			follow_of(o, g, follow_move, its_gap / f.seen_w, its_gap / f.seen_h, dx, dy);
@@ -1575,6 +1805,8 @@ struct FaceAvatar {
 		if (showing > 0.5f) {
 			quiet_face(d.moves);
 			d.hide_own_face = true;
+		} else {
+			d.mic = mic_now; // its mouth from your mic, as much as it has it
 		}
 		rig->pose(d);
 		v.fov = f.fov;
@@ -1587,6 +1819,18 @@ struct FaceAvatar {
 		v.outline = look3d.outline;
 		v.smooth = look3d.smooth && !easy;
 		v.opacity = opacity;
+		v.lights = look3d.lights;
+		v.detail = look3d.detail;
+		v.soft_skin = look3d.soft_skin;
+		const std::string skin_for = std::to_string((uintptr_t)model_now.get()) + "/" + look3d.skin_parts;
+		if (skin_for != skin_key) {
+			skin_now = skin_materials(m, look3d.skin_parts);
+			skin_key = skin_for;
+			std::lock_guard<std::mutex> l(state_lock);
+			for (size_t i = 0; i < state3d.materials.size() && i < skin_now.size(); i++)
+				state3d.materials[i].skin = skin_now[i];
+		}
+		v.skin = &skin_now;
 		gs_texture_t *tex = show ? avatar3d->draw(*rig, v) : nullptr;
 		{
 			std::lock_guard<std::mutex> l(state_lock);
@@ -1924,6 +2168,10 @@ struct FaceAvatar {
 		const int left_card = card[0].c[0] <= card[1].c[0] ? 0 : 1;
 		const int far_card = card[0].depth >= card[1].depth ? 0 : 1;
 		const float yaw = std::fabs(held_turn.yaw);
+		// The character's light on them (the camera's picture is sRGB).
+		const V3 front = front_light(v.lights);
+		vec3 card_light;
+		vec3_set(&card_light, std::pow(front.x, 1 / 2.2f), std::pow(front.y, 1 / 2.2f), std::pow(front.z, 1 / 2.2f));
 		gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 		int drawn_cards = 0;
 		for (int i = 0; i < 3; i++) {
@@ -1988,6 +2236,7 @@ struct FaceAvatar {
 			gs_effect_set_vec2(p_body_down, &b_down);
 			gs_effect_set_vec4(p_ring, &ring);
 			gs_effect_set_float(p_ring_on, skin_auto ? 1.0f : 0.0f);
+			gs_effect_set_vec3(p_card_light, &card_light);
 			gs_effect_set_vec3(p_skin_lab, &skin_lab);
 			gs_effect_set_vec3(p_target_lab, &target_lab);
 			gs_effect_set_float(p_skin_amount, skin);
@@ -2169,10 +2418,51 @@ struct FaceAvatar {
 			reading_peak[i].take(reading[i], clock);
 			shows_peak[i].take(shows[i], clock);
 		}
+		// The mouth from your mic: all the time ("mic"; the camera's when
+		// no sound comes in), or while you talk ("both").
+		since_mic_find += dt;
+		if (since_mic_find >= FIND_EVERY) {
+			since_mic_find = 0;
+			bool auto_mic;
+			{
+				std::lock_guard<std::mutex> l(mic_lock);
+				auto_mic = mic_name.empty();
+			}
+			obs_source_t *m = get_mic();
+			// Looked for again when it's gone, or when it's "" (OBS's own
+			// Mic/Aux may have been set since).
+			if (!m ? mouth_from != MOUTH_FROM_CAMERA : auto_mic)
+				find_mic();
+			obs_source_release(m);
+		}
+		const VoiceOut heard_now = voice.step(dt);
+		VoiceProfile calibrated;
+		if (voice.take_calibrated(calibrated)) {
+			obs_weak_source_addref(weak_self);
+			auto *job = new std::pair<obs_weak_source_t *, std::string>(weak_self, profile_text(calibrated));
+			obs_queue_task(OBS_TASK_UI, save_profile_task, job, false);
+		}
+		const int from = mouth_from;
+		const float share_to = from == MOUTH_FROM_CAMERA ? 0
+				       : from == MOUTH_FROM_MIC  ? (heard_now.hearing ? 1.0f : 0.0f)
+								 : heard_now.talking;
+		const float share_tau = share_to > mic_now.share ? MIC_TAKE : MIC_GIVE;
+		mic_now.share = share_to + (mic_now.share - share_to) * std::exp(-dt / share_tau);
+		if (mic_now.share < 1e-3f)
+			mic_now.share = 0;
+		std::copy(heard_now.vowel, heard_now.vowel + VOWELS, mic_now.vowel);
 		// Its drawn face, from yours (easing to rest when it can't see
-		// you, blinking by itself).
-		drawn_now = drawn_face(alive_now.moves, mirror, drawn_now);
+		// you, blinking by itself) - its mouth from your mic as much as
+		// the mic has it.
+		float drawn_moves[EXPRESSIONS];
+		std::copy(alive_now.moves, alive_now.moves + EXPRESSIONS, drawn_moves);
+		mic_into_moves(mic_now, drawn_moves);
+		drawn_now = drawn_face(drawn_moves, mirror, drawn_now);
+		const Calibration cal = voice.calibration();
 		std::lock_guard<std::mutex> l(state_lock);
+		voice_state = heard_now;
+		cal_state = cal;
+		mic_share_state = mic_now.share;
 		shown_now = o;
 		state_now = seen;
 		drawn_state = drawn_now;
@@ -2201,6 +2491,42 @@ struct FaceAvatar {
 		}
 		if (changed)
 			find_camera();
+
+		// The mouth from your mic: which mic, the gate, how wide, and its
+		// places from "say each vowel" when they're new (one just made and
+		// not saved yet stays).
+		const char *from = obs_data_get_string(settings, "mouth_from");
+		const int from_now = from && std::strcmp(from, "camera") == 0 ? MOUTH_FROM_CAMERA
+				     : from && std::strcmp(from, "mic") == 0  ? MOUTH_FROM_MIC
+										: MOUTH_FROM_BOTH;
+		const char *mic_text = obs_data_get_string(settings, "mic");
+		bool mic_changed = mouth_from.exchange(from_now) != from_now;
+		{
+			std::lock_guard<std::mutex> l(mic_lock);
+			mic_changed = mic_changed || mic_name != (mic_text ? mic_text : "");
+			mic_name = mic_text ? mic_text : "";
+		}
+		if (mic_changed)
+			find_mic();
+		VoiceOptions vo;
+		vo.start_db = (float)obs_data_get_int(settings, "mic_start");
+		vo.full_db = (float)obs_data_get_int(settings, "mic_full");
+		vo.amount = (float)obs_data_get_int(settings, "mic_amount") / 100.0f;
+		const char *profile_text_now = obs_data_get_string(settings, "mic_profile");
+		const std::string profile_now = profile_text_now ? profile_text_now : "";
+		bool new_profile;
+		{
+			std::lock_guard<std::mutex> l(lock);
+			new_profile = profile_now != profile_seen;
+			profile_seen = profile_now;
+		}
+		if (new_profile) {
+			if (!profile_from(profile_now, vo.profile))
+				vo.profile = VoiceProfile();
+			voice.set(vo);
+		} else {
+			voice.set_levels(vo);
+		}
 
 		// "Set" (from DireBot's FaceSet, saved here by save_rest_task),
 		// unless one has just finished and isn't saved yet.
@@ -2389,6 +2715,63 @@ struct FaceAvatar {
 			}
 			l3.place.size = clampf(number("size", 1), 0.1f, 10);
 		}
+		// Its lights: a ready-made set, or its own from the page.
+		const char *preset = obs_data_get_string(settings, "light_preset");
+		l3.light_preset = light_preset_of(preset ? preset : "");
+		if (l3.light_preset == LIGHTS_OWN) {
+			// OBS's colours are 0xAABBGGRR.
+			auto rgb = [settings](const char *key) {
+				const uint32_t c = (uint32_t)obs_data_get_int(settings, key);
+				return (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16 & 0xFF);
+			};
+			LightTerms own;
+			own.side = (int)obs_data_get_int(settings, "light_side");
+			own.height = (int)obs_data_get_int(settings, "light_height");
+			own.colour = rgb("light_colour");
+			own.brightness = (int)obs_data_get_int(settings, "light_brightness");
+			own.room_colour = rgb("room_colour");
+			own.room = (int)obs_data_get_int(settings, "room_brightness");
+			own.rim_colour = rgb("rim_colour");
+			own.rim = (int)obs_data_get_int(settings, "rim_brightness");
+			l3.light_terms = own;
+			l3.lights = lights_of(own);
+		} else {
+			l3.light_terms = preset_terms(l3.light_preset);
+			l3.lights = preset_lights(l3.light_preset);
+		}
+		l3.detail = obs_data_get_bool(settings, "detail_maps");
+		l3.soft_skin = clampf((float)obs_data_get_int(settings, "soft_skin") / 100.0f, 0, 1);
+		const char *skin_parts = obs_data_get_string(settings, "skin_parts");
+		l3.skin_parts = skin_parts ? skin_parts : "";
+		// Its saved camera views, and the one shown ("main": as framed).
+		const json views = json::parse(obs_data_get_string(settings, "views"), nullptr, false);
+		if (views.is_array()) {
+			for (const json &row : views) {
+				if (l3.views.size() >= MOST_VIEWS)
+					break;
+				if (!row.is_object())
+					continue;
+				auto number = [&row](const char *key, float def) {
+					auto it = row.find(key);
+					return it != row.end() && it->is_number() ? (float)it->get<double>() : def;
+				};
+				CameraView cv;
+				cv.yaw = number("yaw", 0);
+				cv.pitch = number("pitch", 0);
+				cv.zoom = number("zoom", 1);
+				cv.x = number("x", 0);
+				cv.y = number("y", 0);
+				const auto name = row.find("name");
+				l3.views.emplace_back(name != row.end() && name->is_string() ? name->get<std::string>() : "",
+						      sensible_view(cv));
+			}
+		}
+		const char *view = obs_data_get_string(settings, "view");
+		const std::string view_name = view ? view : "";
+		for (size_t i = 0; i < l3.views.size(); i++)
+			if (view_name == std::to_string(i + 1))
+				l3.view = (int)i;
+		l3.view_glide = clampf((float)obs_data_get_int(settings, "view_glide") / 1000.0f, 0, 5);
 		const char *setup_text = obs_data_get_string(settings, "model_setup");
 		l3.setup_text = setup_text ? setup_text : "";
 		{
@@ -2466,16 +2849,39 @@ struct FaceAvatar {
 
 	json state(bool with_points)
 	{
+		const VoiceOptions mic_levels = voice.options();
 		// The character's shape first, on its own: the graphics thread
 		// takes the pictures' lock, then the state's.
 		const char *spot_names[PARTS] = {"left_eye", "right_eye", "mouth"};
 		json holes = json::object();
 		bool shaped;
+		json lights_json, views_json = json::array();
+		int view_index;
 		{
 			std::lock_guard<std::mutex> l(pictures_lock);
 			for (int i = 0; i < PARTS; i++)
 				holes[spot_names[i]] = shapes[0] && shapes[0]->hole[i];
 			shaped = shapes[0] && shapes[0]->ready();
+			const LightTerms &t = look3d.light_terms;
+			lights_json = {{"preset", LIGHT_PRESET_NAMES[look3d.light_preset]},
+				       {"side", t.side},
+				       {"height", t.height},
+				       {"colour", colour_text(t.colour)},
+				       {"brightness", t.brightness},
+				       {"room_colour", colour_text(t.room_colour)},
+				       {"room", t.room},
+				       {"rim_colour", colour_text(t.rim_colour)},
+				       {"rim", t.rim},
+				       {"detail", look3d.detail},
+				       {"soft_skin", (int)std::lround(look3d.soft_skin * 100)}};
+			for (const auto &named : look3d.views)
+				views_json.push_back({{"name", named.first},
+						      {"yaw", named.second.yaw},
+						      {"pitch", named.second.pitch},
+						      {"zoom", named.second.zoom},
+						      {"x", named.second.x},
+						      {"y", named.second.y}});
+			view_index = look3d.view;
 		}
 		std::lock_guard<std::mutex> l(state_lock);
 		const Face &face = state_now.face;
@@ -2533,6 +2939,57 @@ struct FaceAvatar {
 					  {"shows_peak", shows_peak}};
 		}
 		answer["alive"] = {{"idle", r(idle_state, 100)}, {"breath", r(breath_state, 100)}};
+		// The mouth from your mic: which mic it hears, how loud (dBFS,
+		// as OBS's meter), what it hears, and "say each vowel".
+		{
+			const VoiceOut &vo = voice_state;
+			const Calibration &c = cal_state;
+			std::string asked, found;
+			{
+				std::lock_guard<std::mutex> l2(mic_lock);
+				asked = mic_name;
+				found = mic_found;
+			}
+			const int from = mouth_from;
+			json vowels = json::object();
+			for (int k = 0; k < VOWELS; k++)
+				vowels[VOWEL_NAMES[k]] = r(vo.vowel[k], 100);
+			json cal = {{"running", c.running},
+				    {"vowel", VOWEL_NAMES[std::min(std::max(c.vowel, 0), VOWELS - 1)]},
+				    {"number", c.vowel + 1},
+				    {"listening", c.listening},
+				    {"left", r(std::max(0.0f, c.left), 10)},
+				    {"done", c.done}};
+			if (c.done) {
+				json got = json::object();
+				for (int k = 0; k < VOWELS; k++)
+					got[VOWEL_NAMES[k]] = c.heard[k];
+				cal["heard"] = got;
+				cal["own"] = c.result.own;
+			}
+			answer["mic"] = {{"from", from == MOUTH_FROM_CAMERA ? "camera"
+						  : from == MOUTH_FROM_MIC  ? "mic"
+									    : "both"},
+					 {"mic", asked},
+					 {"found", !found.empty()},
+					 {"listening_to", found},
+					 {"hearing", vo.hearing},
+					 {"muted", vo.muted},
+					 {"level", r(vo.level_db, 10)},
+					 {"peak", r(vo.peak_db, 10)},
+					 {"start", r(mic_levels.start_db, 10)},
+					 {"full", r(mic_levels.full_db, 10)},
+					 {"heard", vo.heard},
+					 {"voiced", vo.voiced},
+					 {"talking", r(vo.talking, 100)},
+					 {"open", r(vo.open, 100)},
+					 {"share", r(mic_share_state, 100)},
+					 {"vowels", vowels},
+					 {"f1", std::round(vo.f1)},
+					 {"f2", std::round(vo.f2)},
+					 {"own_voice", mic_levels.profile.own},
+					 {"calibration", cal}};
+		}
 		// For "Check my camera": where your face is in the camera's
 		// picture (shares of it), which way you face the camera itself
 		// (degrees, as Turn - not against "Set"), and how lit it is.
@@ -2585,6 +3042,11 @@ struct FaceAvatar {
 				    {"opacity", r(at.opacity, 100)}};
 		answer["see_through"] = holes;
 		answer["shaped"] = shaped;
+		answer["lights"] = lights_json;
+		answer["camera_view"] = {{"view", view_index >= 0 ? std::to_string(view_index + 1) : "main"},
+					 {"showing", view_shown_state >= 0 ? std::to_string(view_shown_state + 1) : "main"},
+					 {"gliding", view_gliding_state},
+					 {"views", views_json}};
 		{
 			const State3D &st = state3d;
 			json values = json::object();
@@ -2621,6 +3083,21 @@ struct FaceAvatar {
 				      {"y", r(st.y, 10)}};
 			if (!st.problem.empty())
 				model["problem"] = st.problem;
+			json materials = json::array();
+			int bumpy = 0, shaded = 0, skin = 0;
+			for (const State3D::Mat &mat : st.materials) {
+				materials.push_back({{"name", mat.name},
+						     {"bumps", mat.bumps},
+						     {"shadows", mat.shadows},
+						     {"skin", mat.skin}});
+				bumpy += mat.bumps;
+				shaded += mat.shadows;
+				skin += mat.skin;
+			}
+			model["materials"] = materials;
+			model["bump_parts"] = bumpy;
+			model["shadow_parts"] = shaded;
+			model["skin_parts"] = skin;
 			if (st.rigged) {
 				model["blinks"] = st.blinks;
 				model["talks"] = st.talks;
@@ -2655,17 +3132,33 @@ struct FaceAvatar {
 		obs_source_t *renamed = static_cast<obs_source_t *>(calldata_ptr(cd, "source"));
 		if (!was || !now || !renamed)
 			return;
+		bool camera_renamed;
 		{
 			std::lock_guard<std::mutex> l(f->lock);
-			if (f->camera_name != was)
-				return;
-			if (f->camera ? !obs_weak_source_references_source(f->camera, renamed)
-				      : obs_source_get_type(renamed) != OBS_SOURCE_TYPE_INPUT)
-				return;
-			f->camera_name = now;
+			camera_renamed = f->camera_name == was &&
+					 (f->camera ? obs_weak_source_references_source(f->camera, renamed)
+						    : obs_source_get_type(renamed) == OBS_SOURCE_TYPE_INPUT);
+			if (camera_renamed)
+				f->camera_name = now;
 		}
+		bool mic_renamed;
+		{
+			std::lock_guard<std::mutex> l(f->mic_lock);
+			// The one it listens to, by any name (its name for the page).
+			if (f->mic && obs_weak_source_references_source(f->mic, renamed))
+				f->mic_found = now;
+			mic_renamed = !f->mic_name.empty() && f->mic_name == was &&
+				      (f->mic ? obs_weak_source_references_source(f->mic, renamed) : is_audio(renamed));
+			if (mic_renamed)
+				f->mic_name = now;
+		}
+		if (!camera_renamed && !mic_renamed)
+			return;
 		obs_data_t *settings = obs_source_get_settings(f->self);
-		obs_data_set_string(settings, "source", now);
+		if (camera_renamed)
+			obs_data_set_string(settings, "source", now);
+		if (mic_renamed)
+			obs_data_set_string(settings, "mic", now);
 		obs_data_release(settings);
 	}
 };
@@ -2683,6 +3176,22 @@ void save_rest_task(void *param)
 	obs_data_release(settings);
 	if (auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src)))
 		f->rest_saved(job->second);
+	obs_source_release(src);
+}
+
+void save_profile_task(void *param)
+{
+	std::unique_ptr<std::pair<obs_weak_source_t *, std::string>> job(
+		static_cast<std::pair<obs_weak_source_t *, std::string> *>(param));
+	obs_source_t *src = obs_weak_source_get_source(job->first);
+	obs_weak_source_release(job->first);
+	if (!src)
+		return;
+	obs_data_t *settings = obs_source_get_settings(src);
+	obs_data_set_string(settings, "mic_profile", job->second.c_str());
+	obs_data_release(settings);
+	if (auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src)))
+		f->profile_saved(job->second);
 	obs_source_release(src);
 }
 
@@ -2773,6 +3282,33 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "auto_blink", false);
 	obs_data_set_default_string(settings, "model_place", "");
 	obs_data_set_default_string(settings, "model_setup", "");
+	// The studio's lights in plain terms (lights.hpp), OBS's colours
+	// 0xAABBGGRR.
+	const LightTerms studio;
+	auto obs_colour = [](uint32_t rgb) {
+		return (long long)(0xFF000000u | (rgb & 0xFF) << 16 | (rgb & 0xFF00) | (rgb >> 16 & 0xFF));
+	};
+	obs_data_set_default_string(settings, "light_preset", "studio");
+	obs_data_set_default_int(settings, "light_side", studio.side);
+	obs_data_set_default_int(settings, "light_height", studio.height);
+	obs_data_set_default_int(settings, "light_colour", obs_colour(studio.colour));
+	obs_data_set_default_int(settings, "light_brightness", studio.brightness);
+	obs_data_set_default_int(settings, "room_colour", obs_colour(studio.room_colour));
+	obs_data_set_default_int(settings, "room_brightness", studio.room);
+	obs_data_set_default_int(settings, "rim_colour", obs_colour(studio.rim_colour));
+	obs_data_set_default_int(settings, "rim_brightness", studio.rim);
+	obs_data_set_default_bool(settings, "detail_maps", true);
+	obs_data_set_default_int(settings, "soft_skin", 0);
+	obs_data_set_default_string(settings, "skin_parts", "");
+	obs_data_set_default_string(settings, "views", "[]");
+	obs_data_set_default_string(settings, "view", "main");
+	obs_data_set_default_int(settings, "view_glide", 600);
+	obs_data_set_default_string(settings, "mouth_from", "both");
+	obs_data_set_default_string(settings, "mic", "");
+	obs_data_set_default_int(settings, "mic_start", -50);
+	obs_data_set_default_int(settings, "mic_full", -30);
+	obs_data_set_default_int(settings, "mic_amount", 100);
+	obs_data_set_default_string(settings, "mic_profile", "");
 }
 
 bool add_camera(void *param, obs_source_t *source)
@@ -2893,7 +3429,48 @@ obs_properties_t *get_properties(void *data)
 	obs_properties_add_bool(m3, "smooth_edges", text("FaceAvatar.SmoothEdges"));
 	p = obs_properties_add_int_slider(m3, "fingers", text("FaceAvatar.Fingers"), 0, 100, 1);
 	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_bool(m3, "detail_maps", text("FaceAvatar.DetailMaps"));
+	p = obs_properties_add_int_slider(m3, "soft_skin", text("FaceAvatar.SoftSkin"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_text(m3, "skin_parts", text("FaceAvatar.SkinParts"), OBS_TEXT_MULTILINE);
+	obs_property_t *shown_view = obs_properties_add_list(m3, "view", text("FaceAvatar.View"), OBS_COMBO_TYPE_LIST,
+							     OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(shown_view, text("FaceAvatar.ViewMain"), "main");
+	if (f) {
+		std::lock_guard<std::mutex> l(f->pictures_lock);
+		for (size_t i = 0; i < f->look3d.views.size(); i++) {
+			const std::string key = std::to_string(i + 1);
+			const std::string &name = f->look3d.views[i].first;
+			obs_property_list_add_string(shown_view, (key + (name.empty() ? "" : ": " + name)).c_str(),
+						     key.c_str());
+		}
+	}
+	p = obs_properties_add_int_slider(m3, "view_glide", text("FaceAvatar.ViewGlide"), 0, 3000, 50);
+	obs_property_int_set_suffix(p, " ms");
 	obs_properties_add_group(props, "model3d", text("FaceAvatar.Model3D"), OBS_GROUP_NORMAL, m3);
+
+	// Its lights (a 3D character's).
+	obs_properties_t *lit = obs_properties_create();
+	obs_property_t *presets = obs_properties_add_list(lit, "light_preset", text("FaceAvatar.LightPreset"),
+							  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	for (int i = 0; i < LIGHT_PRESETS; i++)
+		obs_property_list_add_string(presets, text((std::string("FaceAvatar.Lights.") + LIGHT_PRESET_NAMES[i]).c_str()),
+					     LIGHT_PRESET_NAMES[i]);
+	obs_properties_add_text(lit, "lights_about", text("FaceAvatar.LightsAbout"), OBS_TEXT_INFO);
+	p = obs_properties_add_int_slider(lit, "light_side", text("FaceAvatar.LightSide"), -180, 180, 1);
+	obs_property_int_set_suffix(p, "\xC2\xB0");
+	p = obs_properties_add_int_slider(lit, "light_height", text("FaceAvatar.LightHeight"), -90, 90, 1);
+	obs_property_int_set_suffix(p, "\xC2\xB0");
+	obs_properties_add_color(lit, "light_colour", text("FaceAvatar.LightColour"));
+	p = obs_properties_add_int_slider(lit, "light_brightness", text("FaceAvatar.LightBrightness"), 0, 300, 5);
+	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_color(lit, "room_colour", text("FaceAvatar.RoomColour"));
+	p = obs_properties_add_int_slider(lit, "room_brightness", text("FaceAvatar.RoomBrightness"), 0, 300, 5);
+	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_color(lit, "rim_colour", text("FaceAvatar.RimColour"));
+	p = obs_properties_add_int_slider(lit, "rim_brightness", text("FaceAvatar.RimBrightness"), 0, 300, 5);
+	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_group(props, "lights", text("FaceAvatar.Lights"), OBS_GROUP_NORMAL, lit);
 
 	// Your face's tuning: where each of the camera's readings starts and
 	// where it's full (DireBot's page shows them live).
@@ -2928,6 +3505,38 @@ obs_properties_t *get_properties(void *data)
 	obs_properties_add_bool(alive, "eye_moves", text("FaceAvatar.EyeMoves"));
 	obs_properties_add_bool(alive, "auto_blink", text("FaceAvatar.AutoBlink"));
 	obs_properties_add_group(props, "alive", text("FaceAvatar.Alive"), OBS_GROUP_NORMAL, alive);
+
+	// The mouth from your mic.
+	obs_properties_t *heard = obs_properties_create();
+	obs_properties_add_text(heard, "mic_about", text("FaceAvatar.MicAbout"), OBS_TEXT_INFO);
+	obs_property_t *from = obs_properties_add_list(heard, "mouth_from", text("FaceAvatar.MouthFrom"),
+						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(from, text("FaceAvatar.MouthFromBoth"), "both");
+	obs_property_list_add_string(from, text("FaceAvatar.MouthFromMic"), "mic");
+	obs_property_list_add_string(from, text("FaceAvatar.MouthFromCamera"), "camera");
+	obs_property_t *mics = obs_properties_add_list(heard, "mic", text("FaceAvatar.Mic"), OBS_COMBO_TYPE_LIST,
+						       OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(mics, text("FaceAvatar.MicDefault"), "");
+	obs_enum_sources(
+		[](void *param, obs_source_t *source) {
+			const char *name = obs_source_get_name(source);
+			if (is_audio(source) && name && *name)
+				obs_property_list_add_string(static_cast<obs_property_t *>(param), name, name);
+			return true;
+		},
+		mics);
+	if (f) {
+		std::lock_guard<std::mutex> l(f->mic_lock);
+		if (!f->mic_name.empty() && (!f->mic || obs_weak_source_expired(f->mic)))
+			obs_property_list_add_string(mics, f->mic_name.c_str(), f->mic_name.c_str());
+	}
+	p = obs_properties_add_int_slider(heard, "mic_start", text("FaceAvatar.MicStart"), -90, -6, 1);
+	obs_property_int_set_suffix(p, " dB");
+	p = obs_properties_add_int_slider(heard, "mic_full", text("FaceAvatar.MicFull"), -60, 0, 1);
+	obs_property_int_set_suffix(p, " dB");
+	p = obs_properties_add_int_slider(heard, "mic_amount", text("FaceAvatar.MicAmount"), 0, 200, 5);
+	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_group(props, "mic_mouth", text("FaceAvatar.MicMouth"), OBS_GROUP_NORMAL, heard);
 	return props;
 }
 
@@ -3030,7 +3639,42 @@ json get_state(const json &data)
 	if (!src)
 		return fail("That face avatar isn't in OBS any more.");
 	auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src));
+	if (f) // the page shows how the mic sounds: it listens a while
+		f->listen_for(LISTEN_NS);
 	json answer = f ? f->state(data.value("points", false)) : fail("It isn't ready yet.");
+	obs_source_release(src);
+	return answer;
+}
+
+// "Say each vowel": started, stopped, or the places it made forgotten.
+json mic_calibrate(const json &data)
+{
+	obs_source_t *src = find_avatar(data);
+	if (!src)
+		return fail("That face avatar isn't in OBS any more.");
+	auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src));
+	json answer = {{"ok", true}};
+	const std::string what = data.contains("do") && data["do"].is_string() ? data["do"].get<std::string>() : "start";
+	if (!f) {
+		answer = fail("It isn't ready yet.");
+	} else if (what == "stop") {
+		f->voice.stop_calibrating();
+	} else if (what == "forget") {
+		f->forget_voice();
+	} else if (what == "start") {
+		obs_source_t *m = f->get_mic();
+		if (!m) {
+			answer = fail(f->mouth_from == MOUTH_FROM_CAMERA
+					      ? "Its mouth is from your camera - pick your mic or both first."
+					      : "It can't find your mic in OBS - pick it first.");
+		} else {
+			f->listen_for(LISTEN_NS * 10);
+			f->voice.calibrate();
+		}
+		obs_source_release(m);
+	} else {
+		answer = fail("DireBot for OBS doesn't know that.");
+	}
 	obs_source_release(src);
 	return answer;
 }
@@ -3052,7 +3696,7 @@ json model_front(const json &data)
 
 const std::vector<std::string> &requests()
 {
-	static const std::vector<std::string> list = {"FaceSet", "FaceGetState", "FaceModelFront"};
+	static const std::vector<std::string> list = {"FaceSet", "FaceGetState", "FaceModelFront", "FaceMicCalibrate"};
 	return list;
 }
 
@@ -3071,6 +3715,8 @@ json request(const std::string &type, const json &data)
 			return get_state(data);
 		if (type == "FaceModelFront")
 			return model_front(data);
+		if (type == "FaceMicCalibrate")
+			return mic_calibrate(data);
 		return fail("DireBot for OBS doesn't know that request.");
 	});
 }

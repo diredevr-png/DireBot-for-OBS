@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds and runs the tests for DireBot for OBS that don't need OBS:
 # the unit tests (the link's, the vertical picture's, Follow me's, clean recordings', the face tracker's,
-# the face avatar's 2D and 3D characters'), then the link's
+# the face avatar's 2D and 3D characters', the mouth from your mic's), then the link's
 # network tests through obsws-python.
 # (tests/test_real_obs.py runs it inside a real OBS - see its top.)
 #   pip install pytest obsws-python websocket-client
@@ -45,8 +45,11 @@ done
 	"$here/src/face/avatar2d.cpp" "$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
 "$out/unit-avatar"
 "$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-model" "$here/tests/unit_model.cpp" "$here/src/face/model.cpp" \
-	"$here/src/face/rig.cpp" "$here/src/face/alive.cpp" "$here/src/face/setup.cpp" "$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
+	"$here/src/face/rig.cpp" "$here/src/face/alive.cpp" "$here/src/face/voice.cpp" "$here/src/face/setup.cpp" "$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
 "$out/unit-model"
+"$cxx" "${flags[@]}" -O2 -o "$out/unit-voice" "$here/tests/unit_voice.cpp" "$here/src/face/voice.cpp" \
+	"$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
+"$out/unit-voice"
 
 "$cxx" "${flags[@]}" -o "$out/harness" "$here/tests/harness.cpp" "$here/src/link/server.cpp" "${link_src[@]}"
 DIREBOT_LINK_HARNESS="$out/harness" python3 -m pytest -q "$here/tests/test_link.py" "$@"

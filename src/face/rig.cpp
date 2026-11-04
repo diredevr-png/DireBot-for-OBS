@@ -917,6 +917,18 @@ void Rig::drive_expressions(const Drive &d)
 		if (dr.expression == "blinkLeft" || dr.expression == "blinkRight")
 			per_eye = true;
 	std::map<std::string, float> v = vrm_values(d.moves, per_eye);
+	// The mic's vowels over the camera's mouth, as much as it has it;
+	// ARKit-named shapes from your moves with the mic's mouth in them.
+	float mic_moves[EXPRESSIONS];
+	std::copy(d.moves, d.moves + EXPRESSIONS, mic_moves);
+	const float mic_share = std::min(1.0f, std::max(0.0f, d.mic.share));
+	if (mic_share > 0) {
+		for (int k = 0; k < VOWELS; k++) {
+			float &value = v[VOWEL_VRM[k]];
+			value = value + (std::min(1.0f, std::max(0.0f, d.mic.vowel[k])) - value) * mic_share;
+		}
+		mic_into_moves(d.mic, mic_moves);
+	}
 	if (!d.look || (m.look_bones && (left_eye_ >= 0 || right_eye_ >= 0)))
 		for (const char *k : {"lookUp", "lookDown", "lookLeft", "lookRight"})
 			v[k] = 0;
@@ -959,7 +971,7 @@ void Rig::drive_expressions(const Drive &d)
 			continue;
 		float amount;
 		if (dr.move > 0) {
-			amount = clamp01(d.moves[dr.move]);
+			amount = clamp01(mic_moves[dr.move]);
 		} else {
 			auto it = on.find(dr.expression);
 			amount = it == on.end() ? 0 : it->second;
@@ -1212,9 +1224,22 @@ void Rig::skin()
 			}
 			out.pos.resize(n);
 			out.normal.resize(n);
+			// Its tangents turned as its facings are (the drawing squares
+			// them up with the facing).
+			const bool tangents = p.tangent.size() == n * 4;
+			out.tangent.resize(tangents ? n : 0);
+			auto handed = [](const M4 &a) {
+				const V3 x{a.m[0], a.m[1], a.m[2]}, y{a.m[4], a.m[5], a.m[6]}, z{a.m[8], a.m[9], a.m[10]};
+				return dot(x, cross(y, z)) < 0 ? -1.0f : 1.0f;
+			};
+			out.handed = skin && !p.joints.empty() ? (p.joints[0] < joint.size() ? handed(joint[p.joints[0]]) : 1.0f)
+							       : handed(world_[ni]);
+			auto tangent_of = [&p](size_t i) {
+				return V3{p.tangent[i * 4], p.tangent[i * 4 + 1], p.tangent[i * 4 + 2]};
+			};
 			if (skin && !p.joints.empty()) {
 				for (size_t i = 0; i < n; i++) {
-					V3 v, nn;
+					V3 v, nn, tt;
 					for (int k = 0; k < 4; k++) {
 						const float wk = p.weights[i * 4 + k];
 						const uint16_t j = p.joints[i * 4 + k];
@@ -1222,15 +1247,21 @@ void Rig::skin()
 							continue;
 						v = v + point(joint[j], src_p[i]) * wk;
 						nn = nn + direction(joint[j], src_n[i]) * wk;
+						if (tangents)
+							tt = tt + direction(joint[j], tangent_of(i)) * wk;
 					}
 					out.pos[i] = v;
 					out.normal[i] = normalized(nn, {0, 0, 1});
+					if (tangents)
+						out.tangent[i] = normalized(tt, {1, 0, 0});
 				}
 			} else {
 				const M4 &mw = world_[ni];
 				for (size_t i = 0; i < n; i++) {
 					out.pos[i] = point(mw, src_p[i]);
 					out.normal[i] = normalized(direction(mw, src_n[i]), {0, 0, 1});
+					if (tangents)
+						out.tangent[i] = normalized(direction(mw, tangent_of(i)), {1, 0, 0});
 				}
 			}
 			// Not drawn: every point in one, so its triangles cover nothing.
@@ -1362,9 +1393,55 @@ Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, floa
 
 void move_own_spot(Framing &f, float dx, float dy)
 {
-	const M4 by = moved({dx * f.seen_w, -dy * f.seen_h, 0});
+	// Across the picture, whichever way the camera's turned.
+	const M4 by = moved(f.right * (dx * f.seen_w) + f.up * (-dy * f.seen_h));
 	f.place = by * f.place;
 	f.upright = by * f.upright;
+}
+
+CameraView sensible_view(const CameraView &v)
+{
+	auto fit = [](float x, float lo, float hi, float def) {
+		return std::isfinite(x) ? std::min(hi, std::max(lo, x)) : def;
+	};
+	CameraView c;
+	c.yaw = fit(v.yaw, -120, 120, 0);
+	c.pitch = fit(v.pitch, -45, 60, 0);
+	c.zoom = fit(v.zoom, 0.3f, 4, 1);
+	c.x = fit(v.x, -0.5f, 0.5f, 0);
+	c.y = fit(v.y, -0.5f, 0.5f, 0);
+	return c;
+}
+
+CameraView view_between(const CameraView &a, const CameraView &b, float t)
+{
+	t = std::min(1.0f, std::max(0.0f, t));
+	CameraView c;
+	c.yaw = a.yaw + (b.yaw - a.yaw) * t;
+	c.pitch = a.pitch + (b.pitch - a.pitch) * t;
+	// Growing evenly, as a camera moving in does.
+	c.zoom = a.zoom * std::pow(b.zoom / std::max(1e-3f, a.zoom), t);
+	c.x = a.x + (b.x - a.x) * t;
+	c.y = a.y + (b.y - a.y) * t;
+	return c;
+}
+
+void view_own_spot(Framing &f, const CameraView &cv)
+{
+	const CameraView v = sensible_view(cv);
+	// Round it and up: the world turned the other way under the camera,
+	// round the middle of what's framed (the world's middle).
+	const Quat turn = axis_angle({1, 0, 0}, v.pitch * RAD) * axis_angle({0, 1, 0}, -v.yaw * RAD);
+	const M4 r = matrix_of(turn);
+	// Closer: a narrower view from where it is (its light and its depth
+	// stay as they were).
+	const float t = std::tan(f.fov / 2) / v.zoom;
+	f.fov = 2 * std::atan(t);
+	f.seen_w /= v.zoom;
+	f.seen_h /= v.zoom;
+	f.view = f.view * r * moved(rotate(conj(turn), V3{-v.x * f.seen_w, v.y * f.seen_h, 0}) * -1.0f);
+	f.right = rotate(conj(turn), {1, 0, 0});
+	f.up = rotate(conj(turn), {0, 1, 0});
 }
 
 Framing frame_worn(const Model &m, Quat facing, const WornPlace &place, const M4 &pose, float aspect)

@@ -18,7 +18,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 // A 3D character (model.hpp, posed by rig.hpp) drawn with OBS's own
 // graphics, for the face avatar: its parts with depth (near hides far),
-// lit glossy, as a cartoon or flat (data/effects/direbot-face-3d.effect),
+// lit glossy, as a cartoon or flat (data/effects/direbot-face-3d.effect)
+// by the lights chosen (lights.hpp), with its normal and occlusion maps
+// and soft skin,
 // cartoon outlines, see-through parts after the solid ones (far to near),
 // a hidden head shape that tucks what's behind your head out of sight
 // (worn on your head), and smooth edges (drawn twice the size, halved).
@@ -37,6 +39,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <graphics/graphics.h>
 
 #include "effect-check.hpp"
+#include "lights.hpp"
 #include "math3d.hpp"
 #include "model.hpp"
 #include "rig.hpp"
@@ -105,6 +108,12 @@ struct View3D {
 	bool hide_behind_head = false;
 	M4 head;
 	float opacity = 1;
+	Lights lights;
+	// Its normal and occlusion maps used; soft skin (0 to 1) on the
+	// materials `skin` says are skin (skin_materials; null: none).
+	bool detail = true;
+	float soft_skin = 0;
+	const std::vector<bool> *skin = nullptr;
 };
 
 class Avatar3D {
@@ -128,11 +137,13 @@ private:
 		gs_vertbuffer_t *vb = nullptr;
 		gs_indexbuffer_t *ib = nullptr;
 		size_t points = 0;
+		bool bumped = false; // its points carry tangents (its normal map's)
 	};
 	void clear();
 	void make_head();
 	void set_camera();
-	void set_material(const Material &m, const View3D &v, bool outline);
+	void set_lights(const View3D &v);
+	void set_material(const Material &m, const View3D &v, bool outline, bool skin);
 	void draw_part(size_t i, const Rig::Part &p, const char *technique);
 
 	gs_effect_t *effect_ = nullptr;
@@ -140,10 +151,13 @@ private:
 		    *p_matcap_map = nullptr, *p_metal_map = nullptr, *p_image = nullptr, *p_base = nullptr,
 		    *p_emissive = nullptr, *p_surface = nullptr, *p_toon = nullptr, *p_shade = nullptr,
 		    *p_rim = nullptr, *p_matcap = nullptr, *p_look = nullptr, *p_uv = nullptr,
-		    *p_outline_width = nullptr, *p_outline_colour = nullptr, *p_texel = nullptr;
+		    *p_outline_width = nullptr, *p_outline_colour = nullptr, *p_texel = nullptr,
+		    *p_normal_map = nullptr, *p_occlusion_map = nullptr, *p_detail = nullptr, *p_key_dir = nullptr,
+		    *p_key_colour = nullptr, *p_fill_dir = nullptr, *p_fill_colour = nullptr, *p_room_up = nullptr,
+		    *p_room_down = nullptr, *p_rim_light = nullptr, *p_key_tint = nullptr, *p_room_tint = nullptr;
 	EffectCheck check_;
 	M4 cam_;
-	gs_texture_t *white_ = nullptr, *black_ = nullptr;
+	gs_texture_t *white_ = nullptr, *black_ = nullptr, *flat_ = nullptr;
 	std::shared_ptr<const Model> model_;
 	std::vector<gs_texture_t *> textures_;
 	std::vector<Part> parts_;
