@@ -169,14 +169,15 @@ def ball_points(cx, cy, cz, rx, ry, rz, n=24):
     return pos, nrm, ix
 
 
-def write_glb(path, parts, tree=None, animations=None, materials_more=None, pictures=None):
+def write_glb(path, parts, tree=None, animations=None, materials_more=None, pictures=None, top=None):
     """A plain .glb: one node a part, each (points, facings, triangles,
     colour as linear red/green/blue, roughness) - or, given `tree` (glTF
     nodes, the first the top one, "mesh" naming a part), its parts hung on
     those. `animations`: its own, {name: [(node, path, times, values)]}
     (values flat, straight between keys). `materials_more`: more for a
     part's material, {part: {"doubleSided": True, ...}}. `pictures`: a
-    part's colour picture, {part: (its UVs, PNG bytes)}."""
+    part's colour picture, {part: (its UVs, PNG bytes)}. `top`: more at
+    its top (a VRM's "extensions")."""
     blob = bytearray()
     views, accessors, meshes, nodes, materials = [], [], [], [], []
     images, textures = [], []
@@ -241,6 +242,7 @@ def write_glb(path, parts, tree=None, animations=None, materials_more=None, pict
         doc["animations"] = anims
     if images:
         doc["images"], doc["textures"] = images, textures
+    doc.update(top or {})
     text = json.dumps(doc).encode()
     text += b" " * (-len(text) % 4)
     while len(blob) % 4:
@@ -1930,6 +1932,204 @@ def test_reactions_on_cue(run):
         assert wait_for(lambda: st("React picture")["react"]["items"] == [{"loaded": True}]
                         and not st("React picture")["react"]["hand"], 5, 0.1)
         for name in list(avatars) + ["React camera"]:
+            send(c, "RemoveInput", {"inputName": name})
+    finally:
+        c.disconnect()
+
+
+# ---- 0.8.0: your hands and arms ------------------------------------------------
+
+BODY = os.path.join(HERE, "tests", "data", "body")
+ARM_GREEN = (0.05, 0.6, 0.08)
+HAND_RED = (0.8, 0.02, 0.02)
+
+
+def body_camera(path):
+    """The body tracker's test photo (tests/data/body/astronaut.ppm: head,
+    shoulders and both arms, hands together in front) as a PNG."""
+    w, h, px = read_ppm(os.path.join(BODY, "astronaut.ppm"))
+    write_png(path, w, h, [px[y * w * 3:(y + 1) * w * 3] for y in range(h)])
+
+
+def arms_character(path, vrm=True):
+    """A figure standing in a T, facing the camera: an orange ball head, a
+    blue body, green arms and red hands, each part hung on its own bone (so
+    it moves with it); a VRM 1.0 with those bones, unless `vrm` is False."""
+    parts = [ball_points(0, 0.1, 0, 0.1, 0.11, 0.1) + ((0.8, 0.25, 0.04), 0.4),
+             ball_points(0, 0.1, 0, 0.14, 0.2, 0.08) + ((0.05, 0.1, 0.7), 0.5)]
+    tree = [{"name": "hips", "translation": [0, 1, 0], "children": [1]},
+            {"name": "spine", "translation": [0, 0.1, 0], "children": [2]},
+            {"name": "chest", "translation": [0, 0.15, 0], "mesh": 1, "children": [3, 5, 9]},
+            {"name": "neck", "translation": [0, 0.25, 0], "children": [4]},
+            {"name": "head", "translation": [0, 0.08, 0], "mesh": 0}]
+    bones = {"hips": 0, "spine": 1, "chest": 2, "neck": 3, "head": 4}
+    for side, sx in (("left", 1), ("right", -1)):
+        first = len(tree)
+        parts += [ball_points(sx * 0.12, 0, 0, 0.12, 0.035, 0.035) + (ARM_GREEN, 0.5),
+                  ball_points(sx * 0.12, 0, 0, 0.12, 0.03, 0.03) + (ARM_GREEN, 0.5),
+                  ball_points(sx * 0.05, 0, 0, 0.05, 0.02, 0.04) + (HAND_RED, 0.5)]
+        mesh = len(parts) - 3
+        tree += [{"name": side + "Shoulder", "translation": [sx * 0.04, 0.2, 0], "children": [first + 1]},
+                 {"name": side + "UpperArm", "translation": [sx * 0.1, 0, 0], "mesh": mesh,
+                  "children": [first + 2]},
+                 {"name": side + "LowerArm", "translation": [sx * 0.24, 0, 0], "mesh": mesh + 1,
+                  "children": [first + 3]},
+                 {"name": side + "Hand", "translation": [sx * 0.24, 0, 0], "mesh": mesh + 2}]
+        for k, bone in enumerate(("Shoulder", "UpperArm", "LowerArm", "Hand")):
+            bones[side + bone] = first + k
+    top = {}
+    if vrm:
+        top = {"extensionsUsed": ["VRMC_vrm"],
+                "extensions": {"VRMC_vrm": {
+                    "specVersion": "1.0",
+                    "meta": {"name": "Arms", "authors": ["DireBot"], "avatarPermission": "everyone"},
+                    "humanoid": {"humanBones": {k: {"node": v} for k, v in bones.items()}}}}}
+    write_glb(path, parts, tree=tree, top=top)
+
+
+def test_hands_and_arms_follow_you(run):
+    """0.8.0: a 3D VRM character in its own spot follows your arms from the
+    same camera once it's turned on (the body models loading then): its
+    arms go where yours are - from hanging by its sides to bent, its hands
+    together in front - and back when it's turned off. FaceGetState says
+    what it follows and what of you the camera sees (for DireBot's camera
+    check), and your body's points; calibrating with no hand up gives up
+    and says so; forgetting it clears the source's own; a character that
+    can't follow says why; light mode looks fewer times."""
+    camera = os.path.join(run.home, "astronaut.png")
+    body_camera(camera)
+    figure = os.path.join(run.home, "arms.vrm")
+    arms_character(figure)
+    plain = os.path.join(run.home, "arms-plain.glb")
+    arms_character(plain, vrm=False)
+    size = 300
+    common = {"source": "Arms camera", "width": size, "height": size, "size": 100,
+              "framing": "whole", "style": "drawn", "smoothing": 100, "follow_move": 0,
+              "follow_grow": 0, "follow_tilt": 0, "body_follow": 0, **STILL}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+
+    def st(name="Arms", points=False):
+        return vendor(c, "FaceGetState", {"source": name, "points": points})
+
+    def arms(name="Arms", points=False):
+        return st(name, points)["hands_and_arms"]
+
+    def change(name, settings):
+        send(c, "SetInputSettings", {"inputName": name, "inputSettings": settings})
+    green = lambda px: px[1] > 90 and px[0] < 70 and px[2] < 70  # noqa: E731
+    red = lambda px: px[0] > 120 and px[1] < 50 and px[2] < 50  # noqa: E731
+    try:
+        send(c, "CreateScene", {"sceneName": "Hands and arms"})
+        send(c, "CreateInput", {"sceneName": "Hands and arms", "inputName": "Arms camera",
+                                "inputKind": "image_source", "inputSettings": {"file": camera}})
+        for name, extra in (("Arms", {"model": figure}), ("Arms plain", {"model": plain}),
+                            ("Arms worn", {"model": figure, "worn": True})):
+            send(c, "CreateInput", {"sceneName": "Hands and arms", "inputName": name,
+                                    "inputKind": "direbot_face_avatar",
+                                    "inputSettings": {**common, **extra}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Hands and arms"})
+        assert wait_for(lambda: st()["model"]["shown"], 30, 0.2), st()
+        assert st()["model"]["kind"] == "vrm1"
+        # Off until it's turned on: nothing loaded, nothing looked at.
+        a = arms()
+        assert a["on"] is False and a["can"] is False and a["why_not"] == "off", a
+        assert a["hands"] is True and a["light"] is False
+        assert not a["loading"] and not a["ready"] and a["framing"] == {"found": False}, a
+        rest = screenshot(c, "Arms")
+        keep_shot(rest, "arms-rest")
+        gx0, gy0, gn0 = middle_of(rest, green)
+        _, ry0, rn0 = middle_of(rest, red)
+        assert gn0 > 200 and rn0 > 20, (gn0, rn0)
+        spread0 = sum(abs(x - size / 2) for row in rest for x, px in enumerate(row) if red(px)) / rn0
+
+        # On: the body models load, it finds you and follows both arms.
+        for name in ("Arms", "Arms plain", "Arms worn"):
+            change(name, {"follow_arms": True})
+        assert wait_for(lambda: arms()["ready"], 60, 0.2), arms()
+        assert wait_for(lambda: arms()["found"] and arms()["following"]["left_arm"] and
+                        arms()["following"]["right_arm"], 30, 0.2), arms()
+        # (How many looks a second is counted over a second.)
+        assert wait_for(lambda: arms()["looks_per_second"] > 2, 5, 0.2), arms()
+        a = arms(points=True)
+        assert a["on"] and a["can"] and a["why_not"] == "" and "problem" not in a, a
+        assert 2 < a["looks_per_second"] <= 16 and a["ms"] > 0, a
+        # No hands in this photo (MediaPipe finds none either).
+        assert not a["following"]["left_hand"] and not a["following"]["right_hand"], a
+        f = a["framing"]
+        assert f["found"] and f["head"] and f["shoulders"] == 2 and f["elbows"] == 2, f
+        assert f["wrists"] == 2 and f["hands"] == 0, f
+        # Her shoulders: 297 and 113 of 512 across, at 236 down.
+        assert abs(f["shoulder_width"] - 0.36) < 0.03 and abs(f["shoulder_height"] - 0.46) < 0.03, f
+        # Her nose and shoulders where MediaPipe puts them (following her
+        # from look to look, as MediaPipe's own VIDEO mode does, moves them
+        # a few pixels on a still photo); her elbows and wrists in sight.
+        expected = json.load(open(os.path.join(BODY, "expected.json")))["pictures"]["astronaut"]
+        assert len(a["points"]) == 25
+        for i in (0, 11, 12):
+            want = expected["points"][i]
+            got = a["points"][i]
+            assert abs(got["x"] * 512 - want[0]) < 15 and abs(got["y"] * 512 - want[1]) < 20, (i, got, want)
+        for i in (0, 11, 12, 13, 14, 15, 16):
+            got = a["points"][i]
+            assert got["seen"] > 0.5 and 0 < got["x"] < 1 and 0 < got["y"] < 1, (i, got)
+        assert "left_hand_points" not in a and "right_hand_points" not in a
+        # Its arms hang relaxed by its sides until then; now its elbows bend
+        # and its hands come up and in, together in front of it.
+        time.sleep(1.5)
+        follow = screenshot(c, "Arms")
+        keep_shot(follow, "arms-following")
+        _, _, gn1 = middle_of(follow, green)
+        _, ry1, rn1 = middle_of(follow, red)
+        assert gn1 > 40 and rn1 > 10, (gn1, rn1)
+        spread1 = sum(abs(x - size / 2) for row in follow for x, px in enumerate(row) if red(px)) / rn1
+        assert ry1 < ry0 - 0.04 * size, (ry0, ry1)
+        assert spread1 < 0.6 * spread0, (spread0, spread1)
+
+        # Ones that can't follow say why; the camera isn't looked at for them.
+        p = arms("Arms plain")
+        assert p["on"] and not p["can"] and p["why_not"] == "not_vrm" and not p["found"], p
+        w = arms("Arms worn")
+        assert w["on"] and not w["can"] and w["why_not"] == "worn", w
+        bad = vendor(c, "FaceArms", {"source": "Arms worn", "do": "calibrate"})
+        assert not bad["ok"] and "own spot" in bad["error"], bad
+
+        # Calibrating with no hand by your ear: it gives up and says so.
+        r = vendor(c, "FaceArms", {"source": "Arms", "do": "calibrate"})
+        assert r == {"ok": True}, r
+        assert arms()["calibrating"]
+        assert wait_for(lambda: not arms()["calibrating"], 12, 0.2), arms()
+        a = arms()
+        assert a["calibration"] == "no hand" and not a["calibrated"], a
+        assert "doesn't know" in vendor(c, "FaceArms", {"source": "Arms", "do": "juggle"})["error"]
+        # A calibration put in the settings (DireBot's Undo) is read; forgetting it clears it.
+        kept = json.dumps({"v": 1, "by_ear": [0.1, -0.05, 0], "open": [0] * 15})
+        change("Arms", {"arms_calibration": kept})
+        assert wait_for(lambda: arms()["calibrated"], 5, 0.1), arms()
+        assert vendor(c, "FaceArms", {"source": "Arms", "do": "forget"}) == {"ok": True}
+        assert not arms()["calibrated"]
+        got = send(c, "GetInputSettings", {"inputName": "Arms"})["inputSettings"]
+        assert got.get("arms_calibration", "") == "", got
+        # Without your hands, calibrating asks for them. (OBS hands a video
+        # source its new settings on its next frame.)
+        change("Arms", {"arms_hands": False})
+        assert wait_for(lambda: arms()["hands"] is False, 5, 0.05), arms()
+        nope = vendor(c, "FaceArms", {"source": "Arms", "do": "calibrate"})
+        assert not nope["ok"] and "hands" in nope["error"], nope
+        # Light mode looks about 10 times a second.
+        change("Arms", {"arms_light": True, "arms_hands": True})
+        assert wait_for(lambda: arms()["light"], 5, 0.1)
+        time.sleep(3)
+        assert arms()["looks_per_second"] <= 11, arms()
+
+        # Off: its arms hang by its sides again.
+        change("Arms", {"follow_arms": False})
+        assert wait_for(lambda: arms()["why_not"] == "off", 5, 0.1), arms()
+        time.sleep(1)
+        back = screenshot(c, "Arms")
+        keep_shot(back, "arms-back")
+        gx2, gy2, gn2 = middle_of(back, green)
+        assert abs(gy2 - gy0) < 0.02 * size and abs(gx2 - gx0) < 0.02 * size, (gx0, gy0, gx2, gy2)
+        for name in ("Arms", "Arms plain", "Arms worn"):
             send(c, "RemoveInput", {"inputName": name})
     finally:
         c.disconnect()

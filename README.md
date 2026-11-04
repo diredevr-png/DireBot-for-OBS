@@ -356,7 +356,8 @@ needs `pip install mediapipe`, for the test only). The body tracker's
 (`tests/unit_body.cpp`) check each body and hand model against LiteRT,
 Google's own runtime, and the body against MediaPipe's own answers on two
 photos (`tests/data/body`); `tools/body-expected.py` makes those (`pip
-install mediapipe ai-edge-litert`).
+install mediapipe ai-edge-litert`). Inside OBS, `test_real_face.py` has a
+VRM character follow the arms in one of those photos.
 
 ## Releasing
 
