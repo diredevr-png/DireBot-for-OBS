@@ -24,6 +24,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <cstring>
 #include <functional>
 #include <map>
+#include <set>
 
 namespace direbot::face {
 
@@ -262,6 +263,89 @@ int depth_of(const Model &m, int node)
 	return d;
 }
 
+// The whole-face expressions: a face on cue takes over from yours.
+bool is_emotion(const std::string &n)
+{
+	return n == "happy" || n == "angry" || n == "sad" || n == "relaxed" || n == "surprised";
+}
+// VRM's own expression names (not a file's own).
+bool is_vrm_preset(const std::string &n)
+{
+	return is_emotion(n) || is_blink(n) || is_look(n) || is_mouth(n) || n == "neutral";
+}
+std::string lower(const std::string &n)
+{
+	std::string out;
+	for (char c : n)
+		out.push_back((char)std::tolower((unsigned char)c));
+	return out;
+}
+
+// The five faces from ARKit's shapes, for a character made for them.
+struct Recipe {
+	const char *face;
+	std::vector<std::pair<const char *, float>> parts;
+};
+const std::vector<Recipe> &recipes()
+{
+	static const std::vector<Recipe> r = {
+		{"happy",
+		 {{"mouthSmileLeft", 0.85f},
+		  {"mouthSmileRight", 0.85f},
+		  {"cheekSquintLeft", 0.55f},
+		  {"cheekSquintRight", 0.55f},
+		  {"eyeSquintLeft", 0.45f},
+		  {"eyeSquintRight", 0.45f},
+		  {"mouthDimpleLeft", 0.2f},
+		  {"mouthDimpleRight", 0.2f}}},
+		{"angry",
+		 {{"browDownLeft", 0.9f},
+		  {"browDownRight", 0.9f},
+		  {"eyeSquintLeft", 0.35f},
+		  {"eyeSquintRight", 0.35f},
+		  {"noseSneerLeft", 0.5f},
+		  {"noseSneerRight", 0.5f},
+		  {"mouthFrownLeft", 0.45f},
+		  {"mouthFrownRight", 0.45f},
+		  {"mouthPressLeft", 0.3f},
+		  {"mouthPressRight", 0.3f}}},
+		{"sad",
+		 {{"browInnerUp", 0.85f},
+		  {"mouthFrownLeft", 0.75f},
+		  {"mouthFrownRight", 0.75f},
+		  {"mouthShrugLower", 0.35f},
+		  {"eyeSquintLeft", 0.15f},
+		  {"eyeSquintRight", 0.15f}}},
+		{"relaxed",
+		 {{"eyeBlinkLeft", 0.3f},
+		  {"eyeBlinkRight", 0.3f},
+		  {"eyeSquintLeft", 0.35f},
+		  {"eyeSquintRight", 0.35f},
+		  {"mouthSmileLeft", 0.35f},
+		  {"mouthSmileRight", 0.35f}}},
+		{"surprised",
+		 {{"eyeWideLeft", 0.9f},
+		  {"eyeWideRight", 0.9f},
+		  {"browInnerUp", 0.8f},
+		  {"browOuterUpLeft", 0.9f},
+		  {"browOuterUpRight", 0.9f},
+		  {"jawOpen", 0.35f},
+		  {"mouthFunnel", 0.15f}}},
+	};
+	return r;
+}
+// Your moves a whole-face expression on cue takes over from (your blinks,
+// looks, jaw and mouth's shapes stay yours).
+bool face_move(const char *n)
+{
+	for (const char *p : {"mouthSmile", "mouthFrown", "mouthPress", "mouthDimple", "mouthShrug", "browDown",
+			      "browInnerUp", "browOuterUp", "cheekSquint", "cheekPuff", "noseSneer", "eyeWide",
+			      "eyeSquint"})
+		if (std::strncmp(n, p, std::strlen(p)) == 0)
+			return true;
+	return false;
+}
+
 // Where on a line from a to b is nearest p.
 V3 nearest_on(V3 a, V3 b, V3 p)
 {
@@ -374,6 +458,38 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 	upper_arm_[0] = m.bone("leftUpperArm");
 	upper_arm_[1] = m.bone("rightUpperArm");
 	find_fingers();
+	moved_.assign(n, 0);
+	// Its bones by VRM 1.0's names: a 0.x's thumbs are named a joint on
+	// (its proximal is 1.0's metacarpal, its intermediate 1.0's proximal).
+	for (const auto &b : m.bones) {
+		std::string name = b.first;
+		if (m.vrm < 0)
+			for (const std::string side : {"left", "right"}) {
+				if (name == side + "ThumbProximal")
+					name = side + "ThumbMetacarpal";
+				else if (name == side + "ThumbIntermediate")
+					name = side + "ThumbProximal";
+			}
+		if (b.second >= 0 && b.second < (int)n)
+			bones1_[name] = b.second;
+	}
+	for (int side = 0; side < 2; side++) {
+		const std::string sd = side ? "right" : "left";
+		const int upper = m.bone(sd + "UpperArm"), lower = m.bone(sd + "LowerArm");
+		if (upper >= 0 && lower >= 0) {
+			arm_bone_[side][0] = upper;
+			arm_bone_[side][1] = lower;
+			arm_bone_[side][2] = m.bone(sd + "Hand");
+		}
+	}
+	// Where its feet are, the facing model's way (for a VRM animation's
+	// hips: its height over them).
+	for (int c = 0; c < 8; c++) {
+		const V3 corner{c & 1 ? m.high.x : m.low.x, c & 2 ? m.high.y : m.low.y, c & 4 ? m.high.z : m.low.z};
+		const float y = rotate(options_.facing, corner).y;
+		floor_ = c ? std::min(floor_, y) : y;
+	}
+	measure_head();
 
 	// Expressions: the morphs, each only where it moves something.
 	sparse_.resize(m.meshes.size());
@@ -400,6 +516,12 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 			}
 		}
 	}
+	// Every shape by its name (any case), for a face on cue by a shape's
+	// own name.
+	for (size_t mi = 0; mi < m.meshes.size(); mi++)
+		for (size_t k = 0; k < m.meshes[mi].morph_names.size(); k++)
+			if (!m.meshes[mi].morph_names[k].empty())
+				morph_by_name_[lower(m.meshes[mi].morph_names[k])].push_back({(int)mi, (int)k});
 	// What drives them: ARKit-named morphs straight from your moves; VRM's
 	// expressions (or the usual names) worked out from them.
 	std::map<std::string, bool> bound;
@@ -725,7 +847,7 @@ void Rig::curl_fingers()
 		// One its own animation turns stays as the animation has it.
 		if (anim_turns_[f.node])
 			continue;
-		const float angle = f.most * c - f.has;
+		const float angle = (f.most * c - f.has) * (1 - moved_[f.node]);
 		if (angle > 1e-4f)
 			turn_in_rest(f.node, axis_angle(f.axis, angle));
 	}
@@ -734,6 +856,287 @@ void Rig::curl_fingers()
 void Rig::settle()
 {
 	settled_ = true;
+}
+
+void Rig::measure_head()
+{
+	const Model &m = *model_;
+	head_box_ = HeadBox();
+	if (head_ < 0)
+		return;
+	// The head and all that hangs off it.
+	std::vector<char> under(m.nodes.size(), 0);
+	under[head_] = 2;
+	for (bool more = true; more;) {
+		more = false;
+		for (size_t i = 0; i < m.nodes.size(); i++) {
+			const int p = m.nodes[i].parent;
+			if (!under[i] && p >= 0 && under[p]) {
+				under[i] = 1;
+				more = true;
+			}
+		}
+	}
+	const Quat F = options_.facing;
+	bool any_box = false, any_top = false;
+	auto take = [&](V3 p, bool box) {
+		const V3 f = rotate(F, p);
+		if (!any_top || f.y > head_box_.top)
+			head_box_.top = f.y;
+		any_top = true;
+		if (!box)
+			return;
+		if (!any_box) {
+			head_box_.low = head_box_.high = f;
+		} else {
+			head_box_.low = {std::min(head_box_.low.x, f.x), std::min(head_box_.low.y, f.y),
+					 std::min(head_box_.low.z, f.z)};
+			head_box_.high = {std::max(head_box_.high.x, f.x), std::max(head_box_.high.y, f.y),
+					  std::max(head_box_.high.z, f.z)};
+		}
+		any_box = true;
+	};
+	for (size_t ni = 0; ni < m.nodes.size(); ni++) {
+		const Node &node = m.nodes[ni];
+		if (node.mesh < 0)
+			continue;
+		const Skin *skin = node.skin >= 0 ? &m.skins[node.skin] : nullptr;
+		for (const Primitive &p : m.meshes[node.mesh].parts) {
+			const size_t n = p.pos.size();
+			// A big one: every few points is plenty.
+			const size_t every = std::max<size_t>(1, n / 100000);
+			if (skin && !p.joints.empty() && p.weights.size() == n * 4) {
+				for (size_t i = 0; i < n; i += every) {
+					int best = 0;
+					for (int k = 1; k < 4; k++)
+						if (p.weights[i * 4 + k] > p.weights[i * 4 + best])
+							best = k;
+					const uint16_t j = p.joints[i * 4 + best];
+					if (j >= skin->joints.size())
+						continue;
+					const int bone = skin->joints[j];
+					if (bone < 0 || bone >= (int)m.nodes.size() || !under[bone])
+						continue;
+					take(point(rest_world_[bone] * skin->inverse_bind[j], p.pos[i]), under[bone] == 2);
+				}
+			} else if (under[ni]) {
+				for (size_t i = 0; i < n; i += every)
+					take(point(rest_world_[ni], p.pos[i]), under[ni] == 2);
+			}
+		}
+	}
+	head_box_.found = any_box && head_box_.high.y - head_box_.low.y > 1e-6f;
+	if (head_box_.found)
+		head_box_.top = std::max(head_box_.top, head_box_.high.y);
+}
+
+std::vector<std::string> Rig::faces() const
+{
+	std::vector<std::string> out;
+	auto add = [&out](const std::string &n) {
+		if (!n.empty() && std::find(out.begin(), out.end(), n) == out.end())
+			out.push_back(n);
+	};
+	std::set<int> arkit;
+	for (const Driver &d : drivers_)
+		if (d.move > 0)
+			arkit.insert(d.move);
+	for (const char *e : {"happy", "angry", "sad", "relaxed", "surprised"}) {
+		bool has = false;
+		for (const Driver &d : drivers_)
+			has = has || (d.move < 0 && d.expression == e);
+		// Made for ARKit: from its shapes, if it has most of them.
+		for (const Recipe &r : recipes())
+			if (!has && r.face == std::string(e)) {
+				size_t got = 0;
+				for (const auto &part : r.parts)
+					got += arkit.count(arkit_move(part.first));
+				has = got * 2 > r.parts.size();
+			}
+		if (has)
+			add(e);
+	}
+	for (const Driver &d : drivers_)
+		if (d.move < 0 && !is_vrm_preset(d.expression))
+			add(d.expression);
+	if (morph_by_name_.count("tongueout"))
+		add("tongueOut");
+	return out;
+}
+
+std::vector<std::string> Rig::shapes() const
+{
+	std::vector<std::string> out;
+	std::set<std::string> seen;
+	for (const Mesh &mesh : model_->meshes)
+		for (const std::string &n : mesh.morph_names)
+			if (!n.empty() && out.size() < 400 && seen.insert(n).second)
+				out.push_back(n);
+	return out;
+}
+
+// A bone turned `world_turn` from how it rests (the facing model's way,
+// in the world: VRM's "normalized" turn), `amount` of the way from how it
+// is now.
+void Rig::pose_bone(int node, Quat world_turn, float amount)
+{
+	if (node < 0 || node >= (int)r_.size() || !(amount > 0))
+		return;
+	const Quat F = options_.facing;
+	const Quat N = conj(F) * normalized(world_turn) * F;
+	const int p = model_->nodes[node].parent;
+	const Quat P = p >= 0 ? rot_of(rest_world_[p]) : Quat{};
+	const Quat W = rot_of(rest_world_[node]);
+	r_[node] = normalized(slerp(r_[node], normalized(conj(P) * N * W), clamp01(amount)));
+	moved_[node] = 1 - (1 - moved_[node]) * (1 - clamp01(amount));
+}
+
+// A VRM animation file's moves at `t` seconds: each bone's turn carried
+// over (with those of the bones above it that this character hasn't, an
+// upper chest say, so it still bends as far), its hips moved as far for
+// its height, and its expressions.
+void Rig::play_motion(const Motion &mo, float t, float amount)
+{
+	std::map<std::string, Quat> turn;
+	bool moved_hips = false;
+	V3 hips_at;
+	float v[4];
+	for (const MotionTrack &tr : mo.tracks) {
+		sample(tr.channel, t, v);
+		if (tr.channel.path == AnimChannel::Turn) {
+			const Quat q{v[0], v[1], v[2], v[3]};
+			if (std::isfinite(q.x + q.y + q.z + q.w))
+				turn[tr.bone] = normalized(q);
+		} else if (tr.bone == "hips" && tr.channel.path == AnimChannel::Move) {
+			hips_at = {v[0], v[1], v[2]};
+			moved_hips = std::isfinite(hips_at.x + hips_at.y + hips_at.z);
+		}
+	}
+	for (const auto &b : bones1_) {
+		Quat N;
+		bool any = false;
+		auto it = turn.find(b.first);
+		if (it != turn.end()) {
+			N = it->second;
+			any = true;
+		}
+		std::string up = b.first;
+		for (int steps = 0; steps < 16; steps++) {
+			const char *parent = humanoid_parent(up);
+			if (!parent || !*parent)
+				break;
+			up = parent;
+			if (bones1_.count(up))
+				break;
+			auto jt = turn.find(up);
+			if (jt != turn.end()) {
+				N = jt->second * N;
+				any = true;
+			}
+		}
+		if (any)
+			pose_bone(b.second, N, amount);
+	}
+	auto hips = bones1_.find("hips");
+	if (moved_hips && hips != bones1_.end() && mo.hips_rest.y > 1e-3f) {
+		const Quat F = options_.facing;
+		const int h = hips->second;
+		const float height = rotate(F, move_of(rest_world_[h])).y - floor_;
+		if (height > 1e-4f) {
+			const V3 by = rotate(conj(F), (hips_at - mo.hips_rest) * (height / mo.hips_rest.y));
+			const int p = model_->nodes[h].parent;
+			const V3 local = p >= 0 ? direction(inverse(rest_world_[p]), by) : by;
+			t_[h] = t_[h] + local * clamp01(amount);
+		}
+	}
+	for (const auto &e : mo.expressions) {
+		sample(e.second, t, v);
+		if (!std::isfinite(v[0]))
+			continue;
+		float &f = move_faces_[e.first];
+		f = std::max(f, clamp01(v[0]) * clamp01(amount));
+	}
+}
+
+// One of its own animations, once, at `t` seconds.
+void Rig::play_own(int animation, float t, float amount)
+{
+	const Animation &a = model_->animations[animation];
+	t = std::min(std::max(0.0f, t), a.length);
+	const float k = clamp01(amount);
+	float v[4];
+	for (const AnimChannel &c : a.channels) {
+		if (c.node < 0 || c.node >= (int)r_.size())
+			continue;
+		sample(c, t, v);
+		if (c.path == AnimChannel::Move) {
+			t_[c.node] = t_[c.node] + (V3{v[0], v[1], v[2]} - t_[c.node]) * k;
+		} else if (c.path == AnimChannel::Size) {
+			s_[c.node] = s_[c.node] + (V3{v[0], v[1], v[2]} - s_[c.node]) * k;
+		} else {
+			r_[c.node] = normalized(slerp(r_[c.node], normalized(Quat{v[0], v[1], v[2], v[3]}), k));
+			moved_[c.node] = 1 - (1 - moved_[c.node]) * (1 - k);
+		}
+	}
+}
+
+// A VRM's own wave (its right hand) and cheer (both arms up, pumping), as
+// VRM's turns from how it rests (the facing model's way: its left arm out
+// along +x, its right along -x, facing +z).
+void Rig::play_builtin(BuiltIn b, float t, float amount)
+{
+	const float D = PI_F / 180;
+	auto Rz = [D](float deg) { return axis_angle({0, 0, 1}, deg * D); };
+	auto Ry = [D](float deg) { return axis_angle({0, 1, 0}, deg * D); };
+	if (b == BuiltIn::Wave) {
+		const int *arm = arm_bone_[1];
+		if (arm[0] < 0)
+			return;
+		const float w = std::sin(2 * PI_F * 1.6f * t);
+		// The upper arm out and up a little, forward; the forearm up,
+		// waving side to side; the hand flicking with it, open.
+		pose_bone(arm[0], Ry(25) * Rz(-22), amount);
+		pose_bone(arm[1], Rz(-(68 + 20 * w)), amount);
+		if (arm[2] >= 0)
+			pose_bone(arm[2], Rz(-8 * std::sin(2 * PI_F * 1.6f * t - 0.6f)), amount);
+		for (const auto &bn : bones1_)
+			if (bn.first.rfind("right", 0) == 0 &&
+			    (bn.first.find("Proximal") != std::string::npos ||
+			     bn.first.find("Intermediate") != std::string::npos ||
+			     bn.first.find("Distal") != std::string::npos ||
+			     bn.first.find("Metacarpal") != std::string::npos))
+				pose_bone(bn.second, Quat{}, amount);
+	} else if (b == BuiltIn::Cheer) {
+		const float pump = std::pow(std::sin(2 * PI_F * 1.8f * t), 2.0f);
+		for (int side = 0; side < 2; side++) {
+			const int *arm = arm_bone_[side];
+			if (arm[0] < 0)
+				continue;
+			const float s = side ? -1.0f : 1.0f; // its left out along +x
+			pose_bone(arm[0], Ry(-s * 20) * Rz(s * (58 + 14 * pump)), amount);
+			pose_bone(arm[1], Rz(s * (40 - 25 * pump)), amount);
+		}
+	}
+}
+
+void Rig::play_moves(const Drive &d)
+{
+	std::fill(moved_.begin(), moved_.end(), 0.0f);
+	move_faces_.clear();
+	for (const MoveNow &mv : d.body) {
+		const float a = clamp01(mv.amount);
+		if (!(a > 0) || !std::isfinite(mv.time))
+			continue;
+		if (mv.motion) {
+			if (plays_motions())
+				play_motion(*mv.motion, mv.time, a);
+		} else if (mv.animation >= 0) {
+			if (mv.animation < (int)model_->animations.size())
+				play_own(mv.animation, mv.time, a);
+		} else if (builtin_arms(mv.builtin)) {
+			play_builtin(mv.builtin, mv.time, a);
+		}
+	}
 }
 
 void Rig::set_animation(int which)
@@ -806,8 +1209,10 @@ void Rig::drive_head(const Drive &d)
 		const int sh = shoulder_[side], arm = upper_arm_[side];
 		if (arm < 0 || anim_turns_[arm])
 			continue;
+		// (Less of it as a move holds the arm.)
+		const float k = 1 - moved_[arm];
 		if (sh >= 0 && !anim_turns_[sh] && model_->nodes[arm].parent == sh) {
-			const Quat shrug = own(axis_angle({0, 0, 1}, (side ? -3.0f : 3.0f) * RAD * breath));
+			const Quat shrug = own(axis_angle({0, 0, 1}, (side ? -3.0f : 3.0f) * RAD * breath * k));
 			turn_in_rest(sh, shrug);
 			turn_in_rest(arm, conj(shrug));
 		}
@@ -815,12 +1220,13 @@ void Rig::drive_head(const Drive &d)
 		for (int n = model_->nodes[arm].parent; n >= 0 && !under_chest; n = model_->nodes[n].parent)
 			under_chest = n == chest_top;
 		if (under_chest)
-			turn_in_rest(arm, conj(lean));
+			turn_in_rest(arm, slerp(Quat{}, conj(lean), k));
 	}
-	// (Arms its animation turns are where it has them, down or not.)
+	// (Arms its animation turns are where it has them, down or not; a move
+	// holding them, as much as it does.)
 	for (const Arm &a : arms_)
 		if (!anim_turns_[a.node])
-			turn_in_rest(a.node, a.turn);
+			turn_in_rest(a.node, slerp(Quat{}, a.turn, 1 - moved_[a.node]));
 	if (head_ < 0)
 		return;
 	// Its body: some of your head's turn, its own slow sway, and a breath
@@ -932,6 +1338,58 @@ void Rig::drive_expressions(const Drive &d)
 	if (!d.look || (m.look_bones && (left_eye_ >= 0 || right_eye_ >= 0)))
 		for (const char *k : {"lookUp", "lookDown", "lookLeft", "lookRight"})
 			v[k] = 0;
+	// On cue: faces (and a VRM animation's own), a whole-face one taking
+	// over from yours as much as it's on - your blinks, looks and mouth
+	// stay yours - and its eyes screwed shut.
+	std::map<std::string, float> cue = move_faces_;
+	for (const FaceNow &f : d.faces)
+		if (!f.name.empty() && std::isfinite(f.amount)) {
+			float &c = cue[f.name];
+			c = std::max(c, clamp01(f.amount));
+		}
+	float taken = 0;
+	for (const auto &c : cue)
+		if (is_emotion(c.first))
+			taken = std::max(taken, c.second);
+	if (taken > 0)
+		for (auto &kv : v)
+			if (is_emotion(kv.first))
+				kv.second *= 1 - taken;
+	for (const auto &c : cue) {
+		float &x = v[c.first];
+		x = std::max(x, c.second);
+	}
+	const float squint = std::isfinite(d.squint) ? clamp01(d.squint) : 0.0f;
+	if (squint > 0) {
+		bool both = false;
+		for (const Driver &dr : drivers_)
+			both = both || (dr.move < 0 && dr.expression == "blink");
+		for (const char *k : {"blink", "blinkLeft", "blinkRight"})
+			if (both == (std::strcmp(k, "blink") == 0)) {
+				float &x = v[k];
+				x = std::max(x, squint);
+			}
+	}
+	// Made for ARKit: the faces from its shapes, over yours.
+	if (taken > 0 || squint > 0 || !cue.empty()) {
+		if (taken > 0)
+			for (int i = 1; i < EXPRESSIONS; i++)
+				if (face_move(EXPRESSION_NAMES[i]))
+					mic_moves[i] *= 1 - taken;
+		for (const Recipe &r : recipes()) {
+			auto it = cue.find(r.face);
+			if (it == cue.end())
+				continue;
+			for (const auto &part : r.parts) {
+				const int k = arkit_move(part.first);
+				if (k > 0)
+					mic_moves[k] = std::max(mic_moves[k], part.second * it->second);
+			}
+		}
+		static const int blink_l = move_id("eyeBlinkLeft"), blink_r = move_id("eyeBlinkRight");
+		mic_moves[blink_l] = std::max(mic_moves[blink_l], squint);
+		mic_moves[blink_r] = std::max(mic_moves[blink_r], squint);
+	}
 	// The file's own expressions (not VRM's names) aren't driven.
 	std::map<std::string, float> on;
 	for (const Driver &dr : drivers_)
@@ -980,6 +1438,17 @@ void Rig::drive_expressions(const Drive &d)
 			continue; // a face your face doesn't move: as it rests
 		float &w = weights_[dr.mesh][dr.morph];
 		w = clamp01(w + amount * dr.weight);
+	}
+	// A face on cue by a shape's own name.
+	for (const auto &c : cue) {
+		auto it = morph_by_name_.find(lower(c.first));
+		if (it == morph_by_name_.end())
+			continue;
+		for (const auto &mk : it->second)
+			if (!still_mesh_[mk.first] && mk.second < (int)weights_[mk.first].size()) {
+				float &w = weights_[mk.first][mk.second];
+				w = std::max(w, c.second);
+			}
 	}
 }
 
@@ -1094,6 +1563,7 @@ void Rig::pose(const Drive &d)
 		s_[i] = m.nodes[i].s;
 	}
 	animate(d.dt);
+	play_moves(d);
 	// Swinging parts hang as its animation has them (it may swing a tail
 	// itself), and swing from there.
 	for (Chain &c : springs_)
@@ -1146,6 +1616,12 @@ void Rig::pose(const Drive &d)
 		spring_time_ = 0;
 		settled_ = false;
 	}
+	// Thrown about by a hit: each swinging part given that speed.
+	const V3 knock = d.knock;
+	if (std::isfinite(knock.x + knock.y + knock.z) && dot(knock, knock) > 0)
+		for (Chain &c : springs_)
+			for (Joint &j : c.joints)
+				j.before = j.before - knock * SPRING_STEP;
 	if (!springs_.empty()) {
 		spring_time_ += std::max(0.0f, d.dt);
 		int steps = 0;

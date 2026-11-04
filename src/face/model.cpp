@@ -1095,6 +1095,54 @@ void read_skins(Reader &rd, const json &doc, Model &m)
 // Its own animations. A channel DireBot can't play (an expression's
 // strengths, a missing part, numbers that don't add up) is left out; the
 // model loads all the same.
+// An animation's channel (`cj`, of animation `aj`) on one of `nodes`
+// nodes, into `c`: false if it's broken, isn't a move, turn or size
+// ("weights", its expressions' strengths, aren't played), or there's too
+// much of it (`numbers`: all the keys' numbers so far).
+bool read_channel(Reader &rd, const json &aj, const json &cj, size_t nodes, AnimChannel &c, size_t &numbers)
+{
+	const json &samplers = list(aj, "samplers");
+	const json &target = field(cj, "target");
+	const std::string path = text(target, "path");
+	const int node = index_of(target, "node");
+	const int si = index_of(cj, "sampler");
+	if (node < 0 || node >= (int)nodes || si < 0 || si >= (int)samplers.size())
+		return false;
+	c = AnimChannel();
+	c.node = node;
+	if (path == "translation")
+		c.path = AnimChannel::Move;
+	else if (path == "rotation")
+		c.path = AnimChannel::Turn;
+	else if (path == "scale")
+		c.path = AnimChannel::Size;
+	else
+		return false;
+	const json &sj = samplers[si];
+	const std::string ease = text(sj, "interpolation");
+	c.ease = ease == "STEP" ? AnimChannel::Step : ease == "CUBICSPLINE" ? AnimChannel::Curved : AnimChannel::Straight;
+	try {
+		c.times = rd.floats(index_of(sj, "input"), 1);
+		c.values = rd.floats(index_of(sj, "output"), c.size());
+	} catch (const Fail &) {
+		return false;
+	}
+	const size_t keys = c.times.size();
+	const size_t per = (size_t)c.size() * (c.ease == AnimChannel::Curved ? 3 : 1);
+	if (!keys || c.values.size() != keys * per)
+		return false;
+	for (size_t k = 0; k < keys; k++)
+		if (!std::isfinite(c.times[k]) || c.times[k] < 0 || (k && c.times[k] < c.times[k - 1]))
+			return false;
+	for (float v : c.values)
+		if (!std::isfinite(v))
+			return false;
+	if (numbers + c.values.size() + keys > MOST_KEY_NUMBERS)
+		return false; // too much of it: the rest left out
+	numbers += c.values.size() + keys;
+	return true;
+}
+
 void read_animations(Reader &rd, const json &doc, Model &m)
 {
 	const json &animations = list(doc, "animations");
@@ -1105,48 +1153,10 @@ void read_animations(Reader &rd, const json &doc, Model &m)
 		anim.name = text(aj, "name");
 		if (anim.name.empty())
 			anim.name = "Animation " + std::to_string(ai + 1);
-		const json &samplers = list(aj, "samplers");
 		for (const json &cj : list(aj, "channels")) {
-			const json &target = field(cj, "target");
-			const std::string path = text(target, "path");
-			const int node = index_of(target, "node");
-			const int si = index_of(cj, "sampler");
-			if (node < 0 || node >= (int)m.nodes.size() || si < 0 || si >= (int)samplers.size())
-				continue;
 			AnimChannel c;
-			c.node = node;
-			if (path == "translation")
-				c.path = AnimChannel::Move;
-			else if (path == "rotation")
-				c.path = AnimChannel::Turn;
-			else if (path == "scale")
-				c.path = AnimChannel::Size;
-			else
-				continue; // "weights" (its expressions' strengths): not played
-			const json &sj = samplers[si];
-			const std::string ease = text(sj, "interpolation");
-			c.ease = ease == "STEP"          ? AnimChannel::Step
-				 : ease == "CUBICSPLINE" ? AnimChannel::Curved
-							 : AnimChannel::Straight;
-			try {
-				c.times = rd.floats(index_of(sj, "input"), 1);
-				c.values = rd.floats(index_of(sj, "output"), c.size());
-			} catch (const Fail &) {
+			if (!read_channel(rd, aj, cj, m.nodes.size(), c, numbers))
 				continue;
-			}
-			const size_t keys = c.times.size();
-			const size_t per = (size_t)c.size() * (c.ease == AnimChannel::Curved ? 3 : 1);
-			if (!keys || c.values.size() != keys * per)
-				continue;
-			bool rising = true;
-			for (size_t k = 0; k < keys; k++)
-				if (!std::isfinite(c.times[k]) || c.times[k] < 0 || (k && c.times[k] < c.times[k - 1]))
-					rising = false;
-			if (!rising)
-				continue;
-			if (numbers + c.values.size() + keys > MOST_KEY_NUMBERS)
-				continue; // too much of it: the rest left out
-			numbers += c.values.size() + keys;
 			anim.length = std::max(anim.length, c.times.back());
 			anim.channels.push_back(std::move(c));
 		}
@@ -1220,6 +1230,22 @@ void measure(Model &m)
 	m.high = hi;
 }
 
+void load_buffers(Reader &rd, const json &doc)
+{
+	const json &buffers = list(doc, "buffers");
+	for (size_t i = 0; i < buffers.size(); i++) {
+		const std::string uri = text(buffers[i], "uri");
+		if (uri.empty()) {
+			// A .glb's own: the one after its description.
+			if (i != 0 || !rd.glb)
+				fail("the file is damaged (a missing buffer)");
+			rd.buffers.push_back(std::move(rd.bin));
+			continue;
+		}
+		rd.buffers.push_back(rd.load_uri(uri));
+	}
+}
+
 void load_json(Reader &rd, const json &doc, Model &m)
 {
 	const json &asset = field(doc, "asset");
@@ -1233,18 +1259,7 @@ void load_json(Reader &rd, const json &doc, Model &m)
 			fail("its shape is squeezed (" + name +
 			     "), which DireBot can't read yet: save it again with compression off");
 	}
-	const json &buffers = list(doc, "buffers");
-	for (size_t i = 0; i < buffers.size(); i++) {
-		const std::string uri = text(buffers[i], "uri");
-		if (uri.empty()) {
-			// A .glb's own: the one after its description.
-			if (i != 0 || !rd.glb)
-				fail("the file is damaged (a missing buffer)");
-			rd.buffers.push_back(std::move(rd.bin));
-			continue;
-		}
-		rd.buffers.push_back(rd.load_uri(uri));
-	}
+	load_buffers(rd, doc);
 	for (const json &mj : list(doc, "materials"))
 		m.materials.push_back(read_material(doc, mj));
 	read_nodes(doc, m);
@@ -1290,7 +1305,279 @@ uint32_t u32(const uint8_t *p)
 	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
+// A .glb's description and data, or a .gltf's description.
+void open_file(const uint8_t *bytes, size_t size, json &doc, std::vector<uint8_t> &bin, bool &glb)
+{
+	glb = false;
+	if (size >= 12 && std::memcmp(bytes, "glTF", 4) == 0) {
+		glb = true;
+		const uint32_t version = u32(bytes + 4), total = u32(bytes + 8);
+		if (version != 2)
+			fail("it's an old glTF file; DireBot reads glTF 2.0 (save it again from Blender)");
+		const size_t end = std::min<size_t>(size, total);
+		size_t at = 12;
+		bool have_json = false;
+		while (at + 8 <= end) {
+			const uint32_t len = u32(bytes + at), type = u32(bytes + at + 4);
+			at += 8;
+			if (len > end - at)
+				fail("the file is cut short");
+			if (type == 0x4E4F534A && !have_json) {
+				doc = json::parse(bytes + at, bytes + at + len, nullptr, false);
+				have_json = true;
+			} else if (type == 0x004E4942 && bin.empty()) {
+				bin.assign(bytes + at, bytes + at + len);
+			}
+			at += (len + 3) & ~3u;
+		}
+		if (!have_json)
+			fail("the file is damaged (no description in it)");
+	} else {
+		doc = json::parse(bytes, bytes + size, nullptr, false);
+	}
+}
+
+// The VRM humanoid's bones, each with the one it hangs from (VRM 1.0).
+const char *const HUMANOID[][2] = {
+	{"hips", ""},
+	{"spine", "hips"},
+	{"chest", "spine"},
+	{"upperChest", "chest"},
+	{"neck", "upperChest"},
+	{"head", "neck"},
+	{"leftEye", "head"},
+	{"rightEye", "head"},
+	{"jaw", "head"},
+	{"leftUpperLeg", "hips"},
+	{"leftLowerLeg", "leftUpperLeg"},
+	{"leftFoot", "leftLowerLeg"},
+	{"leftToes", "leftFoot"},
+	{"rightUpperLeg", "hips"},
+	{"rightLowerLeg", "rightUpperLeg"},
+	{"rightFoot", "rightLowerLeg"},
+	{"rightToes", "rightFoot"},
+	{"leftShoulder", "upperChest"},
+	{"leftUpperArm", "leftShoulder"},
+	{"leftLowerArm", "leftUpperArm"},
+	{"leftHand", "leftLowerArm"},
+	{"rightShoulder", "upperChest"},
+	{"rightUpperArm", "rightShoulder"},
+	{"rightLowerArm", "rightUpperArm"},
+	{"rightHand", "rightLowerArm"},
+	{"leftThumbMetacarpal", "leftHand"},
+	{"leftThumbProximal", "leftThumbMetacarpal"},
+	{"leftThumbDistal", "leftThumbProximal"},
+	{"leftIndexProximal", "leftHand"},
+	{"leftIndexIntermediate", "leftIndexProximal"},
+	{"leftIndexDistal", "leftIndexIntermediate"},
+	{"leftMiddleProximal", "leftHand"},
+	{"leftMiddleIntermediate", "leftMiddleProximal"},
+	{"leftMiddleDistal", "leftMiddleIntermediate"},
+	{"leftRingProximal", "leftHand"},
+	{"leftRingIntermediate", "leftRingProximal"},
+	{"leftRingDistal", "leftRingIntermediate"},
+	{"leftLittleProximal", "leftHand"},
+	{"leftLittleIntermediate", "leftLittleProximal"},
+	{"leftLittleDistal", "leftLittleIntermediate"},
+	{"rightThumbMetacarpal", "rightHand"},
+	{"rightThumbProximal", "rightThumbMetacarpal"},
+	{"rightThumbDistal", "rightThumbProximal"},
+	{"rightIndexProximal", "rightHand"},
+	{"rightIndexIntermediate", "rightIndexProximal"},
+	{"rightIndexDistal", "rightIndexIntermediate"},
+	{"rightMiddleProximal", "rightHand"},
+	{"rightMiddleIntermediate", "rightMiddleProximal"},
+	{"rightMiddleDistal", "rightMiddleIntermediate"},
+	{"rightRingProximal", "rightHand"},
+	{"rightRingIntermediate", "rightRingProximal"},
+	{"rightRingDistal", "rightRingIntermediate"},
+	{"rightLittleProximal", "rightHand"},
+	{"rightLittleIntermediate", "rightLittleProximal"},
+	{"rightLittleDistal", "rightLittleIntermediate"},
+};
+
+// Each key of a channel changed by `f` (its value, and a curved one's
+// slopes by `slope`).
+template <typename F, typename G> void each_key(AnimChannel &c, F f, G slope)
+{
+	const int n = c.size();
+	const bool curved = c.ease == AnimChannel::Curved;
+	const size_t per = curved ? 3 : 1;
+	for (size_t k = 0; k < c.times.size(); k++)
+		for (size_t j = 0; j < per; j++) {
+			float *v = &c.values[(k * per + j) * n];
+			if (curved && j != 1)
+				slope(v);
+			else
+				f(v);
+		}
+}
+
+void load_motion_json(Reader &rd, const json &doc, Motion &out)
+{
+	const json &ext = field(field(doc, "extensions"), "VRMC_vrm_animation");
+	if (!ext.is_object())
+		fail("it isn't a VRM animation (.vrma) file");
+	const std::string version = text(ext, "specVersion");
+	if (!version.empty() && version[0] != '1')
+		fail("it's a VRM animation of a version DireBot doesn't know (" + version + ")");
+	load_buffers(rd, doc);
+	Model m;
+	read_nodes(doc, m);
+	const std::vector<M4> world = rest_world(m);
+	// Its bones: which node each is.
+	std::map<std::string, int> bone;
+	const json &bones = field(field(ext, "humanoid"), "humanBones");
+	if (bones.is_object())
+		for (auto it = bones.begin(); it != bones.end(); ++it) {
+			const int node = index_of(it.value(), "node");
+			if (node >= 0 && node < (int)m.nodes.size())
+				bone[it.key()] = node;
+		}
+	if (!bone.count("hips"))
+		fail("it has no hips bone (a VRM animation needs one)");
+	std::map<int, std::string> bone_of_node, face_of_node;
+	for (const auto &b : bone)
+		bone_of_node[b.second] = b.first;
+	const json &faces = field(ext, "expressions");
+	for (const char *kind : {"preset", "custom"}) {
+		const json &list_of = field(faces, kind);
+		if (list_of.is_object())
+			for (auto it = list_of.begin(); it != list_of.end(); ++it) {
+				const int node = index_of(it.value(), "node");
+				if (node >= 0 && node < (int)m.nodes.size() && !bone_of_node.count(node))
+					face_of_node[node] = it.key();
+			}
+	}
+	// Where each bone hangs from at rest: the nearest bone above it that
+	// the file has (VRM's), else where its hips hang from.
+	const int hips = bone["hips"];
+	const M4 hips_parent = m.nodes[hips].parent >= 0 ? world[m.nodes[hips].parent] : M4();
+	auto parent_world = [&](const std::string &name) {
+		std::string p = name;
+		for (int steps = 0; steps < 16; steps++) {
+			const char *up = humanoid_parent(p);
+			if (!up || !*up)
+				break;
+			p = up;
+			auto it = bone.find(p);
+			if (it != bone.end())
+				return world[it->second];
+		}
+		return hips_parent;
+	};
+	out.hips_rest = move_of(world[hips]);
+	const json &animations = list(doc, "animations");
+	size_t numbers = 0;
+	for (size_t ai = 0; ai < animations.size() && out.tracks.empty(); ai++) {
+		const json &aj = animations[ai];
+		out.name = text(aj, "name");
+		for (const json &cj : list(aj, "channels")) {
+			AnimChannel c;
+			if (!read_channel(rd, aj, cj, m.nodes.size(), c, numbers))
+				continue;
+			const int node = c.node;
+			c.node = -1;
+			auto b = bone_of_node.find(node);
+			if (b != bone_of_node.end()) {
+				MotionTrack t;
+				t.bone = b->second;
+				if (c.path == AnimChannel::Turn) {
+					// The turn from rest, in its world: its parent's turn at
+					// rest before it, its own taken out after.
+					const Quat P = normalized(quat_of(parent_world(b->second)));
+					const Quat Wi = conj(normalized(quat_of(world[node])));
+					auto turn = [&](float *v) {
+						const Quat q = P * Quat{v[0], v[1], v[2], v[3]} * Wi;
+						v[0] = q.x, v[1] = q.y, v[2] = q.z, v[3] = q.w;
+					};
+					each_key(c, turn, turn);
+				} else if (c.path == AnimChannel::Move && b->second == "hips") {
+					// Where its hips are, in its world.
+					each_key(
+						c,
+						[&](float *v) {
+							const V3 p = point(hips_parent, {v[0], v[1], v[2]});
+							v[0] = p.x, v[1] = p.y, v[2] = p.z;
+						},
+						[&](float *v) {
+							const V3 p = direction(hips_parent, {v[0], v[1], v[2]});
+							v[0] = p.x, v[1] = p.y, v[2] = p.z;
+						});
+				} else {
+					continue; // VRM moves only its hips' place, and sizes nothing
+				}
+				out.length = std::max(out.length, c.times.back());
+				t.channel = std::move(c);
+				out.tracks.push_back(std::move(t));
+				continue;
+			}
+			auto f = face_of_node.find(node);
+			if (f != face_of_node.end() && c.path == AnimChannel::Move) {
+				// An expression's strength: its node's place across.
+				out.length = std::max(out.length, c.times.back());
+				out.expressions.push_back({f->second, std::move(c)});
+			}
+		}
+		if (out.tracks.empty())
+			out.expressions.clear();
+	}
+	if (out.tracks.empty())
+		fail("it has no moves in it");
+}
+
 } // namespace
+
+const char *humanoid_parent(const std::string &bone)
+{
+	for (const auto &b : HUMANOID)
+		if (bone == b[0])
+			return b[1];
+	return nullptr;
+}
+
+bool load_motion(const uint8_t *bytes, size_t size, const std::string &folder, Motion &out, std::string *problem)
+{
+	out = Motion();
+	try {
+		json doc;
+		std::vector<uint8_t> bin;
+		bool glb = false;
+		open_file(bytes, size, doc, bin, glb);
+		if (doc.is_discarded() || !doc.is_object())
+			fail("it isn't a VRM animation (.vrma) file");
+		Reader rd(doc);
+		rd.folder = folder;
+		rd.glb = glb;
+		rd.bin = std::move(bin);
+		load_motion_json(rd, doc, out);
+		return true;
+	} catch (const Fail &f) {
+		if (problem)
+			*problem = f.why;
+	} catch (const std::bad_alloc &) {
+		if (problem)
+			*problem = "it's too big to load";
+	} catch (const std::exception &) {
+		if (problem)
+			*problem = "the file is damaged";
+	}
+	out = Motion();
+	return false;
+}
+
+bool load_motion(const std::string &path, Motion &out, std::string *problem)
+{
+	std::vector<uint8_t> bytes;
+	if (!read_file(path, bytes)) {
+		if (problem)
+			*problem = "DireBot can't open the file (or it's over 512 MB)";
+		return false;
+	}
+	const size_t slash = path.find_last_of("/\\");
+	const std::string folder = slash == std::string::npos ? "." : path.substr(0, slash);
+	return load_motion(bytes.data(), bytes.size(), folder, out, problem);
+}
 
 std::vector<bool> skin_materials(const Model &m, const std::string &names)
 {
@@ -1384,32 +1671,7 @@ bool load_model(const uint8_t *bytes, size_t size, const std::string &folder, Mo
 		json doc;
 		std::vector<uint8_t> bin;
 		bool glb = false;
-		if (size >= 12 && std::memcmp(bytes, "glTF", 4) == 0) {
-			glb = true;
-			const uint32_t version = u32(bytes + 4), total = u32(bytes + 8);
-			if (version != 2)
-				fail("it's an old glTF file; DireBot reads glTF 2.0 (save it again from Blender)");
-			const size_t end = std::min<size_t>(size, total);
-			size_t at = 12;
-			bool have_json = false;
-			while (at + 8 <= end) {
-				const uint32_t len = u32(bytes + at), type = u32(bytes + at + 4);
-				at += 8;
-				if (len > end - at)
-					fail("the file is cut short");
-				if (type == 0x4E4F534A && !have_json) {
-					doc = json::parse(bytes + at, bytes + at + len, nullptr, false);
-					have_json = true;
-				} else if (type == 0x004E4942 && bin.empty()) {
-					bin.assign(bytes + at, bytes + at + len);
-				}
-				at += (len + 3) & ~3u;
-			}
-			if (!have_json)
-				fail("the file is damaged (no description in it)");
-		} else {
-			doc = json::parse(bytes, bytes + size, nullptr, false);
-		}
+		open_file(bytes, size, doc, bin, glb);
 		if (doc.is_discarded() || !doc.is_object())
 			fail("it isn't a 3D model DireBot can read (.glb, .gltf or .vrm)");
 		Reader rd(doc);

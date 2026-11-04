@@ -1466,6 +1466,272 @@ def test_lights_detail_maps_soft_skin_views_and_mic(run):
         c.disconnect()
 
 
+def disc_picture(path, size, colour):
+    """A see-through picture with one round blob of `colour` in it."""
+    rows = []
+    for y in range(size):
+        row = bytearray(size * 4)
+        for x in range(size):
+            if (x - size / 2 + 0.5) ** 2 + (y - size / 2 + 0.5) ** 2 < (size * 0.45) ** 2:
+                row[x * 4:x * 4 + 4] = bytes(colour) + b"\xff"
+        rows.append(row)
+    write_png(path, size, size, rows, alpha=True)
+
+
+def hand_picture(path, w=48, h=64, colour=(240, 190, 150)):
+    """A made-up patting hand: a skin-coloured block, see-through round it."""
+    rows = []
+    for y in range(h):
+        row = bytearray(w * 4)
+        for x in range(w):
+            if 4 <= x < w - 4 and 4 <= y < h - 2:
+                row[x * 4:x * 4 + 4] = bytes(colour) + b"\xff"
+        rows.append(row)
+    write_png(path, w, h, rows, alpha=True)
+
+
+def vrma_file(path, seconds=2.0):
+    """A VRM animation file (.vrma): its hips turning a little and back."""
+    s, co = math.sin(math.radians(10)), math.cos(math.radians(10))
+    blob = struct.pack("<3f", 0.0, seconds / 2, seconds) + \
+        struct.pack("<12f", 0, 0, 0, 1, 0, s, 0, co, 0, 0, 0, 1)
+    doc = {"asset": {"version": "2.0"}, "extensionsUsed": ["VRMC_vrm_animation"],
+           "extensions": {"VRMC_vrm_animation": {
+               "specVersion": "1.0", "humanoid": {"humanBones": {"hips": {"node": 0}}}}},
+           "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"name": "Hips"}],
+           "buffers": [{"byteLength": len(blob)}],
+           "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 12},
+                           {"buffer": 0, "byteOffset": 12, "byteLength": 48}],
+           "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3,
+                          "type": "SCALAR", "min": [0], "max": [seconds]},
+                         {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC4"}],
+           "animations": [{"name": "Dance", "samplers": [{"input": 0, "output": 1}],
+                           "channels": [{"sampler": 0, "target": {"node": 0, "path": "rotation"}}]}]}
+    text = json.dumps(doc).encode()
+    text += b" " * (-len(text) % 4)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(text) + 8 + len(blob)))
+        f.write(struct.pack("<II", len(text), 0x4E4F534A) + text)
+        f.write(struct.pack("<II", len(blob), 0x004E4942) + blob)
+
+
+def quick_shots(c, name, seconds):
+    """Screenshots of a source, one after another for `seconds`: (seconds
+    since the first, rows) each - read after, so they come quickly."""
+    raw, t0 = [], time.time()
+    while time.time() - t0 < seconds:
+        data = send(c, "GetSourceScreenshot", {"sourceName": name, "imageFormat": "bmp"})["imageData"]
+        raw.append((time.time() - t0, data))
+    return [(t, read_bmp(base64.b64decode(d.split(",", 1)[1]))) for t, d in raw]
+
+
+def keep_shot(rows, name):
+    keep = os.environ.get("DIREBOT_FACE_SHOTS")
+    if keep:
+        write_png(os.path.join(keep, name + ".png"), len(rows[0]), len(rows),
+                  [bytes(v for px in row for v in px) for row in rows])
+
+
+TOMATO = (230, 20, 20)
+FLASH = (255, 240, 40)
+
+
+def test_reactions_on_cue(run):
+    """0.7.0, DireBot's FaceReact: something thrown flies in from the side
+    it's thrown from and hits its face (counted, a flash where it hits, its
+    head knocked back and settling, then it falls away); a volley lands one
+    after another, too many at once is said in words, and stop ends it all;
+    a headpat's hand comes down on top of its head; a bounce moves it; a
+    face shows only on a 3D character that has it; a VRM animation file's
+    move only on a VRM; its own animation plays by name, any case."""
+    face_png = os.path.join(run.home, "camera.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+    body_png = os.path.join(run.home, "react-character.png")
+    character_picture(body_png)
+    tomato = os.path.join(run.home, "react-tomato.png")
+    disc_picture(tomato, 64, TOMATO)
+    flash = os.path.join(run.home, "react-flash.png")
+    disc_picture(flash, 64, FLASH)
+    hand = os.path.join(run.home, "react-hand.png")
+    hand_picture(hand)
+    dance = os.path.join(run.home, "dance.vrma")
+    vrma_file(dance, 2.0)
+    model = os.path.join(run.home, "react-animated.glb")
+    slide = [(3, "translation", [0, 0.5, 1], [0.04, 0, 0.045, -0.04, 0, 0.045, 0.04, 0, 0.045])]
+    set_up_character(model, animations={"Slide": slide})
+    size = 300
+    react = {"react_items": json.dumps([{"file": tomato},
+                                        {"file": os.path.join(run.home, "not-there.png")}]),
+             "react_hand": hand, "react_hit": flash,
+             "react_moves": json.dumps([{"name": "Dance", "file": dance}])}
+    common = {"source": "React camera", "width": size, "height": size, "size": 100,
+              "mirror": False, "smoothing": 100, "follow_move": 0, "follow_grow": 0,
+              "follow_tilt": 0, "bend": 0, **STILL, **react}
+    avatars = {
+        "React picture": {"character": body_png, "style": "drawn", "spots": json.dumps(SPOTS)},
+        "React 3D": {"model": model, "style": "drawn", "bend": 100,
+                     "model_setup": json.dumps({"spots": SET_UP_SPOTS, "chains": []})},
+    }
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+
+    def st(name):
+        return vendor(c, "FaceGetState", {"source": name})
+
+    def cue(name, **data):
+        return vendor(c, "FaceReact", {"source": name, **data})
+    red = lambda px: px[0] > 170 and px[1] < 60 and px[2] < 60  # noqa: E731
+    yellow = lambda px: px[0] > 200 and px[1] > 200 and px[2] < 110  # noqa: E731
+    skin = lambda px: px[0] > 200 and 160 < px[1] < 220 and 110 < px[2] < 190  # noqa: E731
+    orange = lambda px: px[0] > 170 and 90 < px[1] < 160 and px[2] < 90  # noqa: E731
+    try:
+        send(c, "CreateScene", {"sceneName": "Reactions"})
+        send(c, "CreateInput", {"sceneName": "Reactions", "inputName": "React camera",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        for name, extra in avatars.items():
+            send(c, "CreateInput", {"sceneName": "Reactions", "inputName": name,
+                                    "inputKind": "direbot_face_avatar",
+                                    "inputSettings": {**common, **extra}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Reactions"})
+        assert wait_for(lambda: st("React picture")["found"] and st("React picture")["shown"] == 1,
+                        30, 0.2), st("React picture")
+        assert wait_for(lambda: st("React 3D")["found"] and st("React 3D")["model"]["shown"], 30, 0.2), \
+            st("React 3D")
+        # What it has to do it with.
+        r = st("React picture")["react"]
+        assert r["items"] == [{"loaded": True}, {"loaded": False}], r
+        assert r["hand"] and r["hit"] and r["hits"] == 0 and r["flying"] == 0 and not r["busy"], r
+        assert r["faces"] == [] and not r["arms"] and not r["vrm_moves"], r
+        assert r["moves"] == [{"name": "Dance", "length": 2.0}], r
+        r3 = st("React 3D")["react"]
+        assert not r3["arms"] and not r3["vrm_moves"] and r3["faces"] == [], r3
+
+        # Asked for what it can't do: said in words.
+        bad = cue("React picture", do="throw", item=1)
+        assert not bad["ok"] and "no picture" in bad["error"], bad
+        assert not cue("React picture", do="throw", item=7)["ok"]
+        assert "doesn't know" in cue("React picture", do="juggle")["error"]
+        nope = cue("React 3D", do="move", move="Moonwalk")
+        assert not nope["ok"] and "Moonwalk" in nope["error"], nope
+        gone = vendor(c, "FaceReact", {"source": "Nobody", "do": "stop"})
+        assert not gone["ok"] and "isn't in OBS" in gone["error"], gone
+
+        # Faces: on a 3D character that has it, only.
+        f = cue("React picture", do="face", face="happy", seconds=1)
+        assert f["ok"] and f["shows"] is False and "3D" in f["why"], f
+        f = cue("React 3D", do="face", face="Happy", seconds=1)
+        assert f["ok"] and f["shows"] is False and "no face called that" in f["why"], f
+        # Moves: a nod for any character, a wave only with a VRM's arms, a
+        # VRM animation file's only on a VRM, its own by name, any case.
+        m = cue("React 3D", do="move", move="nod")
+        assert m == {"ok": True, "kind": "head", "shows": True}, m
+        m = cue("React 3D", do="move", move="Wave")
+        assert m == {"ok": True, "kind": "arms", "shows": False}, m
+        m = cue("React 3D", do="move", move="dance")
+        assert m == {"ok": True, "kind": "file", "shows": False}, m
+        assert cue("React 3D", do="stop")["ok"]
+        time.sleep(0.6)
+        badge = lambda px: px[0] > 120 and px[1] < 70 and px[2] < 70  # noqa: E731
+        still = [middle_of(screenshot(c, "React 3D"), badge)[0] for _ in range(3)]
+        assert max(still) - min(still) < 1.5, still
+        m = cue("React 3D", do="move", move="slide")
+        assert m == {"ok": True, "kind": "own", "shows": True}, m
+        xs = [middle_of(rows, badge)[0] for _, rows in quick_shots(c, "React 3D", 1.0)]
+        print(f"its own animation on cue: badge x {min(xs):.1f} to {max(xs):.1f} (still {still[0]:.1f})")
+        assert max(xs) - min(xs) > 15, xs
+        assert wait_for(lambda: not st("React 3D")["react"]["busy"], 3, 0.1), st("React 3D")["react"]
+
+        # A throw from the picture's left: in the air, then a hit - a flash
+        # by its face, its head knocked back and settling - then gone.
+        time.sleep(0.3)
+        rest = screenshot(c, "React picture")
+        rest_x, rest_y, rest_n = middle_of(rest, orange)
+        assert rest_n > 10000 and middle_of(rest, red)[2] == 0 and middle_of(rest, yellow)[2] == 0
+        t = cue("React picture", do="throw", item=0, side=-1, strength=1, size=1,
+                face="", face_seconds=1)
+        assert t["ok"] and abs(t["hits_in"] - 0.5) < 0.11, t
+        shots = quick_shots(c, "React picture", 1.6)
+        seen = [(at, middle_of(rows, red), middle_of(rows, yellow)[2], middle_of(rows, orange))
+                for at, rows in shots]
+        flying = [(at, x) for at, (x, _, n), _, _ in seen if n > 40]
+        flashed = [at for at, _, n, _ in seen if n > 30]
+        moved = max(math.hypot(o[0] - rest_x, o[1] - rest_y) for _, _, _, o in seen if o[2])
+        print(f"thrown: in the air {len(flying)} of {len(shots)} looks, x "
+              f"{[round(x) for _, x in flying]}, the flash at {[round(a, 2) for a in flashed]} s, "
+              f"knocked {moved:.1f} px")
+        assert flying and flying[0][1] < rest_x - 30, (flying, rest_x)     # from its left
+        assert flashed, seen
+        assert moved > 3, moved
+        busiest = max(shots, key=lambda s: middle_of(s[1], red)[2])[1]
+        keep_shot(busiest, "React throw")
+        assert wait_for(lambda: st("React picture")["react"]["hits"] == 1, 3, 0.05), \
+            st("React picture")["react"]
+        assert wait_for(lambda: st("React picture")["react"]["flying"] == 0, 3, 0.05)
+        time.sleep(1.0)
+        after = screenshot(c, "React picture")
+        assert middle_of(after, red)[2] == 0 and middle_of(after, yellow)[2] == 0
+        ax, ay, _ = middle_of(after, orange)
+        assert math.hypot(ax - rest_x, ay - rest_y) < 1.5, (ax, ay, rest_x, rest_y)   # settled
+
+        # A volley lands one after another; too many at once is said; stop
+        # ends it (nothing more hits).
+        gaps = [cue("React picture", do="throw", item=0)["hits_in"] for _ in range(3)]
+        assert gaps[1] > gaps[0] + 0.05 and gaps[2] > gaps[1] + 0.05, gaps
+        assert wait_for(lambda: st("React picture")["react"]["hits"] == 4, 4, 0.05), \
+            st("React picture")["react"]
+        answers = [cue("React picture", do="throw", item=0) for _ in range(30)]
+        refused = [a for a in answers if not a["ok"]]
+        assert refused and "Too much" in refused[0]["error"], answers[-1]
+        assert 16 <= len(answers) - len(refused) <= 24, len(refused)
+        assert cue("React picture", do="stop")["ok"]
+        time.sleep(1.2)
+        hits = st("React picture")["react"]["hits"]
+        time.sleep(1.0)
+        r = st("React picture")["react"]
+        assert r["hits"] == hits and r["flying"] == 0 and hits < 4 + 24, r
+
+        # A headpat: the hand comes down on top of its head, pats, and goes.
+        assert middle_of(screenshot(c, "React picture"), skin)[2] == 0
+        assert cue("React picture", do="pat", count=3, size=1)["ok"]
+        shots = quick_shots(c, "React picture", 1.4)
+        pats = [(at, middle_of(rows, skin)) for at, rows in shots]
+        shown = [(at, x, y) for at, (x, y, n) in pats if n > 100]
+        print(f"headpat: the hand in {len(shown)} of {len(shots)} looks, at "
+              f"{[(round(x), round(y)) for _, x, y in shown[-3:]]}, its face at "
+              f"({rest_x:.0f}, {rest_y:.0f})")
+        assert shown, pats
+        _, hx, hy = shown[-1]
+        assert abs(hx - rest_x) < 40 and hy < rest_y - 30, (hx, hy, rest_x, rest_y)
+        keep_shot(max(shots, key=lambda s: middle_of(s[1], skin)[2])[1], "React headpat")
+        assert wait_for(lambda: middle_of(screenshot(c, "React picture"), skin)[2] == 0, 4, 0.1)
+        assert wait_for(lambda: not st("React picture")["react"]["busy"], 4, 0.1), \
+            st("React picture")["react"]
+
+        # A bounce: up and down.
+        assert cue("React picture", do="move", move="bounce")["kind"] == "head"
+        ys = [middle_of(rows, orange)[1] for _, rows in quick_shots(c, "React picture", 1.0)]
+        print(f"bounce: its middle from y {min(ys):.1f} to {max(ys):.1f} (rest {rest_y:.1f})")
+        assert min(ys) < rest_y - 5, (ys, rest_y)
+
+        # Thrown at a 3D character: in the air over it, a hit.
+        before3 = st("React 3D")["react"]["hits"]
+        assert cue("React 3D", do="throw", item=0, side=1)["ok"]
+        shots = quick_shots(c, "React 3D", 0.9)
+        assert any(middle_of(rows, red)[2] > 40 for _, rows in shots)
+        keep_shot(max(shots, key=lambda s: middle_of(s[1], red)[2])[1], "React 3D throw")
+        assert wait_for(lambda: st("React 3D")["react"]["hits"] == before3 + 1, 3, 0.05)
+
+        # Its pictures changed: a missing one is said not loaded.
+        send(c, "SetInputSettings", {"inputName": "React picture", "inputSettings": {
+            "react_items": json.dumps([{"file": tomato}]), "react_hand": ""}})
+        assert wait_for(lambda: st("React picture")["react"]["items"] == [{"loaded": True}]
+                        and not st("React picture")["react"]["hand"], 5, 0.1)
+        for name in list(avatars) + ["React camera"]:
+            send(c, "RemoveInput", {"inputName": name})
+    finally:
+        c.disconnect()
+
+
 def test_closing_obs_leaves_nothing_behind(run):
     assert run.close() == 0
     log = run.log()

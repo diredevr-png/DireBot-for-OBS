@@ -21,6 +21,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <regex>
 #include <set>
@@ -2628,6 +2629,493 @@ static float bend_of(const Rig &rig, int before, int joint, int side, bool *to_p
 	return std::acos(std::min(1.0f, std::max(-1.0f, dot(a, b)))) * 180 / 3.14159265f;
 }
 
+// A VRM animation file (.vrma): a T-posed skeleton whose bones are each
+// turned their own way at rest (as files from other tools are), keys
+// given as the turns from rest they mean (`turns`, VRM's way: in the
+// world), its hips moved to `hips_at` over a second, and its "happy" on.
+struct MotionBones {
+	std::vector<std::string> names;
+	std::map<std::string, int> node;
+	std::map<std::string, Quat> world_turn; // each bone's own turn at rest, in the world
+};
+static std::vector<uint8_t> make_motion(const std::map<std::string, Quat> &turns, V3 hips_at = {0, 1, 0},
+					float happy = -1, bool with_ext = true, bool with_hips = true,
+					MotionBones *out = nullptr)
+{
+	Builder b;
+	struct B {
+		const char *name, *parent;
+		V3 at;
+	};
+	// Where each is in the world, standing in a T (1 m hips), and the
+	// file's own odd turn for each at rest.
+	const B bones[] = {{"hips", "", {0, 1, 0}},
+			   {"spine", "hips", {0, 1.1f, 0}},
+			   {"chest", "spine", {0, 1.25f, 0}},
+			   {"upperChest", "chest", {0, 1.35f, 0}},
+			   {"neck", "upperChest", {0, 1.45f, 0}},
+			   {"head", "neck", {0, 1.55f, 0}},
+			   {"leftShoulder", "upperChest", {0.05f, 1.42f, 0}},
+			   {"leftUpperArm", "leftShoulder", {0.12f, 1.42f, 0}},
+			   {"leftLowerArm", "leftUpperArm", {0.4f, 1.42f, 0}},
+			   {"rightShoulder", "upperChest", {-0.05f, 1.42f, 0}},
+			   {"rightUpperArm", "rightShoulder", {-0.12f, 1.42f, 0}},
+			   {"rightLowerArm", "rightUpperArm", {-0.4f, 1.42f, 0}}};
+	const float PI = 3.14159265f;
+	std::map<std::string, Quat> W;
+	std::map<std::string, V3> at;
+	MotionBones mb;
+	int k = 0;
+	for (const B &bn : bones) {
+		// An odd turn of its own.
+		const Quat w = with_hips || std::string(bn.name) != "hips"
+				       ? normalized(axis_angle(normalized(V3{0.3f + k * 0.1f, 1, -0.2f * k}),
+							       (20 + 13 * k) * PI / 180))
+				       : Quat{};
+		k++;
+		W[bn.name] = w;
+		at[bn.name] = bn.at;
+		const bool root = !*bn.parent;
+		const Quat pw = root ? Quat{} : W[bn.parent];
+		const V3 pa = root ? V3{} : at[bn.parent];
+		const Quat local = normalized(conj(pw) * w);
+		const V3 t = rotate(conj(pw), bn.at - pa);
+		const int n = b.node({{"name", std::string("J_") + bn.name},
+				      {"translation", {t.x, t.y, t.z}},
+				      {"rotation", {local.x, local.y, local.z, local.w}}});
+		mb.node[bn.name] = n;
+		mb.names.push_back(bn.name);
+		if (!root)
+			b.doc["nodes"][mb.node[bn.parent]]["children"].push_back(n);
+	}
+	mb.world_turn = W;
+	const int face = b.node({{"name", "happy"}});
+	json human = json::object();
+	for (const auto &nn : mb.node)
+		if (with_hips || nn.first != "hips")
+			human[nn.first] = {{"node", nn.second}};
+	json samplers = json::array(), channels = json::array();
+	const int times = b.floats({0, 1}, 1, "SCALAR");
+	for (const auto &t : turns) {
+		std::string parent = "";
+		for (const B &bn : bones)
+			if (t.first == bn.name)
+				parent = bn.parent;
+		const Quat P = parent.empty() ? Quat{} : W[parent];
+		// From rest to the turn over the second.
+		const Quat q0 = normalized(conj(P) * W[t.first]);
+		const Quat q1 = normalized(conj(P) * t.second * W[t.first]);
+		samplers.push_back({{"input", times},
+				    {"output", b.floats({q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w}, 4, "VEC4")}});
+		channels.push_back({{"sampler", samplers.size() - 1},
+				    {"target", {{"node", mb.node[t.first]}, {"path", "rotation"}}}});
+	}
+	samplers.push_back({{"input", times}, {"output", b.floats({0, 1, 0, hips_at.x, hips_at.y, hips_at.z}, 3, "VEC3")}});
+	channels.push_back({{"sampler", samplers.size() - 1}, {"target", {{"node", mb.node["hips"]}, {"path", "translation"}}}});
+	if (happy >= 0) {
+		samplers.push_back({{"input", times}, {"output", b.floats({0, 0, 0, happy, 0, 0}, 3, "VEC3")}});
+		channels.push_back({{"sampler", samplers.size() - 1}, {"target", {{"node", face}, {"path", "translation"}}}});
+	}
+	b.doc["animations"] = json::array({{{"name", "Test move"}, {"samplers", samplers}, {"channels", channels}}});
+	if (with_ext)
+		b.doc["extensions"]["VRMC_vrm_animation"] = {
+			{"specVersion", "1.0"},
+			{"humanoid", {{"humanBones", human}}},
+			{"expressions", {{"preset", {{"happy", {{"node", face}}}}}}}};
+	if (out)
+		*out = mb;
+	return b.glb();
+}
+
+static void test_motion_reading()
+{
+	const float PI = 3.14159265f;
+	const Quat up60 = axis_angle({0, 0, 1}, 60 * PI / 180);
+	Motion mo;
+	std::string why;
+	const std::vector<uint8_t> file = make_motion({{"leftUpperArm", up60}}, {0, 1.1f, 0.05f}, 0.8f);
+	CHECK(load_motion(file.data(), file.size(), "", mo, &why));
+	CHECK(mo.name == "Test move");
+	CHECK(near(mo.length, 1, 1e-6));
+	CHECK(near3(mo.hips_rest, {0, 1, 0}, 1e-5f));
+	CHECK(mo.tracks.size() == 2);
+	CHECK(mo.expressions.size() == 1 && mo.expressions[0].first == "happy");
+	for (const MotionTrack &t : mo.tracks) {
+		float v[4];
+		sample(t.channel, 1, v);
+		if (t.bone == "leftUpperArm") {
+			// Its odd turn at rest taken out: the turn as meant.
+			const Quat q{v[0], v[1], v[2], v[3]};
+			CHECK(std::fabs(std::fabs(q.x * up60.x + q.y * up60.y + q.z * up60.z + q.w * up60.w) - 1) < 1e-4f);
+			sample(t.channel, 0, v);
+			CHECK(std::fabs(std::fabs(v[3]) - 1) < 1e-4f); // at rest: no turn
+		} else {
+			CHECK(t.bone == "hips" && t.channel.path == AnimChannel::Move);
+			CHECK(near3({v[0], v[1], v[2]}, {0, 1.1f, 0.05f}, 1e-5f));
+		}
+	}
+	// Not one: plain glTF, no hips, nothing in it, a broken file.
+	Motion bad;
+	const std::vector<uint8_t> plain = make_motion({{"head", up60}}, {0, 1, 0}, -1, false);
+	CHECK(!load_motion(plain.data(), plain.size(), "", bad, &why) && why.find("isn't a VRM animation") != std::string::npos);
+	const std::vector<uint8_t> no_hips = make_motion({{"head", up60}}, {0, 1, 0}, -1, true, false);
+	CHECK(!load_motion(no_hips.data(), no_hips.size(), "", bad, &why) && why.find("hips") != std::string::npos);
+	const std::string junk = "not a file at all";
+	CHECK(!load_motion((const uint8_t *)junk.data(), junk.size(), "", bad, &why) && !why.empty());
+	std::vector<uint8_t> cut(file.begin(), file.begin() + file.size() / 2);
+	CHECK(!load_motion(cut.data(), cut.size(), "", bad, &why) && !why.empty());
+	CHECK(bad.tracks.empty());
+	// A 3D model isn't a move, and a move isn't a 3D model.
+	Model m;
+	CHECK(!load(file, m, &why));
+	CHECK(!load_motion(make_person(false).b.glb().data(), make_person(false).b.glb().size(), "", bad, &why));
+	CHECK(std::string(humanoid_parent("leftThumbMetacarpal")) == "leftHand");
+	CHECK(std::string(humanoid_parent("hips")).empty() && humanoid_parent("tail") == nullptr);
+}
+
+// The way a bone points in the world: from it to its child.
+static V3 way_of(const Rig &rig, int from, int to)
+{
+	return normalized(move_of(rig.world()[to]) - move_of(rig.world()[from]));
+}
+
+static void test_moves_on_a_vrm()
+{
+	const float PI = 3.14159265f;
+	Body body = make_body();
+	Builder &b = body.p.b;
+	// Feet on the ground (y 0), so its hips are 1 m up as the file's are.
+	{
+		std::vector<V3> pos;
+		std::vector<uint16_t> ix;
+		cube(pos, ix, {0, 0.05f, 0}, 0.05f);
+		const int a_pos = b.vec3s(pos), a_ix = b.indices(ix);
+		const json prim = {{"attributes", {{"POSITION", a_pos}}}, {"indices", a_ix}};
+		b.doc["meshes"].push_back({{"primitives", json::array({prim})}});
+		const int feet = b.node({{"name", "feet"}, {"mesh", (int)b.doc["meshes"].size() - 1}});
+		b.doc["scenes"][0]["nodes"].push_back(feet);
+	}
+	auto m = std::make_shared<Model>();
+	CHECK(load(b.glb(), *m));
+	RigOptions o;
+	o.springs = false;
+	Rig rig(m, o);
+	CHECK(rig.plays_motions() && rig.has_arms());
+	const json &bones = b.doc["extensions"]["VRMC_vrm"]["humanoid"]["humanBones"];
+	auto node = [&](const char *n) { return bones[n]["node"].get<int>(); };
+	// The file raises its left arm 60 degrees and twists its upper chest
+	// (which this one hasn't: its neck and shoulders take the twist).
+	const Quat up60 = axis_angle({0, 0, 1}, 60 * PI / 180), twist = axis_angle({0, 1, 0}, 30 * PI / 180);
+	Motion mo;
+	const std::vector<uint8_t> file =
+		make_motion({{"leftUpperArm", up60}, {"upperChest", twist}}, {0, 1.1f, 0}, 0.8f);
+	CHECK(load_motion(file.data(), file.size(), "", mo));
+	auto motion = std::make_shared<const Motion>(mo);
+	rig.pose(still());
+	const V3 hips0 = move_of(rig.world()[node("hips")]);
+	const V3 neck_way0 = direction(rig.world()[node("neck")], {0, 0, 1});
+	const V3 idle = way_of(rig, node("leftUpperArm"), node("leftLowerArm")); // down by its side
+	Drive d = still();
+	MoveNow mv;
+	mv.motion = motion;
+	mv.time = 1;
+	mv.amount = 1;
+	d.body = {mv};
+	rig.pose(d);
+	// Its arm up where the file has it (the twist above it too).
+	const V3 arm = way_of(rig, node("leftUpperArm"), node("leftLowerArm"));
+	const V3 want = rotate(twist * up60, {1, 0, 0});
+	CHECK(near3(arm, want, 2e-3f));
+	CHECK(near3(direction(rig.world()[node("neck")], {0, 0, 1}), rotate(twist, neck_way0), 2e-3f));
+	// Its hips up 10 cm (its hips as high as the file's), its happy on.
+	CHECK(near3(move_of(rig.world()[node("hips")]) - hips0, {0, 0.1f, 0}, 2e-3f));
+	CHECK(near(rig.expression_values().at("happy"), 0.8, 1e-4));
+	// Half of it: half way from how it stands (its arm down by its side)
+	// to the file's pose.
+	d.body[0].amount = 0.5f;
+	rig.pose(d);
+	CHECK(near3(move_of(rig.world()[node("hips")]) - hips0, {0, 0.05f, 0}, 2e-3f));
+	const V3 half = way_of(rig, node("leftUpperArm"), node("leftLowerArm"));
+	const float up_idle = std::asin(idle.y), up_full = std::asin(arm.y), up_half = std::asin(half.y);
+	CHECK(std::fabs(up_half - (up_idle + up_full) / 2) < 5 * PI / 180);
+	// Its start: in a T, as the file starts.
+	d.body[0].time = 0;
+	d.body[0].amount = 1;
+	rig.pose(d);
+	CHECK(near3(way_of(rig, node("leftUpperArm"), node("leftLowerArm")), {1, 0, 0}, 2e-3f));
+	// Nothing playing: its arms back down by its sides.
+	rig.pose(still());
+	CHECK(way_of(rig, node("leftUpperArm"), node("leftLowerArm")).y < -0.8f);
+
+	// VRM 0.x (it faces -z): the same move, the same way as you see it.
+	Person p0 = make_person(true);
+	auto m0 = std::make_shared<Model>();
+	CHECK(load(p0.b.glb(), *m0));
+	RigOptions o0;
+	o0.springs = false;
+	o0.facing = axis_angle({0, 1, 0}, PI);
+	Rig rig0(m0, o0);
+	CHECK(rig0.plays_motions() && !rig0.has_arms());
+	const Quat look = axis_angle({0, 1, 0}, 40 * PI / 180); // its nose towards +x (its left)
+	const std::vector<uint8_t> turn_file = make_motion({{"head", look}});
+	Motion head_mo;
+	CHECK(load_motion(turn_file.data(), turn_file.size(), "", head_mo));
+	Drive d0 = still();
+	MoveNow hm;
+	hm.motion = std::make_shared<const Motion>(head_mo);
+	hm.time = 1;
+	hm.amount = 1;
+	d0.body = {hm};
+	rig0.pose(d0);
+	const V3 nose = rotate(o0.facing, direction(rig0.world()[p0.head], {0, 0, -1}));
+	CHECK(near3(nose, {std::sin(40 * PI / 180), 0, std::cos(40 * PI / 180)}, 2e-3f));
+	// ...and on a VRM 1.0, the same.
+	Person p1 = make_person(false);
+	auto m1 = std::make_shared<Model>();
+	CHECK(load(p1.b.glb(), *m1));
+	Rig rig1(m1, o);
+	rig1.pose(d0);
+	CHECK(near3(direction(rig1.world()[p1.head], {0, 0, 1}), {std::sin(40 * PI / 180), 0, std::cos(40 * PI / 180)},
+		    2e-3f));
+}
+
+static void test_wave_and_cheer()
+{
+	Body body = make_body();
+	auto m = std::make_shared<Model>();
+	CHECK(load(body.p.b.glb(), *m));
+	RigOptions o;
+	o.springs = false;
+	Rig rig(m, o);
+	const json &bones = body.p.b.doc["extensions"]["VRMC_vrm"]["humanoid"]["humanBones"];
+	auto node = [&](const std::string &n) { return bones[n]["node"].get<int>(); };
+	Drive d = still();
+	MoveNow w;
+	w.builtin = BuiltIn::Wave;
+	w.amount = 1;
+	// Its right forearm up, waving side to side; its left arm still down;
+	// its right fingers open (the rest stay relaxed).
+	float most_x = -1, least_x = 1;
+	for (float t = 0; t < 1.2f; t += 0.05f) {
+		w.time = t;
+		d.body = {w};
+		rig.pose(d);
+		const V3 fore = way_of(rig, node("rightLowerArm"), node("rightHand"));
+		CHECK(fore.y > 0.75f);
+		most_x = std::max(most_x, fore.x);
+		least_x = std::min(least_x, fore.x);
+		CHECK(way_of(rig, node("leftUpperArm"), node("leftLowerArm")).y < -0.8f);
+	}
+	CHECK(most_x - least_x > 0.4f);
+	CHECK(bend_of(rig, body.hand[1], body.index[1][0], 1) < 1);
+	CHECK(bend_of(rig, body.index[0][0], body.index[0][1], 0) > 10);
+	// A cheer: both arms up.
+	MoveNow c;
+	c.builtin = BuiltIn::Cheer;
+	c.amount = 1;
+	c.time = 0.3f;
+	d.body = {c};
+	rig.pose(d);
+	CHECK(way_of(rig, node("leftUpperArm"), node("leftLowerArm")).y > 0.5f);
+	CHECK(way_of(rig, node("rightUpperArm"), node("rightLowerArm")).y > 0.5f);
+	CHECK(way_of(rig, node("leftLowerArm"), node("leftHand")).y > 0.7f);
+	// One over another: the cheer taking over from the wave, half way.
+	w.time = 0.5f;
+	c.amount = 0.5f;
+	d.body = {w, c};
+	rig.pose(d);
+	const V3 left = way_of(rig, node("leftUpperArm"), node("leftLowerArm"));
+	CHECK(left.y > -0.7f && left.y < 0.6f);
+	// A character with no arms: nothing happens, nothing breaks.
+	Person p = make_person(false);
+	auto mp = std::make_shared<Model>();
+	CHECK(load(p.b.glb(), *mp));
+	Rig armless(mp, o);
+	d.body = {w};
+	armless.pose(d);
+	CHECK(!armless.has_arms());
+}
+
+static void test_own_move_once()
+{
+	// Its own animation (the tail's "Wag" of test_own_animation, simpler):
+	// played once at a time, as much as asked.
+	Person p = make_person(false);
+	Builder &b = p.b;
+	const float PI = 3.14159265f;
+	const Quat q40 = axis_angle({0, 1, 0}, 40 * PI / 180);
+	const int t2 = b.floats({0, 1}, 1, "SCALAR");
+	const int swing = b.floats({0, 0, 0, 1, q40.x, q40.y, q40.z, q40.w}, 4, "VEC4");
+	b.doc["animations"] = json::array({{{"name", "Look"},
+					     {"samplers", {{{"input", t2}, {"output", swing}}}},
+					     {"channels", {{{"sampler", 0}, {"target", {{"node", p.head}, {"path", "rotation"}}}}}}}});
+	auto m = std::make_shared<Model>();
+	CHECK(load(b.glb(), *m));
+	RigOptions o;
+	o.springs = false;
+	Rig rig(m, o);
+	Drive d = still();
+	MoveNow mv;
+	mv.animation = 0;
+	mv.time = 1;
+	mv.amount = 1;
+	d.body = {mv};
+	rig.pose(d);
+	CHECK(near3(direction(rig.world()[p.head], {0, 0, 1}), {std::sin(40 * PI / 180), 0, std::cos(40 * PI / 180)}, 1e-3f));
+	d.body[0].amount = 0.5f;
+	rig.pose(d);
+	CHECK(near3(direction(rig.world()[p.head], {0, 0, 1}), {std::sin(20 * PI / 180), 0, std::cos(20 * PI / 180)}, 1e-3f));
+	// Past its end: as it ends. Before its start: as it starts.
+	d.body[0].amount = 1;
+	d.body[0].time = 30;
+	rig.pose(d);
+	CHECK(near3(direction(rig.world()[p.head], {0, 0, 1}), {std::sin(40 * PI / 180), 0, std::cos(40 * PI / 180)}, 1e-3f));
+	// One it hasn't, and odd numbers: nothing happens.
+	d.body[0].animation = 5;
+	rig.pose(d);
+	CHECK(near3(direction(rig.world()[p.head], {0, 0, 1}), {0, 0, 1}, 1e-4f));
+	d.body[0].animation = 0;
+	d.body[0].time = std::numeric_limits<float>::quiet_NaN();
+	rig.pose(d);
+	CHECK(near3(direction(rig.world()[p.head], {0, 0, 1}), {0, 0, 1}, 1e-4f));
+}
+
+static void test_faces_on_cue()
+{
+	Person p = make_person(false);
+	auto m = std::make_shared<Model>();
+	CHECK(load(p.b.glb(), *m));
+	RigOptions o;
+	o.springs = false;
+	Rig rig(m, o);
+	const std::vector<std::string> faces = rig.faces();
+	CHECK(std::find(faces.begin(), faces.end(), "happy") != faces.end());
+	CHECK(std::find(faces.begin(), faces.end(), "angry") == faces.end());
+	const std::vector<std::string> shapes = rig.shapes();
+	CHECK(shapes.size() == 4 && shapes[0] == "Fcl_MTH_A");
+	// Happy on: its "happy" (bound at half), blinks held back (it blocks
+	// them) - even an "ouch".
+	Drive d = still();
+	d.faces = {{"happy", 1}};
+	d.squint = 1;
+	rig.pose(d);
+	CHECK(near(rig.expression_values().at("happy"), 1, 1e-6));
+	CHECK(near(rig.weights()[0][2], 0.5, 1e-5));
+	CHECK(near(rig.weights()[0][1], 0, 1e-6));
+	// An "ouch" alone shuts its eyes; half a face half.
+	d.faces.clear();
+	rig.pose(d);
+	CHECK(near(rig.weights()[0][1], 1, 1e-5));
+	d.squint = 0;
+	d.faces = {{"happy", 0.5f}};
+	rig.pose(d);
+	CHECK(near(rig.weights()[0][2], 0.25, 1e-5));
+	// Your own smile under a face on cue is taken over: a big smile
+	// (happy 1 from you) with "happy" half on stays happy...
+	const int smile_l = move_of_name("mouthSmileLeft"), smile_r = move_of_name("mouthSmileRight");
+	d.moves[smile_l] = d.moves[smile_r] = 1;
+	rig.pose(d);
+	CHECK(near(rig.expression_values().at("happy"), 0.5, 1e-5));
+	// ...a face's own shape by name, and an odd one.
+	d.moves[smile_l] = d.moves[smile_r] = 0;
+	d.faces = {{"Fcl_MTH_A", 0.7f}, {"nothing like it", 1}, {"", 1}, {"happy", std::numeric_limits<float>::quiet_NaN()}};
+	rig.pose(d);
+	CHECK(near(rig.weights()[0][0], 0.7, 1e-5));
+	CHECK(near(rig.weights()[0][2], 0, 1e-6));
+	// Your mouth stays yours under a face (it can still talk).
+	d.faces = {{"happy", 1}};
+	d.moves[move_of_name("jawOpen")] = 1;
+	rig.pose(d);
+	CHECK(rig.expression_values().at("aa") > 0.9f);
+
+	// Made for ARKit: faces made from its shapes.
+	GlbPart part;
+	std::vector<uint16_t> ix;
+	cube(part.pos, ix, {}, 0.5f);
+	part.index.assign(ix.begin(), ix.end());
+	const char *names[] = {"mouthSmileLeft", "mouthSmileRight", "cheekSquintLeft", "cheekSquintRight",
+			       "eyeSquintLeft",  "eyeSquintRight",  "browDownLeft",    "browDownRight",
+			       "eyeBlinkLeft",   "eyeBlinkRight",   "jawOpen",         "tongueOut"};
+	for (const char *n : names) {
+		part.morph_names.push_back(n);
+		part.morphs.push_back(std::vector<V3>(part.pos.size(), V3{0, 0.1f, 0}));
+	}
+	auto ma = std::make_shared<Model>();
+	CHECK(load(write_glb({part}), *ma));
+	Rig ar(ma, o);
+	CHECK(ar.arkit_parts() == 11);
+	const std::vector<std::string> af = ar.faces();
+	CHECK(std::find(af.begin(), af.end(), "happy") != af.end());
+	CHECK(std::find(af.begin(), af.end(), "angry") == af.end()); // too few of its shapes
+	CHECK(std::find(af.begin(), af.end(), "tongueOut") != af.end());
+	Drive da = still();
+	da.faces = {{"happy", 1}, {"tongueOut", 1}};
+	ar.pose(da);
+	CHECK(near(ar.weights()[0][0], 0.85, 1e-5) && near(ar.weights()[0][2], 0.55, 1e-5));
+	CHECK(near(ar.weights()[0][11], 1, 1e-6));
+	da.faces.clear();
+	da.squint = 1;
+	ar.pose(da);
+	CHECK(near(ar.weights()[0][8], 1, 1e-6) && near(ar.weights()[0][9], 1, 1e-6));
+	CHECK(near(ar.weights()[0][0], 0, 1e-6));
+}
+
+static void test_knocked_and_head()
+{
+	// A hit throws its ponytail the way it went, and it settles back.
+	Person p = make_person(false);
+	auto &sp = p.b.doc["extensions"]["VRMC_springBone"]["springs"][0];
+	for (auto &j : sp["joints"])
+		if (j.contains("stiffness"))
+			j["stiffness"] = 2.0, j["gravityPower"] = 0.0;
+	auto m = std::make_shared<Model>();
+	CHECK(load(p.b.glb(), *m));
+	Rig rig(m, RigOptions());
+	Drive d = still();
+	for (int i = 0; i < 240; i++)
+		rig.pose(d);
+	const V3 rest = move_of(rig.world()[p.tail2]);
+	Drive k = d;
+	k.knock = {0, 3, 0};
+	rig.pose(k);
+	float highest = rest.y;
+	for (int i = 0; i < 20; i++) {
+		rig.pose(d);
+		highest = std::max(highest, move_of(rig.world()[p.tail2]).y);
+	}
+	CHECK(highest > rest.y + 0.02f);
+	for (int i = 0; i < 400; i++)
+		rig.pose(d);
+	CHECK(near3(move_of(rig.world()[p.tail2]), rest, 5e-3f));
+	// An odd knock: nothing breaks.
+	k.knock = {std::numeric_limits<float>::quiet_NaN(), 0, 0};
+	rig.pose(k);
+	CHECK(std::isfinite(move_of(rig.world()[p.tail2]).x));
+	// Its head: the box round what its head bone moves.
+	const Rig::HeadBox &hb = rig.head_box();
+	CHECK(hb.found);
+	CHECK(near3(hb.low, {-0.1f, 1.6f, -0.1f}, 1e-4f) && near3(hb.high, {0.1f, 1.8f, 0.1f}, 1e-4f));
+	CHECK(near(hb.top, 1.8, 1e-4));
+	// VRM 0.x, facing -z: the same box, the facing way.
+	Person p0 = make_person(true);
+	auto m0 = std::make_shared<Model>();
+	CHECK(load(p0.b.glb(), *m0));
+	RigOptions o0;
+	o0.facing = axis_angle({0, 1, 0}, 3.14159265f);
+	Rig rig0(m0, o0);
+	CHECK(rig0.head_box().found && near(rig0.head_box().high.y - rig0.head_box().low.y, 0.2, 1e-4));
+	// No head bone: none.
+	GlbPart part;
+	std::vector<uint16_t> ix;
+	cube(part.pos, ix);
+	part.index.assign(ix.begin(), ix.end());
+	auto mc = std::make_shared<Model>();
+	CHECK(load(write_glb({part}), *mc));
+	Rig rc(mc, RigOptions());
+	CHECK(!rc.head_box().found && !rc.plays_motions() && !rc.has_arms());
+	CHECK(rc.faces().empty());
+}
+
 static void test_fingers_and_body()
 {
 	Body body = make_body();
@@ -2798,6 +3286,12 @@ int main()
 	test_alive();
 	test_light();
 	test_fingers_and_body();
+	test_motion_reading();
+	test_moves_on_a_vrm();
+	test_wave_and_cheer();
+	test_own_move_once();
+	test_faces_on_cue();
+	test_knocked_and_head();
 	std::printf("unit_model: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;
 }

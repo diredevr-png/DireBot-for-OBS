@@ -28,7 +28,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // into textures by OBS). From VRM too: which bone is the head, neck and
 // eyes, the expressions (blink, "aa", happy...) and the swinging parts
 // (spring bones) with what they bump into. And its own animations
-// (moves, turns and sizes; not its expressions' strengths).
+// (moves, turns and sizes; not its expressions' strengths), and VRM
+// animation files (.vrma) for any VRM.
 //
 // Plain code over plain numbers (tests/unit_model.cpp). Every number in a
 // file is checked before it's used, so a broken or hostile file only
@@ -290,6 +291,36 @@ std::vector<bool> skin_materials(const Model &m, const std::string &names);
 
 // Every node's place in the model at rest (world matrices).
 std::vector<M4> rest_world(const Model &m);
+
+// A VRM animation file (.vrma: VRM's own, VRMC_vrm_animation 1.0) - a
+// wave, a dance, a bow - for any VRM to play (rig.hpp). Its moves go by
+// bone name, so one file fits every VRM. (Carried onto a character's
+// bones as the VRM Animation spec says, the way pixiv's three-vrm - MIT
+// licence - does it: its steps as a recipe, no code copied.)
+struct MotionTrack {
+	std::string bone; // VRM 1.0's name ("hips", "leftUpperArm"...)
+	// Turn: each key the bone's turn from how it rests, in the file's
+	// world (its rest's turn taken out: VRM's "normalized" turn, the same
+	// for any character). Move (its hips only): where its hips are, in
+	// the file's world. (The channel's node isn't used: -1.)
+	AnimChannel channel;
+};
+struct Motion {
+	std::string name;   // the file's name for it (may be empty)
+	float length = 0;   // seconds: its last key
+	std::vector<MotionTrack> tracks;
+	V3 hips_rest;       // where its hips are at rest (its height's scale)
+	// Its expressions ("happy", "aa", "blink"... or the file's own): each
+	// one's strength over time (the channel's first number).
+	std::vector<std::pair<std::string, AnimChannel>> expressions;
+};
+// Loads a .vrma. False, with why in plain words, if it can't.
+bool load_motion(const std::string &path, Motion &out, std::string *problem = nullptr);
+bool load_motion(const uint8_t *bytes, size_t size, const std::string &folder, Motion &out,
+		 std::string *problem = nullptr);
+// The VRM humanoid bone a bone hangs from (VRM 1.0's names): "" for the
+// hips, nullptr if it isn't one.
+const char *humanoid_parent(const std::string &bone);
 
 // A plain .glb from parts (for tests and for characters built in DireBot):
 // one node a part, its picture (a PNG's bytes, or none) on it.

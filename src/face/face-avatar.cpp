@@ -21,6 +21,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
@@ -75,6 +76,11 @@ constexpr uint32_t LOOK_SIZE = 960;
 constexpr int SHOTS = 4;
 // Outfit layers at most.
 constexpr size_t MOST_LAYERS = 12;
+// What it does on cue: at most this many things to throw and VRM
+// animation files, and the numbers its VRM animation files' moves go by
+// (React::play's; under it, its own animations' numbers).
+constexpr size_t MOST_THROW_PICTURES = 24, MOST_MOTIONS = 32;
+constexpr int MOTION_IDS = 10000;
 // How much bigger than its spot an eye or the mouth is drawn: room round
 // it for its soft edge.
 constexpr float PIECE_ROOM = 1.25f;
@@ -826,8 +832,10 @@ struct FaceAvatar {
 		// and follows your head.
 		int fingers = 0;
 		bool body = false;
-		// Its own animations' names, and the one playing ("" none).
+		// Its own animations' names (and lengths, seconds), and the one
+		// playing ("" none).
 		std::vector<std::string> animations;
+		std::vector<float> animation_lengths;
 		std::string animation;
 		// Its materials: each one's name, whether it has a normal map
 		// ("bumps") and an occlusion map, and whether it counts as skin.
@@ -867,6 +875,40 @@ struct FaceAvatar {
 	bool view_gliding_state = false;
 	std::vector<bool> skin_now;
 	std::string skin_key;
+	// What it does on cue (react.hpp): asked for by DireBot's FaceReact on
+	// OBS's UI thread, stepped and drawn on the graphics one.
+	std::mutex react_lock;
+	React react;
+	// Its pictures for it (under pictures_lock): the things thrown (by
+	// number), the patting hand and a hit's flash; and the VRM animation
+	// files it plays, by name.
+	std::vector<PicturePtr> throw_pics;
+	PicturePtr hand_pic, hit_pic;
+	struct NamedMotion {
+		std::string name, file, problem;
+		std::shared_ptr<const Motion> motion;
+		int id = -1; // React::play's number for it (kept while the file is)
+	};
+	std::vector<NamedMotion> motions;
+	int next_motion_id = MOTION_IDS;
+	// Graphics thread: this frame's, and where its face was drawn (the
+	// picture's pixels, without the moves' own shift), how tall its head
+	// is (pixels) and the picture round it (heads), for the next step.
+	ReactOut react_now;
+	ReactView react_view;
+	float face_px[2] = {0, 0}, head_px = 0, react_shift[2] = {0, 0};
+	float head_world = 0; // a 3D character's head, in the world's units
+	bool face_known = false;
+	int react_hits = 0;
+	// ...for FaceGetState (under state_lock): the faces it makes, its own
+	// shapes, whether it waves with arms and plays VRM animation files.
+	struct ReactState {
+		std::vector<std::string> faces, shapes;
+		bool arms = false, motions = false, three_d = false, busy = false, placed = false;
+		int hits = 0, flying = 0;
+		float head_px = 0;
+	};
+	ReactState react_state;
 	// ...and how it sounds, for FaceGetState (under state_lock).
 	VoiceOut voice_state;
 	Calibration cal_state;
@@ -1407,8 +1449,21 @@ struct FaceAvatar {
 				at.yaw = clampf(yaw * bend + a.sway_yaw, -MOST_YAW, MOST_YAW);
 				at.pitch = clampf((a.pitch * bend + a.sway_pitch) * 0.6f, -MOST_PITCH, MOST_PITCH);
 			}
+			// What it does on cue, as the picture shows it (react.hpp):
+			// its head knocked back, nodding, shaking, bobbing.
+			const ReactOut &rn = react_now;
+			at.angle += rn.roll * RAD;
+			if (shaped) {
+				at.yaw += rn.yaw;
+				at.pitch += rn.pitch * 0.6f;
+			}
+			react_shift[0] = rn.dx * head_px;
+			react_shift[1] = rn.dy * head_px;
+			at.x += react_shift[0];
+			at.y += react_shift[1];
 			return at;
 		}
+		react_shift[0] = react_shift[1] = 0;
 		// Worn on your head: its eyes on yours, sized from how far apart
 		// yours are, tilted, turned and nodded as your head is.
 		if (!held.found)
@@ -1618,8 +1673,10 @@ struct FaceAvatar {
 				st.author = m.meta.author;
 				st.points = m.points;
 				st.triangles = m.triangles;
-				for (const Animation &a : m.animations)
+				for (const Animation &a : m.animations) {
 					st.animations.push_back(a.name);
+					st.animation_lengths.push_back(a.length);
+				}
 				for (const Material &mat : m.materials) {
 					State3D::Mat sm;
 					sm.name = mat.name;
@@ -1630,6 +1687,9 @@ struct FaceAvatar {
 			}
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d = st;
+			react_state.faces.clear();
+			react_state.shapes.clear();
+			react_state.arms = react_state.motions = false;
 		}
 		if (!model_now || !avatar3d || !avatar3d->ready()) {
 			rig.reset();
@@ -1687,6 +1747,10 @@ struct FaceAvatar {
 			state3d.set_up = !look3d.setup->empty();
 			state3d.fingers = rig->finger_joints();
 			state3d.body = rig->has_body();
+			react_state.faces = rig->faces();
+			react_state.shapes = rig->shapes();
+			react_state.arms = rig->has_arms();
+			react_state.motions = rig->plays_motions();
 			const float *box = spots3d.box;
 			for (int i = 0; i < 3; i++) {
 				const FaceSpot &sp = spots3d.spot[i];
@@ -1764,12 +1828,22 @@ struct FaceAvatar {
 			follow_of(o, g, follow_move, its_gap / f.seen_w, its_gap / f.seen_h, dx, dy);
 			dx *= 1 - a.idle;
 			dy *= 1 - a.idle;
-			move_own_spot(f, clampf(dx * flip, -most_move, most_move), clampf(dy, -most_move, most_move));
+			// What it does on cue moves it too (react.hpp: heads, as the
+			// picture shows it).
+			const ReactOut &rn = react_now;
+			react_shift[0] = rn.dx * head_px;
+			react_shift[1] = rn.dy * head_px;
+			move_own_spot(f, clampf(dx * flip, -most_move, most_move) + react_shift[0] / std::max(1u, w),
+				      clampf(dy, -most_move, most_move) + react_shift[1] / std::max(1u, h));
 			// Your head's turn (held, then easing ahead when it can't see
-			// you), its own sway on top; its body takes some of it.
-			d.head = head_turn(clampf(a.yaw * bend + a.sway_yaw, -MOST_YAW_3D, MOST_YAW_3D),
-					   clampf(a.pitch * bend + a.sway_pitch, -MOST_PITCH_3D, MOST_PITCH_3D),
-					   clampf((a.roll * follow_tilt + a.sway_roll) * RAD, -0.6f, 0.6f), mirror);
+			// you), its own sway on top; its body takes some of it. And on
+			// cue: knocked back, nodding, shaking (as the picture shows it:
+			// head_turn mirrors yours, not those).
+			d.head = head_turn(clampf(a.yaw * bend + a.sway_yaw, -MOST_YAW_3D, MOST_YAW_3D) + rn.yaw * flip,
+					   clampf(a.pitch * bend + a.sway_pitch, -MOST_PITCH_3D, MOST_PITCH_3D) + rn.pitch,
+					   clampf((a.roll * follow_tilt + a.sway_roll) * RAD, -0.6f, 0.6f) +
+						   rn.roll * RAD * flip,
+					   mirror);
 			d.body_follow = body_follow;
 			d.body_yaw = a.body_yaw;
 			d.body_roll = a.body_roll;
@@ -1790,6 +1864,7 @@ struct FaceAvatar {
 			v.h = ch;
 			v.hide_behind_head = look3d.hide;
 			v.head = worn_pose;
+			react_shift[0] = react_shift[1] = 0;
 			// On your head it sits as your head is: it doesn't grow as a
 			// whole with its breath.
 			d.breathe_whole = false;
@@ -1808,6 +1883,34 @@ struct FaceAvatar {
 		} else {
 			d.mic = mic_now; // its mouth from your mic, as much as it has it
 		}
+		// On cue (react.hpp): a face, its eyes shut, a move, hair thrown
+		// about by a hit (heads a second as the picture shows it, into the
+		// world's units: its picture's right and up, and towards you).
+		d.faces = react_now.faces;
+		d.squint = react_now.squint;
+		for (const BodyMove &bm : react_now.body) {
+			MoveNow mv;
+			mv.time = bm.time;
+			mv.amount = bm.amount;
+			if (bm.move >= MOTION_IDS) {
+				for (const NamedMotion &nm : motions)
+					if (nm.id == bm.move)
+						mv.motion = nm.motion;
+				if (!mv.motion)
+					continue;
+			} else if (bm.move >= 0) {
+				mv.animation = bm.move;
+			} else {
+				mv.builtin = bm.builtin;
+			}
+			d.body.push_back(mv);
+		}
+		{
+			const V3 &k = react_now.knock;
+			const V3 right = wear && mirror ? f.right * -1.0f : f.right;
+			const V3 toward = normalized(cross(f.right, f.up), {0, 0, 1});
+			d.knock = (right * k.x + f.up * k.y + toward * k.z) * head_world;
+		}
 		rig->pose(d);
 		v.fov = f.fov;
 		v.near = f.near;
@@ -1822,6 +1925,7 @@ struct FaceAvatar {
 		v.lights = look3d.lights;
 		v.detail = look3d.detail;
 		v.soft_skin = look3d.soft_skin;
+		react_place_3d(v, f, facing, wear);
 		const std::string skin_for = std::to_string((uintptr_t)model_now.get()) + "/" + look3d.skin_parts;
 		if (skin_for != skin_key) {
 			skin_now = skin_materials(m, look3d.skin_parts);
@@ -1883,12 +1987,72 @@ struct FaceAvatar {
 				cards = draw_cards(cut, cw, ch, tex, v, frame, f.upright, facing, wear,
 						   showing * opacity);
 			drawn_layers += draw_layers_3d(false, v, frame, facing, wear, opacity);
+			draw_reactions();
 		}
 		gs_texrender_end(out);
 		have_out = true;
 		std::lock_guard<std::mutex> l(state_lock);
 		state3d.cards = cards;
 		state3d.layers = drawn_layers;
+	}
+
+	// Where its face is drawn and how tall its head is (a 3D character),
+	// for what's thrown at it and a headpat: a VRM's head as its head bone
+	// moves it (its face's middle a little below its eyes, the top of its
+	// hair), else from its eyes (its head 2.8 times as tall as they're
+	// apart, the top of it all).
+	void react_place_3d(const View3D &v, const Framing &f, Quat facing, bool wear)
+	{
+		face_known = false;
+		const Model &m = *model_now;
+		const float W = (float)v.w, H = (float)v.h;
+		if (!rig || !W || !H)
+			return;
+		const float k = 1 / std::tan(v.fov / 2), aspect = W / H;
+		const M4 frame = rig->head_frame();
+		const Quat back = conj(facing);
+		bool ok = true;
+		auto at = [&](V3 p) { // the facing model's way, at rest
+			const V3 c = point(v.view, point(frame, rotate(back, p)));
+			const float depth = -c.z;
+			if (depth < v.near * 0.5f)
+				ok = false;
+			float sx = (c.x * k / aspect / std::max(depth, 1e-6f) + 1) * 0.5f * W;
+			const float sy = (1 - c.y * k / std::max(depth, 1e-6f)) * 0.5f * H;
+			if (wear && mirror)
+				sx = W - sx;
+			return std::array<float, 2>{sx, sy};
+		};
+		const V3 le = rotate(facing, spots3d.spot[0].at), re = rotate(facing, spots3d.spot[1].at);
+		const bool eyes = std::strcmp(spots3d.from[0], "guessed") != 0 && std::strcmp(spots3d.from[1], "guessed") != 0;
+		float top_y = rotate(facing, m.high).y;
+		for (int c = 0; c < 8; c++)
+			top_y = std::max(top_y, rotate(facing, V3{c & 1 ? m.high.x : m.low.x, c & 2 ? m.high.y : m.low.y,
+								 c & 4 ? m.high.z : m.low.z})
+							.y);
+		const Rig::HeadBox &hb = rig->head_box();
+		V3 mid;
+		float tall, top;
+		if (hb.found) {
+			tall = hb.high.y - hb.low.y;
+			mid = {(hb.low.x + hb.high.x) / 2, hb.low.y + 0.42f * tall, hb.high.z};
+			const float eye_y = (le.y + re.y) / 2;
+			if (eyes && eye_y > hb.low.y && eye_y < hb.high.y)
+				mid.y = eye_y - 0.1f * tall;
+			top = hb.top;
+		} else {
+			const float gap = length(le - re);
+			tall = gap > 1e-6f ? 2.8f * gap : 0.3f * std::max(1e-4f, m.high.y - m.low.y);
+			mid = (le + re) * 0.5f - V3{0, 0.1f * tall, 0};
+			top = std::max(top_y, mid.y + 0.3f * tall);
+		}
+		const auto c = at(mid), up = at(mid + V3{0, tall, 0}), t = at({mid.x, top, mid.z});
+		head_px = std::hypot(up[0] - c[0], up[1] - c[1]);
+		head_world = tall * f.world_scale;
+		if (!ok || !(head_px >= 2) || !std::isfinite(c[0] + c[1] + t[0] + t[1]))
+			return;
+		set_react_view(c[0] - react_shift[0], c[1] - react_shift[1],
+			       std::hypot(t[0] - c[0], t[1] - c[1]) / head_px, v.w, v.h);
 	}
 
 	// What it turns round, whole, in its own spot: where it's put on your
@@ -2341,10 +2505,12 @@ struct FaceAvatar {
 		const PicturePtr &pic = which == 1 ? body_left : which == 2 ? body_right : body;
 		Placed at;
 		gs_texture_t *flat_tex = nullptr;
+		face_known = false;
 		if (loaded(pic)) {
 			at = place(o, *pic, which, shapes[which].get(), wear, w, h);
 			if (at.shown)
 				flat_tex = draw_flat(cut, cw, ch, o, *pic, shapes[which].get(), at.scale);
+			react_place_2d(at, *pic, w, h);
 		}
 		{
 			std::lock_guard<std::mutex> l2(state_lock);
@@ -2364,10 +2530,106 @@ struct FaceAvatar {
 		gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
 		if (wear && show_camera)
 			draw_camera(cam, cw, ch);
-		if (flat_tex)
+		if (flat_tex) {
 			draw_turned(flat_tex, shapes[which], *pic, at);
+			draw_reactions();
+		}
 		gs_texrender_end(out);
 		have_out = true;
+	}
+
+	// Where its face is drawn and how tall its head is (a 2D character),
+	// for what's thrown at it and a headpat: from its eyes' spots (its
+	// head about 2.8 times as tall as they're apart, its face's middle a
+	// little below them), else a guess at the top of its picture.
+	void react_place_2d(const Placed &at, const Picture &pic, uint32_t w, uint32_t h)
+	{
+		face_known = false;
+		if (!at.shown || !w || !h)
+			return;
+		const float char_w = pic.width(), char_h = pic.height();
+		const float CX = canvas.x * char_w, CY = canvas.y * char_h;
+		const float co = std::cos(at.angle), si = std::sin(at.angle);
+		float ex = char_w / 2, ey = 0.3f * char_h, tall = 0.35f * char_h;
+		if (have_spots) {
+			const float lx = (spots[0].x + spots[0].w / 2) * char_w, ly = (spots[0].y + spots[0].h / 2) * char_h;
+			const float rx = (spots[1].x + spots[1].w / 2) * char_w, ry = (spots[1].y + spots[1].h / 2) * char_h;
+			ex = (lx + rx) / 2;
+			ey = (ly + ry) / 2;
+			tall = std::max(2.8f * std::hypot(rx - lx, ry - ly), 0.05f * char_h);
+		}
+		const float u = (ex - CX - at.ax) * at.scale, v = (ey + 0.1f * tall - CY - at.ay) * at.scale;
+		const float x = at.x + co * u - si * v, y = at.y + si * u + co * v;
+		head_px = tall * at.scale;
+		if (!(head_px >= 2) || !std::isfinite(x + y))
+			return;
+		set_react_view(x - react_shift[0], y - react_shift[1], 0.65f, w, h);
+	}
+
+	void set_react_view(float x, float y, float head_top, uint32_t w, uint32_t h)
+	{
+		face_px[0] = x;
+		face_px[1] = y;
+		react_view.left = -x / head_px;
+		react_view.right = ((float)w - x) / head_px;
+		react_view.top = -y / head_px;
+		react_view.bottom = ((float)h - y) / head_px;
+		react_view.head_top = clampf(head_top, 0.2f, 3);
+		// (Called while drawing, its pictures' lock held.)
+		react_view.hand_tall = loaded(hand_pic) ? (float)hand_pic->height() / std::max(1.0f, (float)hand_pic->width())
+							: 1.25f;
+		face_known = true;
+	}
+
+	// What's thrown at it, where things hit and the patting hand, over it
+	// (the picture's pixels: react.hpp's heads from where its face is).
+	void draw_reactions()
+	{
+		const ReactOut &r = react_now;
+		if (!face_known || (r.flying.empty() && !r.hand.shown && r.bursts.empty()))
+			return;
+		gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+		// A picture `across` heads wide (as tall as its shape says), its
+		// middle - or its bottom edge's middle - at (x, y) heads, turned
+		// clockwise `angle` and squashed (sx, sy) in its own ways.
+		auto sprite = [&](const PicturePtr &pic, float x, float y, float across, float angle, float opacity,
+				  float sx, float sy, bool from_bottom) {
+			if (!loaded(pic) || !(opacity > 0.001f) || !(across > 0))
+				return;
+			const float wpx = across * head_px * sx,
+				    hpx = across * head_px * pic->height() / std::max(1.0f, pic->width()) * sy;
+			const float cx = face_px[0] + x * head_px, cy = face_px[1] + y * head_px;
+			const float co = std::cos(angle), si = std::sin(angle);
+			const float ox = -wpx / 2, oy = from_bottom ? -hpx : -hpx / 2;
+			if (!std::isfinite(cx + cy + wpx + hpx + co + si))
+				return;
+			matrix4 m;
+			vec4_set(&m.x, co * wpx, si * wpx, 0, 0);
+			vec4_set(&m.y, -si * hpx, co * hpx, 0, 0);
+			vec4_set(&m.z, 0, 0, 1, 0);
+			vec4_set(&m.t, cx + co * ox - si * oy, cy + si * ox + co * oy, 0, 1);
+			vec4 clip;
+			vec4_set(&clip, 0, 0, 1, 1);
+			gs_effect_set_texture(p_image, pic->texture());
+			gs_effect_set_float(p_opacity, std::min(1.0f, opacity));
+			gs_effect_set_vec4(p_clip, &clip);
+			gs_matrix_push();
+			gs_matrix_mul(&m);
+			check("Picture");
+			while (gs_effect_loop(effect, "Picture"))
+				gs_draw_quadf(pic->texture(), 0, 1, 1);
+			gs_matrix_pop();
+		};
+		for (const Burst &b : r.bursts)
+			sprite(hit_pic, b.x, b.y, b.size, 0, b.opacity, 1, 1, false);
+		for (const Flying &f : r.flying) {
+			const PicturePtr none;
+			const PicturePtr &pic =
+				f.picture >= 0 && f.picture < (int)throw_pics.size() ? throw_pics[f.picture] : none;
+			sprite(pic, f.x, f.y, f.size, f.angle, f.opacity, f.squash_x, f.squash_y, false);
+		}
+		if (r.hand.shown)
+			sprite(hand_pic, r.hand.x, r.hand.y, r.hand.size, r.hand.angle, r.hand.opacity, 1, 1, true);
 	}
 
 	void tick(float dt)
@@ -2407,6 +2669,12 @@ struct FaceAvatar {
 		alive.set(ao);
 		const Shown::Glide &g = o.steady;
 		alive_now = alive.step(dt, o.found, g.yaw, g.pitch, g.angle / RAD, tuned_now);
+		// What it does on cue (react.hpp), round where its face was drawn.
+		{
+			std::lock_guard<std::mutex> l(react_lock);
+			react_now = react.step(dt, react_view);
+		}
+		react_hits += react_now.hits;
 		// The page's live bars: what the camera reads, and what it shows.
 		clock += dt;
 		float reading[TUNE_GROUPS] = {}, shows[TUNE_GROUPS] = {};
@@ -2457,6 +2725,10 @@ struct FaceAvatar {
 		float drawn_moves[EXPRESSIONS];
 		std::copy(alive_now.moves, alive_now.moves + EXPRESSIONS, drawn_moves);
 		mic_into_moves(mic_now, drawn_moves);
+		// An "ouch" or a happy squint shuts its drawn eyes.
+		for (int i = 1; i < EXPRESSIONS; i++)
+			if (std::strncmp(EXPRESSION_NAMES[i], "eyeBlink", 8) == 0)
+				drawn_moves[i] = std::max(drawn_moves[i], react_now.squint);
 		drawn_now = drawn_face(drawn_moves, mirror, drawn_now);
 		const Calibration cal = voice.calibration();
 		std::lock_guard<std::mutex> l(state_lock);
@@ -2474,6 +2746,9 @@ struct FaceAvatar {
 		}
 		idle_state = alive_now.idle;
 		breath_state = alive_now.breath;
+		react_state.hits = react_hits;
+		react_state.busy = react_now.busy;
+		react_state.flying = (int)react_now.flying.size();
 		if (os_gettime_ns() - last_render > 500'000'000ULL)
 			showing_now = false;
 	}
@@ -2606,6 +2881,67 @@ struct FaceAvatar {
 				wearing.push_back(layer);
 			}
 		}
+		// What it does on cue: the things thrown at it, the patting hand,
+		// a hit's flash (a file still used keeps its picture) and the VRM
+		// animation files it plays, each by its name.
+		std::vector<PicturePtr> old_throws, next_throws;
+		PicturePtr next_hand, next_hit;
+		std::vector<NamedMotion> old_motions, next_motions;
+		{
+			std::lock_guard<std::mutex> l(pictures_lock);
+			old_throws = throw_pics;
+			next_hand = hand_pic;
+			next_hit = hit_pic;
+			old_motions = motions;
+		}
+		const json throws = json::parse(obs_data_get_string(settings, "react_items"), nullptr, false);
+		if (throws.is_array())
+			for (const json &row : throws) {
+				if (next_throws.size() >= MOST_THROW_PICTURES)
+					break;
+				const std::string file = row.is_object() && row.contains("file") && row["file"].is_string()
+								 ? row["file"].get<std::string>()
+								 : "";
+				PicturePtr pic;
+				for (const PicturePtr &old : old_throws)
+					if (old && old->path == file)
+						pic = old;
+				next_throws.push_back(pic ? pic : load_picture(nullptr, file.c_str()));
+			}
+		next_hand = load_picture(next_hand, obs_data_get_string(settings, "react_hand"));
+		next_hit = load_picture(next_hit, obs_data_get_string(settings, "react_hit"));
+		const json moves_json = json::parse(obs_data_get_string(settings, "react_moves"), nullptr, false);
+		int motion_id = 0;
+		{
+			std::lock_guard<std::mutex> l(pictures_lock);
+			motion_id = next_motion_id;
+		}
+		if (moves_json.is_array())
+			for (const json &row : moves_json) {
+				if (next_motions.size() >= MOST_MOTIONS || !row.is_object())
+					continue;
+				NamedMotion nm;
+				nm.name = row.contains("name") && row["name"].is_string() ? row["name"].get<std::string>() : "";
+				nm.file = row.contains("file") && row["file"].is_string() ? row["file"].get<std::string>() : "";
+				if (nm.name.empty() || nm.file.empty())
+					continue;
+				for (const NamedMotion &old : old_motions)
+					if (old.file == nm.file && (old.motion || !old.problem.empty())) {
+						nm.motion = old.motion;
+						nm.problem = old.problem;
+						nm.id = old.id;
+					}
+				if (nm.id < 0) {
+					Motion mo;
+					std::string why;
+					if (load_motion(nm.file, mo, &why))
+						nm.motion = std::make_shared<const Motion>(std::move(mo));
+					else
+						nm.problem = why.empty() ? "it couldn't be read" : why;
+					nm.id = motion_id++;
+				}
+				next_motions.push_back(nm);
+			}
 
 		const float part_size_now = clampf((float)obs_data_get_int(settings, "part_size") / 100.0f, 0.5f, 2.0f);
 		// The shapes, worked out again only when what they're of changes.
@@ -2648,6 +2984,11 @@ struct FaceAvatar {
 				mouth_places[i] = mouth_at[i];
 			}
 			layers.swap(wearing);
+			throw_pics.swap(next_throws);
+			hand_pic.swap(next_hand);
+			hit_pic.swap(next_hit);
+			motions.swap(next_motions);
+			next_motion_id = motion_id;
 			have_spots = have;
 			if (have)
 				std::copy(got_spots, got_spots + PARTS, spots);
@@ -2847,6 +3188,154 @@ struct FaceAvatar {
 		worker.rest_saved();
 	}
 
+	// DireBot's FaceReact (OBS's UI thread): a face for a while, a move,
+	// something thrown at it, a headpat, or all of it stopped.
+	json react_to(const json &data)
+	{
+		auto str = [&data](const char *key) {
+			auto it = data.find(key);
+			return it != data.end() && it->is_string() ? it->get<std::string>() : std::string();
+		};
+		auto num = [&data](const char *key, float def) {
+			auto it = data.find(key);
+			return it != data.end() && it->is_number() ? (float)it->get<double>() : def;
+		};
+		auto no = [](const std::string &words) {
+			return json{{"ok", false}, {"error", words}};
+		};
+		auto same = [](const std::string &a, const std::string &b) {
+			if (a.size() != b.size())
+				return false;
+			for (size_t i = 0; i < a.size(); i++)
+				if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i]))
+					return false;
+			return true;
+		};
+		// A face by its own name for it (any case: "Happy" is its "happy"),
+		// whether it has it, and whether it's a 3D character.
+		auto own_face = [this, &same](std::string &name, bool &three_d) {
+			bool known = name.empty();
+			std::lock_guard<std::mutex> l(state_lock);
+			three_d = state3d.loaded;
+			for (const auto *list : {&react_state.faces, &react_state.shapes})
+				for (const std::string &n : *list)
+					if (!known && same(n, name)) {
+						name = n;
+						known = true;
+					}
+			return known;
+		};
+		const std::string what = str("do");
+		json answer = {{"ok", true}};
+		if (what == "face") {
+			std::string name = str("face");
+			bool three_d;
+			const bool known = own_face(name, three_d);
+			{
+				std::lock_guard<std::mutex> l(react_lock);
+				react.face(name, num("seconds", 3), num("amount", 1));
+			}
+			answer["face"] = name;
+			answer["shows"] = three_d && known;
+			if (!three_d)
+				answer["why"] = "Faces show on a 3D character.";
+			else if (!known)
+				answer["why"] = "This character has no face called that.";
+		} else if (what == "move") {
+			const std::string name = str("move");
+			const BuiltIn b = builtin_named(name);
+			if (b != BuiltIn::None) {
+				// A wave or a cheer shows only on a VRM's arms.
+				bool shows = true;
+				if (builtin_arms(b)) {
+					std::lock_guard<std::mutex> l(state_lock);
+					shows = react_state.arms;
+				}
+				std::lock_guard<std::mutex> l(react_lock);
+				react.move(b);
+				answer["kind"] = builtin_arms(b) ? "arms" : "head";
+				answer["shows"] = shows;
+			} else {
+				// A VRM animation file's, by its name (any case), then one of
+				// its own animations.
+				int id = -1;
+				float length = 0;
+				std::string problem;
+				{
+					std::lock_guard<std::mutex> l(pictures_lock);
+					for (const NamedMotion &nm : motions)
+						if (id < 0 && problem.empty() && same(nm.name, name)) {
+							if (nm.motion) {
+								id = nm.id;
+								length = nm.motion->length;
+							} else {
+								problem = nm.problem;
+							}
+						}
+				}
+				if (id < 0 && problem.empty()) {
+					std::lock_guard<std::mutex> l(state_lock);
+					for (size_t i = 0; i < state3d.animations.size() && id < 0; i++)
+						if (same(state3d.animations[i], name)) {
+							id = (int)i;
+							length = i < state3d.animation_lengths.size() ? state3d.animation_lengths[i] : 0;
+						}
+				}
+				if (id < 0)
+					return no(problem.empty() ? "It doesn't know a move called \"" + name + "\"."
+								  : "That move's file can't be played: " + problem + ".");
+				// A VRM animation file's plays only on a VRM character.
+				bool shows = true;
+				if (id >= MOTION_IDS) {
+					std::lock_guard<std::mutex> l(state_lock);
+					shows = react_state.motions;
+				}
+				std::lock_guard<std::mutex> l(react_lock);
+				react.play(id, length);
+				answer["kind"] = id >= MOTION_IDS ? "file" : "own";
+				answer["shows"] = shows;
+			}
+		} else if (what == "throw") {
+			Throw t;
+			t.picture = (int)std::floor(num("item", 0));
+			{
+				std::lock_guard<std::mutex> l(pictures_lock);
+				if (t.picture < 0 || t.picture >= (int)throw_pics.size() || !loaded(throw_pics[t.picture]))
+					return no("That thing to throw has no picture - pick one in DireBot.");
+			}
+			t.side = num("side", 0);
+			t.strength = num("strength", 1);
+			t.size = num("size", 1);
+			t.face = str("face");
+			bool three_d;
+			own_face(t.face, three_d);
+			t.face_time = num("face_seconds", 1.5f);
+			float when;
+			{
+				std::lock_guard<std::mutex> l(react_lock);
+				when = react.throw_at(t);
+			}
+			if (when < 0)
+				return no("Too much is being thrown at once - try again in a moment.");
+			answer["hits_in"] = std::round(when * 1000) / 1000;
+		} else if (what == "pat") {
+			Pat p;
+			p.count = (int)std::lround(clampf(num("count", 5), 1, (float)MOST_PATS));
+			p.size = num("size", 1);
+			p.face = data.contains("face") ? str("face") : std::string("happy");
+			bool three_d;
+			own_face(p.face, three_d);
+			std::lock_guard<std::mutex> l(react_lock);
+			react.pat(p);
+		} else if (what == "stop") {
+			std::lock_guard<std::mutex> l(react_lock);
+			react.stop();
+		} else {
+			return no("DireBot for OBS doesn't know that.");
+		}
+		return answer;
+	}
+
 	json state(bool with_points)
 	{
 		const VoiceOptions mic_levels = voice.options();
@@ -2856,6 +3345,8 @@ struct FaceAvatar {
 		json holes = json::object();
 		bool shaped;
 		json lights_json, views_json = json::array();
+		json react_moves_json = json::array(), react_items_json = json::array();
+		bool react_hand_ok = false, react_hit_ok = false;
 		int view_index;
 		{
 			std::lock_guard<std::mutex> l(pictures_lock);
@@ -2874,6 +3365,16 @@ struct FaceAvatar {
 				       {"rim", t.rim},
 				       {"detail", look3d.detail},
 				       {"soft_skin", (int)std::lround(look3d.soft_skin * 100)}};
+			for (const NamedMotion &nm : motions) {
+				json row = {{"name", nm.name}, {"length", nm.motion ? std::round(nm.motion->length * 100) / 100 : 0}};
+				if (!nm.problem.empty())
+					row["problem"] = nm.problem;
+				react_moves_json.push_back(row);
+			}
+			for (const PicturePtr &pic : throw_pics)
+				react_items_json.push_back({{"loaded", loaded(pic)}});
+			react_hand_ok = loaded(hand_pic);
+			react_hit_ok = loaded(hit_pic);
 			for (const auto &named : look3d.views)
 				views_json.push_back({{"name", named.first},
 						      {"yaw", named.second.yaw},
@@ -3043,6 +3544,28 @@ struct FaceAvatar {
 		answer["see_through"] = holes;
 		answer["shaped"] = shaped;
 		answer["lights"] = lights_json;
+		{
+			// What it does on cue: the faces it makes (its own shapes too),
+			// whether it has arms to wave with and plays VRM animation
+			// files, the moves it knows and the hits so far.
+			const ReactState &rs = react_state;
+			json faces = json::array(), shapes = json::array();
+			for (const std::string &n : rs.faces)
+				faces.push_back({{"name", n}});
+			for (const std::string &n : rs.shapes)
+				shapes.push_back({{"name", n}});
+			answer["react"] = {{"faces", faces},
+					   {"shapes", shapes},
+					   {"arms", rs.arms},
+					   {"vrm_moves", rs.motions},
+					   {"moves", react_moves_json},
+					   {"items", react_items_json},
+					   {"hand", react_hand_ok},
+					   {"hit", react_hit_ok},
+					   {"hits", rs.hits},
+					   {"flying", rs.flying},
+					   {"busy", rs.busy}};
+		}
 		answer["camera_view"] = {{"view", view_index >= 0 ? std::to_string(view_index + 1) : "main"},
 					 {"showing", view_shown_state >= 0 ? std::to_string(view_shown_state + 1) : "main"},
 					 {"gliding", view_gliding_state},
@@ -3301,6 +3824,12 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "soft_skin", 0);
 	obs_data_set_default_string(settings, "skin_parts", "");
 	obs_data_set_default_string(settings, "views", "[]");
+	// What it does on cue (DireBot sets these): pictures to throw ([{"file"}]),
+	// the patting hand, a hit's flash, VRM animation files ([{"name", "file"}]).
+	obs_data_set_default_string(settings, "react_items", "[]");
+	obs_data_set_default_string(settings, "react_hand", "");
+	obs_data_set_default_string(settings, "react_hit", "");
+	obs_data_set_default_string(settings, "react_moves", "[]");
 	obs_data_set_default_string(settings, "view", "main");
 	obs_data_set_default_int(settings, "view_glide", 600);
 	obs_data_set_default_string(settings, "mouth_from", "both");
@@ -3679,6 +4208,17 @@ json mic_calibrate(const json &data)
 	return answer;
 }
 
+json react_on_cue(const json &data)
+{
+	obs_source_t *src = find_avatar(data);
+	if (!src)
+		return fail("That face avatar isn't in OBS any more.");
+	auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src));
+	json answer = f ? f->react_to(data) : fail("It isn't ready yet.");
+	obs_source_release(src);
+	return answer;
+}
+
 json model_front(const json &data)
 {
 	obs_source_t *src = find_avatar(data);
@@ -3696,7 +4236,8 @@ json model_front(const json &data)
 
 const std::vector<std::string> &requests()
 {
-	static const std::vector<std::string> list = {"FaceSet", "FaceGetState", "FaceModelFront", "FaceMicCalibrate"};
+	static const std::vector<std::string> list = {"FaceSet", "FaceGetState", "FaceModelFront", "FaceMicCalibrate",
+						      "FaceReact"};
 	return list;
 }
 
@@ -3717,6 +4258,8 @@ json request(const std::string &type, const json &data)
 			return model_front(data);
 		if (type == "FaceMicCalibrate")
 			return mic_calibrate(data);
+		if (type == "FaceReact")
+			return react_on_cue(data);
 		return fail("DireBot for OBS doesn't know that request.");
 	});
 }

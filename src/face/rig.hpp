@@ -40,6 +40,13 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //   - Its own animation, if it has one and it's chosen (an idle, a tail's
 //     wag...), over and over: your head, eyes and its swinging parts move
 //     from where it has them.
+//   - What it does on cue (react.hpp): a face for a while (VRM's happy,
+//     angry... or the file's own; made from ARKit's shapes for a character
+//     made for them; or any of its shapes by name), its eyes screwed shut,
+//     a move played once - a wave or cheer with a VRM's arms, one of its
+//     own animations, or a VRM animation file's (any VRM: its bones'
+//     turns carried over to this one's, as VRM says) - and its swinging
+//     parts thrown about by a hit.
 //   - Where your real eyes and mouth go on it (face_spots).
 //
 // Then its points are moved by its bones and expressions ("skinned"),
@@ -54,6 +61,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "math3d.hpp"
 #include "model.hpp"
+#include "react.hpp"
 #include "setup.hpp"
 #include "tracker.hpp"
 #include "voice.hpp"
@@ -87,6 +95,16 @@ struct RigOptions {
 	// relaxed as hands rest, 1 curled. Fingers its file already bends are
 	// only bent the rest of the way.
 	float fingers = 0.5f;
+};
+
+// A body move on it (react.hpp's, found): a VRM's wave or cheer, one of
+// its own animations, or a VRM animation file's; how far into it (seconds)
+// and how much it shows (0 to 1).
+struct MoveNow {
+	BuiltIn builtin = BuiltIn::None;
+	int animation = -1;
+	std::shared_ptr<const Motion> motion;
+	float time = 0, amount = 0;
 };
 
 struct Drive {
@@ -125,6 +143,16 @@ struct Drive {
 	// are, ARKit-named shapes through mic_into_moves. `moves` stay the
 	// camera's.
 	MicMouth mic;
+	// On cue (react.hpp): faces (each by name, as faces() lists them, or a
+	// shape's own name; a face takes over from yours as much as it's on,
+	// your blinks and mouth staying yours), its eyes shut this much (0 to
+	// 1), body moves (oldest first, each over the last as much as it
+	// shows) and its swinging parts thrown, once (the world's units a
+	// second).
+	std::vector<FaceNow> faces;
+	float squint = 0;
+	std::vector<MoveNow> body;
+	V3 knock;
 };
 
 class Rig {
@@ -180,6 +208,28 @@ public:
 	// is now (its head bone's, or all of it turned).
 	M4 head_frame() const;
 
+	// The faces it makes on cue, for the page: VRM's own (happy, angry,
+	// sad, relaxed, surprised - those it has) and its file's other
+	// expressions; or, made for ARKit, the five made from its shapes (and
+	// "tongueOut" if it has one); or the usual-named ones it has. Then
+	// every shape's own name (any can be a face).
+	std::vector<std::string> faces() const;
+	std::vector<std::string> shapes() const;
+	// Whether it has arms to wave and cheer with, and plays VRM animation
+	// files (a VRM, with hips).
+	bool has_arms() const { return arm_bone_[0][0] >= 0 || arm_bone_[1][0] >= 0; }
+	bool plays_motions() const { return model_->is_vrm() && model_->bone("hips") >= 0; }
+	// Its head at rest, the facing model's way (x its right as the picture
+	// shows it, y up, z out of its face): the box round what its head
+	// bone moves (its skull and face, and what hangs off it - hair, ears
+	// - up to `top`). Not found: no head bone, or nothing on it.
+	struct HeadBox {
+		V3 low, high;
+		float top = 0;
+		bool found = false;
+	};
+	const HeadBox &head_box() const { return head_box_; }
+
 private:
 	struct Joint {
 		SpringJoint s;
@@ -222,6 +272,12 @@ private:
 	void drive_eyes(const Drive &d);
 	void step_springs(float dt, float scale);
 	void animate(float dt);
+	void play_moves(const Drive &d);
+	void pose_bone(int node, Quat world_turn, float amount);
+	void play_motion(const Motion &mo, float t, float amount);
+	void play_builtin(BuiltIn b, float t, float amount);
+	void play_own(int animation, float t, float amount);
+	void measure_head();
 	void stand_upright(const Drive &d);
 	Quat head_turn_now() const;
 	void skin();
@@ -264,6 +320,18 @@ private:
 	float spring_time_ = 0;
 	float anim_time_ = 0;          // seconds into its animation
 	std::vector<char> anim_turns_; // a node its animation turns
+	// How much a body move holds each node this frame (0 to 1): what the
+	// rig itself does to it (arms down, fingers relaxed) is that much less.
+	std::vector<float> moved_;
+	// The VRM humanoid's bones by VRM 1.0's names (a 0.x's thumbs too).
+	std::map<std::string, int> bones1_;
+	int arm_bone_[2][3] = {{-1, -1, -1}, {-1, -1, -1}}; // each side's upper arm, lower arm, hand
+	// A VRM animation's expressions this frame (name -> strength).
+	std::map<std::string, float> move_faces_;
+	HeadBox head_box_;
+	float floor_ = 0; // its lowest, the facing model's way
+	// Its shapes by name (lower case): mesh and morph.
+	std::map<std::string, std::vector<std::pair<int, int>>> morph_by_name_;
 	V3 last_root_;
 	std::vector<std::vector<std::vector<Sparse>>> sparse_; // mesh, part, morph
 	std::vector<std::vector<float>> weights_;
