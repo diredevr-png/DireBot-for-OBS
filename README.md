@@ -172,8 +172,10 @@ the same, and your real eyes and mouth on it take its light. Its file's
 normal maps (bumps and creases) and occlusion maps (shadows in folds) are
 drawn (`detail_maps`; its own tangents, or worked out as Blender does); `soft_skin`
 (0-100%) lets light reach round into the shadow side of its skin, warmer -
-on the materials named like skin (`skin`, `face`, `body`, `head`, but not
-its eyes, hair, teeth or clothes), or the ones `skin_parts` names, a name
+on the materials named like skin (`skin`, `face`, `body`, `head`, and
+from 0.8.0 a whole word `ear`, `neck`, `nose`, `lip`, `hand`, `arm`, `leg`,
+`foot` or `torso`, so `Ears_L` but not `Earring`; never its eyes, hair,
+teeth or clothes), or the ones `skin_parts` names, a name
 a line. Up to three saved camera views (`views`, JSON: `name`, `yaw` and
 `pitch` in degrees round it, `zoom` (1 as framed), `x` and `y` - shares of
 the picture to move it) - `view` shows one (`1`-`3`, or `main`), gliding
@@ -221,7 +223,10 @@ worn on your head) can follow your arms, hands and fingers from the same
 camera: its upper arms and forearms point where yours do, its elbows bend
 your elbows' way, its hands turn as yours (its forearms take half the
 twist, so its wrists don't pinch thin) and each finger joint bends as
-yours, within each joint's natural limits and how far a wrist bends. It
+yours, within each joint's natural limits and how far a wrist bends. An
+arm raised above level lifts its shoulder too (a third of the way, at
+most 25 degrees, as a real shoulder blade turns), so the top of a raised
+arm doesn't fold into its neck. It
 follows your body as you face the camera - against your chest, so leaning
 or turning in your chair doesn't swing its arms, and they ride on its own
 breathing and turning body - mirrored as its face is (`mirror`). Near your

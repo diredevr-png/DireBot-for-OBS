@@ -2314,6 +2314,17 @@ static void test_skin_parts()
 	const std::vector<bool> named = skin_materials(m, " shirt \r\nMATERIAL.001\n\n");
 	CHECK(named == std::vector<bool>({false, false, false, false, false, true, false, false, false, false, true}));
 	CHECK(skin_materials(Model(), "").empty());
+	// Ears, a neck, hands... by the whole word (a realistic VRM's "ear"),
+	// not inside another (an earring, armour, a handle).
+	Model w;
+	for (const char *name : {"ear", "Ears_L", "earRight", "Neck", "HANDS", "Earring", "ArmorPlate", "Handle",
+				 "HandGlove", "gear", "Nose01", "lipstick"}) {
+		Material mat;
+		mat.name = name;
+		w.materials.push_back(mat);
+	}
+	CHECK(skin_materials(w, "") ==
+	      std::vector<bool>({true, true, true, true, true, false, false, false, false, false, true, false}));
 }
 
 static void test_camera_views()
@@ -3289,6 +3300,34 @@ static void test_arms_follow()
 	CHECK(near(length(at(rig, lower[1]) - at(rig, upper[1])), 0.25, 1e-4));
 	CHECK(near(length(at(rig, body.hand[1]) - at(rig, lower[1])), 0.25, 1e-4));
 
+	// Raised past level, its shoulder (collarbone) lifts a third of how far
+	// the arm is above level, at most 25 degrees, as yours does - its arm
+	// still pointing as yours. Level or lower: as it was.
+	{
+		const int sh[2] = {m->bone("leftShoulder"), m->bone("rightShoulder")};
+		auto lifted = [&](int side) { return std::asin(way(rig, sh[side], upper[side]).y) * 180 / PI; };
+		CHECK(near(lifted(1), 0, 1e-3) && near(lifted(0), 0, 1e-3));
+		R.upper = normalized(V3{0, 1, 1});
+		R.fore = R.upper;
+		rig.pose(d);
+		CHECK(near3(way(rig, upper[1], lower[1]), R.upper, 1e-4f));
+		CHECK(near(lifted(1), 15, 0.1) && near(lifted(0), 0, 1e-3));
+		R.upper = R.fore = {0, 1, 0};
+		rig.pose(d);
+		CHECK(near3(way(rig, upper[1], lower[1]), {0, 1, 0}, 1e-4f));
+		CHECK(near(lifted(1), 25, 0.1));
+		CHECK(near(length(at(rig, lower[1]) - at(rig, upper[1])), 0.25, 1e-4));
+		// Half followed: half as far.
+		R.weight = 0.5f;
+		rig.pose(d);
+		CHECK(near(lifted(1), 12.5, 0.1));
+		R.weight = 1;
+		R.upper = {0, 0, 1};
+		R.fore = {0, 1, 0};
+		rig.pose(d);
+		CHECK(near(lifted(1), 0, 1e-3));
+	}
+
 	// Half followed: half way between its own and yours.
 	L.weight = 0.5f;
 	rig.pose(d);
@@ -3364,6 +3403,19 @@ static void test_arms_follow()
 	if (length(wanted - shoulder) < 0.49f)
 		CHECK(near3(at(rig, body.hand[0]), wanted, 2e-3f));
 	CHECK(near(length(at(rig, lower[0]) - shoulder), 0.25, 1e-4));
+	// ...with its arm raised and its shoulder lifted too: from where its
+	// shoulder is then.
+	L.upper = L.fore = {0, 1, 0};
+	L.by_head = {0.7f, 0.9f, 0.2f};
+	rig.pose(d);
+	{
+		const V3 up_wanted = mid + L.by_head * width;
+		const V3 lifted_at = at(rig, upper[0]);
+		CHECK(lifted_at.y > shoulder.y + 0.005f);
+		if (length(up_wanted - lifted_at) < 0.49f)
+			CHECK(near3(at(rig, body.hand[0]), up_wanted, 2e-3f));
+	}
+	L.upper = L.fore = {0, -1, 0};
 	L.near = 0;
 
 	// A move on cue takes over its arms.

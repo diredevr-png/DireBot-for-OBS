@@ -930,6 +930,17 @@ void Rig::find_arms()
 		a.shoulder = at(up);
 		a.upper = normalized(u);
 		a.fore = normalized(f);
+		// Its collarbone, to lift with an arm raised past level.
+		const int sh = shoulder_[side];
+		if (sh >= 0 && m.nodes[up].parent == sh) {
+			const V3 c = at(up) - at(sh);
+			const V3 axis = cross(normalized(c), V3{0, 1, 0});
+			if (length(c) > 1e-6f && length(axis) > 0.3f) {
+				a.root = at(sh);
+				a.lift_axis = normalized(axis);
+				a.lifts = true;
+			}
+		}
 		// Its elbow bends its forearm forwards (towards its front); an
 		// arm made pointing forwards bends it up.
 		V3 h = cross(a.upper, front);
@@ -989,12 +1000,29 @@ void Rig::drive_arms(const Drive &d)
 		if (!(amount > 0))
 			continue;
 		V3 du = normalized(t.upper, ar.upper), df = normalized(t.fore, ar.fore);
+		// Its shoulder rises with an arm raised past level, as yours does
+		// (your collarbone and shoulder blade take part of a raised arm):
+		// a third of how far it's above level, at most 25 degrees. Turned
+		// by the upper arm alone, an arm held high pinched the top of its
+		// shoulder by its neck. Not while an animation moves the shoulder.
+		const int sh = shoulder_[side];
+		Quat lift{};
+		V3 shoulder_at = ar.shoulder;
+		if (ar.lifts && !anim_turns_[sh]) {
+			constexpr float SHOULDER_SHARE = 1.0f / 3, SHOULDER_MOST = 25 * RAD;
+			const float above = std::asin(std::max(-1.0f, std::min(1.0f, du.y)));
+			const float angle = std::min(SHOULDER_MOST, std::max(0.0f, above) * SHOULDER_SHARE) * amount;
+			if (angle > 1e-4f) {
+				lift = axis_angle(ar.lift_axis, angle);
+				shoulder_at = ar.root + rotate(lift, ar.shoulder - ar.root);
+			}
+		}
 		// By its head: its wrist where yours is by yours (its head's size),
 		// its elbow out the way yours is.
 		const float near = clamp01(t.near);
 		if (near > 0 && head_known_) {
 			const V3 target = head_mid_ + t.by_head * head_width_;
-			const V3 to = target - ar.shoulder;
+			const V3 to = target - shoulder_at;
 			const float lu = ar.upper_len, lf = ar.fore_len;
 			float dist = length(to);
 			if (dist > 1e-6f) {
@@ -1005,9 +1033,9 @@ void Rig::drive_arms(const Drive &d)
 				V3 pole = du - dir * dot(du, dir);
 				if (length(pole) < 1e-3f)
 					pole = V3{0, -1, 0} - dir * dir.y;
-				const V3 elbow = ar.shoulder + dir * along + normalized(pole, {0, -1, 0}) * out;
-				du = toward(du, normalized(elbow - ar.shoulder, du), near);
-				df = toward(df, normalized(ar.shoulder + dir * dist - elbow, df), near);
+				const V3 elbow = shoulder_at + dir * along + normalized(pole, {0, -1, 0}) * out;
+				du = toward(du, normalized(elbow - shoulder_at, du), near);
+				df = toward(df, normalized(shoulder_at + dir * dist - elbow, df), near);
 			}
 		}
 		// The elbow's hinge: square to both parts when it's bent; held
@@ -1048,7 +1076,13 @@ void Rig::drive_arms(const Drive &d)
 			R2 = R2 * slerp(Quat{}, twist, 0.5f * hand);
 			R3 = slerp(R2, hand_world, hand);
 		}
-		pose_bone(up, R1, amount);
+		// The shoulder lifted on top of what it has (a breath's shrug), and
+		// the upper arm turned back by as much, so it points as wanted.
+		if (lift.w < 1) {
+			const Quat F = options_.facing;
+			turn_in_rest(sh, conj(F) * lift * F);
+		}
+		pose_bone(up, conj(lift) * R1, amount);
 		pose_bone(arm_bone_[side][1], conj(R1) * R2, amount);
 		if (hd >= 0)
 			pose_bone(hd, conj(R2) * R3, amount);

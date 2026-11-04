@@ -1759,9 +1759,42 @@ std::vector<bool> skin_materials(const Model &m, const std::string &names)
 		"shirt", "pant", "dress", "shoe", "boot", "glove", "hat",   "cap",   "jacket", "coat",     "skirt",
 		"sock",  "armor", "armour", "helmet", "glass", "mask", "beard", "mustache", "moustache", "suit",
 		"phone", "band", "wear"};
+	// Skin by these whole words too (a name split where it isn't a letter,
+	// and where a capital starts a word: "Ear_L", "earRight", "MAT ears"):
+	// inside another word they're something else ("ear" in "earring",
+	// "arm" in "armour", "hand" in "handle").
+	static const std::initializer_list<const char *> WORDS = {"ear",  "ears",  "neck", "nose", "lip",
+								  "lips", "hand",  "hands", "arm",  "arms",
+								  "leg",  "legs",  "foot", "feet", "torso"};
+	auto has_word = [](const std::string &raw) {
+		std::vector<std::string> words;
+		std::string w;
+		for (const char ch : raw) {
+			const unsigned char c = (unsigned char)ch;
+			if (!std::isalpha(c)) {
+				if (!w.empty())
+					words.push_back(lower(w));
+				w.clear();
+				continue;
+			}
+			if (std::isupper(c) && !w.empty() && std::islower((unsigned char)w.back())) {
+				words.push_back(lower(w));
+				w.clear();
+			}
+			w += ch;
+		}
+		if (!w.empty())
+			words.push_back(lower(w));
+		for (const std::string &word : words)
+			for (const char *s : WORDS)
+				if (word == s)
+					return true;
+		return false;
+	};
 	for (size_t i = 0; i < out.size(); i++) {
 		const std::string name = lower(m.materials[i].name);
-		out[i] = has(name, {"skin", "face", "body", "head"}) && !has(name, NOT);
+		out[i] = (has(name, {"skin", "face", "body", "head"}) || has_word(m.materials[i].name)) &&
+			 !has(name, NOT);
 	}
 	return out;
 }

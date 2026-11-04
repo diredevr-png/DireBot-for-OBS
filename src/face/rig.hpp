@@ -353,6 +353,10 @@ private:
 	struct ArmRest {
 		bool ok = false, hand = false;
 		V3 shoulder;
+		// Its shoulder bone (collarbone), when the arm hangs from it: where
+		// it turns from, and the axis that lifts the arm's root straight up.
+		bool lifts = false;
+		V3 root, lift_axis;
 		float upper_len = 0, fore_len = 0;
 		V3 upper, fore, hinge, fore_hinge;
 		V3 along, across;
