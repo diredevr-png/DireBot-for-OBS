@@ -45,8 +45,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "../link/crypto.hpp"
 #include "../obs/ui-call.hpp"
 #include "alive.hpp"
+#include "arms.hpp"
 #include "avatar2d.hpp"
 #include "avatar3d.hpp"
+#include "body.hpp"
 #include "effect-check.hpp"
 #include "look-pace.hpp"
 #include "model.hpp"
@@ -63,6 +65,9 @@ namespace {
 // How often it looks for your face at most, in seconds ("Easy on my PC":
 // half as often) - at each new picture the camera sends, up to that.
 constexpr float LOOK_EVERY = 1.0f / 30, EASY_LOOK_EVERY = 1.0f / 15;
+// ...and for your hands and arms (light mode: less often, and a lighter
+// hand model). The character eases between looks (ArmSolver::EASE).
+constexpr float ARMS_EVERY = 1.0f / 15, LIGHT_ARMS_EVERY = 1.0f / 10;
 // Not drawn for this long (not shown): what it saw last is too old.
 constexpr float STALE = 0.5f;
 constexpr float FIND_EVERY = 1.0f;
@@ -559,6 +564,190 @@ private:
 	Light light_;
 };
 
+// Your body and hands (body.hpp), on a thread of their own as your face
+// is. Its models load the first time "Follow my hands and arms" is on;
+// while it's off nothing goes to it. OBS hands it a copy of the picture
+// the face tracker gets, at most every ARMS_EVERY (light: LIGHT_ARMS_EVERY).
+class BodyWorker {
+public:
+	BodyWorker(std::string task, std::string lite) : task_(std::move(task)), lite_(std::move(lite))
+	{
+		thread_ = std::thread([this] { run(); });
+	}
+	~BodyWorker() { stop(); }
+
+	void stop()
+	{
+		{
+			std::lock_guard<std::mutex> l(lock_);
+			stop_ = true;
+		}
+		wake_.notify_all();
+		if (thread_.joinable())
+			thread_.join();
+	}
+
+	// On (its models load, once) or off; your hands looked for too or
+	// not; the light hand model; the smoothing (0 steadiest, 1 snappiest).
+	void set(bool on, bool hands, bool light, float smoothing)
+	{
+		{
+			std::lock_guard<std::mutex> l(lock_);
+			if (on_ && !on)
+				forget_ = true;
+			on_ = on;
+			hands_ = hands;
+			light_ = light;
+			smoothing_ = smoothing;
+		}
+		wake_.notify_one();
+	}
+
+	// A new picture (the graphics thread), copied: one not yet worked on
+	// is replaced.
+	void give(const std::vector<uint8_t> &rgba, int w, int h, uint64_t ns)
+	{
+		{
+			std::lock_guard<std::mutex> l(lock_);
+			if (!on_)
+				return;
+			in_.assign(rgba.begin(), rgba.end());
+			in_w_ = w;
+			in_h_ = h;
+			in_ns_ = ns;
+			have_ = true;
+		}
+		wake_.notify_one();
+	}
+
+	// A new camera: the next look starts afresh.
+	void forget()
+	{
+		{
+			std::lock_guard<std::mutex> l(lock_);
+			forget_ = true;
+		}
+		wake_.notify_one();
+	}
+
+	struct State {
+		Body body;
+		uint64_t ns = 0, looks = 0;
+		bool on = false, loading = false, ready = false;
+		std::string problem;
+		float rate = 0, ms = 0;
+	};
+	void state(State &out) const
+	{
+		std::lock_guard<std::mutex> l(lock_);
+		out.body = body_;
+		out.ns = body_ns_;
+		out.looks = looks_;
+		out.on = on_;
+		out.loading = loading_;
+		out.ready = ready_;
+		out.problem = problem_;
+		out.rate = rate_;
+		out.ms = ms_;
+	}
+
+private:
+	void run()
+	{
+		BodyTracker tracker;
+		bool loaded = false;
+		std::vector<uint8_t> rgba;
+		uint64_t window_start = os_gettime_ns();
+		int window_looks = 0;
+		double window_ms = 0;
+		for (;;) {
+			bool load = false, look = false, forget = false, hands, light;
+			float smoothing;
+			int w = 0, h = 0;
+			uint64_t ns = 0;
+			{
+				std::unique_lock<std::mutex> l(lock_);
+				wake_.wait(l, [this] { return stop_ || have_ || forget_ || (on_ && !tried_); });
+				if (stop_)
+					return;
+				if (on_ && !tried_) {
+					load = true;
+					tried_ = true;
+					loading_ = true;
+				}
+				if (have_) {
+					rgba.swap(in_);
+					w = in_w_;
+					h = in_h_;
+					ns = in_ns_;
+					have_ = false;
+					look = on_;
+				}
+				forget = forget_;
+				forget_ = false;
+				hands = hands_;
+				light = light_;
+				smoothing = smoothing_;
+			}
+			if (load) {
+				std::string problem;
+				loaded = tracker.load_files(task_, lite_, &problem);
+				if (!loaded)
+					obs_log(LOG_WARNING, "DireBot Face Avatar: %s", problem.c_str());
+				std::lock_guard<std::mutex> l(lock_);
+				ready_ = loaded;
+				problem_ = problem;
+				loading_ = false;
+			}
+			if (forget)
+				tracker.forget();
+			tracker.set_hands(hands);
+			tracker.set_light(light);
+			tracker.set_smoothing(smoothing);
+			look = look && loaded;
+			if (look) {
+				const Frame frame{rgba.data(), w, h, w * 4, false};
+				tracker.look(frame, (double)ns / 1e9);
+				window_looks++;
+				window_ms += tracker.body().ms;
+			}
+			const uint64_t now = os_gettime_ns();
+			std::lock_guard<std::mutex> l(lock_);
+			if (look) {
+				body_ = tracker.body();
+				body_ns_ = ns;
+				looks_++;
+			} else if (forget) {
+				body_ = Body();
+				looks_++;
+			}
+			if (now - window_start >= 2'000'000'000ULL) {
+				rate_ = window_looks * 1e9f / (float)(now - window_start);
+				ms_ = window_looks ? (float)(window_ms / window_looks) : 0;
+				window_start = now;
+				window_looks = 0;
+				window_ms = 0;
+			}
+		}
+	}
+
+	const std::string task_, lite_;
+	mutable std::mutex lock_;
+	std::condition_variable wake_;
+	std::thread thread_;
+	bool stop_ = false, have_ = false, forget_ = false, tried_ = false;
+	bool on_ = false, hands_ = true, light_ = false;
+	float smoothing_ = 0.5f;
+	std::vector<uint8_t> in_;
+	int in_w_ = 0, in_h_ = 0;
+	uint64_t in_ns_ = 0;
+	Body body_;
+	uint64_t body_ns_ = 0, looks_ = 0;
+	bool loading_ = false, ready_ = false;
+	std::string problem_;
+	float rate_ = 0, ms_ = 0;
+};
+
 // Where the face models are: data/face, next to the add-on.
 std::string models_path()
 {
@@ -568,8 +757,19 @@ std::string models_path()
 	return out;
 }
 
+// ...and the body models (Google's holistic one, and a lighter hand
+// model for light mode - without it, light mode uses the full one).
+std::string data_file(const char *name, bool needed)
+{
+	char *path = obs_module_file(name);
+	std::string out = path ? path : needed ? std::string("data/") + name : std::string();
+	bfree(path);
+	return out;
+}
+
 void save_rest_task(void *param);
 void save_profile_task(void *param);
+void save_arms_task(void *param);
 
 // Where its mouth comes from: your camera, your mic, or both - the mic
 // while you talk, the camera between (smiles, a mouth held open).
@@ -708,6 +908,26 @@ struct FaceAvatar {
 	float body_follow = 0.3f;
 
 	Worker worker;
+	// Your hands and arms (body.hpp, arms.hpp), on a 3D VRM character in
+	// its own spot: looked for on their own thread, followed on the
+	// graphics one. On and light mode from the settings.
+	BodyWorker body_worker;
+	std::atomic<bool> arms_on{false}, arms_light{false}, arms_hands{true};
+	std::atomic<bool> reset_arms{false};
+	ArmOptions arm_options; // under pictures_lock
+	// The solver: followed on the graphics thread, calibrated from
+	// DireBot's FaceArms on the UI one.
+	std::mutex arms_lock;
+	ArmSolver arms;
+	bool arms_pending = false; // a calibration made here, not in the settings yet
+	std::string arms_cal_seen; // "arms_calibration" as last read or saved
+	// Graphics thread: on, with a character to follow them on (else why
+	// not, for the page), the newest look's, and what it follows now.
+	bool arms_wanted = false;
+	const char *arms_why = "off";
+	uint64_t body_seen_looks = 0, body_given_ns = 0;
+	BodyWorker::State body_seen;
+	ArmsNow arms_now;
 	// Only on OBS's graphics thread (video_tick and video_render).
 	Shown shown;
 	// Your moves through the tuning, and what it does by itself on top
@@ -916,16 +1136,24 @@ struct FaceAvatar {
 	VoiceOut voice_state;
 	Calibration cal_state;
 	float mic_share_state = 0;
+	// ...and your hands and arms (under state_lock).
+	BodyWorker::State body_state;
+	ArmsSeen arms_seen_state;
+	bool arms_wanted_state = false;
+	const char *arms_why_state = "off";
 
 	explicit FaceAvatar(obs_source_t *source)
 		: self(source),
 		  weak_self(obs_source_get_weak_source(source)),
-		  worker(models_path(), [weak = weak_self](const std::string &text) {
-			  // Saved in the settings on OBS's UI thread (save_rest_task).
-			  obs_weak_source_addref(weak);
-			  auto *job = new std::pair<obs_weak_source_t *, std::string>(weak, text);
-			  obs_queue_task(OBS_TASK_UI, save_rest_task, job, false);
-		  })
+		  worker(models_path(),
+			 [weak = weak_self](const std::string &text) {
+				 // Saved in the settings on OBS's UI thread (save_rest_task).
+				 obs_weak_source_addref(weak);
+				 auto *job = new std::pair<obs_weak_source_t *, std::string>(weak, text);
+				 obs_queue_task(OBS_TASK_UI, save_rest_task, job, false);
+			 }),
+		  body_worker(data_file("face/holistic_landmarker.task", true),
+			      data_file("face/hand_landmark_lite.tflite", false))
 	{
 		skin_colour = lab_of(0.8f, 0.62f, 0.5f);
 		char *path = obs_module_file("effects/direbot-face.effect");
@@ -986,6 +1214,7 @@ struct FaceAvatar {
 		}
 		obs_weak_source_release(mic);
 		worker.stop();
+		body_worker.stop();
 		obs_enter_graphics();
 		avatar3d.reset();
 		for (Shot &shot : shots)
@@ -1037,6 +1266,8 @@ struct FaceAvatar {
 			obs_weak_source_release(camera);
 			camera = found ? obs_source_get_weak_source(found) : nullptr;
 			new_camera = true;
+			reset_arms = true;
+			body_worker.forget();
 		}
 		obs_source_release(old);
 		obs_source_release(found);
@@ -1166,6 +1397,14 @@ struct FaceAvatar {
 					rgba.assign(given.begin(), given.end());
 					worker.give(rgba, (int)stage_w, (int)stage_h, staged_ns);
 					gave = true;
+					// Your hands and arms, less often (a little early is
+					// fine: the camera's pictures come unevenly).
+					const float every = arms_light ? LIGHT_ARMS_EVERY : ARMS_EVERY;
+					if (arms_wanted &&
+					    (staged_ns < body_given_ns || staged_ns - body_given_ns >= (uint64_t)(every * 0.9e9f))) {
+						body_worker.give(given, (int)stage_w, (int)stage_h, staged_ns);
+						body_given_ns = staged_ns;
+					}
 				}
 				gs_stagesurface_unmap(stage);
 			}
@@ -1183,6 +1422,8 @@ struct FaceAvatar {
 			stage_w = sw;
 			stage_h = sh;
 			worker.forget();
+			body_worker.forget();
+			reset_arms = true;
 		}
 		// The oldest shot that isn't in use.
 		int slot = -1;
@@ -1855,6 +2096,9 @@ struct FaceAvatar {
 			d.body_follow = body_follow;
 			d.body_yaw = a.body_yaw;
 			d.body_roll = a.body_roll;
+			// Your hands and arms (step_arms).
+			d.follow_arms = arms_wanted;
+			d.arms = arms_now;
 			v.w = w;
 			v.h = h;
 		} else {
@@ -2640,6 +2884,71 @@ struct FaceAvatar {
 			sprite(hand_pic, r.hand.x, r.hand.y, r.hand.size, r.hand.angle, r.hand.opacity, 1, 1, true);
 	}
 
+	// Your hands and arms, followed on a 3D VRM character in its own spot
+	// (not worn on your head): the newest look, then this frame's ease.
+	void step_arms(float dt)
+	{
+		const bool wear = worn;
+		const bool vrm = model_now && model_now->is_vrm();
+		arms_wanted = arms_on && !wear && rig && rig->follows_arms();
+		arms_why = arms_wanted		 ? ""
+			   : !arms_on		 ? "off"
+			   : wear		 ? "worn"
+			   : !model_now || !rig ? "no_3d"
+			   : !vrm		 ? "not_vrm"
+						 : "no_arms";
+		ArmOptions ao;
+		{
+			std::lock_guard<std::mutex> l(pictures_lock);
+			ao = arm_options;
+		}
+		ao.mirror = mirror;
+		body_worker.state(body_seen);
+		const bool fresh = body_seen.looks != body_seen_looks;
+		body_seen_looks = body_seen.looks;
+		std::string finished;
+		ArmsSeen seen_now;
+		{
+			std::lock_guard<std::mutex> l(arms_lock);
+			arms.set_options(ao);
+			const bool was_calibrating = arms.calibrating();
+			if (reset_arms.exchange(false) || !arms_wanted) {
+				arms.reset();
+				if (!arms_wanted)
+					arms.stop_calibration();
+			} else if (fresh) {
+				arms.look(body_seen.body);
+			}
+			arms.step(dt);
+			if (was_calibrating && !arms.calibrating() && arms.calibration_result() == "ok") {
+				finished = arms.save_calibration();
+				arms_pending = true;
+			}
+			arms_now = arms.now();
+			seen_now = arms.seen();
+		}
+		if (!finished.empty()) {
+			// Saved in the settings on OBS's UI thread (save_arms_task).
+			obs_weak_source_addref(weak_self);
+			auto *job = new std::pair<obs_weak_source_t *, std::string>(weak_self, finished);
+			obs_queue_task(OBS_TASK_UI, save_arms_task, job, false);
+		}
+		std::lock_guard<std::mutex> l(state_lock);
+		body_state = body_seen;
+		arms_seen_state = seen_now;
+		arms_wanted_state = arms_wanted;
+		arms_why_state = arms_why;
+	}
+
+	// A calibration is in the settings now (save_arms_task, on the UI
+	// thread), or one was forgotten ("").
+	void arms_saved(const std::string &text)
+	{
+		std::lock_guard<std::mutex> l(arms_lock);
+		arms_cal_seen = text;
+		arms_pending = false;
+	}
+
 	void tick(float dt)
 	{
 		drawn = false;
@@ -2683,6 +2992,7 @@ struct FaceAvatar {
 			react_now = react.step(dt, react_view);
 		}
 		react_hits += react_now.hits;
+		step_arms(dt);
 		// The page's live bars: what the camera reads, and what it shows.
 		clock += dt;
 		float reading[TUNE_GROUPS] = {}, shows[TUNE_GROUPS] = {};
@@ -3166,6 +3476,39 @@ struct FaceAvatar {
 		worker.set_smoothing(smoothing);
 		lead = 1 - smoothing;
 
+		// Your hands and arms: on (its body models load the first time),
+		// your hands too or not, light mode, how far it reaches and holds
+		// its arms out, how long a lost hand stays, its own smoothing; and
+		// its calibration, unless one just made isn't saved yet.
+		ArmOptions arm_o;
+		const bool arms_on_now = obs_data_get_bool(settings, "follow_arms");
+		arm_o.fingers = obs_data_get_bool(settings, "arms_hands");
+		arm_o.reach = clampf((float)obs_data_get_int(settings, "arms_reach") / 100.0f, 0.5f, 2);
+		arm_o.spread = clampf((float)obs_data_get_int(settings, "arms_spread"), 0, 45);
+		arm_o.hold = clampf((float)obs_data_get_int(settings, "arms_hold") / 1000.0f, 0, 3);
+		{
+			std::lock_guard<std::mutex> l(pictures_lock);
+			arm_options = arm_o;
+		}
+		arms_on = arms_on_now;
+		arms_hands = arm_o.fingers;
+		arms_light = obs_data_get_bool(settings, "arms_light");
+		body_worker.set(arms_on_now, arm_o.fingers, arms_light,
+				clampf((float)obs_data_get_int(settings, "arms_smoothing") / 100.0f, 0, 1));
+		{
+			const char *cal = obs_data_get_string(settings, "arms_calibration");
+			const std::string cal_now = cal ? cal : "";
+			std::lock_guard<std::mutex> l(arms_lock);
+			if (!arms_pending && !arms.calibrating() && cal_now != arms_cal_seen) {
+				arms_cal_seen = cal_now;
+				if (!arms.load_calibration(cal_now)) {
+					arms.clear_calibration();
+					obs_log(LOG_WARNING,
+						"DireBot Face Avatar: its hands' calibration couldn't be read; calibrate again in DireBot.");
+				}
+			}
+		}
+
 		// Each of your eyes and your mouth is cut the shape of the
 		// character's spot it goes into, so it's never stretched (a 3D
 		// character's, once it's loaded: pick_model).
@@ -3194,6 +3537,54 @@ struct FaceAvatar {
 			rest_seen = text;
 		}
 		worker.rest_saved();
+	}
+
+	// DireBot's FaceArms (OBS's UI thread): calibrate (hold a hand up by
+	// your ear, open, palm to the camera), stop, or forget it.
+	json arms_to(const std::string &what)
+	{
+		auto no = [](const std::string &words) {
+			return json{{"ok", false}, {"error", words}};
+		};
+		bool can, showing, ready, loading;
+		{
+			std::lock_guard<std::mutex> l(state_lock);
+			can = arms_wanted_state;
+			showing = showing_now;
+			ready = body_state.ready;
+			loading = body_state.loading;
+		}
+		if (what == "stop") {
+			std::lock_guard<std::mutex> l(arms_lock);
+			arms.stop_calibration();
+		} else if (what == "forget") {
+			{
+				std::lock_guard<std::mutex> l(arms_lock);
+				arms.stop_calibration();
+				arms.clear_calibration();
+			}
+			obs_data_t *settings = obs_source_get_settings(self);
+			obs_data_set_string(settings, "arms_calibration", "");
+			obs_data_release(settings);
+			arms_saved("");
+		} else if (what == "calibrate") {
+			if (!arms_on)
+				return no("Turn on \"Follow my hands and arms\" first.");
+			if (!arms_hands)
+				return no("Turn on \"Follow my hands and fingers too\" first - it learns your open hand.");
+			if (!can)
+				return no("Hands and arms show on a 3D VRM character in its own spot - not worn on your head.");
+			if (!ready)
+				return no(loading ? "The body models are still loading - try again in a moment."
+						  : "The body models couldn't be loaded - reinstall DireBot for OBS.");
+			if (!showing)
+				return no("Show the face avatar in OBS first - it only looks for you while it's shown.");
+			std::lock_guard<std::mutex> l(arms_lock);
+			arms.start_calibration();
+		} else {
+			return no("DireBot for OBS doesn't know that.");
+		}
+		return {{"ok", true}};
 	}
 
 	// DireBot's FaceReact (OBS's UI thread): a face for a while, a move,
@@ -3391,6 +3782,14 @@ struct FaceAvatar {
 						      {"x", named.second.x},
 						      {"y", named.second.y}});
 			view_index = look3d.view;
+		}
+		bool arms_calibrating, arms_calibrated;
+		std::string arms_result;
+		{
+			std::lock_guard<std::mutex> l(arms_lock);
+			arms_calibrating = arms.calibrating();
+			arms_calibrated = arms.calibrated();
+			arms_result = arms.calibration_result();
 		}
 		std::lock_guard<std::mutex> l(state_lock);
 		const Face &face = state_now.face;
@@ -3655,7 +4054,95 @@ struct FaceAvatar {
 					{{"x", r((p.x + 0.5f) / face.w, 1e4f)}, {"y", r((p.y + 0.5f) / face.h, 1e4f)}});
 			answer["points"] = points;
 		}
+		answer["hands_and_arms"] =
+			arms_state(with_points, arms_calibrating, arms_calibrated, arms_result);
 		return answer;
+	}
+
+	// For FaceGetState (under state_lock): your hands and arms - on, and
+	// whether this character can follow them (else why not); the body
+	// tracker; what it follows now (your own left and right); its
+	// calibration; for "Check my camera", what of you the camera sees;
+	// and, asked for, your body's and hands' points (shares of the picture).
+	json arms_state(bool with_points, bool calibrating, bool calibrated, const std::string &result) const
+	{
+		auto r = [](float v, float steps) {
+			return std::round(v * steps) / steps;
+		};
+		const BodyWorker::State &bs = body_state;
+		const Body &b = bs.body;
+		const bool mirrored = mirror;
+		// Its sides -> yours: mirrored, its left arm is your right.
+		auto yours = [&](const bool its[2], int you) {
+			return its[mirrored ? 1 - you : you];
+		};
+		json a = {{"on", arms_on.load()},
+			  {"hands", arms_hands.load()},
+			  {"light", arms_light.load()},
+			  {"can", arms_wanted_state},
+			  {"why_not", arms_why_state},
+			  {"loading", bs.loading},
+			  {"ready", bs.ready},
+			  {"looks_per_second", r(bs.rate, 10)},
+			  {"ms", r(bs.ms, 10)},
+			  {"found", b.found},
+			  {"following",
+			   {{"left_arm", yours(arms_seen_state.arm, 0)},
+			    {"right_arm", yours(arms_seen_state.arm, 1)},
+			    {"left_hand", yours(arms_seen_state.hand, 0)},
+			    {"right_hand", yours(arms_seen_state.hand, 1)}}},
+			  {"calibrating", calibrating},
+			  {"calibrated", calibrated},
+			  {"calibration", result}};
+		if (!bs.problem.empty())
+			a["problem"] = bs.problem;
+		// What of you is in the picture: a point counts if the body model
+		// thinks it's in sight and it's inside the picture.
+		json framing = {{"found", b.found}};
+		if (b.found && b.w > 0 && b.h > 0) {
+			auto in_sight = [&b](int i) {
+				const Point &p = b.points[i];
+				return b.seen[i] >= 0.5f && p.x >= 0 && p.y >= 0 && p.x < b.w && p.y < b.h;
+			};
+			auto both = [&](int left, int right) {
+				return (int)in_sight(left) + (int)in_sight(right);
+			};
+			framing["head"] = in_sight(BODY_NOSE);
+			framing["shoulders"] = both(BODY_LEFT_SHOULDER, BODY_RIGHT_SHOULDER);
+			framing["elbows"] = both(BODY_LEFT_ELBOW, BODY_RIGHT_ELBOW);
+			framing["wrists"] = both(BODY_LEFT_WRIST, BODY_RIGHT_WRIST);
+			framing["hips"] = both(BODY_LEFT_HIP, BODY_RIGHT_HIP);
+			framing["hands"] = (int)b.hands[0].found + (int)b.hands[1].found;
+			// Your shoulders' width and their middle's height (shares of
+			// the picture): too close, too far, too low.
+			const Point &sl = b.points[BODY_LEFT_SHOULDER], &sr = b.points[BODY_RIGHT_SHOULDER];
+			framing["shoulder_width"] = r(std::fabs(sl.x - sr.x) / b.w, 1e3f);
+			framing["shoulder_height"] = r((sl.y + sr.y) * 0.5f / b.h, 1e3f);
+		}
+		a["framing"] = framing;
+		if (with_points && b.found && b.w > 0 && b.h > 0) {
+			// Your top half (MediaPipe's first 25 points), then each hand.
+			auto at = [&](const Point &p) {
+				return json{{"x", r((p.x + 0.5f) / b.w, 1e4f)}, {"y", r((p.y + 0.5f) / b.h, 1e4f)}};
+			};
+			json body_points = json::array();
+			for (int i = 0; i <= BODY_RIGHT_HIP; i++) {
+				json p = at(b.points[i]);
+				p["seen"] = r(b.seen[i], 100);
+				body_points.push_back(p);
+			}
+			a["points"] = body_points;
+			const char *names[2] = {"left_hand_points", "right_hand_points"};
+			for (int you = 0; you < 2; you++) {
+				if (!b.hands[you].found)
+					continue;
+				json pts = json::array();
+				for (const Point &p : b.hands[you].points)
+					pts.push_back(at(p));
+				a[names[you]] = pts;
+			}
+		}
+		return a;
 	}
 
 	static void on_rename(void *data, calldata_t *cd)
@@ -3726,6 +4213,22 @@ void save_profile_task(void *param)
 	obs_data_release(settings);
 	if (auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src)))
 		f->profile_saved(job->second);
+	obs_source_release(src);
+}
+
+void save_arms_task(void *param)
+{
+	std::unique_ptr<std::pair<obs_weak_source_t *, std::string>> job(
+		static_cast<std::pair<obs_weak_source_t *, std::string> *>(param));
+	obs_source_t *src = obs_weak_source_get_source(job->first);
+	obs_weak_source_release(job->first);
+	if (!src)
+		return;
+	obs_data_t *settings = obs_source_get_settings(src);
+	obs_data_set_string(settings, "arms_calibration", job->second.c_str());
+	obs_data_release(settings);
+	if (auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src)))
+		f->arms_saved(job->second);
 	obs_source_release(src);
 }
 
@@ -3849,6 +4352,16 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "mic_full", -30);
 	obs_data_set_default_int(settings, "mic_amount", 100);
 	obs_data_set_default_string(settings, "mic_profile", "");
+	// Your hands and arms: off until you turn them on (they use more of
+	// your PC), and its calibration (ArmSolver::save_calibration).
+	obs_data_set_default_bool(settings, "follow_arms", false);
+	obs_data_set_default_bool(settings, "arms_hands", true);
+	obs_data_set_default_bool(settings, "arms_light", false);
+	obs_data_set_default_int(settings, "arms_reach", 100);
+	obs_data_set_default_int(settings, "arms_spread", 0);
+	obs_data_set_default_int(settings, "arms_hold", 500);
+	obs_data_set_default_int(settings, "arms_smoothing", 50);
+	obs_data_set_default_string(settings, "arms_calibration", "");
 }
 
 bool add_camera(void *param, obs_source_t *source)
@@ -4046,6 +4559,22 @@ obs_properties_t *get_properties(void *data)
 	obs_properties_add_bool(alive, "auto_blink", text("FaceAvatar.AutoBlink"));
 	obs_properties_add_group(props, "alive", text("FaceAvatar.Alive"), OBS_GROUP_NORMAL, alive);
 
+	// Your hands and arms (3D VRM characters).
+	obs_properties_t *arms = obs_properties_create();
+	obs_properties_add_text(arms, "arms_about", text("FaceAvatar.ArmsAbout"), OBS_TEXT_INFO);
+	obs_properties_add_bool(arms, "follow_arms", text("FaceAvatar.FollowArms"));
+	obs_properties_add_bool(arms, "arms_hands", text("FaceAvatar.ArmsHands"));
+	obs_properties_add_bool(arms, "arms_light", text("FaceAvatar.ArmsLight"));
+	p = obs_properties_add_int_slider(arms, "arms_reach", text("FaceAvatar.ArmsReach"), 50, 200, 5);
+	obs_property_int_set_suffix(p, "%");
+	p = obs_properties_add_int_slider(arms, "arms_spread", text("FaceAvatar.ArmsSpread"), 0, 45, 1);
+	obs_property_int_set_suffix(p, "\xC2\xB0");
+	p = obs_properties_add_int_slider(arms, "arms_hold", text("FaceAvatar.ArmsHold"), 0, 3000, 100);
+	obs_property_int_set_suffix(p, " ms");
+	p = obs_properties_add_int_slider(arms, "arms_smoothing", text("FaceAvatar.ArmsSmoothing"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_group(props, "hands_and_arms", text("FaceAvatar.HandsAndArms"), OBS_GROUP_NORMAL, arms);
+
 	// The mouth from your mic.
 	obs_properties_t *heard = obs_properties_create();
 	obs_properties_add_text(heard, "mic_about", text("FaceAvatar.MicAbout"), OBS_TEXT_INFO);
@@ -4219,6 +4748,20 @@ json mic_calibrate(const json &data)
 	return answer;
 }
 
+// "Follow my hands and arms": calibrate, stop, or forget it.
+json arms_request(const json &data)
+{
+	obs_source_t *src = find_avatar(data);
+	if (!src)
+		return fail("That face avatar isn't in OBS any more.");
+	auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src));
+	const std::string what = data.contains("do") && data["do"].is_string() ? data["do"].get<std::string>()
+										: "calibrate";
+	json answer = f ? f->arms_to(what) : fail("It isn't ready yet.");
+	obs_source_release(src);
+	return answer;
+}
+
 json react_on_cue(const json &data)
 {
 	obs_source_t *src = find_avatar(data);
@@ -4247,8 +4790,8 @@ json model_front(const json &data)
 
 const std::vector<std::string> &requests()
 {
-	static const std::vector<std::string> list = {"FaceSet", "FaceGetState", "FaceModelFront", "FaceMicCalibrate",
-						      "FaceReact"};
+	static const std::vector<std::string> list = {"FaceSet",	   "FaceGetState", "FaceModelFront",
+						      "FaceMicCalibrate", "FaceReact",	   "FaceArms"};
 	return list;
 }
 
@@ -4271,6 +4814,8 @@ json request(const std::string &type, const json &data)
 			return mic_calibrate(data);
 		if (type == "FaceReact")
 			return react_on_cue(data);
+		if (type == "FaceArms")
+			return arms_request(data);
 		return fail("DireBot for OBS doesn't know that request.");
 	});
 }

@@ -25,3 +25,34 @@ sha256 64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff
 
 DireBot for OBS runs the models with its own code (src/face/nn); no
 MediaPipe or TensorFlow code is part of it.
+
+---
+
+holistic_landmarker.task - Google MediaPipe Holistic Landmarker
+Copyright The MediaPipe Authors (Google LLC)
+Licensed under the Apache License, Version 2.0 (LICENSE in this folder).
+
+It holds Google's body and hand models (DireBot for OBS uses these four
+of them, for its hands and arms; the face ones in it go unused):
+  pose_detector.tflite             - finds a body (BlazePose)
+  pose_landmarks_detector.tflite   - BlazePose GHUM: 33 points on a body
+  hand_roi_refinement.tflite       - where a hand is, from the body's points
+  hand_landmarks_detector.tflite   - 21 points on a hand
+Model cards: https://ai.google.dev/edge/mediapipe/solutions/vision/holistic_landmarker
+
+The file is Google's, unchanged, as downloaded from
+https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/1/holistic_landmarker.task
+sha256 e2dab61191e2dcd0a15f943d8e3ed1dce13c82dfa597b9dd39f562975a50c3f8
+
+---
+
+hand_landmark_lite.tflite - Google MediaPipe Hands, the lighter hand model
+Copyright The MediaPipe Authors (Google LLC)
+Licensed under the Apache License, Version 2.0 (LICENSE in this folder).
+
+21 points on a hand, quicker than the full model (for light mode).
+Model card: https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker
+
+The file is Google's, unchanged, as downloaded from
+https://storage.googleapis.com/mediapipe-assets/hand_landmark_lite.tflite
+sha256 d7fde8ac11f8ce03f8663775bfc323f4fc9f2a38062b4f4efa142874ef5b2a48

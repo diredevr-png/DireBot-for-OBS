@@ -83,6 +83,9 @@ target_sources(
 # 0.4.0: the face avatar - your real eyes and mouth on a character, your
 # face followed by Google's MediaPipe face models (data/face) on our own
 # engine (src/face/nn).
+# 0.8.0: its arms, hands and fingers follow yours - Google's MediaPipe
+# body and hand models (data/face) on the same engine (body.cpp), the
+# arm and finger maths after Kalidokit's (arms.cpp).
 target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE
@@ -98,6 +101,8 @@ target_sources(
     src/face/pictures.cpp
     src/face/avatar3d.cpp
     src/face/face-avatar.cpp
+    src/face/body.cpp
+    src/face/arms.cpp
     src/face/nn/net.cpp
     src/face/nn/kernels.cpp
     src/face/nn/kernels-sse2.cpp

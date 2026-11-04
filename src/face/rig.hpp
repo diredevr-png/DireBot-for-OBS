@@ -59,6 +59,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <string>
 #include <vector>
 
+#include "arms.hpp"
 #include "math3d.hpp"
 #include "model.hpp"
 #include "react.hpp"
@@ -153,6 +154,11 @@ struct Drive {
 	float squint = 0;
 	std::vector<MoveNow> body;
 	V3 knock;
+	// Your arms, hands and fingers (arms.hpp), if followed: a VRM's arms
+	// as yours (a move on cue takes over from them as much as it shows),
+	// its hand by its head where yours is by yours.
+	bool follow_arms = false;
+	ArmsNow arms;
 };
 
 class Rig {
@@ -218,6 +224,8 @@ public:
 	// Whether it has arms to wave and cheer with, and plays VRM animation
 	// files (a VRM, with hips).
 	bool has_arms() const { return arm_bone_[0][0] >= 0 || arm_bone_[1][0] >= 0; }
+	// Its arms can follow yours (Drive::follow_arms): a VRM with arms.
+	bool follows_arms() const { return arm_rest_[0].ok || arm_rest_[1].ok; }
 	bool plays_motions() const { return model_->is_vrm() && model_->bone("hips") >= 0; }
 	// Its head at rest, the facing model's way (x its right as the picture
 	// shows it, y up, z out of its face): the box round what its head
@@ -266,7 +274,9 @@ private:
 	void world_from(int node);
 	void turn_in_rest(int node, Quat by);
 	void find_fingers();
-	void curl_fingers();
+	void curl_fingers(const Drive &d);
+	void find_arms();
+	void drive_arms(const Drive &d);
 	void drive_expressions(const Drive &d);
 	void drive_head(const Drive &d);
 	void drive_eyes(const Drive &d);
@@ -300,10 +310,13 @@ private:
 	std::vector<Arm> arms_;
 	// A finger joint: bent about `axis` (the model at rest) by `most` at
 	// a full curl, less what the file already bends it (`has`; radians).
+	// Which it is: its side (0 its left), digit (0 the thumb, then first
+	// to little) and joint (0 its root).
 	struct Finger {
 		int node = -1;
 		V3 axis;
 		float most = 0, has = 0;
+		int side = 0, digit = 0, joint = 0;
 	};
 	std::vector<Finger> fingers_;
 	// Its spine, chest and upper chest (as it has them, lowest first) and
@@ -326,6 +339,23 @@ private:
 	// The VRM humanoid's bones by VRM 1.0's names (a 0.x's thumbs too).
 	std::map<std::string, int> bones1_;
 	int arm_bone_[2][3] = {{-1, -1, -1}, {-1, -1, -1}}; // each side's upper arm, lower arm, hand
+	// Each arm at rest, the facing model's way, for following yours: its
+	// shoulder (where the upper arm turns), its parts' lengths and ways,
+	// its elbow's hinge (bending its forearm forwards) and its hand's
+	// ways (wrist to middle knuckle, little knuckle to first).
+	struct ArmRest {
+		bool ok = false, hand = false;
+		V3 shoulder;
+		float upper_len = 0, fore_len = 0;
+		V3 upper, fore, hinge, fore_hinge;
+		V3 along, across;
+	};
+	ArmRest arm_rest_[2];
+	// Its head's middle and width (ear to ear, about), the facing model's
+	// way, for a hand by its head (`head_known_`: it has them).
+	V3 head_mid_;
+	float head_width_ = 0;
+	bool head_known_ = false;
 	// A VRM animation's expressions this frame (name -> strength).
 	std::map<std::string, float> move_faces_;
 	HeadBox head_box_;

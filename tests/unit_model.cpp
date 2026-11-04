@@ -2624,13 +2624,13 @@ static void test_light()
 // arms out in a T and hands with fingers held straight out, palms down
 // (VRM 1.0's bones). `bent`: its left first finger's knuckle already
 // bent this far towards its palm (degrees), as some files have them.
-struct Body {
+struct Figure {
 	Person p;
 	int spine, chest, hand[2], index[2][3], middle[2][3], thumb[2][3];
 };
-static Body make_body(float bent = 0)
+static Figure make_body(float bent = 0)
 {
-	Body o;
+	Figure o;
 	o.p = make_person(false);
 	Person &p = o.p;
 	Builder &b = p.b;
@@ -2858,7 +2858,7 @@ static V3 way_of(const Rig &rig, int from, int to)
 static void test_moves_on_a_vrm()
 {
 	const float PI = 3.14159265f;
-	Body body = make_body();
+	Figure body = make_body();
 	Builder &b = body.p.b;
 	// Feet on the ground (y 0), so its hips are 1 m up as the file's are.
 	{
@@ -2957,7 +2957,7 @@ static void test_moves_on_a_vrm()
 
 static void test_wave_and_cheer()
 {
-	Body body = make_body();
+	Figure body = make_body();
 	auto m = std::make_shared<Model>();
 	CHECK(load(body.p.b.glb(), *m));
 	RigOptions o;
@@ -3192,9 +3192,153 @@ static void test_knocked_and_head()
 	CHECK(rc.faces().empty());
 }
 
+// Your arms (arms.hpp) on a VRM: each part pointing where yours does, the
+// elbow bending your way, the hand turned as yours (its forearm taking
+// half the twist), each finger joint bent as yours, by its head where your
+// hand is by yours - and as much as it follows you, the rest its own.
+static void test_arms_follow()
+{
+	const float PI = 3.14159265f;
+	Figure body = make_body();
+	auto m = std::make_shared<Model>();
+	CHECK(load(body.p.b.glb(), *m));
+	RigOptions o;
+	o.springs = false;
+	Rig rig(m, o);
+	CHECK(rig.follows_arms());
+	auto at = [&](const Rig &r, int node) { return move_of(r.world()[node]); };
+	auto way = [&](const Rig &r, int from, int to) { return normalized(at(r, to) - at(r, from)); };
+	const int lower[2] = {m->bone("leftLowerArm"), m->bone("rightLowerArm")};
+	const int upper[2] = {m->bone("leftUpperArm"), m->bone("rightUpperArm")};
+	// Not following: its arms down by its sides as ever.
+	rig.pose(still());
+	const V3 own_upper = way(rig, upper[0], lower[0]);
+	Drive d = still();
+	d.follow_arms = true;
+	rig.pose(d);
+	CHECK(near3(way(rig, upper[0], lower[0]), own_upper, 1e-5f));
+
+	// Its left arm straight down, its right out in front, bent up at the
+	// elbow (its hand at its shoulder's height).
+	ArmTarget &L = d.arms.side[0], &R = d.arms.side[1];
+	L.weight = R.weight = 1;
+	L.upper = L.fore = {0, -1, 0};
+	R.upper = {0, 0, 1};
+	R.fore = {0, 1, 0};
+	R.hinge = normalized(cross(R.upper, R.fore));
+	R.hinge_sure = 1;
+	rig.pose(d);
+	CHECK(near3(way(rig, upper[0], lower[0]), {0, -1, 0}, 1e-4f));
+	CHECK(near3(way(rig, lower[0], body.hand[0]), {0, -1, 0}, 1e-4f));
+	CHECK(near3(way(rig, upper[1], lower[1]), {0, 0, 1}, 1e-4f));
+	CHECK(near3(way(rig, lower[1], body.hand[1]), {0, 1, 0}, 1e-4f));
+	// Its bones keep their lengths.
+	CHECK(near(length(at(rig, lower[1]) - at(rig, upper[1])), 0.25, 1e-4));
+	CHECK(near(length(at(rig, body.hand[1]) - at(rig, lower[1])), 0.25, 1e-4));
+
+	// Half followed: half way between its own and yours.
+	L.weight = 0.5f;
+	rig.pose(d);
+	const V3 half = way(rig, upper[0], lower[0]);
+	const float own_angle = std::acos(std::min(1.0f, dot(own_upper, V3{0, -1, 0})));
+	CHECK(near(std::acos(std::min(1.0f, dot(half, V3{0, -1, 0}))), own_angle / 2, 0.02));
+	L.weight = 1;
+
+	// Its hand as yours: hanging down, fingers down, its first finger to
+	// its front - and its palm turned to its body.
+	L.hand = 1;
+	L.along = {0, -1, 0};
+	L.across = {0, 0, 1};
+	rig.pose(d);
+	const int knuckle = body.middle[0][0], first = body.index[0][0];
+	const int little = m->bone("leftLittleProximal");
+	CHECK(near3(way(rig, body.hand[0], knuckle), {0, -1, 0}, 1e-3f));
+	CHECK(near3(way(rig, little, first), {0, 0, 1}, 1e-3f));
+	// Turned palm forward (a quarter twist about the forearm): its hand
+	// takes it all, its forearm half.
+	L.across = {-1, 0, 0};
+	rig.pose(d);
+	CHECK(near3(way(rig, body.hand[0], knuckle), {0, -1, 0}, 1e-3f));
+	CHECK(near3(way(rig, little, first), {-1, 0, 0}, 1e-3f));
+	{
+		// The forearm's own turn about its length, against the upper arm's.
+		const V3 fa = normalized(direction(rig.world()[lower[0]], {0, 0, 1}));
+		const V3 ua = normalized(direction(rig.world()[upper[0]], {0, 0, 1}));
+		const float twist = std::acos(std::min(1.0f, std::max(-1.0f, dot(fa, ua)))) * 180 / PI;
+		CHECK(near(twist, 45, 1));
+	}
+	// A wrist bent further than a wrist bends: no more than 80 degrees.
+	L.across = {0, 0, 1};
+	L.along = {0, 1, 0};
+	rig.pose(d);
+	{
+		const float bent = std::acos(std::min(1.0f, std::max(-1.0f, dot(way(rig, body.hand[0], knuckle),
+										      way(rig, lower[0], body.hand[0]))))) *
+				   180 / PI;
+		CHECK(near(bent, 80, 1));
+	}
+	L.along = {0, -1, 0};
+
+	// Each finger joint bent as yours (with your hand followed).
+	L.bend[1][0] = 40 * PI / 180;
+	L.bend[1][1] = 70 * PI / 180;
+	rig.pose(d);
+	bool palm = false;
+	CHECK(near(bend_of(rig, body.hand[0], body.index[0][0], 0, &palm), 40, 0.1) && palm);
+	CHECK(near(bend_of(rig, body.index[0][0], body.index[0][1], 0, &palm), 70, 0.1) && palm);
+	// ...not while its fingers don't follow yours: relaxed, its own way.
+	d.arms.fingers = false;
+	rig.pose(d);
+	CHECK(near(bend_of(rig, body.hand[0], body.index[0][0], 0), 20, 0.05));
+	d.arms.fingers = true;
+	// ...and half as your hand fades: half way to its own.
+	L.hand = 0.5f;
+	rig.pose(d);
+	CHECK(near(bend_of(rig, body.hand[0], body.index[0][0], 0), 30, 0.1));
+	L.hand = 1;
+
+	// By its head: its wrist where yours is by yours, in head widths from
+	// the middle of its head.
+	const Rig::HeadBox &hb = rig.head_box();
+	CHECK(hb.found);
+	const V3 mid = (hb.low + hb.high) * 0.5f;
+	const float width = (hb.high.x - hb.low.x) * 0.85f;
+	L.near = 1;
+	L.by_head = {0.9f, -0.4f, 0.4f};
+	rig.pose(d);
+	const V3 wanted = mid + L.by_head * width;
+	const V3 shoulder = at(rig, upper[0]);
+	if (length(wanted - shoulder) < 0.49f)
+		CHECK(near3(at(rig, body.hand[0]), wanted, 2e-3f));
+	CHECK(near(length(at(rig, lower[0]) - shoulder), 0.25, 1e-4));
+	L.near = 0;
+
+	// A move on cue takes over its arms.
+	d.body.clear();
+	MoveNow wave;
+	wave.builtin = BuiltIn::Wave;
+	wave.time = 0.5f;
+	wave.amount = 1;
+	d.body.push_back(wave);
+	rig.pose(d);
+	CHECK(!near3(way(rig, upper[0], lower[0]), {0, -1, 0}, 0.05f) ||
+	      !near3(way(rig, upper[1], lower[1]), {0, 0, 1}, 0.05f));
+	d.body.clear();
+
+	// Not a VRM: its arms aren't followed (they aren't known for sure).
+	Figure plain = make_body();
+	plain.p.b.doc["extensions"].erase("VRMC_vrm");
+	plain.p.b.doc["extensionsUsed"] = json::array();
+	auto mg = std::make_shared<Model>();
+	if (load(plain.p.b.glb(), *mg)) {
+		Rig gr(mg, o);
+		CHECK(!gr.follows_arms());
+	}
+}
+
 static void test_fingers_and_body()
 {
-	Body body = make_body();
+	Figure body = make_body();
 	auto m = std::make_shared<Model>();
 	CHECK(load(body.p.b.glb(), *m));
 	RigOptions o;
@@ -3251,7 +3395,7 @@ static void test_fingers_and_body()
 		CHECK(tip_to_index(rig) < tip_to_index(flat) - 0.002f && tip_to_index(curled) < tip_to_index(rig));
 		// Its bones rolled a quarter turn about their own way (as a VRM's
 		// thumb is, its nail out): the same bend, the same way.
-		Body rolled = make_body();
+		Figure rolled = make_body();
 		const V3 along = normalized(V3{side ? -1.0f : 1.0f, 0, 1});
 		const Quat roll = axis_angle(along, 3.14159265f / 2);
 		rolled.p.b.doc["nodes"][rolled.thumb[side][0]]["rotation"] = {roll.x, roll.y, roll.z, roll.w};
@@ -3269,7 +3413,7 @@ static void test_fingers_and_body()
 
 	// A finger its file already bends 30 degrees: relaxed leaves it be;
 	// curled, it's bent only the rest of the way.
-	Body pre = make_body(30);
+	Figure pre = make_body(30);
 	auto mp = std::make_shared<Model>();
 	CHECK(load(pre.p.b.glb(), *mp));
 	o.fingers = 0.5f;
@@ -3283,7 +3427,7 @@ static void test_fingers_and_body()
 
 	// A finger its own animation moves is left to it.
 	{
-		Body an = make_body();
+		Figure an = make_body();
 		Builder &b = an.p.b;
 		b.doc["animations"] = json::array(
 			{{{"name", "Point"},
@@ -3403,6 +3547,7 @@ int main()
 	test_alive();
 	test_light();
 	test_fingers_and_body();
+	test_arms_follow();
 	test_motion_reading();
 	test_moves_on_a_vrm();
 	test_wave_and_cheer();

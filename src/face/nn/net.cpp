@@ -23,6 +23,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <cmath>
 #include <map>
 #include <cstring>
+#include <functional>
 #include <limits>
 
 #include "kernels.hpp"
@@ -155,13 +156,16 @@ enum TfOp {
 	TF_CONCATENATION = 2,
 	TF_CONV_2D = 3,
 	TF_DEPTHWISE_CONV_2D = 4,
+	TF_DEPTH_TO_SPACE = 5,
 	TF_DEQUANTIZE = 6,
+	TF_FULLY_CONNECTED = 9,
 	TF_LOGISTIC = 14,
 	TF_MAX_POOL_2D = 17,
 	TF_MUL = 18,
 	TF_RELU = 19,
 	TF_RELU6 = 21,
 	TF_RESHAPE = 22,
+	TF_RESIZE_BILINEAR = 23,
 	TF_PAD = 34,
 	TF_TRANSPOSE = 39,
 	TF_MEAN = 40,
@@ -174,6 +178,7 @@ enum TfOp {
 	TF_SQRT = 75,
 	TF_RSQRT = 76,
 	TF_SQUARED_DIFFERENCE = 99,
+	TF_DENSIFY = 124,
 };
 enum TfType { TF_FLOAT32 = 0, TF_FLOAT16 = 1, TF_INT32 = 2 };
 enum TfActivation { TF_ACT_NONE = 0, TF_ACT_RELU = 1, TF_ACT_RELU_N1_TO_1 = 2, TF_ACT_RELU6 = 3 };
@@ -190,8 +195,16 @@ const char *op_name(int code)
 		return "CONV_2D";
 	case TF_DEPTHWISE_CONV_2D:
 		return "DEPTHWISE_CONV_2D";
+	case TF_DEPTH_TO_SPACE:
+		return "DEPTH_TO_SPACE";
 	case TF_DEQUANTIZE:
 		return "DEQUANTIZE";
+	case TF_FULLY_CONNECTED:
+		return "FULLY_CONNECTED";
+	case TF_RESIZE_BILINEAR:
+		return "RESIZE_BILINEAR";
+	case TF_DENSIFY:
+		return "DENSIFY";
 	case TF_LOGISTIC:
 		return "LOGISTIC";
 	case TF_MAX_POOL_2D:
@@ -290,6 +303,126 @@ void align(const std::vector<int> &shape, int rank, int *out)
 		out[i] = i < pad ? 1 : shape[i - pad];
 }
 
+// TensorFlow Lite's sparse weights (its schema's SparsityParameters): the
+// values that aren't 0, in `traversal` order over the tensor's dimensions
+// and any blocks of them, each dimension either whole (dense) or listing
+// only the places used (CSR: where each run starts, and the places). Laid
+// out whole as TensorFlow Lite's own FormatConverter does.
+bool densify(Flat &f, size_t sparsity, const std::vector<int> &shape, const std::vector<float> &stored,
+	     std::vector<float> &dense, std::string &why)
+{
+	const std::vector<int> order = f.ints(sparsity, 0), block_map = f.ints(sparsity, 1);
+	uint32_t n_dims;
+	const size_t dims = f.vec(sparsity, 2, n_dims, 4);
+	const size_t rank = shape.size();
+	if (f.bad || order.size() != n_dims || n_dims != rank + block_map.size() || rank == 0 || rank > MOST_DIMS ||
+	    n_dims > 2 * MOST_DIMS) {
+		why = "its sparse layout is damaged";
+		return false;
+	}
+	struct Level {
+		bool dense = true;
+		int size = 0;
+		std::vector<int> segments, indices;
+	};
+	std::vector<Level> levels(n_dims);
+	auto index_vector = [&](size_t table, int type_field, int field, std::vector<int> &out) {
+		const int type = f.scalar<uint8_t>(table, type_field, 0);
+		const size_t v = f.table(table, field);
+		uint32_t count;
+		const size_t item = type == 1 ? 4 : type == 2 ? 2 : type == 3 ? 1 : 0;
+		if (!item || !v)
+			return false;
+		const size_t first = f.vec(v, 0, count, item);
+		out.resize(count);
+		for (uint32_t i = 0; i < count; i++)
+			out[i] = type == 1 ? f.get<int32_t>(first + 4 * (size_t)i)
+				 : type == 2 ? f.get<uint16_t>(first + 2 * (size_t)i)
+					     : f.get<uint8_t>(first + i);
+		return !f.bad;
+	};
+	for (uint32_t i = 0; i < n_dims; i++) {
+		const size_t d = f.item(dims, i);
+		Level &l = levels[i];
+		l.dense = f.scalar<int8_t>(d, 0, 0) == 0;
+		l.size = f.scalar<int32_t>(d, 1, 0);
+		if (!l.dense && (!index_vector(d, 2, 3, l.segments) || !index_vector(d, 4, 5, l.indices))) {
+			why = "its sparse layout is damaged";
+			return false;
+		}
+	}
+	// Each block's size, and each traversed dimension's size.
+	std::vector<int> block(block_map.size());
+	for (size_t k = 0; k < block_map.size(); k++) {
+		block[k] = levels[rank + k].size;
+		if (block_map[k] < 0 || block_map[k] >= (int)rank || block[k] < 1) {
+			why = "its sparse layout is damaged";
+			return false;
+		}
+	}
+	for (uint32_t i = 0; i < n_dims; i++)
+		if (order[i] < 0 || order[i] >= (int)n_dims || (i < rank) != (order[i] < (int)rank)) {
+			why = "its sparse layout is damaged";
+			return false;
+		}
+	dense.assign(count_of(shape), 0.0f);
+	size_t used = 0;
+	std::vector<int> at(n_dims, 0);
+	bool ok = true;
+	// One level at a time: whole ones count up, CSR ones list theirs.
+	std::function<void(size_t, int)> walk = [&](size_t level, int prev) {
+		if (!ok)
+			return;
+		if (level == n_dims) {
+			int place[MOST_DIMS] = {0};
+			for (size_t i = 0; i < rank; i++)
+				place[order[i]] = at[i];
+			for (size_t i = rank; i < n_dims; i++) {
+				const int b = order[i] - (int)rank;
+				const int dim = block_map[(size_t)b];
+				place[dim] = place[dim] * block[(size_t)b] + at[i];
+			}
+			size_t flat = 0;
+			for (size_t d = 0; d < rank; d++) {
+				if (place[d] < 0 || place[d] >= shape[d]) {
+					ok = false;
+					return;
+				}
+				flat = flat * (size_t)shape[d] + (size_t)place[d];
+			}
+			if (used >= stored.size()) {
+				ok = false;
+				return;
+			}
+			dense[flat] = stored[used++];
+			return;
+		}
+		const Level &l = levels[level];
+		if (l.dense) {
+			for (int i = 0; i < l.size && ok; i++) {
+				at[level] = i;
+				walk(level + 1, prev * l.size + i);
+			}
+		} else if (prev >= 0 && prev + 1 < (int)l.segments.size()) {
+			const int from = l.segments[(size_t)prev], to = l.segments[(size_t)prev + 1];
+			if (from < 0 || to < from || to > (int)l.indices.size()) {
+				ok = false;
+				return;
+			}
+			for (int i = from; i < to && ok; i++) {
+				at[level] = l.indices[(size_t)i];
+				walk(level + 1, i);
+			}
+		}
+	};
+	walk(0, 0);
+	if (!ok || used != stored.size()) {
+		why = "its sparse layout doesn't fit its size";
+		return false;
+	}
+	return true;
+}
+
 } // namespace
 
 struct Net::Impl {
@@ -311,6 +444,8 @@ struct Net::Impl {
 		int padding = TF_SAME, stride_w = 1, stride_h = 1, dil_w = 1, dil_h = 1, act = TF_ACT_NONE;
 		int filter_w = 1, filter_h = 1, multiplier = 1, axis = 0;
 		bool keep_dims = false;
+		int block = 1;                                 // DEPTH_TO_SPACE
+		bool align_corners = false, half_pixel = false; // RESIZE_BILINEAR
 		int begin_mask = 0, end_mask = 0, ellipsis_mask = 0, new_axis_mask = 0, shrink_mask = 0;
 		bool offset = false;
 		// Done by another step.
@@ -327,6 +462,9 @@ struct Net::Impl {
 
 	bool plain = false;
 	bool ready = false;
+	// Only these outputs are worked out (all, if empty): steps that lead
+	// only to others are left out.
+	std::vector<int> wanted;
 	std::vector<Tensor> tensors;
 	std::vector<Step> steps;
 	std::vector<int> ins, outs;
@@ -346,6 +484,7 @@ struct Net::Impl {
 	}
 
 	bool read(const uint8_t *bytes, size_t size);
+	bool prune();
 	bool check(Step &s);
 	void fuse();
 	bool prepare(Step &s);
@@ -353,6 +492,10 @@ struct Net::Impl {
 	void exec(const Step &s);
 
 	Tensor &t(int i) { return tensors[(size_t)i]; }
+	bool is_wanted(size_t output) const
+	{
+		return wanted.empty() || std::find(wanted.begin(), wanted.end(), (int)output) != wanted.end();
+	}
 	bool is_float(int i) const { return i >= 0 && tensors[(size_t)i].type == TF_FLOAT32; }
 	// A constant int32 tensor's values (empty if it isn't one).
 	const std::vector<int> &ints(int i)
@@ -420,20 +563,32 @@ bool Net::Impl::read(const uint8_t *bytes, size_t size)
 				return fail("the model keeps its weights outside the file");
 			continue;
 		}
-		const size_t want = x.count() * (x.type == TF_FLOAT16 ? 2 : 4);
-		if (bytes_n != want)
+		const size_t item = x.type == TF_FLOAT16 ? 2 : 4;
+		// Weights kept sparse (only the ones that aren't 0, and where they
+		// go): made whole now, once.
+		const size_t sparse = f.table(tt, 6);
+		const size_t want = sparse ? bytes_n / item * item : x.count() * item;
+		if (bytes_n != want || (sparse && x.type == TF_INT32))
 			return fail("tensor " + x.name + " has the wrong amount of data");
 		x.constant = true;
 		const uint8_t *p = bytes + data;
-		if (x.type == TF_FLOAT32) {
-			x.values.resize(x.count());
-			std::memcpy(x.values.data(), p, want);
-		} else if (x.type == TF_FLOAT16) {
-			x.values.resize(x.count());
-			for (size_t k = 0; k < x.values.size(); k++) {
-				uint16_t h;
-				std::memcpy(&h, p + 2 * k, 2);
-				x.values[k] = half_to_float(h);
+		if (x.type == TF_FLOAT32 || x.type == TF_FLOAT16) {
+			std::vector<float> stored(want / item);
+			if (x.type == TF_FLOAT32) {
+				std::memcpy(stored.data(), p, want);
+			} else {
+				for (size_t k = 0; k < stored.size(); k++) {
+					uint16_t h;
+					std::memcpy(&h, p + 2 * k, 2);
+					stored[k] = half_to_float(h);
+				}
+			}
+			if (!sparse) {
+				x.values.swap(stored);
+			} else {
+				std::string why;
+				if (!densify(f, sparse, x.shape, stored, x.values, why))
+					return fail("tensor " + x.name + ": " + why);
 			}
 		} else {
 			x.ints.resize(x.count());
@@ -505,6 +660,19 @@ bool Net::Impl::read(const uint8_t *bytes, size_t size)
 		case TF_SUM:
 			s.keep_dims = f.scalar<uint8_t>(opt, 0, 0) != 0;
 			break;
+		case TF_FULLY_CONNECTED:
+			s.act = f.scalar<int8_t>(opt, 0, 0);
+			if (f.scalar<int8_t>(opt, 1, 0) != 0)
+				return fail("FULLY_CONNECTED with shuffled weights isn't something this engine can do");
+			s.keep_dims = f.scalar<uint8_t>(opt, 2, 0) != 0;
+			break;
+		case TF_DEPTH_TO_SPACE:
+			s.block = f.scalar<int32_t>(opt, 0, 1);
+			break;
+		case TF_RESIZE_BILINEAR:
+			s.align_corners = f.scalar<uint8_t>(opt, 2, 0) != 0;
+			s.half_pixel = f.scalar<uint8_t>(opt, 3, 0) != 0;
+			break;
 		case TF_STRIDED_SLICE:
 			s.begin_mask = f.scalar<int32_t>(opt, 0, 0);
 			s.end_mask = f.scalar<int32_t>(opt, 1, 0);
@@ -518,6 +686,17 @@ bool Net::Impl::read(const uint8_t *bytes, size_t size)
 		}
 		if (f.bad)
 			return fail("the model file is damaged");
+		if (s.code == TF_DENSIFY) {
+			// Sparse weights, already made whole as the file was read.
+			if (s.in.size() != 1 || s.out.size() != 1 || s.in[0] < 0 || !t(s.in[0]).constant ||
+			    t(s.in[0]).type == TF_INT32 || t(s.out[0]).type != t(s.in[0]).type ||
+			    t(s.out[0]).count() != t(s.in[0]).values.size())
+				return fail("the model makes sparse numbers whole as it goes, which this engine can't do");
+			Tensor &to = t(s.out[0]);
+			to.constant = true;
+			to.values = t(s.in[0]).values;
+			continue;
+		}
 		if (s.code == TF_DEQUANTIZE) {
 			// Half-size weights: made floats now, once.
 			if (s.in.size() != 1 || s.out.size() != 1 || s.in[0] < 0 || !t(s.in[0]).constant ||
@@ -533,6 +712,42 @@ bool Net::Impl::read(const uint8_t *bytes, size_t size)
 		}
 		steps.push_back(std::move(s));
 	}
+	return true;
+}
+
+// Just the steps the wanted outputs need (a model's extra outputs - a
+// picture of where the person is, say - aren't worked out).
+bool Net::Impl::prune()
+{
+	if (wanted.empty())
+		return true;
+	std::vector<int> made_by(tensors.size(), -1);
+	for (size_t k = 0; k < steps.size(); k++)
+		for (int o : steps[k].out)
+			made_by[(size_t)o] = (int)k;
+	std::vector<bool> need(steps.size(), false);
+	std::vector<int> stack;
+	for (int w : wanted) {
+		if (w < 0 || w >= (int)outs.size())
+			return fail("the model hasn't that many outputs");
+		stack.push_back(outs[(size_t)w]);
+	}
+	while (!stack.empty()) {
+		const int x = stack.back();
+		stack.pop_back();
+		const int k = made_by[(size_t)x];
+		if (k < 0 || need[(size_t)k])
+			continue;
+		need[(size_t)k] = true;
+		for (int i : steps[(size_t)k].in)
+			if (i >= 0)
+				stack.push_back(i);
+	}
+	std::vector<Step> kept;
+	for (size_t k = 0; k < steps.size(); k++)
+		if (need[k])
+			kept.push_back(std::move(steps[k]));
+	steps.swap(kept);
 	return true;
 }
 
@@ -723,6 +938,48 @@ bool Net::Impl::check(Step &s)
 		}
 		return expect(shape);
 	}
+	case TF_FULLY_CONNECTED: {
+		if (!need(2) || !floats({s.in[0], s.in[1], s.out[0]}))
+			return false;
+		const auto &w = t(s.in[1]).shape;
+		if (w.size() != 2 || !t(s.in[1]).constant || w[0] < 1 || w[1] < 1)
+			return fail("FULLY_CONNECTED's weights aren't fixed");
+		if (s.in.size() > 2 && s.in[2] >= 0 &&
+		    (!t(s.in[2]).constant || !is_float(s.in[2]) || t(s.in[2]).count() != (size_t)w[0]))
+			return fail("FULLY_CONNECTED's bias doesn't fit");
+		const size_t n = t(s.in[0]).count();
+		if (n % (size_t)w[1] != 0)
+			return fail("FULLY_CONNECTED's input doesn't fit its weights");
+		const int rows = (int)(n / (size_t)w[1]);
+		if (s.keep_dims) {
+			std::vector<int> shape = t(s.in[0]).shape;
+			if (shape.empty() || shape.back() != w[1])
+				return fail("FULLY_CONNECTED's input doesn't fit its weights");
+			shape.back() = w[0];
+			return expect(shape);
+		}
+		return expect({rows, w[0]});
+	}
+	case TF_DEPTH_TO_SPACE: {
+		if (!need(1) || !floats({s.in[0], s.out[0]}))
+			return false;
+		const auto &x = t(s.in[0]).shape;
+		const int b = s.block;
+		if (x.size() != 4 || x[0] != 1 || b < 1 || b > 16 || x[3] % (b * b) != 0)
+			return fail("DEPTH_TO_SPACE has shapes this engine can't do");
+		return expect({1, x[1] * b, x[2] * b, x[3] / (b * b)});
+	}
+	case TF_RESIZE_BILINEAR: {
+		if (!need(2) || !floats({s.in[0], s.out[0]}))
+			return false;
+		const auto &x = t(s.in[0]).shape;
+		const auto &size = ints(s.in[1]);
+		if (x.size() != 4 || x[0] != 1 || size.size() != 2 || size[0] < 1 || size[1] < 1)
+			return fail("RESIZE_BILINEAR's size isn't fixed");
+		if (s.align_corners && s.half_pixel)
+			return fail("RESIZE_BILINEAR with both corner settings isn't something this engine can do");
+		return expect({1, size[0], size[1], x[3]});
+	}
 	case TF_STRIDED_SLICE: {
 		if (!need(4) || !floats({s.in[0], s.out[0]}))
 			return false;
@@ -773,8 +1030,9 @@ void Net::Impl::fuse()
 		for (int o : steps[k].out)
 			made_by[(size_t)o] = (int)k;
 	}
-	for (int o : outs)
-		users[(size_t)o] += 1000; // never folded away
+	for (size_t w = 0; w < outs.size(); w++)
+		if (is_wanted(w))
+			users[(size_t)outs[w]] += 1000; // never folded away
 	auto only_user = [&](int tensor, size_t after) -> int {
 		if (users[(size_t)tensor] != 1)
 			return -1;
@@ -897,8 +1155,9 @@ void Net::Impl::plan()
 	std::vector<bool> keep(n, false);
 	for (int i : ins)
 		keep[(size_t)i] = true;
-	for (int o : outs)
-		keep[(size_t)o] = true;
+	for (size_t w = 0; w < outs.size(); w++)
+		if (is_wanted(w))
+			keep[(size_t)outs[w]] = true;
 	for (size_t k = 0; k < steps.size(); k++) {
 		if (steps[k].skip)
 			continue;
@@ -1286,6 +1545,72 @@ void Net::Impl::exec(const Step &s)
 		}
 		return;
 	}
+	case TF_FULLY_CONNECTED: {
+		const Tensor &w = t(s.in[1]);
+		const int outs_n = w.shape[0], in_n = w.shape[1];
+		const float *bias = s.in.size() > 2 && s.in[2] >= 0 ? t(s.in[2]).data : nullptr;
+		const size_t rows = x.count() / (size_t)in_n;
+		for (size_t r = 0; r < rows; r++) {
+			const float *in = x.data + r * (size_t)in_n;
+			float *out = y.data + r * (size_t)outs_n;
+			for (int o = 0; o < outs_n; o++) {
+				const float *wo = w.data + (size_t)o * in_n;
+				double sum = bias ? bias[o] : 0.0;
+				for (int i = 0; i < in_n; i++)
+					sum += (double)in[i] * wo[i];
+				out[o] = clamp((float)sum);
+			}
+		}
+		return;
+	}
+	case TF_DEPTH_TO_SPACE: {
+		// Each pixel's channels spread over a block of b x b pixels:
+		// channel (dy * b + dx) * c + k goes to (y * b + dy, x * b + dx), k.
+		const int b = s.block, ih = x.shape[1], iw = x.shape[2], ic = x.shape[3];
+		const int c = ic / (b * b), ow = iw * b;
+		for (int iy = 0; iy < ih; iy++)
+			for (int ix = 0; ix < iw; ix++) {
+				const float *in = x.data + ((size_t)iy * iw + ix) * ic;
+				for (int dy = 0; dy < b; dy++)
+					for (int dx = 0; dx < b; dx++)
+						std::memcpy(y.data + (((size_t)(iy * b + dy) * ow) + (ix * b + dx)) * c,
+							    in + (size_t)(dy * b + dx) * c, (size_t)c * sizeof(float));
+			}
+		return;
+	}
+	case TF_RESIZE_BILINEAR: {
+		// TensorFlow Lite's own sums (its reference ResizeBilinear).
+		const int ih = x.shape[1], iw = x.shape[2], c = x.shape[3];
+		const int oh = y.shape[1], ow = y.shape[2];
+		auto scale_of = [&](int in, int out) {
+			return s.align_corners && out > 1 ? (float)(in - 1) / (float)(out - 1) : (float)in / (float)out;
+		};
+		const float sy = scale_of(ih, oh), sx = scale_of(iw, ow);
+		auto place = [&](int v, float scale, int in, float &at, int &lo, int &hi) {
+			at = s.half_pixel ? ((float)v + 0.5f) * scale - 0.5f : (float)v * scale;
+			lo = std::max((int)std::floor(at), 0);
+			hi = std::min((int)std::ceil(at), in - 1);
+		};
+		for (int oy = 0; oy < oh; oy++) {
+			float fy;
+			int y0, y1;
+			place(oy, sy, ih, fy, y0, y1);
+			const float wy = fy - (float)y0;
+			for (int ox = 0; ox < ow; ox++) {
+				float fx;
+				int x0, x1;
+				place(ox, sx, iw, fx, x0, x1);
+				const float wx = fx - (float)x0;
+				const float *p00 = x.data + ((size_t)y0 * iw + x0) * c, *p01 = x.data + ((size_t)y0 * iw + x1) * c;
+				const float *p10 = x.data + ((size_t)y1 * iw + x0) * c, *p11 = x.data + ((size_t)y1 * iw + x1) * c;
+				float *out = y.data + ((size_t)oy * ow + ox) * c;
+				for (int k = 0; k < c; k++)
+					out[k] = p00[k] * (1 - wy) * (1 - wx) + p10[k] * wy * (1 - wx) + p01[k] * (1 - wy) * wx +
+						 p11[k] * wy * wx;
+			}
+		}
+		return;
+	}
 	case TF_STRIDED_SLICE: {
 		const auto &b = t(s.in[1]).ints, &e = t(s.in[2]).ints;
 		const int rank = (int)x.shape.size();
@@ -1356,14 +1681,21 @@ void Net::set_plain(bool plain)
 	impl_->plain = plain;
 }
 
+void Net::set_wanted(const std::vector<int> &outputs)
+{
+	impl_->wanted = outputs;
+}
+
 bool Net::load(const uint8_t *bytes, size_t size, std::string *problem)
 {
 	const bool plain = impl_->plain;
+	const std::vector<int> wanted = impl_->wanted;
 	delete impl_;
 	impl_ = new Impl();
 	impl_->plain = plain;
 	Impl &m = *impl_;
-	bool ok = bytes && m.read(bytes, size);
+	m.wanted = wanted;
+	bool ok = bytes && m.read(bytes, size) && m.prune();
 	for (size_t k = 0; ok && k < m.steps.size(); k++)
 		ok = m.check(m.steps[k]);
 	// Every input is there before the step that reads it.
@@ -1381,8 +1713,8 @@ bool Net::load(const uint8_t *bytes, size_t size, std::string *problem)
 			for (int o : s.out)
 				have[(size_t)o] = true;
 		}
-		for (int o : m.outs)
-			if (!have[(size_t)o])
+		for (size_t w = 0; w < m.outs.size(); w++)
+			if (m.is_wanted(w) && !have[(size_t)m.outs[w]])
 				ok = m.fail("the model never works out its answer");
 	}
 	if (ok && !plain)
@@ -1397,6 +1729,7 @@ bool Net::load(const uint8_t *bytes, size_t size, std::string *problem)
 		delete impl_;
 		impl_ = new Impl();
 		impl_->plain = keep_plain;
+		impl_->wanted = wanted;
 		return false;
 	}
 	m.table = plain ? &kernels::plain() : &kernels::best();

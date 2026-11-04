@@ -18,6 +18,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "tracker.hpp"
 #include "files.hpp"
+#include "vision.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -51,7 +52,7 @@ const char *const EXPRESSION_NAMES[EXPRESSIONS] = {
 
 namespace {
 
-constexpr double PI = 3.14159265358979323846;
+constexpr double PI = vision::PI;
 
 // MediaPipe's Face Landmarker's settings (its defaults).
 constexpr float FIND_SCORE = 0.5f; // the face finder: this sure, at least
@@ -60,7 +61,7 @@ constexpr float PRESENCE = 0.5f;   // the face model: there's a face there
 constexpr float GROW = 1.5f;       // the square: this much bigger than the face
 // The smoothing at 0.5 on the slider (MediaPipe's own): steady at rest,
 // quick to follow a move.
-constexpr double MIN_CUTOFF = 0.05, BETA = 80, D_CUTOFF = 1.0;
+constexpr double MIN_CUTOFF = 0.05, BETA = 80;
 // "Set" keeps this many looks.
 constexpr int REST_LOOKS = 10;
 
@@ -75,191 +76,23 @@ constexpr int SHAPE_POINTS[146] = {0,   1,   4,   5,   6,   7,   8,   10,  13,  
 				   382, 384, 385, 386, 387, 388, 389, 390, 397, 398, 400, 402, 405, 409, 415, 454, 466,
 				   468, 469, 470, 471, 472, 473, 474, 475, 476, 477};
 
-uint16_t le16(const uint8_t *p)
-{
-	return (uint16_t)(p[0] | p[1] << 8);
-}
-
-uint32_t le32(const uint8_t *p)
-{
-	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-}
-
-// The files in a zip that are stored as they are (Google's .task file
-// keeps them that way, so nothing needs unpacking).
-struct Entry {
-	const uint8_t *data = nullptr;
-	size_t size = 0;
-};
-
-bool zip_entry(const uint8_t *zip, size_t size, const std::string &name, Entry &out)
-{
-	if (size < 22)
-		return false;
-	// The end record, within the last 64 KB (it can carry a comment).
-	size_t end = size - 22;
-	const size_t stop = size > 22 + 65535 ? size - 22 - 65535 : 0;
-	while (le32(zip + end) != 0x06054b50) {
-		if (end == stop)
-			return false;
-		end--;
-	}
-	const uint16_t count = le16(zip + end + 10);
-	size_t at = le32(zip + end + 16);
-	for (uint16_t i = 0; i < count; i++) {
-		if (at + 46 > size || le32(zip + at) != 0x02014b50)
-			return false;
-		const uint16_t method = le16(zip + at + 10);
-		const uint32_t packed = le32(zip + at + 20), unpacked = le32(zip + at + 24);
-		const uint16_t name_len = le16(zip + at + 28), extra_len = le16(zip + at + 30),
-			       note_len = le16(zip + at + 32);
-		const uint32_t local = le32(zip + at + 42);
-		if (at + 46 + name_len > size)
-			return false;
-		if (name_len == name.size() && std::memcmp(zip + at + 46, name.data(), name_len) == 0) {
-			if (method != 0 || packed != unpacked)
-				return false;
-			if ((size_t)local + 30 > size || le32(zip + local) != 0x04034b50)
-				return false;
-			const size_t data = (size_t)local + 30 + le16(zip + local + 26) + le16(zip + local + 28);
-			if (data > size || packed > size - data)
-				return false;
-			out.data = zip + data;
-			out.size = packed;
-			return true;
-		}
-		at += 46 + (size_t)name_len + extra_len + note_len;
-	}
-	return false;
-}
-
-size_t elements(const std::vector<int> &shape)
-{
-	size_t n = 1;
-	for (int d : shape)
-		n *= (size_t)std::max(0, d);
-	return n;
-}
-
-float sigmoid(float x)
-{
-	return 1 / (1 + std::exp(-x));
-}
-
-float wrap_angle(float a)
-{
-	return (float)(a - 2 * PI * std::floor((a + PI) / (2 * PI)));
-}
+using vision::Entry;
+using vision::LowPass;
+using vision::OneEuro;
+using vision::elements;
+using vision::sigmoid;
+using vision::wrap_angle;
+using vision::zip_entry;
 
 // A turned box in the picture: middle, size (pixels) and turn (radians,
 // clockwise as the picture shows it).
 using Square = Tracker::Square;
 
-// Cuts `sq` out of the picture at out_w x out_h, the way MediaPipe does
-// it (OpenCV's warp with bilinear sampling: 1/32 pixel steps, weights in
-// 15 bits, rounded to whole 0-255 values), then each value * scale +
-// offset as floats, red, green, blue. Outside the picture: black, or
-// the nearest edge pixel.
 void cut(const Frame &pic, const Square &sq, int out_w, int out_h, bool black_edges, float scale, float offset,
 	 float *out)
 {
-	const double c = std::cos((double)sq.angle), s = std::sin((double)sq.angle);
-	const double sx = sq.w / out_w, sy = sq.h / out_h;
-	// out (u, v) -> picture: middle + turn * (u * sx - w/2, v * sy - h/2).
-	const double m0 = c * sx, m1 = -s * sy, m2 = sq.cx - c * sq.w / 2 + s * sq.h / 2;
-	const double m3 = s * sx, m4 = c * sy, m5 = sq.cy - s * sq.w / 2 - c * sq.h / 2;
-	const int r = pic.bgra ? 2 : 0, b = pic.bgra ? 0 : 2;
-	const int w = pic.w, h = pic.h;
-	for (int v = 0; v < out_h; v++) {
-		const double x0 = m1 * v + m2, y0 = m4 * v + m5;
-		float *o = out + (size_t)v * out_w * 3;
-		for (int u = 0; u < out_w; u++, o += 3) {
-			const long X = std::lrint((x0 + m0 * u) * 32), Y = std::lrint((y0 + m3 * u) * 32);
-			const long ix = X >> 5, iy = Y >> 5;
-			const int fx = (int)(X & 31), fy = (int)(Y & 31);
-			const int w00 = (32 - fx) * (32 - fy) * 32, w01 = fx * (32 - fy) * 32;
-			const int w10 = (32 - fx) * fy * 32, w11 = fx * fy * 32;
-			const uint8_t *p00, *p01, *p10, *p11;
-			static const uint8_t zero[4] = {0, 0, 0, 0};
-			if (ix >= 0 && ix < w - 1 && iy >= 0 && iy < h - 1) {
-				p00 = pic.px + (size_t)iy * pic.stride + (size_t)ix * 4;
-				p01 = p00 + 4;
-				p10 = p00 + pic.stride;
-				p11 = p10 + 4;
-			} else if (black_edges) {
-				if (ix >= w || ix + 1 < 0 || iy >= h || iy + 1 < 0) {
-					o[0] = o[1] = o[2] = offset;
-					continue;
-				}
-				auto at = [&](long x, long y) {
-					return x >= 0 && x < w && y >= 0 && y < h
-						       ? pic.px + (size_t)y * pic.stride + (size_t)x * 4
-						       : zero;
-				};
-				p00 = at(ix, iy);
-				p01 = at(ix + 1, iy);
-				p10 = at(ix, iy + 1);
-				p11 = at(ix + 1, iy + 1);
-			} else {
-				auto at = [&](long x, long y) {
-					x = std::min<long>(std::max<long>(x, 0), w - 1);
-					y = std::min<long>(std::max<long>(y, 0), h - 1);
-					return pic.px + (size_t)y * pic.stride + (size_t)x * 4;
-				};
-				p00 = at(ix, iy);
-				p01 = at(ix + 1, iy);
-				p10 = at(ix, iy + 1);
-				p11 = at(ix + 1, iy + 1);
-			}
-			const int ch[3] = {r, 1, b};
-			for (int k = 0; k < 3; k++) {
-				const int i = ch[k];
-				const int sum = p00[i] * w00 + p01[i] * w01 + p10[i] * w10 + p11[i] * w11;
-				const int value = std::min(255, std::max(0, (sum + (1 << 14)) >> 15));
-				o[k] = (float)value * scale + offset;
-			}
-		}
-	}
+	vision::cut(pic, {sq.cx, sq.cy, sq.w, sq.h, sq.angle}, out_w, out_h, black_edges, scale, offset, out);
 }
-
-// MediaPipe's One Euro filter (G. Casiez et al., 2012): a low-pass filter
-// whose cut-off rises with how fast the value moves.
-struct LowPass {
-	bool started = false;
-	float raw = 0, kept = 0;
-	float apply(float value, double alpha)
-	{
-		const float result = started ? (float)(alpha * value + (1 - alpha) * kept) : value;
-		started = true;
-		raw = value;
-		kept = result;
-		return result;
-	}
-};
-
-struct OneEuro {
-	double hz = 30;
-	int64_t last = -1;
-	LowPass x, dx;
-
-	static double alpha(double hz, double cutoff)
-	{
-		const double te = 1 / hz, tau = 1 / (2 * PI * cutoff);
-		return 1 / (1 + tau / te);
-	}
-	float apply(int64_t ns, double scale, float value, double min_cutoff, double beta)
-	{
-		if (last >= ns)
-			return value;
-		if (last != 0 && ns != 0)
-			hz = 1e9 / (double)(ns - last);
-		last = ns;
-		const double speed = x.started ? (value - x.raw) * scale * hz : 0;
-		const double eased = dx.apply((float)speed, alpha(hz, D_CUTOFF));
-		const double cutoff = min_cutoff + beta * std::fabs(eased);
-		return x.apply(value, alpha(hz, cutoff));
-	}
-};
 
 } // namespace
 
@@ -543,8 +376,8 @@ void Tracker::Impl::smooth(double seconds)
 	}
 	// The slider: steadier at rest and slower to follow one way, the
 	// other way snappier; 0.5 is MediaPipe's.
-	const double t = std::min(1.0f, std::max(0.0f, amount)) * 2 - 1;
-	const double min_cutoff = MIN_CUTOFF * std::pow(5.0, t), beta = BETA * std::pow(3.0, t);
+	double min_cutoff, beta;
+	vision::smoothing_of(amount, MIN_CUTOFF, BETA, min_cutoff, beta);
 	const int64_t ns = (int64_t)std::llround(seconds * 1e9);
 	const double scale = 1 / size;
 	for (int i = 0; i < POINTS; i++) {

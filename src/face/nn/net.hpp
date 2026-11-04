@@ -17,15 +17,19 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 // Our own small engine for the face models: it reads a TensorFlow Lite
-// model file (Google's MediaPipe face models, data/face) and works it out
-// on the CPU, with no TensorFlow or any other library.
+// model file (Google's MediaPipe face models, data/face, and its body and
+// hand models) and works it out on the CPU, with no TensorFlow or any
+// other library.
 //
-// It knows only the steps those models use - convolutions (normal and
-// depthwise), PReLU and ReLU, adding and multiplying (with broadcasting),
-// padding, max pooling, reshaping, joining, slicing, transposing, means
-// and sums, and a few maths ones. Anything else in a file and it says so
-// rather than guessing. Every shape is fixed when the file is read, so a
-// run allocates nothing.
+// It knows only the steps those models (and the body and hand models,
+// body.hpp) use - convolutions (normal and depthwise), PReLU and ReLU,
+// adding and multiplying (with broadcasting), padding, max pooling,
+// reshaping, joining, slicing, transposing, means and sums, fully
+// connected layers, growing a picture (bilinear, or spreading channels
+// over pixels) and a few maths ones; weights kept sparse or half-size are
+// made whole floats as the file is read. Anything else in a file and it
+// says so rather than guessing. Every shape is fixed when the file is
+// read, so a run allocates nothing.
 //
 // Convolutions run on the fastest code the CPU has (AVX2 or SSE2,
 // kernels.hpp). Next to a convolution, the PReLU or ReLU after it and a
@@ -69,6 +73,10 @@ public:
 	// For tests: off, each step runs as the file has it (no steps done
 	// together) on the plain C++ code. Set before load.
 	void set_plain(bool plain);
+	// Only these outputs (by number) are worked out - the steps that lead
+	// only to the others are left out; their output() is null. Empty: all.
+	// Set before load.
+	void set_wanted(const std::vector<int> &outputs);
 	// Multiply-adds in one run, for the speed report.
 	double work() const;
 	// For the speed check: how long each kind of step took over the runs

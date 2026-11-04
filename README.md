@@ -215,6 +215,45 @@ is next told about it, and files in a folder named in other letters load
 on Windows. `FaceGetState` says which parts with bumps had no tangents in
 their file (worked out instead, close but not always the same).
 
+**Your hands and arms (0.8.0).** A 3D VRM character in its own spot (not
+worn on your head) can follow your arms, hands and fingers from the same
+camera: its upper arms and forearms point where yours do, its elbows bend
+your elbows' way, its hands turn as yours (its forearms take half the
+twist, so its wrists don't pinch thin) and each finger joint bends as
+yours, within each joint's natural limits and how far a wrist bends. It
+follows your body as you face the camera - against your chest, so leaning
+or turning in your chair doesn't swing its arms, and they ride on its own
+breathing and turning body - mirrored as its face is (`mirror`). Near your
+head, its hand goes to the same place by its own head, whatever its size:
+a hand on your cheek is on its cheek. It uses more of your PC, so it's
+off until you turn it on (`follow_arms`); `arms_hands` follows your hands
+and fingers too (off: your arms only, quicker); `arms_light` looks 10
+times a second instead of 15, with a lighter hand model. `arms_reach`
+(50-200%) is how far it reaches towards and away from the camera (the
+camera judges that least well), `arms_spread` (0-45 degrees) holds its
+arms out from its body when they hang down, `arms_hold` (ms) is how long
+a hand or arm it loses stays as it was before it rests (arms down,
+fingers relaxed; found again, it's back in a quarter of a second), and
+`arms_smoothing` (0-100) is its own steady-or-snappy. A hand must be seen
+two looks running before it moves anything, and a hand is only looked
+for at your own wrist, must be where your wrist is and counts once if
+it's found twice - so a hand in the background, or a "ghost" hand, never
+moves it. Calibrate (`FaceArms`): hold a hand up by your ear, open, palm
+to the camera, and it learns how your open hand looks (so its fingers
+open all the way when yours do) and where your hand is by your ear (so
+its hand goes by its ear); it's kept in `arms_calibration`. A move on cue
+(a wave, a cheer, an animation) takes over its arms while it plays.
+`FaceGetState`'s `hands_and_arms` says what the camera sees of you, for
+DireBot's camera check: your head, shoulders, elbows, wrists and hips in
+the picture.
+
+Google's MediaPipe Holistic models do the seeing (its body finder, body
+model, hand-square model and hand model, `data/face/holistic_landmarker.task`,
+and the lighter hand model, `data/face/hand_landmark_lite.tflite`), run by
+the same engine as the face's, with the steps around them as MediaPipe's
+Holistic Landmarker does them: the tests check each model against Google's
+own runtime and the body's points against MediaPipe's own answers.
+
 The link never hands out your stream key: `GetStreamServiceSettings`
 through it shows the key (and a custom server's password or token) as
 `********`, and settings sent back as they were read keep the real one.
@@ -274,9 +313,10 @@ The add-on's own requests go through `CallVendorRequest` with
 | `RecordSetOptions` `{options}` | saves them (the same shape as `options` above); answers the state |
 | `RecordStart` / `RecordStop` | the state, plus `note` when some couldn't start, or `error` in words when none could. The `RecordChanged` vendor event sends the state whenever it changes |
 | `FaceSet` `{source, clear?}` | "Set": the next looks that find the face are its rest, kept in the source's `rest` setting (`setting` while it's taking them); `clear` forgets it. `ok`, or `error` in words (for one, the face avatar isn't shown) |
-| `FaceGetState` `{source, points?}` | `camera`, `ready`, `showing`, `found`, `presence` (0-1), `set`, `setting`, `turn` (`yaw`, `pitch`, `roll` in degrees, since "Set"), `turned` (-1, 0, 1), `moves` (the 51 expressions, 0-1 since "Set", ARKit's names), `parts` (first eye, second eye, mouth: `x`, `y`, `w`, `h` shares of the camera's picture), `shown`, `holding`, `looks_per_second`, `ms`, `problem`; with `points`, the 478 `points` (`x`, `y` shares); with a 3D character, `model`: `file`, `loaded`, `loading`, `shown`, `kind` (`gltf`, `vrm0`, `vrm1`), `title`, `author`, `points`, `triangles`, `springs`, `animations` (its own animations: `name` each), `animation` (the one playing, or ""), `swinging_chain`, `arkit_parts`, `blinks` and `talks` (once it's rigged: whether its own blink and mouth shapes move its face enough to see, at least 0.1% of its height; tiny marker shapes don't count), `set_up` (it has a set-up), `upright_parts`, `cards` (your eyes and mouth drawn on it last frame, 0-3), `outfit_layers` (outfit pictures drawn on it last frame), `spots` (`left_eye`, `right_eye`, `mouth`: `x`, `y`, `w`, `h` shares of its picture from the front, `from` where it found them: `expressions`, `eye bones`, `set up`, `guessed`), `expressions` (VRM's, 0-1), `yaw`, `pitch`, `x`, `y` (its middle in the picture, pixels), `finger_joints` (the finger joints it curls), `body` (it has a spine or chest that breathes and follows your head), `problem` in words when it couldn't be read. Always (0.5.0): `tune`: `reading` and `shows` (each tune group, 0-1: what the camera reads and what the character shows from it) and `reading_peak`, `shows_peak` (the same, held at their highest for 0.6 s); `alive`: `idle` (0 following you to 1 idle), `breath` (0-1); `camera_check`: `seen`, `box` (`x`, `y`, `w`, `h`: your face in the camera's picture, shares of it), `facing` (`yaw`, `pitch`, `roll`: which way you face the camera itself, degrees, not since "Set"), `light` (`face`, `left`, `right` - each side of your face as the picture shows it - and `room`, the rest of the picture: 0 black to 1 white), `camera_width`, `camera_height`. Always (0.6.0): `mic`: `from`, `mic` (as set), `found`, `listening_to` (the mic it hears), `hearing`, `muted`, `level` and `peak` (dB), `start`, `full`, `heard` (louder than the start), `voiced`, `talking`, `open` (0-1), `share` (how much of its mouth is the mic's, 0-1), `vowels` (`a`, `i`, `u`, `e`, `o`: 0-1), `f1`, `f2` (Hz), `own_voice` (a saved "say each vowel"), `calibration` (`running`, `vowel`, `number`, `listening`, `left` seconds, `done`, and once done `heard` per vowel and `own`); `lights`: `preset`, `side`, `height`, `colour`, `brightness`, `room_colour`, `room`, `rim_colour`, `rim`, `detail`, `soft_skin`; `camera_view`: `view` (the one asked for), `showing`, `gliding`, `views` (`name`, `yaw`, `pitch`, `zoom`, `x`, `y`); and in `model`: `materials` (`name`, `bumps`, `shadows`, `skin` each; 0.7.0: `own_tangents`, its bumps on the file's own tangents), `bump_parts`, `shadow_parts`, `skin_parts`, `guessed_tangent_parts` (0.7.0: parts with bumps whose file had no tangents, so they're worked out). Always (0.7.0): `react`: `faces` (the faces it makes: `name` each), `shapes` (its file's own shapes: `name` each), `arms` (it waves and cheers with them), `vrm_moves` (it plays VRM animation files), `moves` (each of `react_moves`: `name`, `length` seconds, `problem` in words when its file couldn't be read), `items` (each of `react_items`: `loaded`), `hand`, `hit` (their pictures loaded), `hits` (so far), `flying` (in the air now), `busy` (anything on) |
+| `FaceGetState` `{source, points?}` | `camera`, `ready`, `showing`, `found`, `presence` (0-1), `set`, `setting`, `turn` (`yaw`, `pitch`, `roll` in degrees, since "Set"), `turned` (-1, 0, 1), `moves` (the 51 expressions, 0-1 since "Set", ARKit's names), `parts` (first eye, second eye, mouth: `x`, `y`, `w`, `h` shares of the camera's picture), `shown`, `holding`, `looks_per_second`, `ms`, `problem`; with `points`, the 478 `points` (`x`, `y` shares); with a 3D character, `model`: `file`, `loaded`, `loading`, `shown`, `kind` (`gltf`, `vrm0`, `vrm1`), `title`, `author`, `points`, `triangles`, `springs`, `animations` (its own animations: `name` each), `animation` (the one playing, or ""), `swinging_chain`, `arkit_parts`, `blinks` and `talks` (once it's rigged: whether its own blink and mouth shapes move its face enough to see, at least 0.1% of its height; tiny marker shapes don't count), `set_up` (it has a set-up), `upright_parts`, `cards` (your eyes and mouth drawn on it last frame, 0-3), `outfit_layers` (outfit pictures drawn on it last frame), `spots` (`left_eye`, `right_eye`, `mouth`: `x`, `y`, `w`, `h` shares of its picture from the front, `from` where it found them: `expressions`, `eye bones`, `set up`, `guessed`), `expressions` (VRM's, 0-1), `yaw`, `pitch`, `x`, `y` (its middle in the picture, pixels), `finger_joints` (the finger joints it curls), `body` (it has a spine or chest that breathes and follows your head), `problem` in words when it couldn't be read. Always (0.5.0): `tune`: `reading` and `shows` (each tune group, 0-1: what the camera reads and what the character shows from it) and `reading_peak`, `shows_peak` (the same, held at their highest for 0.6 s); `alive`: `idle` (0 following you to 1 idle), `breath` (0-1); `camera_check`: `seen`, `box` (`x`, `y`, `w`, `h`: your face in the camera's picture, shares of it), `facing` (`yaw`, `pitch`, `roll`: which way you face the camera itself, degrees, not since "Set"), `light` (`face`, `left`, `right` - each side of your face as the picture shows it - and `room`, the rest of the picture: 0 black to 1 white), `camera_width`, `camera_height`. Always (0.6.0): `mic`: `from`, `mic` (as set), `found`, `listening_to` (the mic it hears), `hearing`, `muted`, `level` and `peak` (dB), `start`, `full`, `heard` (louder than the start), `voiced`, `talking`, `open` (0-1), `share` (how much of its mouth is the mic's, 0-1), `vowels` (`a`, `i`, `u`, `e`, `o`: 0-1), `f1`, `f2` (Hz), `own_voice` (a saved "say each vowel"), `calibration` (`running`, `vowel`, `number`, `listening`, `left` seconds, `done`, and once done `heard` per vowel and `own`); `lights`: `preset`, `side`, `height`, `colour`, `brightness`, `room_colour`, `room`, `rim_colour`, `rim`, `detail`, `soft_skin`; `camera_view`: `view` (the one asked for), `showing`, `gliding`, `views` (`name`, `yaw`, `pitch`, `zoom`, `x`, `y`); and in `model`: `materials` (`name`, `bumps`, `shadows`, `skin` each; 0.7.0: `own_tangents`, its bumps on the file's own tangents), `bump_parts`, `shadow_parts`, `skin_parts`, `guessed_tangent_parts` (0.7.0: parts with bumps whose file had no tangents, so they're worked out). Always (0.7.0): `react`: `faces` (the faces it makes: `name` each), `shapes` (its file's own shapes: `name` each), `arms` (it waves and cheers with them), `vrm_moves` (it plays VRM animation files), `moves` (each of `react_moves`: `name`, `length` seconds, `problem` in words when its file couldn't be read), `items` (each of `react_items`: `loaded`), `hand`, `hit` (their pictures loaded), `hits` (so far), `flying` (in the air now), `busy` (anything on). Always (0.8.0): `hands_and_arms`: `on`, `hands`, `light` (as set), `can` (it can follow them on this character now), `why_not` (`off`, `worn`, `no_3d`, `not_vrm`, `no_arms`, or ""), `loading`, `ready`, `problem` (the body models), `looks_per_second`, `ms`, `found` (a body), `following` (`left_arm`, `right_arm`, `left_hand`, `right_hand`: yours, followed now), `calibrating`, `calibrated`, `calibration` (`ok`, `no hand`, or "" - the last one's result), `framing` (`found`, and with a body: `head` (in the picture), `shoulders`, `elbows`, `wrists`, `hips` (how many, 0-2), `hands` (found), `shoulder_width` and `shoulder_height` (shares of the picture)); with `points`, `points` (your top half's 25 points: `x`, `y` shares of the picture, `seen` 0-1) and `left_hand_points`, `right_hand_points` (21 each, when found) |
 | `FaceMicCalibrate` `{source, do}` | "Say each vowel": `do` `start` (it asks for each vowel in turn - follow `mic.calibration` in `FaceGetState` - and saves your voice's places in `mic_profile` when it's done), `stop`, or `forget` (back to the usual places). `ok`, or `error` in words (no mic found, or its mouth is from the camera only) |
 | `FaceReact` `{source, do, ...}` | what it does on cue. `do`: `face` (`face`, its name in any case, "" eases the one on off; `seconds`, up to 60; `amount` 0-1) answers `face` (its own name for it), `shows`, and `why` in words when it won't show (not a 3D character, or no face called that); `move` (`move`: `nod`, `shake`, `tilt`, `bounce`, `wave`, `cheer`, or a `react_moves` name or one of its file's own animations, any case) answers `kind` (`head`, `arms`, `file`, `own`) and `shows` (false for `wave` and `cheer` without a VRM's arms, and for a `react_moves` file's move on a character that isn't a VRM); `throw` (`item`, the number in `react_items` from 0; `side` -1 its left, 1 its right, 0 either; `strength` 0.1-2; `size` 0.2-3 (1: a little under half its head); `face` and `face_seconds` (up to 10), the face it makes when it's hit) answers `hits_in` (seconds until it hits, for the hit's sound); `pat` (`count`, 1-20 pats; `size` 0.3-3 (1: about its head's width); `face`, "happy" unless given, "" none); `stop` (everything eased off quickly, nothing waiting). `ok`, or `error` in words |
+| `FaceArms` `{source, do}` | Your hands and arms (0.8.0): `do` `calibrate` (hold a hand up by your ear, open, palm to the camera; follow `hands_and_arms.calibrating` in `FaceGetState` - it's saved in `arms_calibration` when it's done), `stop`, or `forget`. `ok`, or `error` in words (not on, your hands not followed, not a 3D VRM in its own spot, the body models not ready, or the avatar not shown) |
 | `FaceModelFront` `{source, width?, close?}` | its 3D character straight from the front as it's made: `width`, `height`, `rgba` (base64, plain colour), `box` (`left`, `top`, `width`, `height` in the model), `region` (`x`, `y`, `w`, `h`: the part of the box drawn, as shares of it), `spots` (as in `FaceGetState`) - its front picture, which spots and outfit places are shares of. `close`: just the part round its face, for its eyes and mouth up close (`spots` are still shares of the whole box) |
 | `GetUsage` | `measuring` (first 3 seconds), `fps`, `fps_now`, `frame_ms`, `frame_budget_ms`, `frames`, `frames_lagged`, `encoded`, `encoded_skipped`, `cpu`, `memory_mb`, `stream_frames`, `stream_dropped`, and `sources`: per input and filter `name`, `uuid`, `kind`, `type`, `active`, `showing`, `measured`, `tick_ms`, `render_ms`, `gpu_ms` (+ `_max_ms`), `fps_in`/`fps_shown` for cameras and media, `parent`/`enabled` for filters (and `own_ms`/`own_gpu_ms`: a filter's time takes in what it draws on, so this is its own part), and `hints` (browser size/fps/"shut down when hidden", whether it shows a page on this PC and its port, a short fingerprint of a camera to spot the same one added twice) |
 
@@ -307,7 +347,11 @@ OBS from source and point the build at it with `OBS_PREFIX=/path/to/obs`
 The face tracker's tests (`tests/unit_face.cpp`) check it against
 MediaPipe's own answers on a photo (`tests/data/face`), mirrored, turned
 and half size. `tools/face-expected.py` makes those answers again (it
-needs `pip install mediapipe`, for the test only).
+needs `pip install mediapipe`, for the test only). The body tracker's
+(`tests/unit_body.cpp`) check each body and hand model against LiteRT,
+Google's own runtime, and the body against MediaPipe's own answers on two
+photos (`tests/data/body`); `tools/body-expected.py` makes those (`pip
+install mediapipe ai-edge-litert`).
 
 ## Releasing
 
@@ -336,10 +380,11 @@ needs `pip install mediapipe`, for the test only).
     src/record/           clean recordings: a private picture and file per source
     src/moves/            the DireBot Move transition and its plan
     src/filters/          the DireBot Blur filter
-    src/face/             the DireBot Face Avatar source and its face tracker
-    src/face/nn/          our own engine for the face models
+    src/face/             the DireBot Face Avatar source, its face tracker,
+                          and its body tracker and arm solver (body, arms)
+    src/face/nn/          our own engine for the face and body models
     data/effects/         the shaders the transition, the filter and the face avatar draw with
-    data/face/            Google's MediaPipe face models (Apache 2.0, see its NOTICE)
+    data/face/            Google's MediaPipe face, body and hand models (Apache 2.0, see its NOTICE)
     deps/                 nlohmann/json (MIT), obs-websocket's API header (GPL-2.0)
 
 Later parts each get their own folder under `src/`, their own `direbot`
@@ -360,5 +405,13 @@ VRM Consortium's VRM Animation spec says, the way pixiv's three-vrm (MIT
 licence) does it: its steps as a recipe, with no code copied.
 
 `data/face/face_landmarker.task` is Google's MediaPipe Face Landmarker,
+`data/face/holistic_landmarker.task` its Holistic Landmarker and
+`data/face/hand_landmark_lite.tflite` its lighter hand model, all
 unchanged: Copyright The MediaPipe Authors, under the Apache License 2.0
 (`data/face/LICENSE`, `data/face/NOTICE`).
+
+Following your arms and fingers is our own code; its maths (each part of
+an arm pointing where yours does, a hand turned to your palm's way, each
+finger joint bent as far as the angle between your finger's bones) follow
+Kalidokit's (yeemachine, MIT licence) as a recipe, with no code
+copied.

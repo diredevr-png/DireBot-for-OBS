@@ -490,6 +490,7 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 		floor_ = c ? std::min(floor_, y) : y;
 	}
 	measure_head();
+	find_arms();
 
 	// Expressions: the morphs, each only where it moves something.
 	sparse_.resize(m.meshes.size());
@@ -848,24 +849,209 @@ void Rig::find_fingers()
 				f.axis = joint_axis;
 				f.most = digit.bend[k] * PI_F / 180;
 				f.has = has;
+				f.side = side;
+				f.digit = thumb ? 0 : (int)(&digit - DIGITS) + 1;
+				f.joint = k;
 				fingers_.push_back(f);
 			}
 		}
 	}
 }
 
-void Rig::curl_fingers()
+void Rig::curl_fingers(const Drive &d)
 {
 	const float c = clamp01(options_.fingers);
-	if (c <= 0)
-		return;
 	for (const Finger &f : fingers_) {
 		// One its own animation turns stays as the animation has it.
 		if (anim_turns_[f.node])
 			continue;
-		const float angle = (f.most * c - f.has) * (1 - moved_[f.node]);
-		if (angle > 1e-4f)
+		// Relaxed (or as curled as asked)...
+		float angle = c > 0 ? std::max(0.0f, f.most * c - f.has) : 0.0f;
+		// ...or as yours, as much as your hand is followed.
+		if (d.follow_arms && d.arms.fingers) {
+			const ArmTarget &t = d.arms.side[f.side];
+			const float k = clamp01(t.weight) * clamp01(t.hand);
+			if (k > 0)
+				angle += (t.bend[f.digit][f.joint] - f.has - angle) * k;
+		}
+		angle *= 1 - moved_[f.node];
+		if (std::fabs(angle) > 1e-4f)
 			turn_in_rest(f.node, axis_angle(f.axis, angle));
+	}
+}
+
+// The turn taking x to `a` and y to `b` (made square to `a`).
+static Quat frame_turn(V3 a, V3 b)
+{
+	a = normalized(a, {1, 0, 0});
+	b = b - a * dot(b, a);
+	if (length(b) < 1e-6f)
+		b = std::fabs(a.y) < 0.9f ? V3{0, 1, 0} - a * a.y : V3{1, 0, 0} - a * a.x;
+	b = normalized(b);
+	const V3 c = cross(a, b);
+	M4 m;
+	m.m[0] = a.x;
+	m.m[1] = a.y;
+	m.m[2] = a.z;
+	m.m[4] = b.x;
+	m.m[5] = b.y;
+	m.m[6] = b.z;
+	m.m[8] = c.x;
+	m.m[9] = c.y;
+	m.m[10] = c.z;
+	return quat_of(m);
+}
+
+// `v` turned towards `to` a share `k` of the way (unit vectors).
+static V3 toward(V3 v, V3 to, float k)
+{
+	return normalized(rotate(slerp(Quat{}, turn_between(v, to), clamp01(k)), v), to);
+}
+
+// A VRM's arms at rest, the facing model's way (for following yours), and
+// its head's middle and width.
+void Rig::find_arms()
+{
+	const Model &m = *model_;
+	const Quat F = options_.facing;
+	auto at = [&](int n) { return rotate(F, move_of(rest_world_[n])); };
+	const V3 front{0, 0, 1};
+	for (int side = 0; side < 2; side++) {
+		ArmRest &a = arm_rest_[side];
+		a = ArmRest();
+		const int up = arm_bone_[side][0], lo = arm_bone_[side][1], hd = arm_bone_[side][2];
+		if (up < 0 || lo < 0 || hd < 0 || !m.is_vrm())
+			continue;
+		const V3 u = at(lo) - at(up), f = at(hd) - at(lo);
+		a.upper_len = length(u);
+		a.fore_len = length(f);
+		if (a.upper_len < 1e-6f || a.fore_len < 1e-6f)
+			continue;
+		a.shoulder = at(up);
+		a.upper = normalized(u);
+		a.fore = normalized(f);
+		// Its elbow bends its forearm forwards (towards its front); an
+		// arm made pointing forwards bends it up.
+		V3 h = cross(a.upper, front);
+		if (length(h) < 0.3f)
+			h = cross(a.upper, V3{0, 1, 0});
+		a.hinge = normalized(h);
+		V3 hf = a.hinge - a.fore * dot(a.hinge, a.fore);
+		a.fore_hinge = normalized(hf, a.hinge);
+		a.ok = std::isfinite(a.hinge.x + a.hinge.y + a.hinge.z + a.fore_hinge.x + a.fore_hinge.y + a.fore_hinge.z);
+		// Its hand's ways, from its finger bones.
+		const std::string sd = side ? "right" : "left";
+		int knuckle = m.bone(sd + "MiddleProximal");
+		const int first = m.bone(sd + "IndexProximal");
+		int little = m.bone(sd + "LittleProximal");
+		if (little < 0)
+			little = m.bone(sd + "RingProximal");
+		if (knuckle < 0)
+			knuckle = first;
+		if (knuckle >= 0 && first >= 0 && little >= 0 && first != little) {
+			const V3 along = at(knuckle) - at(hd), across = at(first) - at(little);
+			if (length(along) > 1e-6f && length(across) > 1e-6f &&
+			    length(cross(normalized(along), normalized(across))) > 0.3f) {
+				a.along = normalized(along);
+				a.across = normalized(across);
+				a.hand = true;
+			}
+		}
+	}
+	head_known_ = false;
+	if (head_box_.found) {
+		const float w = head_box_.high.x - head_box_.low.x;
+		if (w > 1e-6f) {
+			head_mid_ = (head_box_.low + head_box_.high) * 0.5f;
+			head_width_ = w * 0.85f;
+			head_known_ = true;
+		}
+	}
+}
+
+// Your arms (arms.hpp) as a VRM's: each part pointing where yours does
+// (by its head, reaching where your hand is by yours), its elbow bending
+// as yours, its hand turned as yours with its forearm taking half the
+// twist (a wrist twisted alone pinches thin, the "candy wrapper"), within
+// how far a wrist bends. In its chest's terms: they ride on its body.
+// A move on cue takes over from them as much as it shows.
+void Rig::drive_arms(const Drive &d)
+{
+	if (!d.follow_arms)
+		return;
+	for (int side = 0; side < 2; side++) {
+		const ArmRest &ar = arm_rest_[side];
+		const ArmTarget &t = d.arms.side[side];
+		const int up = arm_bone_[side][0], hd = arm_bone_[side][2];
+		if (!ar.ok || !(t.weight > 0) || anim_turns_[up])
+			continue;
+		const float amount = clamp01(t.weight) * (1 - moved_[up]);
+		if (!(amount > 0))
+			continue;
+		V3 du = normalized(t.upper, ar.upper), df = normalized(t.fore, ar.fore);
+		// By its head: its wrist where yours is by yours (its head's size),
+		// its elbow out the way yours is.
+		const float near = clamp01(t.near);
+		if (near > 0 && head_known_) {
+			const V3 target = head_mid_ + t.by_head * head_width_;
+			const V3 to = target - ar.shoulder;
+			const float lu = ar.upper_len, lf = ar.fore_len;
+			float dist = length(to);
+			if (dist > 1e-6f) {
+				dist = std::min((lu + lf) * 0.999f, std::max(std::fabs(lu - lf) + 1e-3f * (lu + lf), dist));
+				const V3 dir = normalized(to);
+				const float along = (lu * lu - lf * lf + dist * dist) / (2 * dist);
+				const float out = std::sqrt(std::max(0.0f, lu * lu - along * along));
+				V3 pole = du - dir * dot(du, dir);
+				if (length(pole) < 1e-3f)
+					pole = V3{0, -1, 0} - dir * dir.y;
+				const V3 elbow = ar.shoulder + dir * along + normalized(pole, {0, -1, 0}) * out;
+				du = toward(du, normalized(elbow - ar.shoulder, du), near);
+				df = toward(df, normalized(ar.shoulder + dir * dist - elbow, df), near);
+			}
+		}
+		// The elbow's hinge: square to both parts when it's bent; held
+		// straight, as yours was (or, not known, its own turned with it).
+		const V3 natural = rotate(turn_between(ar.upper, du), ar.hinge);
+		const float sure = clamp01(t.hinge_sure);
+		V3 pref = natural * (1 - sure) + normalized(t.hinge, natural) * sure;
+		pref = normalized(pref - du * dot(pref, du), normalized(natural - du * dot(natural, du), {0, 0, 1}));
+		const float bent = std::acos(std::max(-1.0f, std::min(1.0f, dot(du, df))));
+		const float bend_sure = ramp(bent, 0.15f, 0.45f);
+		V3 plane = normalized(cross(du, df), pref);
+		V3 h = normalized(plane * bend_sure + pref * (1 - bend_sure), pref);
+		const Quat R1 = frame_turn(du, h) * conj(frame_turn(ar.upper, ar.hinge));
+		Quat R2 = frame_turn(df, h) * conj(frame_turn(ar.fore, ar.fore_hinge));
+		Quat R3 = R2;
+		const float hand = clamp01(t.hand);
+		if (hd >= 0 && ar.hand && hand > 0) {
+			// Its hand as yours, against its forearm: a twist about the
+			// forearm and a bend (the wrist's, no more than WRIST_MOST).
+			const Quat G = frame_turn(t.along, t.across) * conj(frame_turn(ar.along, ar.across));
+			Quat L = normalized(conj(R2) * G);
+			const V3 axis = ar.fore;
+			const float p = L.x * axis.x + L.y * axis.y + L.z * axis.z;
+			Quat twist = normalized(Quat{axis.x * p, axis.y * p, axis.z * p, L.w});
+			if (twist.w < 0)
+				twist = {-twist.x, -twist.y, -twist.z, -twist.w};
+			Quat swing = normalized(L * conj(twist));
+			if (swing.w < 0)
+				swing = {-swing.x, -swing.y, -swing.z, -swing.w};
+			// Within a wrist's bend.
+			const float swing_angle = 2 * std::acos(std::min(1.0f, swing.w));
+			constexpr float WRIST_MOST = 80 * RAD;
+			if (swing_angle > WRIST_MOST)
+				swing = slerp(Quat{}, swing, WRIST_MOST / swing_angle);
+			// Its hand's turn, and half the twist in its forearm (as much
+			// as the hand is yours).
+			const Quat hand_world = R2 * swing * twist;
+			R2 = R2 * slerp(Quat{}, twist, 0.5f * hand);
+			R3 = slerp(R2, hand_world, hand);
+		}
+		pose_bone(up, R1, amount);
+		pose_bone(arm_bone_[side][1], conj(R1) * R2, amount);
+		if (hd >= 0)
+			pose_bone(hd, conj(R2) * R3, amount);
 	}
 }
 
@@ -1603,7 +1789,8 @@ void Rig::pose(const Drive &d)
 		root_ = d.place;
 	}
 	drive_head(d);
-	curl_fingers();
+	drive_arms(d);
+	curl_fingers(d);
 	drive_eyes(d);
 	drive_expressions(d);
 	for (int r : m.roots)
