@@ -69,6 +69,9 @@ for src in "${sources[@]}"; do
 done
 "${prefix}gcc" "${cflags[@]}" -c "$out/gen/plugin-support.c" -o "$out/obj/plugin-support.o"
 objects+=("$out/obj/plugin-support.o")
+# MikkTSpace (zlib licence), as it comes: C.
+"${prefix}gcc" "${cflags[@]}" -c "$here/deps/mikktspace/mikktspace.c" -o "$out/obj/mikktspace.o"
+objects+=("$out/obj/mikktspace.o")
 
 # Import libraries: every OBS function the plugin calls, found in OBS's
 # headers. A name in neither header is left for the C runtime / Windows.

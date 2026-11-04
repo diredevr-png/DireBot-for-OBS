@@ -170,7 +170,7 @@ room's `room_colour` and `room_brightness`, a rim light's `rim_colour` and
 `rim_brightness`) sit where your camera is, so every camera view is lit
 the same, and your real eyes and mouth on it take its light. Its file's
 normal maps (bumps and creases) and occlusion maps (shadows in folds) are
-drawn (`detail_maps`; its own tangents, or worked out); `soft_skin`
+drawn (`detail_maps`; its own tangents, or worked out as Blender does); `soft_skin`
 (0-100%) lets light reach round into the shadow side of its skin, warmer -
 on the materials named like skin (`skin`, `face`, `body`, `head`, but not
 its eyes, hair, teeth or clothes), or the ones `skin_parts` names, a name
@@ -213,7 +213,8 @@ empty; a relaxed thumb bends towards the first finger, not down under
 the hand. A character file made again in its place loads again when OBS
 is next told about it, and files in a folder named in other letters load
 on Windows. `FaceGetState` says which parts with bumps had no tangents in
-their file (worked out instead, close but not always the same).
+their file (worked out instead; from 0.8.0 with MikkTSpace, the way Blender
+and most other tools work them out, so its bumps look as they did there).
 
 **Your hands and arms (0.8.0).** A 3D VRM character in its own spot (not
 worn on your head) can follow your arms, hands and fingers from the same
@@ -253,6 +254,10 @@ and the lighter hand model, `data/face/hand_landmark_lite.tflite`), run by
 the same engine as the face's, with the steps around them as MediaPipe's
 Holistic Landmarker does them: the tests check each model against Google's
 own runtime and the body's points against MediaPipe's own answers.
+
+Also in 0.8.0, a character file with bumps but no tangents has them worked
+out with MikkTSpace (as Blender, Unity and Unreal do) instead of our own
+guess, so its bumps and creases fall the way they were made.
 
 The link never hands out your stream key: `GetStreamServiceSettings`
 through it shows the key (and a custom server's password or token) as
@@ -385,7 +390,8 @@ install mediapipe ai-edge-litert`).
     src/face/nn/          our own engine for the face and body models
     data/effects/         the shaders the transition, the filter and the face avatar draw with
     data/face/            Google's MediaPipe face, body and hand models (Apache 2.0, see its NOTICE)
-    deps/                 nlohmann/json (MIT), obs-websocket's API header (GPL-2.0)
+    deps/                 nlohmann/json (MIT), obs-websocket's API header (GPL-2.0),
+                          MikkTSpace (zlib)
 
 Later parts each get their own folder under `src/`, their own `direbot`
 requests and a line in `features`.
@@ -415,3 +421,7 @@ an arm pointing where yours does, a hand turned to your palm's way, each
 finger joint bent as far as the angle between your finger's bones) follow
 Kalidokit's (yeemachine, MIT licence) as a recipe, with no code
 copied.
+
+`deps/mikktspace` is Morten S. Mikkelsen's MikkTSpace, unchanged, under
+the zlib licence (in its own files and `deps/mikktspace/README.md`): it
+works out a character's tangents when its file has none.

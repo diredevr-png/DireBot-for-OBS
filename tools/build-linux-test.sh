@@ -20,6 +20,7 @@ libs=()
 flags=(-O1 -g -fPIC -fvisibility=hidden -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 	-I"$prefix/include/obs" -I"$here/src" -I"$here/deps" ${EXTRA_FLAGS:-})
 gcc -std=c17 "${flags[@]}" -c "$out/gen/plugin-support.c" -o "$out/plugin-support.o"
+gcc -std=c17 "${flags[@]}" -c "$here/deps/mikktspace/mikktspace.c" -o "$out/mikktspace.o"
 # The face engine's AVX2 convolutions, with their own flags (only called on
 # a CPU that has AVX2).
 g++ -std=c++17 "${flags[@]}" -O2 -mavx2 -mfma -c "$here/src/face/nn/kernels-avx2.cpp" -o "$out/kernels-avx2.o"
@@ -29,6 +30,6 @@ g++ -std=c++17 "${flags[@]}" -shared -o "$out/$name.so" \
 	"$here"/src/multistream/{multistream,places}.cpp "$here"/src/follow/{tracker,follow-cam}.cpp "$here"/src/record/{rules,record}.cpp \
 	"$here"/src/moves/{plan,move-transition}.cpp "$here"/src/filters/blur-filter.cpp \
 	"$here"/src/face/{tracker,pose,avatar2d,model,rig,alive,react,voice,setup,pictures,avatar3d,face-avatar,body,arms}.cpp "$here"/src/face/nn/{net,kernels,kernels-sse2}.cpp "$out/kernels-avx2.o" \
-	"$here"/src/vertical/{rules,options,canvas,outputs,settings,vertical}.cpp "$out/plugin-support.o" \
+	"$here"/src/vertical/{rules,options,canvas,outputs,settings,vertical}.cpp "$out/plugin-support.o" "$out/mikktspace.o" \
 	"${libs[@]}" -lobs -lobs-frontend-api -pthread -Wl,--no-undefined
 echo "Built $out/$name.so"

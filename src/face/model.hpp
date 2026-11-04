@@ -145,8 +145,9 @@ struct Primitive {
 	std::vector<float> tangent;
 	bool own_tangents = false; // its tangents are the file's (not worked out)
 };
-// A part's tangents worked out from its points, facings and UVs, as glTF
-// has them (its UVs' v going down the picture, a normal map's green up).
+// A part's tangents worked out from its points, facings and UVs with
+// MikkTSpace, as glTF asks (its UVs' v going down the picture, a normal
+// map's green up) and as Blender has them.
 std::vector<float> tangents_of(const Primitive &p);
 
 struct Mesh {

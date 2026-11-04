@@ -2170,6 +2170,59 @@ static void test_detail_maps()
 		p.uv.clear();
 		CHECK(tangents_of(p).empty());
 	}
+	// MikkTSpace's, as Blender works them out: round a tube (its picture
+	// wrapped round it, the picture's top at the tube's top), each point's
+	// tangent along the picture's right - round the tube - and its up up
+	// the tube; the picture's second half mirrored (its right the other
+	// way round, its up still up: w the other way). Points at its seam,
+	// the mirror's middle and its ends are shared as a file has them.
+	{
+		Primitive p;
+		const int K = 16;
+		for (int row = 0; row < 2; row++)
+			for (int j = 0; j <= K; j++) {
+				const float a = 2 * 3.14159265f * j / K;
+				p.pos.push_back({std::cos(a), (float)row, std::sin(a)});
+				p.normal.push_back({std::cos(a), 0, std::sin(a)});
+				// u to 1 half way round, then back (mirrored).
+				const float u = j <= K / 2 ? 2.0f * j / K : 2.0f - 2.0f * j / K;
+				p.uv.insert(p.uv.end(), {u, row ? 0.0f : 1.0f});
+			}
+		for (int j = 0; j < K; j++) {
+			const uint32_t a = j, b = j + 1, c = K + 1 + j, d = K + 2 + j;
+			p.index.insert(p.index.end(), {a, c, b, b, c, d});
+		}
+		const std::vector<float> t = tangents_of(p);
+		CHECK(t.size() == p.pos.size() * 4);
+		int right = 0, flipped = 0;
+		for (int row = 0; row < 2 && t.size() == p.pos.size() * 4; row++)
+			for (int j = 1; j < K; j++) {
+				if (j == K / 2)
+					continue; // the mirror's middle: either way
+				const size_t i = (size_t)row * (K + 1) + j;
+				const float a = 2 * 3.14159265f * j / K;
+				const V3 round{-std::sin(a), 0, std::cos(a)}; // u growing, first half
+				const V3 tv{t[i * 4], t[i * 4 + 1], t[i * 4 + 2]};
+				const V3 up = cross(p.normal[i], tv) * t[i * 4 + 3];
+				const bool first = j < K / 2;
+				right += near3(tv, first ? round : round * -1.0f, 1e-3f) && near3(up, {0, 1, 0}, 1e-3f);
+				flipped += t[i * 4 + 3] == (first ? -1.0f : 1.0f);
+			}
+		CHECK(right == 2 * (K - 2) && flipped == 2 * (K - 2));
+		// The same again: the same tangents.
+		CHECK(tangents_of(p) == t);
+		// A triangle naming a point that isn't there is left out, and a
+		// point no triangle has gets one anyway.
+		p.index.insert(p.index.end(), {0, 1, 999});
+		p.pos.push_back({0, 5, 0});
+		p.normal.push_back({0, 1, 0});
+		p.uv.insert(p.uv.end(), {0.5f, 0.5f});
+		const std::vector<float> t2 = tangents_of(p);
+		CHECK(t2.size() == p.pos.size() * 4 && std::equal(t.begin(), t.end(), t2.begin()));
+		const size_t last = (p.pos.size() - 1) * 4;
+		CHECK(t2.size() == p.pos.size() * 4 && near(length(V3{t2[last], t2[last + 1], t2[last + 2]}), 1, 1e-5) &&
+		      near(t2[last + 1], 0, 1e-5));
+	}
 }
 
 static void test_lights()

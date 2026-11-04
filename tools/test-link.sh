@@ -45,8 +45,10 @@ done
 "$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-avatar" "$here/tests/unit_avatar.cpp" \
 	"$here/src/face/avatar2d.cpp" "$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
 "$out/unit-avatar"
+# MikkTSpace (zlib licence), as it comes: C.
+"${CC:-gcc}" -std=c17 -O2 -c "$here/deps/mikktspace/mikktspace.c" -o "$out/mikktspace.o"
 "$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-model" "$here/tests/unit_model.cpp" "$here/src/face/model.cpp" \
-	"$here/src/face/rig.cpp" "$here/src/face/alive.cpp" "$here/src/face/react.cpp" "$here/src/face/voice.cpp" "$here/src/face/setup.cpp" "$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
+	"$here/src/face/rig.cpp" "$here/src/face/alive.cpp" "$here/src/face/react.cpp" "$here/src/face/voice.cpp" "$here/src/face/setup.cpp" "$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}" "$out/mikktspace.o"
 "$out/unit-model"
 # Following your hands and arms: the body and hand models against Google's
 # own runtime, the body tracker against MediaPipe, the arm and finger solver.

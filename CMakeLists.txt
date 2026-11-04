@@ -103,6 +103,7 @@ target_sources(
     src/face/face-avatar.cpp
     src/face/body.cpp
     src/face/arms.cpp
+    deps/mikktspace/mikktspace.c
     src/face/nn/net.cpp
     src/face/nn/kernels.cpp
     src/face/nn/kernels-sse2.cpp

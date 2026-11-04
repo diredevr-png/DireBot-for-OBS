@@ -19,6 +19,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "model.hpp"
 #include "files.hpp"
 
+#include <mikktspace/mikktspace.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -1623,49 +1625,98 @@ std::vector<bool> skin_materials(const Model &m, const std::string &names)
 	return out;
 }
 
+namespace {
+
+// What MikkTSpace asks for, from a part: its triangles (only those whose
+// corners are all its points), each corner's place, facing and UV, and
+// where each corner's tangent goes.
+struct Mikk {
+	const Primitive *p = nullptr;
+	std::vector<uint32_t> tris; // where each triangle starts in p->index
+	std::vector<float> *out = nullptr;
+	std::vector<uint8_t> done; // a point's tangent is set (its first corner's)
+
+	static Mikk &of(const SMikkTSpaceContext *c) { return *static_cast<Mikk *>(c->m_pUserData); }
+	uint32_t point(int face, int vert) const { return p->index[tris[(size_t)face] + (uint32_t)vert]; }
+	static int faces(const SMikkTSpaceContext *c) { return (int)of(c).tris.size(); }
+	static int corners(const SMikkTSpaceContext *, const int) { return 3; }
+	static void place(const SMikkTSpaceContext *c, float out[], const int face, const int vert)
+	{
+		const V3 v = of(c).p->pos[of(c).point(face, vert)];
+		out[0] = v.x, out[1] = v.y, out[2] = v.z;
+	}
+	static void facing(const SMikkTSpaceContext *c, float out[], const int face, const int vert)
+	{
+		const V3 n = normalized(of(c).p->normal[of(c).point(face, vert)], {0, 0, 1});
+		out[0] = n.x, out[1] = n.y, out[2] = n.z;
+	}
+	// A glTF picture's v runs down it; MikkTSpace's (as Blender's, where
+	// most normal maps are baked) runs up.
+	static void uv(const SMikkTSpaceContext *c, float out[], const int face, const int vert)
+	{
+		const float *t = &of(c).p->uv[(size_t)of(c).point(face, vert) * 2];
+		out[0] = t[0], out[1] = 1 - t[1];
+	}
+	static void tangent(const SMikkTSpaceContext *c, const float t[], const float sign, const int face,
+			    const int vert)
+	{
+		Mikk &m = of(c);
+		const uint32_t i = m.point(face, vert);
+		if (m.done[i] || !std::isfinite(t[0] + t[1] + t[2]))
+			return;
+		m.done[i] = 1;
+		float *o = &(*m.out)[(size_t)i * 4];
+		o[0] = t[0], o[1] = t[1], o[2] = t[2], o[3] = sign < 0 ? -1.0f : 1.0f;
+	}
+};
+
+} // namespace
+
 std::vector<float> tangents_of(const Primitive &p)
 {
 	const size_t n = p.pos.size();
 	if (p.uv.size() != n * 2 || p.normal.size() != n)
 		return {};
-	// Each triangle's way along its picture's u (right) and v (down),
-	// added up at its corners (Lengyel's way)...
-	std::vector<V3> along_u(n), along_v(n);
-	for (size_t i = 0; i + 2 < p.index.size(); i += 3) {
-		const uint32_t a = p.index[i], b = p.index[i + 1], c = p.index[i + 2];
-		if (a >= n || b >= n || c >= n)
-			continue;
-		const V3 e1 = p.pos[b] - p.pos[a], e2 = p.pos[c] - p.pos[a];
-		const float du1 = p.uv[b * 2] - p.uv[a * 2], dv1 = p.uv[b * 2 + 1] - p.uv[a * 2 + 1];
-		const float du2 = p.uv[c * 2] - p.uv[a * 2], dv2 = p.uv[c * 2 + 1] - p.uv[a * 2 + 1];
-		const float det = du1 * dv2 - du2 * dv1;
-		if (!std::isfinite(det) || std::fabs(det) < 1e-12f)
-			continue;
-		const float r = 1 / det;
-		const V3 u = (e1 * dv2 - e2 * dv1) * r, v = (e2 * du1 - e1 * du2) * r;
-		if (!std::isfinite(u.x + u.y + u.z + v.x + v.y + v.z))
-			continue;
-		for (uint32_t k : {a, b, c}) {
-			along_u[k] = along_u[k] + u;
-			along_v[k] = along_v[k] + v;
-		}
-	}
-	// ...flattened onto each point's facing. A glTF picture's v runs down
-	// it and its normal map's green up, so up is against v.
+	// MikkTSpace's (Morten S. Mikkelsen's, zlib licence: deps/mikktspace),
+	// as glTF asks and as Blender works them out - so a normal map baked
+	// there lies on the part as it was made. A point shared by triangles
+	// that want it two ways (a seam its file didn't split) takes its first
+	// triangle's.
 	std::vector<float> out(n * 4);
+	Mikk m;
+	m.p = &p;
+	m.out = &out;
+	m.done.assign(n, 0);
+	for (size_t i = 0; i + 2 < p.index.size(); i += 3)
+		if (p.index[i] < n && p.index[i + 1] < n && p.index[i + 2] < n && i <= UINT32_MAX)
+			m.tris.push_back((uint32_t)i);
+	if (!m.tris.empty() && m.tris.size() <= (size_t)std::numeric_limits<int>::max()) {
+		SMikkTSpaceInterface calls = {};
+		calls.m_getNumFaces = Mikk::faces;
+		calls.m_getNumVerticesOfFace = Mikk::corners;
+		calls.m_getPosition = Mikk::place;
+		calls.m_getNormal = Mikk::facing;
+		calls.m_getTexCoord = Mikk::uv;
+		calls.m_setTSpaceBasic = Mikk::tangent;
+		SMikkTSpaceContext context = {};
+		context.m_pInterface = &calls;
+		context.m_pUserData = &m;
+		genTangSpaceDefault(&context);
+	}
+	// A point no triangle has (or one MikkTSpace couldn't do): any way
+	// across its facing.
 	for (size_t i = 0; i < n; i++) {
-		const V3 nn = p.normal[i];
-		V3 t = along_u[i] - nn * dot(nn, along_u[i]);
-		if (length(t) < 1e-9f) {
-			// No way along the picture here: any way across its facing.
+		float *o = &out[i * 4];
+		const V3 nn = normalized(p.normal[i], {0, 0, 1});
+		V3 t{o[0], o[1], o[2]};
+		t = t - nn * dot(nn, t);
+		if (!m.done[i] || !(length(t) > 1e-6f)) {
 			t = cross(std::fabs(nn.y) < 0.9f ? V3{0, 1, 0} : V3{1, 0, 0}, nn);
+			if (!m.done[i])
+				o[3] = 1;
 		}
 		t = normalized(t, {1, 0, 0});
-		const float w = dot(cross(nn, t), along_v[i] * -1.0f) < 0 ? -1.0f : 1.0f;
-		out[i * 4] = t.x;
-		out[i * 4 + 1] = t.y;
-		out[i * 4 + 2] = t.z;
-		out[i * 4 + 3] = w;
+		o[0] = t.x, o[1] = t.y, o[2] = t.z;
 	}
 	return out;
 }
