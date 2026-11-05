@@ -50,9 +50,21 @@ constexpr float FINGER_LIMITS[3][2] = {{-15, 90}, {0, 110}, {0, 80}};
 // A hand whose fingers bend back this far all told (degrees, each joint of
 // the four fingers) is turned round (finger_bends).
 constexpr float BENT_BACK = 40;
+// An open hand's thumb: its first bone this far (degrees) from the way
+// across the hand (little knuckle to first), out at the side. Swung in
+// further - across the palm or in front of it - its root is bent.
+constexpr float THUMB_OUT = 50;
 // A calibration's open hand bends no more than this (degrees), and moves
 // a hand by its head no more than this (head widths).
 constexpr float OPEN_MOST = 30, OFFSET_MOST = 0.6f;
+// What the hand model reads for each joint bent as far as it goes, in a
+// fist (degrees; the thumb's, then a finger's). It reads less of a fist's
+// curl at the knuckles than a hand has there - 45 to 70 degrees, not 90 -
+// and more at the tips: so it reads fists by the face, raised and from
+// behind, either hand, and MediaPipe's own photo of one. Read this far, a
+// joint is bent to its limit; less, as much less.
+constexpr float THUMB_FULL[3] = {30, 30, 60};
+constexpr float FINGER_FULL[3] = {60, 90, 70};
 
 float clamp01(float v)
 {
@@ -72,16 +84,12 @@ V3 upright(const Point &p)
 	return {p.x, -p.y, -p.z};
 }
 
-// The bend from `a` to `b` towards `palm` (radians): only the part of the
-// turn that's towards the palm (a sideways spread isn't a bend).
-float flex(V3 a, V3 b, V3 palm)
+// The whole turn from `a` to `b` (radians, 0 to pi), whichever way.
+float turn(V3 a, V3 b)
 {
-	const V3 ah = normalized(a, {0, 0, 0});
-	const V3 side = palm - ah * dot(palm, ah);
-	if (length(ah) < 0.5f || length(side) < 1e-9f || length(b) < 1e-9f)
+	if (length(a) < 1e-9f || length(b) < 1e-9f)
 		return 0;
-	const V3 n = normalized(side);
-	return std::atan2(dot(b, n), dot(b, ah));
+	return std::atan2(length(cross(a, b)), dot(a, b));
 }
 
 // The bend from `a` to `b` about `axis` (unit; radians, + turning by the
@@ -102,15 +110,21 @@ bool in_picture(const Body &body, int i)
 	return p.x >= 0 && p.x <= body.w - 1 && p.y >= 0 && p.y <= body.h - 1;
 }
 
-// A bend `v` with a calibration's open hand bent `open` there: open is
-// straight, and the most a joint bends (`most`) stays the most - so a
-// calibration opens your hand all the way and still closes your fist.
-// (Less than open: back from straight, as much.)
-float opened(float v, float open, float most)
+// A joint's bend as the hand model reads it (`v`) -> as your hand bends:
+// what it reads for your open hand (`open`, from a calibration; else 0) is
+// straight, and what it reads for a joint bent all the way (`full`) is the
+// most it bends (`most`) - so a calibration opens your hand all the way and
+// your fist still closes. (Less than open: back from straight, as much.)
+float bend_shown(float v, float open, float full, float most)
 {
-	if (v <= open || !(most - open > 1e-3f))
+	if (v <= open)
 		return v - open;
-	return (v - open) * most / (most - open);
+	// An open hand read nearly as bent as a fist (a bad calibration) still
+	// leaves room to close.
+	const float span = std::max(full - open, full * 0.5f);
+	if (!(span > 1e-3f))
+		return v - open;
+	return (v - open) * most / span;
 }
 
 float limit(float v, const float lim[2])
@@ -164,16 +178,20 @@ bool finger_bends(const Point *hand, bool left, float bend[5][3])
 	// fist from behind, a small hand far off), or it's the other hand.
 	const bool round = back < -BENT_BACK * DEG;
 	if (round) {
-		palm = -palm;
 		for (int f = 1; f < 5; f++)
 			for (int j = 0; j < 3; j++)
 				bend[f][j] = -bend[f][j];
 	}
-	// The thumb: its root bends towards the palm, past it towards the
-	// first finger's knuckle.
-	bend[0][0] = flex(p[1] - p[0], p[2] - p[1], palm);
-	bend[0][1] = flex(p[2] - p[1], p[3] - p[2], p[5] - p[2]);
-	bend[0][2] = flex(p[3] - p[2], p[4] - p[3], p[5] - p[3]);
+	// The thumb, Kalidokit's way: by its joints' whole turns, as a thumb
+	// moves every way and hardly bends back (and so whichever way round
+	// the hand model guesses its depth). Its root: how far its first bone
+	// has swung in from out at the side (THUMB_OUT) - in a fist it's
+	// across the fingers; past it, the turn at each joint.
+	const V3 along = normalized(p[9] - p[0], {0, 0, 0});
+	const V3 across = normalized((p[5] - p[17]) - along * dot(p[5] - p[17], along), {0, 0, 0});
+	bend[0][0] = length(across) > 0.5f ? turn(p[2] - p[1], across) - THUMB_OUT * DEG : 0;
+	bend[0][1] = turn(p[2] - p[1], p[3] - p[2]);
+	bend[0][2] = turn(p[3] - p[2], p[4] - p[3]);
 	return round;
 }
 
@@ -317,9 +335,9 @@ void ArmSolver::look(const Body &body)
 				for (int f = 0; f < 5; f++)
 					for (int j = 0; j < 3; j++) {
 						const float *lim = f ? FINGER_LIMITS[j] : THUMB_LIMITS[j];
-						t.bend[f][j] = limit(calibrated_ ? opened(b[f][j], open_[f][j], lim[1] * DEG)
-										 : b[f][j],
-								     lim);
+						const float full = (f ? FINGER_FULL[j] : THUMB_FULL[j]) * DEG;
+						t.bend[f][j] = limit(
+							bend_shown(b[f][j], calibrated_ ? open_[f][j] : 0, full, lim[1] * DEG), lim);
 					}
 				hand = true;
 			}
@@ -465,7 +483,7 @@ std::string ArmSolver::save_calibration() const
 	for (const auto &f : open_)
 		for (float j : f)
 			open.push_back(rounded(j));
-	return json{{"v", 2},
+	return json{{"v", 3},
 		    {"by_ear", {rounded(ear_offset_.x), rounded(ear_offset_.y), rounded(ear_offset_.z)}},
 		    {"open", open}}
 		.dump();
@@ -477,12 +495,13 @@ bool ArmSolver::load_calibration(const std::string &text)
 		clear_calibration();
 		return true;
 	}
-	// v 2: today's. v 1: from a test build of 0.8.0 before its fingers were
-	// measured as now - its hand by your ear is kept, its open hand isn't
-	// (bends measured another way would keep a fist from closing).
+	// v 3: today's. From test builds of 0.8.0 that measured bends another
+	// way (they'd keep a fist from closing), the hand by your ear is kept
+	// and what's still measured the same: v 2's fingers (its thumb was
+	// measured another way), v 1's none of its open hand.
 	const json j = json::parse(text, nullptr, false);
 	const int version = j.is_object() ? j.value("v", 0) : 0;
-	if (version != 1 && version != 2)
+	if (version < 1 || version > 3)
 		return false;
 	const auto by_ear = j.find("by_ear"), open = j.find("open");
 	if (by_ear == j.end() || !by_ear->is_array() || by_ear->size() != 3 || open == j.end() || !open->is_array() ||
@@ -501,7 +520,7 @@ bool ArmSolver::load_calibration(const std::string &text)
 	ear_offset_ = {v[0], v[1], v[2]};
 	for (int f = 0; f < 5; f++)
 		for (int k = 0; k < 3; k++)
-			open_[f][k] = version == 2 ? v[3 + f * 3 + k] : 0;
+			open_[f][k] = version == 3 || (version == 2 && f > 0) ? v[3 + f * 3 + k] : 0;
 	calibrated_ = true;
 	return true;
 }

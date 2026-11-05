@@ -579,6 +579,27 @@ static void make_curled_hand(Point *p, const float bend[4][3], bool left)
 	}
 }
 
+// Google MediaPipe's own hand model (its hand landmarker, through
+// MediaPipe) on two of its test photos (mediapipe-assets, Apache 2.0):
+// a right fist, and a right hand pointing up, both their palms to the
+// camera - in metres, the camera's way.
+static const Point mp_fist[HAND_POINTS] = {
+	{-0.0086f, 0.0817f, 0.0060f},  {0.0272f, 0.0620f, -0.0089f},  {0.0498f, 0.0353f, -0.0168f},
+	{0.0502f, 0.0052f, -0.0289f},  {0.0155f, -0.0062f, -0.0316f}, {0.0292f, -0.0024f, 0.0011f},
+	{0.0346f, -0.0176f, -0.0207f}, {0.0341f, -0.0060f, -0.0257f}, {0.0287f, 0.0112f, -0.0098f},
+	{0.0016f, -0.0048f, 0.0057f},  {0.0105f, -0.0197f, -0.0271f}, {0.0132f, 0.0072f, -0.0349f},
+	{0.0138f, 0.0119f, -0.0042f},  {-0.0199f, -0.0007f, -0.0003f}, {-0.0108f, -0.0085f, -0.0288f},
+	{-0.0054f, 0.0129f, -0.0342f}, {-0.0029f, 0.0219f, -0.0118f}, {-0.0388f, 0.0119f, -0.0076f},
+	{-0.0309f, 0.0011f, -0.0227f}, {-0.0184f, 0.0140f, -0.0328f}, {-0.0243f, 0.0225f, -0.0235f}};
+static const Point mp_pointing[HAND_POINTS] = {
+	{0.0170f, 0.0864f, 0.0360f},   {0.0420f, 0.0567f, 0.0197f},   {0.0504f, 0.0318f, 0.0025f},
+	{0.0433f, 0.0091f, -0.0249f},  {0.0160f, 0.0051f, -0.0369f},  {0.0245f, -0.0135f, 0.0041f},
+	{0.0248f, -0.0414f, -0.0029f}, {0.0258f, -0.0620f, -0.0103f}, {0.0229f, -0.0797f, -0.0317f},
+	{0.0007f, -0.0061f, 0.0049f},  {0.0077f, -0.0170f, -0.0297f}, {0.0176f, 0.0092f, -0.0369f},
+	{0.0145f, 0.0175f, -0.0110f},  {-0.0181f, 0.0062f, -0.0027f}, {-0.0102f, 0.0053f, -0.0346f},
+	{0.0044f, 0.0284f, -0.0329f},  {0.0038f, 0.0360f, -0.0074f},  {-0.0318f, 0.0299f, -0.0089f},
+	{-0.0240f, 0.0216f, -0.0276f}, {-0.0085f, 0.0319f, -0.0323f}, {-0.0129f, 0.0387f, -0.0171f}};
+
 static void test_finger_bends()
 {
 	Point hand[HAND_POINTS];
@@ -647,26 +668,6 @@ static void test_finger_bends()
 						for (int j = 0; j < 3; j++)
 							CHECK(near(bend[f][j], pose->bend[f - 1][j] * PI / 180, 1e-3));
 				}
-	// Google MediaPipe's own hand model (its hand landmarker, through
-	// MediaPipe) on two of its test photos (mediapipe-assets, Apache 2.0):
-	// a right fist, and a right hand pointing up, both their palms to the
-	// camera - in metres, the camera's way.
-	const Point mp_fist[HAND_POINTS] = {
-		{-0.0086f, 0.0817f, 0.0060f},  {0.0272f, 0.0620f, -0.0089f},  {0.0498f, 0.0353f, -0.0168f},
-		{0.0502f, 0.0052f, -0.0289f},  {0.0155f, -0.0062f, -0.0316f}, {0.0292f, -0.0024f, 0.0011f},
-		{0.0346f, -0.0176f, -0.0207f}, {0.0341f, -0.0060f, -0.0257f}, {0.0287f, 0.0112f, -0.0098f},
-		{0.0016f, -0.0048f, 0.0057f},  {0.0105f, -0.0197f, -0.0271f}, {0.0132f, 0.0072f, -0.0349f},
-		{0.0138f, 0.0119f, -0.0042f},  {-0.0199f, -0.0007f, -0.0003f}, {-0.0108f, -0.0085f, -0.0288f},
-		{-0.0054f, 0.0129f, -0.0342f}, {-0.0029f, 0.0219f, -0.0118f}, {-0.0388f, 0.0119f, -0.0076f},
-		{-0.0309f, 0.0011f, -0.0227f}, {-0.0184f, 0.0140f, -0.0328f}, {-0.0243f, 0.0225f, -0.0235f}};
-	const Point mp_pointing[HAND_POINTS] = {
-		{0.0170f, 0.0864f, 0.0360f},   {0.0420f, 0.0567f, 0.0197f},   {0.0504f, 0.0318f, 0.0025f},
-		{0.0433f, 0.0091f, -0.0249f},  {0.0160f, 0.0051f, -0.0369f},  {0.0245f, -0.0135f, 0.0041f},
-		{0.0248f, -0.0414f, -0.0029f}, {0.0258f, -0.0620f, -0.0103f}, {0.0229f, -0.0797f, -0.0317f},
-		{0.0007f, -0.0061f, 0.0049f},  {0.0077f, -0.0170f, -0.0297f}, {0.0176f, 0.0092f, -0.0369f},
-		{0.0145f, 0.0175f, -0.0110f},  {-0.0181f, 0.0062f, -0.0027f}, {-0.0102f, 0.0053f, -0.0346f},
-		{0.0044f, 0.0284f, -0.0329f},  {0.0038f, 0.0360f, -0.0074f},  {-0.0318f, 0.0299f, -0.0089f},
-		{-0.0240f, 0.0216f, -0.0276f}, {-0.0085f, 0.0319f, -0.0323f}, {-0.0129f, 0.0387f, -0.0171f}};
 	for (int mirror = 0; mirror < 2; mirror++) {
 		Point f[HAND_POINTS], up[HAND_POINTS];
 		for (int i = 0; i < HAND_POINTS; i++) {
@@ -687,13 +688,65 @@ static void test_finger_bends()
 		for (int k = 2; k < 5; k++)
 			CHECK(bend[k][0] > 40 * PI / 180 && bend[k][1] > 40 * PI / 180);
 	}
-	// The thumb's root bends towards the palm (in at the camera).
-	make_hand(hand, 0, false);
-	hand[2].z -= 0.02f;
-	hand[3].z -= 0.035f;
-	hand[4].z -= 0.05f;
+	// The thumb (Kalidokit's way: its joints' whole turns). Straight, out at
+	// the side as an open hand's: nothing bent, either hand, whichever way
+	// round its depth.
+	auto thumb = [&](Point *h, bool left, float in, float middle, float tip) {
+		// Its first bone `in` degrees further in than an open hand's
+		// (towards the fingers, across the palm), then bent at its middle
+		// and tip, in the palm's plane.
+		make_hand(h, 0, left);
+		float a = (90 - 50 - in) * PI / 180; // from straight up, out to the side
+		const float lengths[3] = {0.03f, 0.03f, 0.025f};
+		V3 at{0.025f, -0.02f, 0};
+		for (int j = 0; j < 3; j++) {
+			if (j == 1)
+				a -= middle * PI / 180;
+			if (j == 2)
+				a -= tip * PI / 180;
+			at = at + V3{std::sin(a), -std::cos(a), 0} * lengths[j];
+			h[2 + j] = {left ? -at.x : at.x, at.y, at.z};
+		}
+	};
+	for (int left = 0; left < 2; left++)
+		for (int mirror = 0; mirror < 2; mirror++) {
+			auto measure = [&](float in, float middle, float tip) {
+				thumb(hand, left, in, middle, tip);
+				if (mirror)
+					for (Point &q : hand)
+						q.z = -q.z;
+				finger_bends(hand, left, bend);
+			};
+			measure(0, 0, 0);
+			CHECK(near(bend[0][0], 0, 1e-3) && near(bend[0][1], 0, 1e-3) && near(bend[0][2], 0, 1e-3));
+			// Swung in across the palm, bent at its middle and tip: as far.
+			measure(25, 30, 45);
+			CHECK(near(bend[0][0], 25 * PI / 180, 1e-3));
+			CHECK(near(bend[0][1], 30 * PI / 180, 1e-3) && near(bend[0][2], 45 * PI / 180, 1e-3));
+			// Swung out wider than an open hand's: its root back from
+			// straight.
+			measure(-15, 0, 0);
+			CHECK(near(bend[0][0], -15 * PI / 180, 1e-3));
+		}
+	// ...and in front of the palm (in at the camera) its root's bent too.
+	thumb(hand, false, 0, 0, 0);
+	for (int i = 2; i <= 4; i++)
+		hand[i].z -= 0.04f * (float)(i - 1);
 	finger_bends(hand, false, bend);
-	CHECK(bend[0][0] > 0.2f);
+	CHECK(bend[0][0] > 15 * PI / 180);
+	// MediaPipe's fist and finger up: its thumb across the fingers, bent
+	// (the old measure had it nearly straight, sticking out).
+	for (int mirror = 0; mirror < 2; mirror++) {
+		Point f[HAND_POINTS], up[HAND_POINTS];
+		for (int i = 0; i < HAND_POINTS; i++) {
+			f[i] = {mp_fist[i].x, mp_fist[i].y, mirror ? -mp_fist[i].z : mp_fist[i].z};
+			up[i] = {mp_pointing[i].x, mp_pointing[i].y, mirror ? -mp_pointing[i].z : mp_pointing[i].z};
+		}
+		for (const Point *h : {(const Point *)f, (const Point *)up}) {
+			finger_bends(h, false, bend);
+			CHECK(bend[0][0] > 5 * PI / 180 && bend[0][1] > 25 * PI / 180 && bend[0][2] > 45 * PI / 180);
+		}
+	}
 }
 
 // --- The arm solver -------------------------------------------------------
@@ -978,6 +1031,28 @@ static Body with_hands(float bend)
 	return b;
 }
 
+// Both your hands as a right hand `h` (the hand model's metres; your left
+// mirrored), at your wrists.
+static Body with_these_hands(const Point *h)
+{
+	Body b = with_hands(0);
+	for (int you = 0; you < 2; you++) {
+		const Point &w = b.world[you ? BODY_RIGHT_WRIST : BODY_LEFT_WRIST];
+		for (int i = 0; i < HAND_POINTS; i++) {
+			const float x = h[i].x - h[0].x, y = h[i].y - h[0].y, z = h[i].z - h[0].z;
+			b.hands[you].world[i] = {w.x + (you ? x : -x), w.y + y, w.z + z};
+		}
+	}
+	return b;
+}
+
+// A middle joint read `deg` degrees by the hand model, as its hand shows it
+// (uncalibrated): read as far as a fist reads (90), its most (110).
+static double middle_shown(double deg)
+{
+	return deg * 110.0 / 90 * PI / 180;
+}
+
 static void test_hands()
 {
 	ArmSolver s;
@@ -988,7 +1063,7 @@ static void test_hands()
 	for (int side = 0; side < 2; side++) {
 		const ArmTarget &t = s.now().side[side];
 		CHECK(t.hand == 1);
-		CHECK(near(t.bend[2][1], 60 * PI / 180, 2e-3));
+		CHECK(near(t.bend[2][1], middle_shown(60), 2e-3));
 		CHECK(near(t.bend[2][0], 0, 2e-3));
 		// Fingers up, its palm to the camera: along up; mirrored.
 		CHECK(near3(t.along, {0, 1, 0}, 1e-3f));
@@ -997,6 +1072,47 @@ static void test_hands()
 	// your body's middle) is its right, first finger towards its left.
 	CHECK(s.now().side[1].across.x > 0.99f);
 	CHECK(s.now().side[0].across.x < -0.99f);
+	// The hand model reads a fist's knuckles less bent than a hand has
+	// them (45 to 70 degrees, not 90) and its tips more: each joint read
+	// as far as its fist is bent to its limit, and half as far, half way.
+	{
+		const float fist[4][3] = {{60, 90, 70}, {60, 90, 70}, {60, 90, 70}, {60, 90, 70}};
+		const float half[4][3] = {{30, 45, 35}, {30, 45, 35}, {30, 45, 35}, {30, 45, 35}};
+		const float past[4][3] = {{80, 100, 85}, {80, 100, 85}, {80, 100, 85}, {80, 100, 85}};
+		const float want[3][3] = {{90, 110, 80}, {45, 55, 40}, {90, 110, 80}};
+		const float(*read[3])[3] = {fist, half, past};
+		for (int r = 0; r < 3; r++) {
+			Body h = with_hands(0);
+			for (int you = 0; you < 2; you++)
+				make_curled_hand(h.hands[you].world, read[r], you == 0);
+			ArmSolver a;
+			settle(a, h);
+			for (int side = 0; side < 2; side++)
+				for (int k = 1; k < 5; k++)
+					for (int j = 0; j < 3; j++)
+						CHECK(near(a.now().side[side].bend[k][j], want[r][j] * PI / 180, 2e-3));
+		}
+	}
+	// MediaPipe's own fist (a photo of one): a closed fist, its thumb
+	// bent across it; pointing up: its first finger straight, the rest a
+	// fist.
+	{
+		ArmSolver f, u;
+		settle(f, with_these_hands(mp_fist));
+		settle(u, with_these_hands(mp_pointing));
+		CHECK(f.seen().hand[0] && f.seen().hand[1] && u.seen().hand[0] && u.seen().hand[1]);
+		for (int side = 0; side < 2; side++) {
+			const ArmTarget &x = f.now().side[side], &y = u.now().side[side];
+			for (int k = 1; k < 5; k++)
+				CHECK(x.bend[k][0] > 70 * PI / 180 && x.bend[k][1] > 90 * PI / 180 &&
+				      x.bend[k][2] > 75 * PI / 180);
+			CHECK(x.bend[0][0] > 10 * PI / 180 && x.bend[0][1] > 50 * PI / 180 && x.bend[0][2] > 70 * PI / 180);
+			for (int j = 0; j < 3; j++)
+				CHECK(std::fabs(y.bend[1][j]) < 35 * PI / 180);
+			for (int k = 2; k < 5; k++)
+				CHECK(y.bend[k][0] > 70 * PI / 180 && y.bend[k][1] > 90 * PI / 180);
+		}
+	}
 	// Your hands turned towards the camera and to one side, then the same
 	// as the hand model sees them the other way round (its depth a mirror
 	// of yours, as it can guess a fist from behind): the same bends, and
@@ -1023,7 +1139,7 @@ static void test_hands()
 			CHECK(c.seen().hand[side] && y.hand == 1);
 			CHECK(std::fabs(x.along.z) > 0.3f);
 			CHECK(near3(x.along, y.along, 1e-3f) && near3(x.across, y.across, 1e-3f));
-			CHECK(near(y.bend[2][1], 60 * PI / 180, 2e-3));
+			CHECK(near(y.bend[2][1], middle_shown(60), 2e-3));
 			for (int f = 0; f < 5; f++)
 				for (int j = 0; j < 3; j++)
 					CHECK(near(x.bend[f][j], y.bend[f][j], 1e-3));
@@ -1039,7 +1155,7 @@ static void test_hands()
 		ArmSolver c;
 		settle(c, by_face);
 		CHECK(c.seen().arm[1] && c.seen().hand[1] && c.now().side[1].weight == 1);
-		CHECK(near(c.now().side[1].bend[2][1], 60 * PI / 180, 2e-3));
+		CHECK(near(c.now().side[1].bend[2][1], middle_shown(60), 2e-3));
 		// Not found there: not followed.
 		by_face.hands[0].found = false;
 		by_face.hands[0].gate = HandGate::Unsure;
@@ -1126,12 +1242,15 @@ static void test_by_head_and_calibration()
 	CHECK(!s.calibrating() && s.calibrated() && s.calibration_result() == "ok");
 	settle(s, b);
 	CHECK(near(s.now().side[1].bend[2][1], 0, 2e-3));
-	// ...and your fist still closes all the way: the most a joint bends
-	// stays the most, half way is a little less than half way.
+	// ...and your fist still closes all the way: read as far as the hand
+	// model reads a fist (90 at a middle joint), its most; between, as far
+	// between.
+	settle(s, by_ear({}, 90));
+	CHECK(near(s.now().side[1].bend[2][1], 110 * PI / 180, 2e-3));
 	settle(s, by_ear({}, 110));
 	CHECK(near(s.now().side[1].bend[2][1], 110 * PI / 180, 2e-3));
 	settle(s, by_ear({}, 59));
-	CHECK(near(s.now().side[1].bend[2][1], (59 - 8) * 110.0 / (110 - 8) * PI / 180, 2e-3));
+	CHECK(near(s.now().side[1].bend[2][1], (59 - 8) * 110.0 / (90 - 8) * PI / 180, 2e-3));
 	// Bent back from your open hand: back from straight as much.
 	settle(s, by_ear({}, 2));
 	CHECK(near(s.now().side[1].bend[2][1], 0, 2e-3));
@@ -1155,23 +1274,39 @@ static void test_by_head_and_calibration()
 	std::swap(right.world[BODY_LEFT_HIP], right.world[BODY_RIGHT_HIP]);
 	settle(again, right);
 	CHECK(near3(again.now().side[0].by_head, {ArmSolver::BY_EAR_OUT, -ArmSolver::BY_EAR_DOWN, 0}, 1e-3f));
-	// One from a test build before today's finger bends ("v" 1): its hand
-	// by your ear is kept, its open hand isn't (so a fist still closes).
+	// From test builds that measured bends another way: one before today's
+	// finger bends ("v" 1) keeps its hand by your ear, not its open hand
+	// (so a fist still closes); one before today's thumb ("v" 2) keeps its
+	// fingers' open hand too, not its thumb's.
 	{
-		ArmSolver old;
+		ArmSolver none, old, older;
+		settle(none, b);
 		json v1 = json::parse(text);
-		CHECK(v1["v"] == 2);
+		CHECK(v1["v"] == 3);
 		v1["v"] = 1;
-		v1["open"] = std::vector<float>(15, 0.5f);
-		CHECK(old.load_calibration(v1.dump()) && old.calibrated());
+		v1["open"] = std::vector<float>(15, 0.3f);
+		CHECK(older.load_calibration(v1.dump()) && older.calibrated());
+		settle(older, b);
+		CHECK(near3(older.now().side[1].by_head, s.now().side[1].by_head, 1e-3f));
+		CHECK(near(older.now().side[1].bend[2][1], middle_shown(8), 2e-3));
+		settle(older, by_ear({}, 110));
+		CHECK(near(older.now().side[1].bend[2][1], 110 * PI / 180, 2e-3));
+		json v2 = v1;
+		v2["v"] = 2;
+		CHECK(old.load_calibration(v2.dump()) && old.calibrated());
 		settle(old, b);
 		CHECK(near3(old.now().side[1].by_head, s.now().side[1].by_head, 1e-3f));
-		CHECK(near(old.now().side[1].bend[2][1], 8 * PI / 180, 2e-3));
-		settle(old, by_ear({}, 110));
-		CHECK(near(old.now().side[1].bend[2][1], 110 * PI / 180, 2e-3));
+		// (0.3 radians open: the middle joint's 8 degrees is less - straight.)
+		CHECK(near(old.now().side[1].bend[2][1], 0, 2e-3));
+		for (int j = 0; j < 3; j++)
+			CHECK(near(old.now().side[1].bend[0][j], none.now().side[1].bend[0][j], 1e-4));
+		CHECK(none.now().side[1].bend[0][1] > 0.2f);
+		// Saved again, it's today's.
+		CHECK(json::parse(old.save_calibration())["v"] == 3);
 	}
 	// Bad text: not taken, the calibration it had kept.
-	for (const char *bad : {"x", "{}", "[]", "{\"v\":3,\"by_ear\":[0,0,0],\"open\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}",
+	for (const char *bad : {"x", "{}", "[]", "{\"v\":4,\"by_ear\":[0,0,0],\"open\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}",
+				"{\"v\":0,\"by_ear\":[0,0,0],\"open\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}",
 				"{\"v\":2,\"by_ear\":[0,0,0],\"open\":[]}",
 				"{\"v\":1,\"by_ear\":[9,0,0],\"open\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}",
 				"{\"v\":1,\"by_ear\":[0,0,0],\"open\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"})

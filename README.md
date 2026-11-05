@@ -223,7 +223,10 @@ worn on your head) can follow your arms, hands and fingers from the same
 camera: its upper arms and forearms point where yours do, its elbows bend
 your elbows' way, its hands turn as yours (its forearms take half the
 twist, so its wrists don't pinch thin) and each finger joint bends as
-yours, within each joint's natural limits and how far a wrist bends. An
+yours, within each joint's natural limits and how far a wrist bends (the
+hand model reads a fist's knuckles less bent than they are, 45 to 70
+degrees, not 90, and its tips more, so a joint read as far as its fist
+reads is bent all the way: a fist closes, its thumb across it). An
 arm raised above level lifts its shoulder too (a third of the way, at
 most 25 degrees, as a real shoulder blade turns), so the top of a raised
 arm doesn't fold into its neck. It

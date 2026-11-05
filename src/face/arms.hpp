@@ -162,10 +162,11 @@ private:
 	ArmOptions options_;
 	Side side_[2];
 	ArmsNow now_;
-	// Calibration: your open hand's bends (open is straight, and a
-	// joint's most stays its most) and the offset that takes your hand by
+	// Calibration: your open hand's bends (open is straight, and a fist
+	// still closes all the way) and the offset that takes your hand by
 	// your ear to BY_EAR (out, down, forward; head widths). Kept as text
-	// (save_calibration), "v" 2; a "v" 1 one's open hand isn't used.
+	// (save_calibration), "v" 3; of an older one's open hand, only what's
+	// still measured the same is used (load_calibration).
 	bool calibrated_ = false, calibrating_ = false;
 	float open_[5][3] = {};
 	V3 ear_offset_;
