@@ -40,15 +40,17 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //     yours; a hand the hand model guesses back to front (its fingers bent
 //     back, as no hand bends) is turned the right way round.
 //   - Natural limits on each finger joint, and on how far a wrist bends.
-//   - A part that's lost (out of sight - an arm's elbow or wrist, as the
-//     page draws them - or a "ghost" hand) is held as it was for a moment,
-//     then rests (arms down, fingers relaxed); found again, it's back
-//     quickly. A hand must be seen two looks running before it moves
-//     anything.
+//   - Only an arm it can see: one hanging below the picture, or the body
+//     model's guess at an arm out of sight (its elbow out of the picture
+//     and no hand found where its wrist would be), isn't followed. A part
+//     that's lost (such an arm, one out of sight, a "ghost" hand) is held
+//     as it was for a moment, then rests (arms down, fingers relaxed);
+//     found again, it's back quickly. A hand must be seen two looks
+//     running before it moves anything.
 //   - Calibrate: hold a hand up by your ear, open, palm to the camera.
 //     It learns how your open hand looks (so its fingers open all the
-//     way when yours do) and where your hand is when it's by your ear
-//     (so its hand goes by its ear).
+//     way when yours do, and still close all the way in a fist) and where
+//     your hand is when it's by your ear (so its hand goes by its ear).
 //   - Reach (how far it reaches towards and away from the camera, as the
 //     camera judges depth less well) and arms out from its body.
 //
@@ -160,9 +162,10 @@ private:
 	ArmOptions options_;
 	Side side_[2];
 	ArmsNow now_;
-	// Calibration: your open hand's bends (subtracted, so open is
-	// straight) and the offset that takes your hand by your ear to
-	// BY_EAR (out, down, forward; head widths).
+	// Calibration: your open hand's bends (open is straight, and a
+	// joint's most stays its most) and the offset that takes your hand by
+	// your ear to BY_EAR (out, down, forward; head widths). Kept as text
+	// (save_calibration), "v" 2; a "v" 1 one's open hand isn't used.
 	bool calibrated_ = false, calibrating_ = false;
 	float open_[5][3] = {};
 	V3 ear_offset_;

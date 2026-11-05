@@ -682,7 +682,8 @@ void BodyTracker::Impl::hands(const Frame &pic, double seconds)
 		hand.presence = 0;
 		hand.handedness = 0;
 		hand.tracked = false;
-		if (!hands_on || !look_at_hand(pic, side, hand)) {
+		if (!looks_for_hand(hands_on, raw[side ? BODY_RIGHT_ELBOW : BODY_LEFT_ELBOW], pic.w, pic.h) ||
+		    !look_at_hand(pic, side, hand)) {
 			lose_hand(side);
 			continue;
 		}
@@ -727,6 +728,11 @@ void BodyTracker::Impl::hands(const Frame &pic, double seconds)
 
 BodyTracker::BodyTracker() : impl_(std::make_unique<Impl>()) {}
 BodyTracker::~BodyTracker() = default;
+
+bool looks_for_hand(bool hands_on, const Point &elbow, int w, int h)
+{
+	return hands_on || !(elbow.x >= 0 && elbow.x <= w - 1 && elbow.y >= 0 && elbow.y <= h - 1);
+}
 
 bool BodyTracker::load(const uint8_t *task, size_t task_size, const uint8_t *lite, size_t lite_size,
 		       std::string *problem)

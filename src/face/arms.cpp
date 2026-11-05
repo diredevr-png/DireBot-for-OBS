@@ -95,6 +95,24 @@ float bend_about(V3 a, V3 b, V3 axis)
 	return std::atan2(dot(cross(f, t), axis), dot(f, t));
 }
 
+// A point in the picture (pixels).
+bool in_picture(const Body &body, int i)
+{
+	const Point &p = body.points[i];
+	return p.x >= 0 && p.x <= body.w - 1 && p.y >= 0 && p.y <= body.h - 1;
+}
+
+// A bend `v` with a calibration's open hand bent `open` there: open is
+// straight, and the most a joint bends (`most`) stays the most - so a
+// calibration opens your hand all the way and still closes your fist.
+// (Less than open: back from straight, as much.)
+float opened(float v, float open, float most)
+{
+	if (v <= open || !(most - open > 1e-3f))
+		return v - open;
+	return (v - open) * most / (most - open);
+}
+
 float limit(float v, const float lim[2])
 {
 	return std::min(lim[1] * DEG, std::max(lim[0] * DEG, v));
@@ -212,10 +230,27 @@ void ArmSolver::look(const Body &body)
 		const int S = you ? BODY_RIGHT_SHOULDER : BODY_LEFT_SHOULDER;
 		const int E = you ? BODY_RIGHT_ELBOW : BODY_LEFT_ELBOW;
 		const int W = you ? BODY_RIGHT_WRIST : BODY_LEFT_WRIST;
-		// Only an arm you can see, its elbow and its wrist (as the page
-		// draws it): the body model guesses where an arm it can't see is -
-		// down by your desk, in your lap - and says it's unsure.
-		if (!(body.seen[E] >= SEEN) || !(body.seen[W] >= SEEN) || !ok(E) || !ok(W)) {
+		// Only an arm you can see. The body model guesses where an arm it
+		// can't see is - down by your desk, in your lap, even a wrist in
+		// front of your chest - and is often sure of it:
+		//   - a hand the hand model finds at its wrist is there;
+		//   - else a wrist below the picture is an arm hanging down out of
+		//     it (one raised out of the top or the sides is followed);
+		//   - else its elbow and wrist must be in sight, and - where the
+		//     hand model looked at the wrist and found no hand of its own -
+		//     its elbow in the picture too (sitting close, your elbows are
+		//     below the picture with your hand by your face: then only
+		//     your hand found shows the arm is there).
+		const HandSeen &h = body.hands[you];
+		bool there;
+		if (h.found)
+			there = true;
+		else if (!(body.points[W].y <= body.h - 1) || !std::isfinite(body.points[W].x))
+			there = false;
+		else
+			there = body.seen[E] >= SEEN && body.seen[W] >= SEEN &&
+				(h.gate == HandGate::NotLooked || in_picture(body, E));
+		if (!there || !ok(E) || !ok(W)) {
 			lose(sd);
 			continue;
 		}
@@ -251,7 +286,6 @@ void ArmSolver::look(const Body &body)
 			rel = rel + V3{you ? -ear_offset_.x : ear_offset_.x, ear_offset_.y, ear_offset_.z};
 		t.by_head = flip(rel);
 		// Its hand.
-		const HandSeen &h = body.hands[you];
 		bool hand = false;
 		if (h.found && options_.fingers) {
 			float b[5][3];
@@ -281,9 +315,12 @@ void ArmSolver::look(const Body &body)
 					calibration_seen = true;
 				}
 				for (int f = 0; f < 5; f++)
-					for (int j = 0; j < 3; j++)
-						t.bend[f][j] = limit(b[f][j] - (calibrated_ ? open_[f][j] : 0),
-								     f ? FINGER_LIMITS[j] : THUMB_LIMITS[j]);
+					for (int j = 0; j < 3; j++) {
+						const float *lim = f ? FINGER_LIMITS[j] : THUMB_LIMITS[j];
+						t.bend[f][j] = limit(calibrated_ ? opened(b[f][j], open_[f][j], lim[1] * DEG)
+										 : b[f][j],
+								     lim);
+					}
 				hand = true;
 			}
 		}
@@ -428,7 +465,7 @@ std::string ArmSolver::save_calibration() const
 	for (const auto &f : open_)
 		for (float j : f)
 			open.push_back(rounded(j));
-	return json{{"v", 1},
+	return json{{"v", 2},
 		    {"by_ear", {rounded(ear_offset_.x), rounded(ear_offset_.y), rounded(ear_offset_.z)}},
 		    {"open", open}}
 		.dump();
@@ -440,8 +477,12 @@ bool ArmSolver::load_calibration(const std::string &text)
 		clear_calibration();
 		return true;
 	}
+	// v 2: today's. v 1: from a test build of 0.8.0 before its fingers were
+	// measured as now - its hand by your ear is kept, its open hand isn't
+	// (bends measured another way would keep a fist from closing).
 	const json j = json::parse(text, nullptr, false);
-	if (!j.is_object() || j.value("v", 0) != 1)
+	const int version = j.is_object() ? j.value("v", 0) : 0;
+	if (version != 1 && version != 2)
 		return false;
 	const auto by_ear = j.find("by_ear"), open = j.find("open");
 	if (by_ear == j.end() || !by_ear->is_array() || by_ear->size() != 3 || open == j.end() || !open->is_array() ||
@@ -460,7 +501,7 @@ bool ArmSolver::load_calibration(const std::string &text)
 	ear_offset_ = {v[0], v[1], v[2]};
 	for (int f = 0; f < 5; f++)
 		for (int k = 0; k < 3; k++)
-			open_[f][k] = v[3 + f * 3 + k];
+			open_[f][k] = version == 2 ? v[3 + f * 3 + k] : 0;
 	calibrated_ = true;
 	return true;
 }

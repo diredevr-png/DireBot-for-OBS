@@ -244,10 +244,14 @@ fingers relaxed; found again, it's back in a quarter of a second), and
 two looks running before it moves anything, and a hand is only looked
 for at your own wrist, must be where your wrist is and counts once if
 it's found twice - so a hand in the background, or a "ghost" hand, never
-moves it. Calibrate (`FaceArms`): hold a hand up by your ear, open, palm
-to the camera, and it learns how your open hand looks (so its fingers
-open all the way when yours do) and where your hand is by your ear (so
-its hand goes by its ear); it's kept in `arms_calibration`. A move on cue
+moves it. Only an arm it can see is followed: an arm hanging below the
+picture, or the body model's guess at an arm out of sight (its elbow out
+of the picture and no hand found at its wrist - with `arms_hands` off it
+still looks for one there), rests. Calibrate (`FaceArms`): hold a hand up
+by your ear, open, palm to the camera, and it learns how your open hand
+looks (so its fingers open all the way when yours do, and still close
+all the way in a fist) and where your hand is by your ear (so its hand
+goes by its ear); it's kept in `arms_calibration`. A move on cue
 (a wave, a cheer, an animation) takes over its arms while it plays.
 `FaceGetState`'s `hands_and_arms` says what the camera sees of you, for
 DireBot's camera check: your head, shoulders, elbows, wrists and hips in

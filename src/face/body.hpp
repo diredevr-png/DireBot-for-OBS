@@ -107,7 +107,7 @@ enum HandPointId {
 // wasn't looked for).
 enum class HandGate {
 	Ok,
-	NotLooked, // no body, the wrist out of the picture or out of sight, or hands off
+	NotLooked, // no body, the wrist out of the picture or out of sight, or hands off (see looks_for_hand)
 	Unsure,    // the hand model isn't sure a hand is there
 	Elsewhere, // its wrist isn't where your body's wrist is
 	Twice,     // the other hand's: your hands together, one hand found twice
@@ -171,7 +171,8 @@ public:
 	// The next look starts with the body finder. Hands too.
 	void forget();
 
-	// Hands: looked for (else only the body). Light: the lighter hand model.
+	// Hands: looked for (else only the body, and a hand only where
+	// looks_for_hand says). Light: the lighter hand model.
 	void set_hands(bool on);
 	void set_light(bool on);
 	bool light() const;
@@ -194,5 +195,12 @@ private:
 	struct Impl;
 	std::unique_ptr<Impl> impl_;
 };
+
+// Whether the tracker looks for a hand at a wrist (in sight, in the
+// picture) whose elbow is `elbow` in a picture w x h: hands on, always;
+// hands off (arms only), only where the elbow is out of the picture - only
+// a hand found there tells your arm from the body model's guess at one
+// (ArmSolver).
+bool looks_for_hand(bool hands_on, const Point &elbow, int w, int h);
 
 } // namespace direbot::face

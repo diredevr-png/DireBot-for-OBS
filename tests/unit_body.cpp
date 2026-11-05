@@ -466,6 +466,15 @@ static void test_hand_gates()
 	t.set_hands(false);
 	const Body &off = t.look(f.frame, 1.0 / 15);
 	CHECK(off.found && off.hands[0].gate == HandGate::NotLooked && off.hands[1].gate == HandGate::NotLooked);
+	// ...but, hands off, a hand is still looked for at a wrist whose elbow
+	// is out of the picture (here, both elbows are in it): only a hand found
+	// there tells your arm from the body model's guess at one.
+	CHECK(looks_for_hand(true, {320, 240}, 640, 480) && looks_for_hand(true, {320, 600}, 640, 480));
+	CHECK(!looks_for_hand(false, {320, 240}, 640, 480) && !looks_for_hand(false, {0, 479}, 640, 480) &&
+	      !looks_for_hand(false, {639, 0}, 640, 480));
+	CHECK(looks_for_hand(false, {320, 480}, 640, 480) && looks_for_hand(false, {-1, 240}, 640, 480) &&
+	      looks_for_hand(false, {640, 240}, 640, 480) && looks_for_hand(false, {320, -3}, 640, 480) &&
+	      looks_for_hand(false, {std::numeric_limits<float>::quiet_NaN(), 240}, 640, 480));
 	// Light mode runs the lighter hand model (or the full one without it).
 	t.set_hands(true);
 	t.set_light(true);
@@ -884,6 +893,42 @@ static void test_lost_and_found()
 		ArmSolver e;
 		settle(e, close);
 		CHECK(e.seen().arm[1] && e.now().side[1].weight == 1);
+		// Its wrist below the picture (an arm hanging down out of it),
+		// however sure the body model is: not followed. Raised out of the
+		// top or a side: followed.
+		for (Point at : {Point{320, 480, 0}, Point{400, 700, 0},
+				 Point{std::numeric_limits<float>::quiet_NaN(), 240, 0}}) {
+			Body low = b;
+			low.points[BODY_LEFT_WRIST] = at;
+			ArmSolver c;
+			settle(c, low);
+			CHECK(!c.seen().arm[1] && c.seen().arm[0] && c.now().side[1].weight == 0);
+		}
+		for (Point at : {Point{320, -40, 0}, Point{700, 100, 0}, Point{-5, 100, 0}, Point{320, 479, 0}}) {
+			Body up = b;
+			up.points[BODY_LEFT_WRIST] = at;
+			ArmSolver c;
+			settle(c, up);
+			CHECK(c.seen().arm[1]);
+		}
+		// The body model's guess at an arm out of sight: its wrist in the
+		// picture (in front of your chest), its elbow below it, and the
+		// hand model, looking where its wrist is, finds no hand of its
+		// own there - not followed. Its elbow in the picture: followed
+		// (the hand only hidden).
+		for (HandGate g : {HandGate::Unsure, HandGate::Elsewhere, HandGate::Twice}) {
+			Body ghost = b;
+			ghost.points[BODY_LEFT_ELBOW] = {400, 530, 0};
+			ghost.points[BODY_LEFT_WRIST] = {380, 430, 0};
+			ghost.hands[0].gate = g;
+			ArmSolver c;
+			settle(c, ghost);
+			CHECK(!c.seen().arm[1] && c.seen().arm[0] && c.now().side[1].weight == 0);
+			ghost.points[BODY_LEFT_ELBOW] = {400, 470, 0};
+			ArmSolver d;
+			settle(d, ghost);
+			CHECK(d.seen().arm[1]);
+		}
 		// Followed, then its elbow out of sight: held, then resting.
 		Body gone = b;
 		gone.seen[BODY_LEFT_ELBOW] = 0.3f;
@@ -984,6 +1029,24 @@ static void test_hands()
 					CHECK(near(x.bend[f][j], y.bend[f][j], 1e-3));
 		}
 	}
+	// A hand found at its wrist shows the arm is there, its elbow out of
+	// the picture and unsure (sitting close, a hand by your face).
+	{
+		Body by_face = with_hands(60);
+		by_face.points[BODY_LEFT_ELBOW] = {400, 560, 0};
+		by_face.seen[BODY_LEFT_ELBOW] = 0.2f;
+		by_face.seen[BODY_LEFT_WRIST] = 0.4f;
+		ArmSolver c;
+		settle(c, by_face);
+		CHECK(c.seen().arm[1] && c.seen().hand[1] && c.now().side[1].weight == 1);
+		CHECK(near(c.now().side[1].bend[2][1], 60 * PI / 180, 2e-3));
+		// Not found there: not followed.
+		by_face.hands[0].found = false;
+		by_face.hands[0].gate = HandGate::Unsure;
+		ArmSolver d;
+		settle(d, by_face);
+		CHECK(!d.seen().arm[1] && d.seen().arm[0]);
+	}
 	// Beyond a joint's limit: no further.
 	Body far = with_hands(150);
 	settle(s, far);
@@ -1021,15 +1084,16 @@ static void test_hands()
 	CHECK(once.now().side[0].hand == 0 && once.now().side[0].weight == 1);
 }
 
-// Your left hand by your left ear, open, palm to the camera.
-static Body by_ear(V3 off = {})
+// Your left hand by your left ear, open (each finger's middle joint bent
+// `bend` degrees), palm to the camera.
+static Body by_ear(V3 off = {}, float bend = 8)
 {
-	Body b = with_hands(8);
+	Body b = with_hands(bend);
 	const Point &ear = b.world[BODY_LEFT_EAR];
 	const V3 wrist{ear.x + 0.06f + off.x, ear.y + 0.05f + off.y, ear.z - 0.02f + off.z};
 	b.world[BODY_LEFT_ELBOW] = {0.3f, -0.3f, -0.05f};
 	b.world[BODY_LEFT_WRIST] = {wrist.x, wrist.y, wrist.z};
-	make_hand(b.hands[0].world, 8, true, wrist);
+	make_hand(b.hands[0].world, bend, true, wrist);
 	b.hands[1].found = false;
 	return b;
 }
@@ -1062,6 +1126,16 @@ static void test_by_head_and_calibration()
 	CHECK(!s.calibrating() && s.calibrated() && s.calibration_result() == "ok");
 	settle(s, b);
 	CHECK(near(s.now().side[1].bend[2][1], 0, 2e-3));
+	// ...and your fist still closes all the way: the most a joint bends
+	// stays the most, half way is a little less than half way.
+	settle(s, by_ear({}, 110));
+	CHECK(near(s.now().side[1].bend[2][1], 110 * PI / 180, 2e-3));
+	settle(s, by_ear({}, 59));
+	CHECK(near(s.now().side[1].bend[2][1], (59 - 8) * 110.0 / (110 - 8) * PI / 180, 2e-3));
+	// Bent back from your open hand: back from straight as much.
+	settle(s, by_ear({}, 2));
+	CHECK(near(s.now().side[1].bend[2][1], 0, 2e-3));
+	settle(s, b);
 	CHECK(near3(s.now().side[1].by_head, {-ArmSolver::BY_EAR_OUT, -ArmSolver::BY_EAR_DOWN, 0}, 1e-3f));
 	// Kept as text, and read back the same.
 	const std::string text = s.save_calibration();
@@ -1081,8 +1155,24 @@ static void test_by_head_and_calibration()
 	std::swap(right.world[BODY_LEFT_HIP], right.world[BODY_RIGHT_HIP]);
 	settle(again, right);
 	CHECK(near3(again.now().side[0].by_head, {ArmSolver::BY_EAR_OUT, -ArmSolver::BY_EAR_DOWN, 0}, 1e-3f));
+	// One from a test build before today's finger bends ("v" 1): its hand
+	// by your ear is kept, its open hand isn't (so a fist still closes).
+	{
+		ArmSolver old;
+		json v1 = json::parse(text);
+		CHECK(v1["v"] == 2);
+		v1["v"] = 1;
+		v1["open"] = std::vector<float>(15, 0.5f);
+		CHECK(old.load_calibration(v1.dump()) && old.calibrated());
+		settle(old, b);
+		CHECK(near3(old.now().side[1].by_head, s.now().side[1].by_head, 1e-3f));
+		CHECK(near(old.now().side[1].bend[2][1], 8 * PI / 180, 2e-3));
+		settle(old, by_ear({}, 110));
+		CHECK(near(old.now().side[1].bend[2][1], 110 * PI / 180, 2e-3));
+	}
 	// Bad text: not taken, the calibration it had kept.
-	for (const char *bad : {"x", "{}", "{\"v\":2,\"by_ear\":[0,0,0],\"open\":[]}",
+	for (const char *bad : {"x", "{}", "[]", "{\"v\":3,\"by_ear\":[0,0,0],\"open\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}",
+				"{\"v\":2,\"by_ear\":[0,0,0],\"open\":[]}",
 				"{\"v\":1,\"by_ear\":[9,0,0],\"open\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}",
 				"{\"v\":1,\"by_ear\":[0,0,0],\"open\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"})
 		CHECK(!again.load_calibration(bad) && again.calibrated());
