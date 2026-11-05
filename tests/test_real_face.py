@@ -2173,14 +2173,23 @@ def test_hands_and_arms_follow_you(run):
             assert got["seen"] > 0.5 and 0 < got["x"] < 1 and 0 < got["y"] < 1, (i, got)
         assert "left_hand_points" not in a and "right_hand_points" not in a
         # Its arms hang relaxed by its sides until then; now its elbows bend
-        # and its hands come up and in, together in front of it.
+        # and its hands come up and in, together in front of it. (The body
+        # models settle on the photo over their first looks - a few a
+        # second on a slow PC - so it's looked at until they have.)
+        shots = []
+
+        def risen():
+            shot = screenshot(c, "Arms")
+            _, _, gn = middle_of(shot, green)
+            _, ry, rn = middle_of(shot, red)
+            spread = sum(abs(x - size / 2) for row in shot for x, px in enumerate(row) if red(px)) / max(rn, 1)
+            shots.append((shot, gn, ry, rn, spread))
+            return gn > 40 and rn > 10 and ry < ry0 - 0.04 * size and spread < 0.6 * spread0
         time.sleep(1.5)
-        follow = screenshot(c, "Arms")
+        wait_for(risen, 8, 0.5)
+        follow, gn1, ry1, rn1, spread1 = shots[-1]
         keep_shot(follow, "arms-following")
-        _, _, gn1 = middle_of(follow, green)
-        _, ry1, rn1 = middle_of(follow, red)
         assert gn1 > 40 and rn1 > 10, (gn1, rn1)
-        spread1 = sum(abs(x - size / 2) for row in follow for x, px in enumerate(row) if red(px)) / rn1
         assert ry1 < ry0 - 0.04 * size, (ry0, ry1)
         assert spread1 < 0.6 * spread0, (spread0, spread1)
         # The ball copying its upper arm's turn has gone round with it.
