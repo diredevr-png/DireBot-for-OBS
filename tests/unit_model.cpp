@@ -2867,6 +2867,114 @@ static std::vector<uint8_t> make_motion(const std::map<std::string, Quat> &turns
 	return b.glb();
 }
 
+// 0.8.1: "All of it" framed as it stands - its arms down by its sides,
+// not as wide as its arms reach in the T it was made in - with a little
+// room round it; a VRM's head and shoulders as before; Size up to 3.
+static void test_framed_as_it_stands()
+{
+	Figure body = make_body();
+	Builder &b = body.p.b;
+	// A box on each hand, out at the ends of its arms in the T, on its
+	// hand bone.
+	const float hand_x = 0.6f, hand_y = 1.48f;
+	std::vector<V3> pos, other;
+	std::vector<uint16_t> ix, ix_other;
+	cube(pos, ix, {hand_x, hand_y, 0}, 0.05f);
+	cube(other, ix_other, {-hand_x, hand_y, 0}, 0.05f);
+	for (uint16_t i : ix_other)
+		ix.push_back((uint16_t)(i + 8));
+	pos.insert(pos.end(), other.begin(), other.end());
+	std::vector<uint8_t> joints;
+	std::vector<float> weights;
+	for (int i = 0; i < 16; i++) {
+		joints.insert(joints.end(), {(uint8_t)(i < 8 ? 0 : 1), 0, 0, 0});
+		weights.insert(weights.end(), {1, 0, 0, 0});
+	}
+	const int a_pos = b.vec3s(pos), a_ix = b.indices(ix);
+	const int a_j = b.accessor(b.view(joints.data(), joints.size()), 5121, 16, "VEC4");
+	const int a_w = b.floats(weights, 4, "VEC4");
+	json mesh;
+	mesh["primitives"] = json::array(
+		{{{"attributes", {{"POSITION", a_pos}, {"JOINTS_0", a_j}, {"WEIGHTS_0", a_w}}}, {"indices", a_ix}}});
+	b.doc["meshes"].push_back(mesh);
+	const std::vector<float> ibm = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -hand_x, -hand_y, 0, 1,
+					1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, hand_x,  -hand_y, 0, 1};
+	b.doc["skins"].push_back(
+		{{"joints", {body.hand[0], body.hand[1]}}, {"inverseBindMatrices", b.floats(ibm, 16, "MAT4")}});
+	const int hands = b.node({{"name", "hands"},
+				  {"mesh", (int)b.doc["meshes"].size() - 1},
+				  {"skin", (int)b.doc["skins"].size() - 1}});
+	b.doc["scenes"][0]["nodes"].push_back(hands);
+	auto m = std::make_shared<Model>();
+	CHECK(load(b.glb(), *m));
+	// Its file's box: as wide as its arms reach (1.3), from its hands to
+	// the top of its head (0.37 tall).
+	CHECK(near(m->high.x - m->low.x, 1.3, 1e-4) && near(m->high.y - m->low.y, 0.37, 1e-4));
+
+	// As it stands: its hands hang by its sides, below its hips' height.
+	RigOptions o;
+	o.springs = false;
+	Rig rig(m, o);
+	const Bounds s = rig.rest_bounds();
+	CHECK(s.found);
+	CHECK(s.high.x < 0.35f && s.low.x > -0.35f);
+	CHECK(s.low.y < 1.0f && s.low.y > 0.9f);
+	CHECK(near(s.high.y, 1.8, 1e-3));
+	// ...and the same again after it's been posed.
+	rig.pose(still());
+	CHECK(rig.rest_bounds().low.y == s.low.y);
+	// One left in its T is as wide as ever.
+	RigOptions in_t = o;
+	in_t.arms_down = false;
+	Rig t_rig(m, in_t);
+	CHECK(near(t_rig.rest_bounds().high.x, 0.65, 1e-3));
+
+	// Framed: its box as it stands, with room round it.
+	V3 middle, extent;
+	framed_box(*m, Quat{}, false, &s, middle, extent);
+	const float room = 0.05f * (s.high.y - s.low.y);
+	CHECK(near(extent.x, s.high.x - s.low.x + room, 1e-4) && near(extent.y, s.high.y - s.low.y + room, 1e-4));
+	CHECK(near(middle.y, (s.high.y + s.low.y) / 2, 1e-4));
+	// Without it (or not found): its file's box, as before 0.8.1.
+	framed_box(*m, Quat{}, false, nullptr, middle, extent);
+	CHECK(near(extent.x, 1.3, 1e-4) && near(extent.y, 0.37, 1e-4));
+	const Bounds none;
+	framed_box(*m, Quat{}, false, &none, middle, extent);
+	CHECK(near(extent.x, 1.3, 1e-4));
+	// Head and shoulders: half a metre round its head, either way.
+	framed_box(*m, Quat{}, true, &s, middle, extent);
+	CHECK(near(extent.x, 0.5, 1e-6) && near(extent.y, 0.5, 1e-6));
+
+	// In a square spot at 100%: as tall as the spot (with its room),
+	// where its T made it a quarter of that.
+	const Framing stood = frame_own_spot(*m, Quat{}, 1000, 1000, 1, false, 0, 0, 1, &s);
+	const Framing in_its_t = frame_own_spot(*m, Quat{}, 1000, 1000, 1, false, 0, 0, 1);
+	CHECK(near(stood.height, 1, 1e-5));
+	CHECK(in_its_t.height < 0.3f);
+	// Twice the size: the camera nearer, about half as much seen; up to 3.
+	const Framing twice = frame_own_spot(*m, Quat{}, 1000, 1000, 2, false, 0, 0, 1, &s);
+	CHECK(twice.seen_h < stood.seen_h * 0.6f);
+	const Framing most = frame_own_spot(*m, Quat{}, 1000, 1000, 3, false, 0, 0, 1, &s);
+	CHECK(near(frame_own_spot(*m, Quat{}, 1000, 1000, 9, false, 0, 0, 1, &s).seen_h, most.seen_h, 1e-6));
+	CHECK(most.seen_h < twice.seen_h);
+	// Bigger than its spot, its top's kept in the picture (just under its
+	// top edge) and it's cut off at the bottom: head and chest, not its
+	// middle. (Up the picture: +1 at its top edge, -1 at its bottom.)
+	auto up_the_picture = [&](const Framing &f, float y) {
+		const V3 p = point(f.view * f.place, {0, y, 0});
+		return p.y / (-p.z * std::tan(f.fov / 2));
+	};
+	for (const Framing *f : {&stood, &twice, &most}) {
+		const float top = up_the_picture(*f, s.high.y);
+		CHECK(top < 1 && top > 0.85f);
+	}
+	CHECK(up_the_picture(stood, s.low.y) > -1);
+	CHECK(up_the_picture(twice, s.low.y) < -1);
+	// Not taller than its spot (a wide one, lying down): in its middle.
+	const Framing wide = frame_own_spot(*m, Quat{}, 1000, 1000, 1, false, 0, 0, 1);
+	CHECK(near(up_the_picture(wide, (m->high.y + m->low.y) / 2), 0, 1e-4));
+}
+
 static void test_motion_reading()
 {
 	const float PI = 3.14159265f;
@@ -3883,6 +3991,7 @@ int main()
 	test_lights();
 	test_skin_parts();
 	test_camera_views();
+	test_framed_as_it_stands();
 	test_tune();
 	test_alive();
 	test_light();

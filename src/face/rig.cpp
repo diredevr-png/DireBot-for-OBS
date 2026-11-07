@@ -32,6 +32,9 @@ namespace {
 
 // Arms brought down to this far from straight down (radians).
 constexpr float ARM_FROM_SIDE = 0.3f;
+// "All of it" as it stands: this much room each side (a share of its
+// longer side).
+constexpr float FRAMED_ROOM = 0.025f;
 
 constexpr float PI_F = 3.14159265f;
 constexpr float RAD = PI_F / 180;
@@ -1094,6 +1097,29 @@ void Rig::settle()
 	settled_ = true;
 }
 
+Bounds Rig::rest_bounds()
+{
+	Drive d; // in model space, nothing moving it
+	d.look = false;
+	d.expressions = false;
+	pose(d);
+	Bounds b;
+	V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+	for (const Part &p : parts_)
+		for (const V3 &v : p.pos)
+			if (std::isfinite(v.x + v.y + v.z)) {
+				lo = {std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+				hi = {std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
+				b.found = true;
+			}
+	if (b.found) {
+		b.low = lo;
+		b.high = hi;
+	}
+	settle();
+	return b;
+}
+
 void Rig::measure_head()
 {
 	const Model &m = *model_;
@@ -2028,18 +2054,25 @@ void Rig::skin()
 
 namespace {
 
-// A model's size turned to face +z: its middle and how big each way.
-void facing_bounds(const Model &m, Quat facing, V3 &middle, V3 &size)
+// A box (model space) turned to face +z: its middle and how big each way.
+void facing_bounds(V3 low, V3 high, Quat facing, V3 &middle, V3 &size)
 {
 	V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
 	for (int i = 0; i < 8; i++) {
-		const V3 c{i & 1 ? m.high.x : m.low.x, i & 2 ? m.high.y : m.low.y, i & 4 ? m.high.z : m.low.z};
+		const V3 c{i & 1 ? high.x : low.x, i & 2 ? high.y : low.y, i & 4 ? high.z : low.z};
 		const V3 r = rotate(facing, c);
 		lo = {std::min(lo.x, r.x), std::min(lo.y, r.y), std::min(lo.z, r.z)};
 		hi = {std::max(hi.x, r.x), std::max(hi.y, r.y), std::max(hi.z, r.z)};
 	}
 	middle = (lo + hi) * 0.5f;
 	size = {std::max(1e-4f, hi.x - lo.x), std::max(1e-4f, hi.y - lo.y), std::max(1e-4f, hi.z - lo.z)};
+}
+
+// A model's size turned to face +z (its file's box): its middle and how
+// big each way.
+void facing_bounds(const Model &m, Quat facing, V3 &middle, V3 &size)
+{
+	facing_bounds(m.low, m.high, facing, middle, size);
 }
 
 // The head bone's place at rest, turned to face +z, or false.
@@ -2111,21 +2144,35 @@ Quat head_turn(float yaw, float pitch, float tilt, bool mirror)
 	       axis_angle({1, 0, 0}, -pitch * RAD);
 }
 
-Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, float size, bool head, float dx, float dy,
-		       float grow)
+void framed_box(const Model &m, Quat facing, bool head, const Bounds *stands, V3 &middle, V3 &extent)
 {
-	Framing f;
-	V3 middle, extent;
-	facing_bounds(m, facing, middle, extent);
+	if (stands && stands->found) {
+		facing_bounds(stands->low, stands->high, facing, middle, extent);
+		// A little room round it: as tight as it stands, its toes (the
+		// nearest the camera) would touch its spot's edge at 100%.
+		const float room = 2 * FRAMED_ROOM * std::max(extent.x, extent.y);
+		extent.x += room;
+		extent.y += room;
+	} else {
+		facing_bounds(m, facing, middle, extent);
+	}
 	V3 hb;
 	if (head && m.is_vrm() && head_bone(m, facing, hb)) {
 		// Head and shoulders: about half a metre round its head.
 		middle = hb + V3{0, 0.04f, 0};
 		extent = {0.5f, 0.5f, 0.3f};
 	}
+}
+
+Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, float size, bool head, float dx, float dy,
+		       float grow, const Bounds *stands)
+{
+	Framing f;
+	V3 middle, extent;
+	framed_box(m, facing, head, stands, middle, extent);
 	const float s = 1 / std::max(extent.x, extent.y);
 	const float aspect = (float)std::max(1u, w) / std::max(1u, h);
-	size = std::min(1.0f, std::max(0.05f, size));
+	size = std::min(3.0f, std::max(0.05f, size));
 	f.fov = 20 * RAD;
 	const float t = std::tan(f.fov / 2);
 	// Far enough back that its front fits too (nearer, it looks bigger).
@@ -2142,7 +2189,12 @@ Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, floa
 	f.height = extent.y * s * grow;
 	f.pivot = rotate(conj(facing), middle);
 	f.upright = f.place;
-	move_own_spot(f, dx, dy);
+	// Taller than its spot (Size past 100%): its top kept in the picture
+	// and the rest cut off at the bottom - head and chest out of "All of
+	// it", not its middle.
+	const float tall = extent.y * s;
+	const float keep_top = tall > seen_h ? (tall - seen_h) / (2 * seen_h) : 0;
+	move_own_spot(f, dx, dy + keep_top);
 	return f;
 }
 

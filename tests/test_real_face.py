@@ -2248,6 +2248,97 @@ def test_hands_and_arms_follow_you(run):
         c.disconnect()
 
 
+def test_hidden_it_still_loads_and_all_of_it_fills_its_spot(run):
+    """0.8.1: a 3D character in a scene that isn't shown (or switched off
+    in the one that is) is loaded all the same - OBS only draws what's
+    shown, and it used to wait to be drawn, saying it was loading for
+    ever. "All of it" frames it as it stands, its arms down - not as
+    wide as its arms reach in the T it was made in - so it fills its
+    spot, top to bottom. FaceGetState says the shape of what's framed
+    (for DireBot's "Fit the OBS box to it"), and Size goes past 100%."""
+    camera = os.path.join(run.home, "astronaut.png")
+    if not os.path.exists(camera):
+        body_camera(camera)
+    figure = os.path.join(run.home, "arms.vrm")
+    if not os.path.exists(figure):
+        arms_character(figure)
+    size = 300
+    common = {"source": "Fill camera", "width": size, "height": size, "size": 100,
+              "framing": "whole", "model": figure, "mirror": False, "smoothing": 100,
+              "follow_move": 0, "follow_grow": 0, "follow_tilt": 0, "body_follow": 0,
+              "bend": 0, **STILL}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+
+    def st(name):
+        return vendor(c, "FaceGetState", {"source": name})["model"]
+    try:
+        send(c, "CreateScene", {"sceneName": "Fill shown"})
+        send(c, "CreateScene", {"sceneName": "Fill not shown"})
+        send(c, "CreateInput", {"sceneName": "Fill shown", "inputName": "Fill camera",
+                                "inputKind": "image_source", "inputSettings": {"file": camera}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Fill shown"})
+        # One in a scene that isn't shown, one switched off where it is.
+        send(c, "CreateInput", {"sceneName": "Fill not shown", "inputName": "Fill away",
+                                "inputKind": "direbot_face_avatar", "inputSettings": common})
+        item = send(c, "CreateInput", {"sceneName": "Fill shown", "inputName": "Fill off",
+                                       "inputKind": "direbot_face_avatar",
+                                       "inputSettings": common})["sceneItemId"]
+        send(c, "SetSceneItemEnabled", {"sceneName": "Fill shown", "sceneItemId": item,
+                                        "sceneItemEnabled": False})
+        for name in ("Fill away", "Fill off"):
+            assert wait_for(lambda: st(name)["loaded"], 20, 0.2), st(name)
+            m = st(name)
+            assert not m["shown"] and not m["loading"] and m["kind"] == "vrm1", m
+            assert vendor(c, "FaceGetState", {"source": name})["showing"] is False
+        # The shape of what's framed: as it stands, its arms hanging (its
+        # hands below its body; the cyan ball that copies its arm swung
+        # down and out), with a little room round it - where its file's
+        # box, the T, is 1.44 wide and 0.64 tall.
+        f = st("Fill away")["framed"]
+        print(f"framed as it stands: {f}")
+        assert 0.85 < f["w"] < 1.05 and 0.9 < f["h"] < 1.0, f
+        # Head and shoulders: half a metre round its head.
+        send(c, "SetInputSettings", {"inputName": "Fill away", "inputSettings": {"framing": "head"}})
+        assert wait_for(lambda: st("Fill away")["framed"] == {"w": 0.5, "h": 0.5}, 5, 0.1), st("Fill away")
+        send(c, "SetInputSettings", {"inputName": "Fill away", "inputSettings": {"framing": "whole"}})
+        assert wait_for(lambda: st("Fill away")["framed"] == f, 5, 0.1), st("Fill away")
+
+        # Shown now: it fills its spot top to bottom (its arms down by its
+        # sides, its hands in the picture), see-through either side.
+        send(c, "SetSceneItemEnabled", {"sceneName": "Fill shown", "sceneItemId": item,
+                                        "sceneItemEnabled": True})
+        assert wait_for(lambda: st("Fill off")["shown"], 10, 0.1), st("Fill off")
+        time.sleep(0.5)
+        rows = screenshot(c, "Fill off")
+        drawn = lambda px: px != (0, 0, 0)  # noqa: E731
+        ys = [y for y in range(size) if any(drawn(px) for px in rows[y])]
+        xs = [x for x in range(size) if any(drawn(rows[y][x]) for y in range(size))]
+        print(f"all of it at 100%: rows {ys[0]}-{ys[-1]}, columns {xs[0]}-{xs[-1]}")
+        # (Framed by the T, it was 0.64 / 1.44 of that, and its hands
+        # hung out of the bottom.)
+        assert ys[-1] - ys[0] > size * 0.85, (ys[0], ys[-1])
+        assert ys[0] > 0 and ys[-1] < size - 1   # all of it, nothing cut off
+        assert xs[0] > 0 and xs[-1] < size - 1
+        _, _, hands = middle_of(rows, lambda px: px[0] > 120 and px[1] < 60 and px[2] < 60)
+        assert hands > 10, hands
+        whole = sum(1 for row in rows for px in row if drawn(px))
+        # Size past 100%: twice as big, its top kept in its spot (just
+        # under the edge) and cut off at the bottom - not at its middle.
+        send(c, "SetInputSettings", {"inputName": "Fill off", "inputSettings": {"size": 200}})
+        time.sleep(0.5)
+        rows = screenshot(c, "Fill off")
+        bigger = sum(1 for row in rows for px in row if drawn(px))
+        top = next(y for y in range(size) if any(drawn(px) for px in rows[y]))
+        print(f"drawn at 100%: {whole} pixels, at 200%: {bigger}, its top at row {top}")
+        assert bigger > whole * 1.8, (whole, bigger)
+        assert 0 < top < size * 0.08, top
+        assert any(drawn(px) for px in rows[-1])
+        for name in ("Fill away", "Fill off", "Fill camera"):
+            send(c, "RemoveInput", {"inputName": name})
+    finally:
+        c.disconnect()
+
+
 def test_closing_obs_leaves_nothing_behind(run):
     assert run.close() == 0
     log = run.log()

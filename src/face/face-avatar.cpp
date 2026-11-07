@@ -70,6 +70,9 @@ constexpr float LOOK_EVERY = 1.0f / 30, EASY_LOOK_EVERY = 1.0f / 15;
 constexpr float ARMS_EVERY = 1.0f / 15, LIGHT_ARMS_EVERY = 1.0f / 10;
 // Not drawn for this long (not shown): what it saw last is too old.
 constexpr float STALE = 0.5f;
+// Hidden on every scene that's shown, how often it looks for a newly
+// loaded 3D character (seconds) - 0.8.1.
+constexpr float HIDDEN_PICK_EVERY = 0.25f;
 constexpr float FIND_EVERY = 1.0f;
 constexpr int MIN_SIZE = 64, MAX_SIZE = 4096;
 // The picture the tracker gets: the camera, at most this big on its
@@ -1033,6 +1036,14 @@ struct FaceAvatar {
 	std::unique_ptr<Rig> rig;
 	std::shared_ptr<const Model> model_now;
 	std::string rig_key;
+	// Its box as it stands (Rig::rest_bounds), which "All of it" frames in
+	// its own spot, and the framing its shape for FaceGetState was worked
+	// out for (-1: not yet) - 0.8.1.
+	Bounds stands3d;
+	int framed_for = -1;
+	// Hidden on every scene that's shown (OBS doesn't draw it): how long
+	// since it last looked for a newly loaded 3D character (0.8.1).
+	float since_hidden_pick = 0;
 	M4 worn_pose;
 	bool have_worn_pose = false;
 	// Where your eyes and mouth go on it (worked out with its rig), and
@@ -1074,6 +1085,9 @@ struct FaceAvatar {
 		// picture (shares of FaceSpots::box) and how it was found.
 		float spot[3][4] = {};
 		const char *spot_from[3] = {"", "", ""};
+		// How wide and tall what's framed in its own spot is (the model's
+		// units; 0 not known yet) - 0.8.1.
+		float framed_w = 0, framed_h = 0;
 		float yaw = 0, pitch = 0, x = 0, y = 0;
 		std::map<std::string, float> values;
 	};
@@ -1971,12 +1985,17 @@ struct FaceAvatar {
 					std::to_string(ro.fingers) + "/" + look3d.setup_text + "/" + look3d.still_faces;
 		if (rig && rig->animation() != ro.animation) {
 			rig->set_animation(ro.animation);
+			// As it stands in that one (its first moment).
+			stands3d = rig->rest_bounds();
+			framed_for = -1;
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d.animation = ro.animation >= 0 ? model_now->animations[ro.animation].name : "";
 		}
 		if (!rig || key != rig_key) {
 			rig = std::make_unique<Rig>(model_now, ro);
 			rig_key = key;
+			stands3d = rig->rest_bounds();
+			framed_for = -1;
 			spots3d = face_spots(model_now, ro.facing, *look3d.setup);
 			// Your eyes and mouth are cut the shape of its spots.
 			const float eye = (spots3d.spot[0].h / std::max(1e-6f, spots3d.spot[0].w) +
@@ -2016,6 +2035,18 @@ struct FaceAvatar {
 				state3d.spot_from[i] = spots3d.from[i];
 			}
 		}
+		// The shape of what's framed in its own spot, for DireBot's "Fit
+		// the OBS box to it" (0.8.1).
+		if (framed_for != look3d.framing) {
+			framed_for = look3d.framing;
+			const Model &m = *model_now;
+			const bool head = look3d.framing == 2 || (look3d.framing == 0 && m.is_vrm());
+			V3 middle, extent;
+			framed_box(m, ro.facing, head, &stands3d, middle, extent);
+			std::lock_guard<std::mutex> l(state_lock);
+			state3d.framed_w = extent.x;
+			state3d.framed_h = extent.y;
+		}
 	}
 
 	// The 3D character into `out`: posed by your face and drawn - in its
@@ -2050,7 +2081,7 @@ struct FaceAvatar {
 			const bool head = look3d.framing == 2 || (look3d.framing == 0 && m.is_vrm());
 			// Moved in proportion to its size: its eye gap (its spots), as
 			// it's framed - seen from the camera view, gliding to a new one.
-			f = frame_own_spot(m, facing, w, h, size, head, 0, 0, grow);
+			f = frame_own_spot(m, facing, w, h, size, head, 0, 0, grow, &stands3d);
 			const int want = look3d.view >= 0 && look3d.view < (int)look3d.views.size() ? look3d.view : -1;
 			const CameraView target = want >= 0 ? look3d.views[want].second : CameraView();
 			if (!view_started) { // the first picture: straight there, no glide
@@ -3076,6 +3107,32 @@ struct FaceAvatar {
 			showing_now = false;
 	}
 
+	// Hidden on every scene that's shown, OBS never draws it - and a 3D
+	// character is only taken onto the graphics card as it's drawn, so it
+	// said it was loading for ever. Here it's taken (rigged, measured) a
+	// few times a second instead, so it's loaded - and says so - before
+	// it's shown (0.8.1). OBS's graphics thread, after tick.
+	void pick_while_hidden(float dt)
+	{
+		{
+			std::lock_guard<std::mutex> l(state_lock);
+			if (showing_now) {
+				since_hidden_pick = 0;
+				return;
+			}
+		}
+		since_hidden_pick += dt;
+		if (since_hidden_pick < HIDDEN_PICK_EVERY)
+			return;
+		since_hidden_pick = 0;
+		obs_enter_graphics();
+		{
+			std::lock_guard<std::mutex> l(pictures_lock);
+			pick_model();
+		}
+		obs_leave_graphics();
+	}
+
 	void update(obs_data_t *settings)
 	{
 		width = even_size(obs_data_get_int(settings, "width"));
@@ -3321,7 +3378,7 @@ struct FaceAvatar {
 					shapes[i].swap(next_shapes[i]);
 				shape_key = shape_key_now;
 			}
-			size = clampf((float)obs_data_get_int(settings, "size") / 100.0f, 0.2f, 1.0f);
+			size = clampf((float)obs_data_get_int(settings, "size") / 100.0f, 0.2f, 3.0f);
 			part_size = part_size_now;
 			feather = clampf((float)obs_data_get_int(settings, "feather") / 100.0f, 0, 1);
 			skin = clampf((float)obs_data_get_int(settings, "skin") / 100.0f, 0, 1);
@@ -4042,6 +4099,8 @@ struct FaceAvatar {
 				model["blinks"] = st.blinks;
 				model["talks"] = st.talks;
 			}
+			if (st.framed_w > 0 && st.framed_h > 0)
+				model["framed"] = {{"w", r(st.framed_w, 1e3f)}, {"h", r(st.framed_h, 1e3f)}};
 			if (st.loaded) {
 				json spots = json::object();
 				for (int i = 0; i < PARTS; i++)
@@ -4408,7 +4467,7 @@ obs_properties_t *get_properties(void *data)
 							OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(style, text("FaceAvatar.StyleReal"), "real");
 	obs_property_list_add_string(style, text("FaceAvatar.StyleDrawn"), "drawn");
-	obs_property_t *p = obs_properties_add_int_slider(props, "size", text("FaceAvatar.Size"), 20, 100, 1);
+	obs_property_t *p = obs_properties_add_int_slider(props, "size", text("FaceAvatar.Size"), 20, 300, 1);
 	obs_property_int_set_suffix(p, "%");
 	p = obs_properties_add_int_slider(props, "part_size", text("FaceAvatar.PartSize"), 50, 200, 5);
 	obs_property_int_set_suffix(p, "%");
@@ -4631,7 +4690,9 @@ uint32_t get_height(void *data)
 
 void video_tick(void *data, float seconds)
 {
-	static_cast<FaceAvatar *>(data)->tick(seconds);
+	auto *f = static_cast<FaceAvatar *>(data);
+	f->tick(seconds);
+	f->pick_while_hidden(seconds);
 }
 
 void video_render(void *data, gs_effect_t *)

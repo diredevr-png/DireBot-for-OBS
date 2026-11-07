@@ -164,11 +164,23 @@ struct Drive {
 	ArmsNow arms;
 };
 
+// A box round what a character takes up (model space).
+struct Bounds {
+	V3 low, high;
+	bool found = false;
+};
+
 class Rig {
 public:
 	Rig(std::shared_ptr<const Model> model, const RigOptions &options);
 
 	void pose(const Drive &drive);
+	// Its box as it stands at rest (0.8.1): its arms down (a character
+	// made standing in a T, RigOptions::arms_down), its own animation
+	// where it is, nothing on cue, your face not on it. Posed once to
+	// measure; its swinging parts start again at rest after. Not found:
+	// no points.
+	Bounds rest_bounds();
 	// Another of its own animations (or -1 none), from its start: no need
 	// to start again.
 	void set_animation(int which);
@@ -403,12 +415,20 @@ struct Framing {
 	V3 right{1, 0, 0}, up{0, 1, 0};
 };
 
+// What's framed in its own spot, turned to face +z: its middle and how
+// big it is each way. `head`: round its head and shoulders (a VRM with a
+// head bone), else all of it - as it stands (`stands`, Rig::rest_bounds,
+// from 0.8.1; with a little room round it), or its file's box if not
+// given (a character made standing in a T is as wide as its arms reach
+// then).
+void framed_box(const Model &m, Quat facing, bool head, const Bounds *stands, V3 &middle, V3 &extent);
 // In its own spot: the picture `w` x `h`, the character `size` of it
-// (0 to 1), its middle moved by `dx`, `dy` (shares of the picture, + right
-// and down) and grown by `grow`. `head`: framed round its head and
-// shoulders (a VRM with a head bone), else all of it.
+// (1: as tall or as wide as the picture; up to 3, bigger than the picture,
+// its top kept in it, from 0.8.1), its middle moved by `dx`, `dy` (shares
+// of the picture, + right and down) and grown by `grow`. `head` and
+// `stands`: as framed_box.
 Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, float size, bool head, float dx, float dy,
-		       float grow);
+		       float grow, const Bounds *stands = nullptr);
 // Moves it on in its spot by `dx`, `dy` more (shares of the picture).
 void move_own_spot(Framing &f, float dx, float dy);
 
