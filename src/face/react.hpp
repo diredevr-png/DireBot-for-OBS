@@ -33,9 +33,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //     snaps back and settles), its hair and ears thrown about, a flash
 //     where it hit, an "ouch" (its eyes screwed shut a moment, and a face
 //     if one is picked) - then it bounces off and falls away.
-//   - A headpat: a hand coming down onto the top of its head and patting
-//     it, its head bobbing with each pat, while it squints happily (and
-//     makes a face, if one is picked).
+//   - A headpat: a hand coming in from a side, over the top of its head,
+//     palm down, and patting it - lifted from the wrist and let fall, a
+//     couple of times a second - its head dipping with each pat and
+//     leaning into the hand, its hair bouncing, while it squints happily
+//     (and makes a face, if one is picked). A 3D hand on its head (or a
+//     picture of one, turned at its wrist).
 //
 // Where things are is in "heads" (the height of its head on the picture)
 // from the middle of its face (where it would be without these moves), x
@@ -89,13 +92,15 @@ struct Throw {
 };
 
 // A headpat: the hand's picture (the caller's number), how many pats,
-// how big the hand is (1: about its head's width), and its face meanwhile
-// ("" none: it only squints).
+// how big the hand is (1: as big as a hand is for a head), its face
+// meanwhile ("" none: it only squints), and the side it comes from (-1
+// the picture's left, 1 its right, 0 either, at random).
 struct Pat {
 	int picture = -1;
 	int count = 5;
 	float size = 1;
 	std::string face = "happy";
+	float side = 0;
 };
 
 // A body move for rig.hpp: a VRM's wave or cheer (`builtin`), or the
@@ -122,14 +127,26 @@ struct Flying {
 	// Squashed a moment as it hits: its width and height times these.
 	float squash_x = 1, squash_y = 1;
 	bool hit = false;
+	// A 3D one turns `angle` about this way (as the picture shows it: x
+	// right, y up, z out of the picture towards you).
+	V3 axis{0, 0, 1};
 };
 
-// The patting hand: shown, its picture, where the middle of its bottom
-// edge is (heads), how big (heads across), its turn and how much it shows.
+// The patting hand: shown, its picture, the side it comes from (-1 the
+// picture's left, 1 its right), how big (`size`: 1 as made), how much it
+// shows, and its pose:
+//   - a picture of a hand: the middle of its bottom edge (where it touches
+//     its head) at (x, y) heads, `across` heads wide, turned `angle`
+//     (radians, clockwise) about its wrist (its bottom corner on its side);
+//   - a 3D hand on the top of its head: lifted off it (`rise`) and out to
+//     its side (`away`; both in heads), its wrist bent up (`lift`: 0 flat
+//     on its head, 1 lifted between pats).
 struct Hand {
 	bool shown = false;
 	int picture = -1;
-	float x = 0, y = 0, size = 0, angle = 0, opacity = 0;
+	float side = -1, size = 1, opacity = 0;
+	float x = 0, y = 0, across = 0, angle = 0;
+	float rise = 0, away = 0, lift = 0;
 };
 
 // The flash where something hit: where, how big, how much it shows.
@@ -217,6 +234,7 @@ private:
 		float at = 0;   // seconds since it was thrown
 		float x0 = 0, y0 = 0, x1 = 0, y1 = 0, arc = 0;
 		float spin = 0, angle = 0;
+		V3 axis{0, 0, 1};
 		bool hit = false;
 		bool dropped = false; // stopped before it hit: it only falls away
 		float hit_at = 0;     // `at` when it hit
@@ -242,19 +260,27 @@ private:
 	Spring yaw_, pitch_, roll_, dx_, dy_;
 	// The "ouch": how long since it was hit.
 	float ouch_ = -1;
-	// The headpat on now: how long since it started, when its hand
-	// starts to leave (and from how high), and the pats it's made.
+	// A headpat's hand and what it does to its head, at a moment: out to
+	// its side and lifted off it (heads), its wrist bent, how much it
+	// shows, its head pushed down (0 to 1), its squint and its lean into
+	// the hand (0 to 1).
+	struct PatPose {
+		float away = 0, rise = 0, lift = 0, opacity = 0, press = 0, squint = 0, lean = 0;
+	};
+	PatPose pat_pose(float t) const;
+	// The headpat on now: how long since it started, how many pats, when
+	// its hand starts to leave, and the pats it's made.
 	bool patting_ = false;
 	Pat pat_;
 	float pat_t_ = 0, pat_leave_ = 0;
+	int pat_count_ = 0;
 	bool leaving_ = false;
 	int pats_done_ = 0;
-	// The hand last drawn, a new headpat's hand taking over from it, and
-	// the hand as it started to leave.
-	Hand last_hand_, from_, leave_from_;
-	float blend_ = 1, from_squint_ = 0, from_press_ = 0;
-	// The pat's squint and push on its head last frame, and as it left.
-	float pat_squint_ = 0, press_ = 0, leave_squint_ = 0, leave_press_ = 0;
+	// The pose last drawn, a new headpat's hand taking over from it, and
+	// the pose as it started to leave.
+	PatPose last_pose_, from_, leave_from_;
+	bool shown_ = false;
+	float blend_ = 1;
 	struct Flash {
 		float x = 0, y = 0, at = 0, size = 0.6f;
 	};

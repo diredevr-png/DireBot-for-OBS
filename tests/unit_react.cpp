@@ -44,7 +44,7 @@ static bool finite_out(const ReactOut &o)
 	auto ok = [](float v) { return std::isfinite(v); };
 	bool good = ok(o.squint) && ok(o.yaw) && ok(o.pitch) && ok(o.roll) && ok(o.dx) && ok(o.dy) &&
 		    ok(o.knock.x) && ok(o.knock.y) && ok(o.knock.z) && ok(o.hand.x) && ok(o.hand.y) &&
-		    ok(o.hand.size) && ok(o.hand.angle) && ok(o.hand.opacity);
+		    ok(o.hand.size) && ok(o.hand.across) && ok(o.hand.angle) && ok(o.hand.opacity);
 	for (const FaceNow &f : o.faces)
 		good = good && ok(f.amount) && f.amount >= 0 && f.amount <= 1;
 	for (const BodyMove &m : o.body)
@@ -584,23 +584,32 @@ static void test_throws()
 	}
 }
 
+// How long a headpat's hand shows: coming in, its pats (it leaves part way
+// into its last one's lift) and going.
+static float pat_length(int count)
+{
+	return 0.5f + (count - 1 + 0.42f) * 0.42f + 0.5f;
+}
+
 static void test_pats()
 {
 	ReactView view;
 	view.head_top = 0.7f;
 	{
-		// Down from above the picture, three pats (its head bobbing with
-		// each, its hair bounced), squinting happily with a face, then up
-		// and away.
+		// In from the picture's left, over its head, three pats (its head
+		// dipping with each and leaning into the hand, its hair bounced),
+		// squinting happily with a face, then up and away.
 		React r;
 		Pat p;
 		p.picture = 4;
 		p.count = 3;
+		p.side = -1;
 		r.pat(p);
-		float first_y = 0, lowest_dy = 0, most_dy = 0, squint = 0, happy = 0;
+		float first_x = 0, first_y = 0, first_away = 0, first_rise = 0, lowest_dy = 0, most_dy = 0;
+		float squint = 0, happy = 0, lean = 0, most_lift = 0, most_rise = 0, turned = 0;
 		int knocks = 0, frames = 0, shown_frames = 0;
-		bool picture = true, finite = true;
-		float hand_jump = 0, last_y = 0;
+		bool picture = true, finite = true, side = true;
+		float hand_jump = 0, last_x = 0, last_y = 0, lift_jump = 0, last_lift = 0;
 		bool had_last = false;
 		Jumps j;
 		run(r, 3, view, [&](const ReactOut &o) {
@@ -610,55 +619,123 @@ static void test_pats()
 			if (o.hand.shown) {
 				shown_frames++;
 				picture = picture && o.hand.picture == 4;
-				if (frames == 1)
+				side = side && o.hand.side == -1 && o.hand.x <= 1e-6f && o.hand.angle <= 1e-6f;
+				if (frames == 1) {
+					first_x = o.hand.x;
 					first_y = o.hand.y;
-				if (had_last)
-					hand_jump = std::max(hand_jump, std::fabs(o.hand.y - last_y));
+					first_away = o.hand.away;
+					first_rise = o.hand.rise;
+				}
+				if (had_last) {
+					hand_jump = std::max({hand_jump, std::fabs(o.hand.y - last_y),
+							      std::fabs(o.hand.x - last_x)});
+					lift_jump = std::max(lift_jump, std::fabs(o.hand.lift - last_lift));
+				}
+				last_x = o.hand.x;
 				last_y = o.hand.y;
+				last_lift = o.hand.lift;
 				had_last = true;
+				if (frames * FRAME > 0.6f && frames * FRAME < 1.3f) {
+					most_lift = std::max(most_lift, o.hand.lift);
+					most_rise = std::max(most_rise, o.hand.rise);
+					turned = std::min(turned, o.hand.angle);
+				}
 			}
 			if (o.knock.y < 0)
 				knocks++;
 			lowest_dy = std::min(lowest_dy, o.dy);
 			most_dy = std::max(most_dy, o.dy);
+			lean = std::min(lean, o.roll);
 			squint = std::max(squint, o.squint);
 			happy = std::max(happy, face_amount(o, "happy"));
 		});
-		CHECK(finite && picture);
-		CHECK(first_y < view.top);
+		CHECK(finite && picture && side);
+		// From above and out to its side.
+		CHECK(first_x < -0.5f && first_away > 0.5f && first_rise > 0.85f);
+		CHECK(first_y < -view.head_top - 0.8f);
 		CHECK(knocks == 3);
-		CHECK(most_dy > 0.03f);
+		CHECK(most_dy > 0.03f && most_dy < 0.036f);
 		CHECK(lowest_dy > -0.001f);
-		CHECK(std::fabs(squint - 0.6f) < 0.01f);
+		CHECK(lean < -5.5f && lean > -6.5f); // the top of its head to the left
+		CHECK(std::fabs(squint - 0.7f) < 0.01f);
 		CHECK(happy == 1);
-		const float length = 0.45f + 3 * 0.42f + 0.45f;
-		CHECK(std::abs(shown_frames - (int)std::lround(length / FRAME)) <= 2);
-		CHECK(hand_jump < 0.25f);
-		CHECK(j.squint < 0.1f && j.face < 0.12f && j.place < 0.02f);
+		// Lifted from the wrist between pats, a little off its head.
+		CHECK(most_lift > 0.99f && std::fabs(most_rise - 0.1f) < 0.002f);
+		CHECK(std::fabs(turned + 0.38f) < 0.01f);
+		CHECK(std::abs(shown_frames - (int)std::lround(pat_length(3) / FRAME)) <= 2);
+		CHECK(hand_jump < 0.12f && lift_jump < 0.3f); // quick as it lands
+		CHECK(j.squint < 0.1f && j.face < 0.12f && j.place < 0.02f && j.turn < 2.5f);
 		ReactOut o = r.step(FRAME, view);
 		CHECK(!o.hand.shown && !o.busy);
 	}
 	{
-		// Patting: its hand comes down onto the top of its head (pushing
-		// it down a little) with each pat.
+		// A pat: it lands, rests a moment pressing (its head giving under
+		// it, then coming back up), is lifted from the wrist (eased) and
+		// falls again - faster as it lands than as it was lifted.
 		React r;
 		Pat p;
-		p.count = 4;
+		p.count = 6;
 		p.face = "";
+		p.side = 1;
 		r.pat(p);
-		float lowest = -100;
+		run(r, 0.5f + 0.42f, view, [](const ReactOut &) {}); // to the second landing
+		std::vector<float> lift, dy, roll;
+		float x = 0, angle = 0;
 		bool face = false;
-		run(r, 1.2f, view, [&](const ReactOut &o) {
-			lowest = std::max(lowest, o.hand.y);
+		run(r, 0.42f, view, [&](const ReactOut &o) {
+			lift.push_back(o.hand.lift);
+			dy.push_back(o.dy);
+			roll.push_back(o.roll);
+			x = std::max(x, o.hand.x);
+			angle = std::max(angle, o.hand.angle);
 			face = face || !o.faces.empty();
 		});
-		CHECK(std::fabs(lowest - (0.035f - view.head_top)) < 0.01f);
+		const size_t n = lift.size();
+		CHECK(n == 25);
+		CHECK(lift[0] < 0.01f && lift[n * 25 / 100] < 0.001f); // resting
+		CHECK(*std::max_element(lift.begin(), lift.end()) > 0.97f);
+		const size_t top = std::max_element(lift.begin(), lift.end()) - lift.begin();
+		CHECK(top > n / 2 && top < n * 85 / 100);
+		float up = 0, down = 0;
+		for (size_t i = 1; i < n; i++) {
+			up = std::max(up, lift[i] - lift[i - 1]);
+			down = std::max(down, lift[i - 1] - lift[i]);
+		}
+		CHECK(down > 1.3f * up);
+		const size_t deepest = std::max_element(dy.begin(), dy.end()) - dy.begin();
+		CHECK(deepest <= 4 && dy[deepest] > 0.03f);
+		CHECK(dy[n / 2] < 0.01f);
+		CHECK(*std::min_element(roll.begin(), roll.end()) > 5.9f); // leaning right, towards it
+		CHECK(x < 1e-6f && angle > 0.3f);
 		CHECK(!face);
 	}
 	{
+		// Patting: its hand rests on the top of its head, going down with
+		// it as it gives.
+		React r;
+		Pat p;
+		p.count = 4;
+		r.pat(p);
+		float lowest = -100;
+		run(r, 1.2f, view, [&](const ReactOut &o) { lowest = std::max(lowest, o.hand.y); });
+		CHECK(std::fabs(lowest - (0.035f - view.head_top)) < 0.004f);
+	}
+	{
+		// Either side, at random.
+		int left = 0, right = 0;
+		for (uint32_t seed = 1; seed <= 20; seed++) {
+			React r(seed);
+			r.pat(Pat());
+			const ReactOut o = r.step(FRAME, view);
+			left += o.hand.side == -1;
+			right += o.hand.side == 1;
+		}
+		CHECK(left + right == 20 && left > 2 && right > 2);
+	}
+	{
 		// A character filling its picture, its head up to the top edge:
-		// the hand comes down far enough to be seen (nearly half of it),
-		// never below its eyebrows - on any picture of a hand.
+		// a picture of the hand comes down far enough to be seen (nearly
+		// half of it), never below its eyebrows - any picture of a hand.
 		for (float tall : {1.25f, 0.5f, 3.0f}) {
 			ReactView edge = view;
 			edge.top = -0.64f;
@@ -679,7 +756,7 @@ static void test_pats()
 			const float shows = (lowest - edge.top) / hand;
 			CHECK(shows > 0.44f || lowest > -0.25f - 0.001f);
 			CHECK(lowest < -0.25f + 0.035f + 0.005f);
-			CHECK(start <= edge.top + 0.01f);          // from out of sight
+			CHECK(start <= edge.top + 0.01f); // from out of sight
 		}
 		// Too odd to use: a hand as tall as usual.
 		ReactView odd = view;
@@ -698,12 +775,13 @@ static void test_pats()
 		Pat p;
 		p.count = 2;
 		r.pat(p);
-		run(r, 0.6f, view, [](const ReactOut &) {});
+		int knocks = 0;
+		run(r, 0.6f, view, [&](const ReactOut &o) { knocks += o.knock.y < 0; });
+		CHECK(knocks == 1);
 		p.count = 2;
 		r.pat(p);
-		int knocks = 0;
 		run(r, 5, view, [&](const ReactOut &o) { knocks += o.knock.y < 0; });
-		CHECK(knocks == 3); // 4 in all, one already made
+		CHECK(knocks == 4);
 		React big;
 		p.count = 1000;
 		big.pat(p);
@@ -712,29 +790,46 @@ static void test_pats()
 		knocks = 0;
 		run(big, 30, view, [&](const ReactOut &o) { knocks += o.knock.y < 0; });
 		CHECK(knocks == MOST_PATS);
+		// More once its last pat has landed (before it goes): one more
+		// lift and fall.
+		React late;
+		p.count = 1;
+		late.pat(p);
+		knocks = 0;
+		run(late, 0.55f, view, [&](const ReactOut &o) { knocks += o.knock.y < 0; });
+		late.pat(p);
+		run(late, 3, view, [&](const ReactOut &o) { knocks += o.knock.y < 0; });
+		CHECK(knocks == 2);
 	}
 	{
 		// Another headpat as the hand goes: it takes over from where the
-		// hand is, no jump.
+		// hand is (from the same side), no jump.
 		React r;
 		Pat p;
 		p.count = 1;
+		p.side = 1;
 		r.pat(p);
-		run(r, 0.45f + 0.42f + 0.2f, view, [](const ReactOut &) {});
+		run(r, pat_length(1) - 0.3f, view, [](const ReactOut &) {});
 		ReactOut before = r.step(FRAME, view);
-		CHECK(before.hand.shown);
+		CHECK(before.hand.shown && before.hand.opacity < 1);
+		p.side = -1;
 		r.pat(p);
-		float jump = 0, op_jump = 0, last_y = before.hand.y, last_op = before.hand.opacity;
+		float jump = 0, op_jump = 0, last_x = before.hand.x, last_y = before.hand.y,
+		      last_op = before.hand.opacity;
+		bool same_side = true;
 		run(r, 2, view, [&](const ReactOut &o) {
 			if (!o.hand.shown)
 				return;
-			jump = std::max(jump, std::fabs(o.hand.y - last_y));
+			same_side = same_side && o.hand.side == 1;
+			jump = std::max({jump, std::fabs(o.hand.y - last_y), std::fabs(o.hand.x - last_x)});
 			op_jump = std::max(op_jump, std::fabs(o.hand.opacity - last_op));
+			last_x = o.hand.x;
 			last_y = o.hand.y;
 			last_op = o.hand.opacity;
 		});
-		CHECK(jump < 0.25f);
+		CHECK(jump < 0.12f);
 		CHECK(op_jump < 0.15f);
+		CHECK(same_side);
 	}
 	{
 		// Stopped mid-pat: the hand leaves from where it is.
@@ -742,31 +837,36 @@ static void test_pats()
 		Pat p;
 		p.count = 10;
 		r.pat(p);
-		run(r, 0.45f + 0.42f * 2.5f, view, [](const ReactOut &) {});
-		float last_y = r.step(FRAME, view).hand.y;
+		run(r, 0.5f + 0.42f * 2.5f, view, [](const ReactOut &) {});
+		ReactOut o = r.step(FRAME, view);
+		float last_x = o.hand.x, last_y = o.hand.y;
 		r.stop();
 		float jump = 0;
 		run(r, 1, view, [&](const ReactOut &o) {
 			if (!o.hand.shown)
 				return;
-			jump = std::max(jump, std::fabs(o.hand.y - last_y));
+			jump = std::max({jump, std::fabs(o.hand.y - last_y), std::fabs(o.hand.x - last_x)});
+			last_x = o.hand.x;
 			last_y = o.hand.y;
 		});
-		CHECK(jump < 0.25f);
+		CHECK(jump < 0.12f);
 		CHECK(!r.step(FRAME, view).busy);
 		// Stopped as it came in, too.
 		r.pat(p);
 		run(r, 0.2f, view, [](const ReactOut &) {});
-		last_y = r.step(FRAME, view).hand.y;
+		o = r.step(FRAME, view);
+		last_x = o.hand.x;
+		last_y = o.hand.y;
 		r.stop();
 		jump = 0;
 		run(r, 1, view, [&](const ReactOut &o) {
 			if (!o.hand.shown)
 				return;
-			jump = std::max(jump, std::fabs(o.hand.y - last_y));
+			jump = std::max({jump, std::fabs(o.hand.y - last_y), std::fabs(o.hand.x - last_x)});
+			last_x = o.hand.x;
 			last_y = o.hand.y;
 		});
-		CHECK(jump < 0.25f);
+		CHECK(jump < 0.12f);
 		CHECK(!r.step(FRAME, view).busy);
 	}
 	{
@@ -775,11 +875,13 @@ static void test_pats()
 		Pat p;
 		p.count = -5;
 		p.size = std::numeric_limits<float>::quiet_NaN();
+		p.side = std::numeric_limits<float>::quiet_NaN();
 		r.pat(p);
 		bool fine = true;
 		int knocks = 0;
 		run(r, 2, view, [&](const ReactOut &o) {
-			fine = fine && finite_out(o);
+			fine = fine && finite_out(o) && std::isfinite(o.hand.rise + o.hand.away + o.hand.lift) &&
+			       (!o.hand.shown || o.hand.side == -1 || o.hand.side == 1);
 			knocks += o.knock.y < 0;
 		});
 		CHECK(fine);

@@ -39,12 +39,22 @@ constexpr float FALL_TIME = 0.75f;
 constexpr float FLASH_TIME = 0.32f;
 // The "ouch": shut fast, held, then opened slowly.
 constexpr float OUCH_SHUT = 0.05f, OUCH_HOLD = 0.3f, OUCH_OPEN = 0.45f;
-// A headpat: its hand comes down, pats, and goes.
-constexpr float PAT_ENTER = 0.45f, PAT_TIME = 0.42f, PAT_LEAVE = 0.45f;
-// How far the hand rises between pats, how much it squints meanwhile.
-constexpr float PAT_LIFT = 0.13f, PAT_SQUINT = 0.6f;
-// How far each pat pushes its head (and the hand) down.
-constexpr float PAT_PRESS = 0.035f;
+// A headpat: its hand comes in from a side and lands, pats (a pat every
+// PAT_TIME: lands, rests a moment pressing, is lifted from the wrist and
+// falls again), and goes - from part way into its last pat's lift.
+constexpr float PAT_ENTER = 0.5f, PAT_TIME = 0.42f, PAT_LEAVE = 0.5f, PAT_LEAVE_AT = 0.42f;
+// Where in a pat (a share of it, from landing) it starts to lift, is up
+// highest and lands again; how long its head takes to give under it, and
+// to come back up.
+constexpr float PAT_LIFT_FROM = 0.3f, PAT_TOP = 0.72f, PAT_GIVE = 0.12f, PAT_BACK = 0.35f;
+// Where it comes in from and goes to (heads above the top of its head and
+// out to its side), how high a pat lifts it (heads) and how far a
+// picture of it turns at its wrist then (radians).
+constexpr float PAT_FROM_RISE = 0.9f, PAT_FROM_AWAY = 0.55f, PAT_RISE = 0.1f, PAT_TURN = 0.38f;
+// How much it squints meanwhile, how far each pat pushes its head (and the
+// hand) down (heads) and nods it (degrees), and how far it leans into the
+// hand (degrees).
+constexpr float PAT_SQUINT = 0.7f, PAT_PRESS = 0.035f, PAT_NOD = 4.0f, PAT_LEAN = 6.0f;
 // With its head up to the picture's top edge: at least this much of the
 // hand shows (a share of its height), its bottom edge never lower than
 // this (heads from the middle of its face: about its eyebrows).
@@ -258,19 +268,20 @@ void React::pat(const Pat &p)
 	if (patting_ && !leaving_) {
 		// Patting already: more pats (the same hand), never more than
 		// MOST_PATS to come.
-		const int left = (int)std::ceil((pat_leave_ - std::max(pat_t_, PAT_ENTER)) / PAT_TIME - 1e-4f);
-		const int more = std::max(0, std::min(count, MOST_PATS - std::max(0, left)));
-		pat_leave_ += more * PAT_TIME;
+		const int landed = pat_t_ < PAT_ENTER ? 0 : 1 + (int)((pat_t_ - PAT_ENTER) / PAT_TIME);
+		const int left = std::max(0, pat_count_ - landed);
+		pat_count_ += std::max(0, std::min(count, MOST_PATS - left));
+		pat_leave_ = PAT_ENTER + (pat_count_ - 1 + PAT_LEAVE_AT) * PAT_TIME;
 		if (!pat_.face.empty())
 			face(pat_.face, pat_leave_ - pat_t_ + PAT_LEAVE * 0.5f);
 		return;
 	}
 	// Its hand still going from the last one: the new one takes over from
-	// where it is.
-	if (patting_ && leaving_ && last_hand_.shown) {
-		from_ = last_hand_;
-		from_squint_ = pat_squint_;
-		from_press_ = press_;
+	// where it is (from the same side).
+	const bool taking_over = patting_ && leaving_ && shown_;
+	const float side = taking_over ? pat_.side : p.side < 0 ? -1.0f : p.side > 0 ? 1.0f : (random01() < 0.5f ? -1.0f : 1.0f);
+	if (taking_over) {
+		from_ = last_pose_;
 		blend_ = 0;
 	} else {
 		blend_ = 1;
@@ -278,13 +289,56 @@ void React::pat(const Pat &p)
 	patting_ = true;
 	leaving_ = false;
 	pat_ = p;
+	pat_.side = side;
 	pat_.count = count;
 	pat_.size = finite(p.size) ? clampf(p.size, 0.3f, 3.0f) : 1.0f;
 	pat_t_ = 0;
-	pat_leave_ = PAT_ENTER + count * PAT_TIME;
+	pat_count_ = count;
+	pat_leave_ = PAT_ENTER + (count - 1 + PAT_LEAVE_AT) * PAT_TIME;
 	pats_done_ = 0;
 	if (!pat_.face.empty())
 		face(pat_.face, pat_leave_ + PAT_LEAVE * 0.5f);
+}
+
+// The hand `t` seconds into a headpat, before it leaves: coming in over
+// its head (by two thirds of the way in it's up over the top of it,
+// lifted as between pats), falling onto it; then each pat.
+React::PatPose React::pat_pose(float t) const
+{
+	PatPose p;
+	p.lean = smooth(t / PAT_ENTER);
+	if (t < PAT_ENTER) {
+		const float u = t / PAT_ENTER, over = 0.65f;
+		p.opacity = smooth(u / 0.35f);
+		if (u < over) {
+			const float e = smooth(u / over);
+			p.away = PAT_FROM_AWAY * (1 - e);
+			p.rise = PAT_FROM_RISE + (PAT_RISE - PAT_FROM_RISE) * e;
+			p.lift = 0.6f + 0.4f * e;
+		} else {
+			// Falling, faster as it goes, like a pat.
+			const float f = 1 - sq((u - over) / (1 - over));
+			p.rise = PAT_RISE * f;
+			p.lift = f;
+		}
+		p.squint = PAT_SQUINT * smooth((u - 0.5f) / 0.5f);
+		return p;
+	}
+	const float into = t - PAT_ENTER;
+	const float phase = (into - PAT_TIME * std::floor(into / PAT_TIME)) / PAT_TIME;
+	p.opacity = 1;
+	p.squint = PAT_SQUINT;
+	// Its head gives under it as it lands, and comes back up.
+	p.press = phase < PAT_GIVE ? smooth(phase / PAT_GIVE) : 1 - smooth((phase - PAT_GIVE) / PAT_BACK);
+	// Resting a moment, lifted (eased), and let fall (faster as it goes).
+	if (phase < PAT_LIFT_FROM)
+		p.lift = 0;
+	else if (phase < PAT_TOP)
+		p.lift = smooth((phase - PAT_LIFT_FROM) / (PAT_TOP - PAT_LIFT_FROM));
+	else
+		p.lift = 1 - sq((phase - PAT_TOP) / (1 - PAT_TOP));
+	p.rise = PAT_RISE * p.lift;
+	return p;
 }
 
 void React::stop()
@@ -329,6 +383,8 @@ void React::launch(Item &it, const ReactView &view)
 	// Spinning the way it flies.
 	it.spin = -it.side * random(5.0f, 10.0f);
 	it.angle = random(-PI_F, PI_F);
+	// A 3D one tumbles about a way of its own, mostly end over end.
+	it.axis = normalized(V3{random(-0.4f, 0.4f), random(-1, 1), 1}, {0, 0, 1});
 	it.x = it.x0;
 	it.y = it.y0;
 	it.size = big;
@@ -435,6 +491,7 @@ ReactOut React::step(float dt, const ReactView &view)
 		f.y = it.y;
 		f.size = it.size;
 		f.angle = it.angle;
+		f.axis = it.axis;
 		f.hit = it.hit;
 		if (it.hit) {
 			const float tt = it.at - it.hit_at;
@@ -595,97 +652,81 @@ ReactOut React::step(float dt, const ReactView &view)
 	if (patting_) {
 		pat_t_ += dt;
 		const float t = pat_t_;
-		Hand h;
-		h.shown = true;
-		h.picture = pat_.picture;
-		h.size = 0.85f * pat_.size;
-		// On top of its head - but a head up to the picture's top edge (a
-		// character filling it, as most do) would leave the hand outside
-		// it: then it comes down far enough that some of it shows (never
-		// lower than its eyebrows).
-		const float hand_tall = h.size * clampf(finite(view.hand_tall) ? view.hand_tall : 1.25f, 0.2f, 5);
-		const float rest = std::max(-view.head_top, std::min(view.top + PAT_SHOWS * hand_tall, PAT_LOWEST));
-		const float above = std::min(view.top, rest) - std::max(pat_.size * 1.1f, hand_tall);
-		float squint_now = 0, press = 0;
 		if (!leaving_ && t >= pat_leave_) {
 			// Leaving from just as it is now (mid-pat, if stopped).
 			leaving_ = true;
-			leave_from_ = last_hand_.shown ? last_hand_ : h;
-			if (!last_hand_.shown) {
-				leave_from_.y = above;
-				leave_from_.opacity = 0;
-			}
-			leave_squint_ = pat_squint_;
-			leave_press_ = press_;
+			leave_from_ = shown_ ? last_pose_ : pat_pose(0);
 		}
-		if (!leaving_ && t < PAT_ENTER) {
-			// Coming down from above the picture onto its head, landing
-			// softly.
-			const float e = 1 - sq(1 - clamp01(t / PAT_ENTER));
-			h.y = above + (rest - above) * e;
-			h.x = 0.12f * (1 - e);
-			h.angle = -0.25f * (1 - e) - 0.1f;
-			h.opacity = smooth(t / (PAT_ENTER * 0.4f));
-			squint_now = PAT_SQUINT * smooth((t - PAT_ENTER * 0.5f) / (PAT_ENTER * 0.5f));
-			press = smooth((t - (PAT_ENTER - 0.12f)) / 0.12f);
-		} else if (!leaving_) {
-			const float into = t - PAT_ENTER;
-			const int n = (int)(into / PAT_TIME);
-			const float phase = (into - n * PAT_TIME) / PAT_TIME;
-			const float lift = sq(std::sin(PI_F * phase));
-			h.y = rest - PAT_LIFT * lift;
-			// Rubbing a little side to side between pats.
-			h.x = 0.04f * (n % 2 ? -1.0f : 1.0f) * lift;
-			h.angle = -0.1f + 0.08f * lift;
-			h.opacity = 1;
-			// Its head pushed down a little with each pat.
-			press = sq(sq(std::cos(PI_F * phase)));
-			if (n >= pats_done_) {
-				// Each pat bounces its hair.
-				pats_done_ = n + 1;
+		PatPose p;
+		if (!leaving_) {
+			p = pat_pose(t);
+			// Each pat bounces its hair as it lands.
+			const int landed = t < PAT_ENTER ? 0 : 1 + (int)((t - PAT_ENTER) / PAT_TIME);
+			if (landed > pats_done_) {
+				pats_done_ = landed;
 				out.knock = out.knock + V3{0, -0.8f * pat_.size, 0};
 			}
-			squint_now = PAT_SQUINT;
 		} else {
-			const float u = clamp01((t - pat_leave_) / PAT_LEAVE);
-			const float e = smooth(u);
-			const Hand &f = leave_from_;
-			h.y = f.y + (above - f.y) * e;
-			h.x = f.x + (-0.1f - f.x) * e;
-			h.angle = f.angle + (-0.3f - f.angle) * e;
-			h.size = f.size + (h.size - f.size) * e;
-			h.opacity = f.opacity * (1 - smooth((u - 0.4f) / 0.6f));
-			squint_now = leave_squint_ * (1 - smooth(u * 1.6f));
-			press = leave_press_ * (1 - smooth((t - pat_leave_) / 0.15f));
+			// Up and away to its side, fading as it goes.
+			const float u = clamp01((t - pat_leave_) / PAT_LEAVE), e = smooth(u);
+			const PatPose &f = leave_from_;
+			p.away = f.away + (PAT_FROM_AWAY - f.away) * e;
+			p.rise = f.rise + (PAT_FROM_RISE - f.rise) * e;
+			p.lift = f.lift + (0.6f - f.lift) * e;
+			p.opacity = f.opacity * (1 - smooth((u - 0.4f) / 0.6f));
+			p.squint = f.squint * (1 - smooth(u * 1.6f));
+			p.press = f.press * (1 - smooth((t - pat_leave_) / 0.15f));
+			p.lean = f.lean * (1 - e);
 			if (u >= 1) {
 				patting_ = false;
-				h = Hand();
-				squint_now = press = 0;
+				p = PatPose();
 			}
 		}
-		// The hand goes down with its head.
-		if (h.shown && !leaving_)
-			h.y += PAT_PRESS * press;
-		if (blend_ < 1 && h.shown) {
+		if (blend_ < 1 && patting_) {
 			// Taking over from the last hand.
 			blend_ = std::min(1.0f, blend_ + dt / 0.2f);
 			const float w = smooth(blend_);
-			h.x = from_.x + (h.x - from_.x) * w;
-			h.y = from_.y + (h.y - from_.y) * w;
-			h.angle = from_.angle + (h.angle - from_.angle) * w;
-			h.opacity = from_.opacity + (h.opacity - from_.opacity) * w;
-			h.size = from_.size + (h.size - from_.size) * w;
-			squint_now = from_squint_ + (squint_now - from_squint_) * w;
-			press = from_press_ + (press - from_press_) * w;
+			auto mix = [w](float a, float b) { return a + (b - a) * w; };
+			p.away = mix(from_.away, p.away);
+			p.rise = mix(from_.rise, p.rise);
+			p.lift = mix(from_.lift, p.lift);
+			p.opacity = mix(from_.opacity, p.opacity);
+			p.press = mix(from_.press, p.press);
+			p.squint = mix(from_.squint, p.squint);
+			p.lean = mix(from_.lean, p.lean);
 		}
-		out.dy += PAT_PRESS * press;
-		out.pitch -= 4.0f * press;
-		out.hand = h;
-		pat_squint_ = squint_now;
-		press_ = press;
-		squint = std::max(squint, squint_now);
+		if (patting_) {
+			Hand &h = out.hand;
+			h.shown = true;
+			h.picture = pat_.picture;
+			h.side = pat_.side;
+			h.size = pat_.size;
+			h.opacity = p.opacity;
+			h.rise = p.rise;
+			h.away = p.away;
+			h.lift = p.lift;
+			// A picture of it: on top of its head - but a head up to the
+			// picture's top edge (a character filling it, as most do) would
+			// leave it outside it: then it comes down far enough that some
+			// of it shows (never lower than its eyebrows). It goes down
+			// with its head.
+			h.across = 0.85f * pat_.size;
+			const float hand_tall =
+				h.across * clampf(finite(view.hand_tall) ? view.hand_tall : 1.25f, 0.2f, 5);
+			const float rest =
+				std::max(-view.head_top, std::min(view.top + PAT_SHOWS * hand_tall, PAT_LOWEST));
+			h.x = pat_.side * p.away;
+			h.y = rest - p.rise + PAT_PRESS * p.press;
+			h.angle = pat_.side * PAT_TURN * p.lift;
+		}
+		out.dy += PAT_PRESS * p.press;
+		out.pitch -= PAT_NOD * p.press;
+		// Leaning into the hand: the top of its head towards its side.
+		out.roll += pat_.side * PAT_LEAN * p.lean;
+		squint = std::max(squint, p.squint);
+		last_pose_ = p;
 	}
-	last_hand_ = out.hand;
+	shown_ = out.hand.shown;
 	out.squint = squint;
 
 	const bool settling = std::fabs(yaw_.value) + std::fabs(pitch_.value) + std::fabs(roll_.value) > 0.01f ||

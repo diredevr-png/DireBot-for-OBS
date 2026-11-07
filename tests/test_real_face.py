@@ -2019,6 +2019,162 @@ def test_reactions_on_cue(run):
         c.disconnect()
 
 
+def gif_picture(path, size, colour):
+    """A GIF (as chat's emotes often are): a square of `colour` with a
+    see-through ring round it. Written plainly - every two pixels a fresh
+    start, so its codes stay 3 bits long."""
+    pixels = [1 if size // 8 <= x < size - size // 8 and size // 8 <= y < size - size // 8 else 0
+              for y in range(size) for x in range(size)]
+    codes = []
+    for i in range(0, len(pixels), 2):
+        codes += [4] + pixels[i:i + 2]
+    codes.append(5)
+    bits, data = 0, bytearray()
+    acc = 0
+    for code in codes:
+        acc |= code << bits
+        bits += 3
+        while bits >= 8:
+            data.append(acc & 0xFF)
+            acc >>= 8
+            bits -= 8
+    if bits:
+        data.append(acc & 0xFF)
+    blocks = b"".join(bytes([len(data[i:i + 255])]) + bytes(data[i:i + 255]) for i in range(0, len(data), 255))
+    with open(path, "wb") as f:
+        f.write(b"GIF89a" + struct.pack("<HHBBB", size, size, 0x81, 0, 0))
+        f.write(b"\0\0\0" + bytes(colour) + b"\0" * 6)              # 4 colours, 0 see-through
+        f.write(b"\x21\xf9\x04\x01\x0a\x00\x00\x00")              # a graphic control: index 0 clear
+        f.write(b"\x2c" + struct.pack("<HHHHB", 0, 0, size, size, 0))
+        f.write(b"\x02" + blocks + b"\x00\x3b")
+
+
+GREEN = (0.01, 0.6, 0.01)       # linear, as a model has it
+BLUE = (30, 60, 230)
+
+
+def test_pats_from_a_side_3d_things_and_emotes(run):
+    """0.8.1: a headpat's hand comes in from the side asked - a picture
+    (turned at its wrist), or a 3D hand, over a 2D character too, its skin
+    the colour asked - and a 3D hand that can't be read is said, the
+    picture patting instead; a 3D thing to throw loads on its own and is
+    thrown like a picture; one of chat's emotes is thrown by its picture's
+    file (a GIF too), kept for the next time."""
+    face_png = os.path.join(run.home, "camera.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+    body_png = os.path.join(run.home, "react-character.png")
+    character_picture(body_png)
+    hand = os.path.join(run.home, "react-hand.png")
+    hand_picture(hand)
+    hand3d = os.path.join(run.home, "react-hand.glb")
+    # A long flat bar for a hand: the palm at the middle of its one end, the
+    # rest going back towards its wrist (+x: its fingers point -x).
+    write_glb(hand3d, [ball_points(0.1, 0.015, 0, 0.12, 0.02, 0.045) + ((0.8, 0.8, 0.8), 0.6)],
+              materials_more={0: {"name": "skin"}})
+    broken = os.path.join(run.home, "broken-hand.glb")
+    with open(broken, "wb") as f:
+        f.write(b"glTF not really")
+    ball = os.path.join(run.home, "green-ball.glb")
+    write_glb(ball, [ball_points(0, 0, 0, 0.1, 0.1, 0.1) + (GREEN, 0.5)])
+    emote = os.path.join(run.home, "emote.gif")
+    gif_picture(emote, 48, BLUE)
+    size = 300
+    settings = {"source": "Pat camera", "width": size, "height": size, "size": 85, "mirror": False,
+                "smoothing": 100, "follow_move": 0, "follow_grow": 0, "follow_tilt": 0, "bend": 0,
+                **STILL, "character": body_png, "style": "drawn", "spots": json.dumps(SPOTS),
+                "react_hand": hand, "react_items": json.dumps([{"file": ball}])}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+
+    def st():
+        return vendor(c, "FaceGetState", {"source": "Pat"})["react"]
+
+    def cue(**data):
+        return vendor(c, "FaceReact", {"source": "Pat", **data})
+    skin = lambda px: px[0] > 200 and 160 < px[1] < 220 and 110 < px[2] < 190  # noqa: E731
+    reddish = lambda px: px[0] > 90 and px[0] > 2 * px[1] and px[0] > 2 * px[2]  # noqa: E731
+    green = lambda px: px[1] > 100 and px[1] > 2 * px[0] and px[1] > 2 * px[2]  # noqa: E731
+    blue = lambda px: px[2] > 150 and px[2] > 2 * px[0] and px[2] > 2 * px[1]  # noqa: E731
+
+    def first_in(test, seconds):
+        """Where the first look with `test`'s pixels has them (x), and the
+        most there were."""
+        shots = quick_shots(c, "Pat", seconds)
+        seen = [middle_of(rows, test) for _, rows in shots]
+        xs = [x for x, _, n in seen if n > 40]
+        return (xs[0] if xs else None), max(n for _, _, n in seen), shots
+    try:
+        send(c, "CreateScene", {"sceneName": "Pats"})
+        send(c, "CreateInput", {"sceneName": "Pats", "inputName": "Pat camera",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        send(c, "CreateInput", {"sceneName": "Pats", "inputName": "Pat",
+                                "inputKind": "direbot_face_avatar", "inputSettings": settings})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Pats"})
+        assert wait_for(lambda: vendor(c, "FaceGetState", {"source": "Pat"})["shown"] == 1, 30, 0.2)
+        # The 3D thing loads on its own thread.
+        assert wait_for(lambda: st()["items"] == [{"loaded": True, "three_d": True}], 20, 0.1), st()
+        rest = screenshot(c, "Pat")
+        orange = lambda px: px[0] > 170 and 90 < px[1] < 160 and px[2] < 90  # noqa: E731
+        rest_x, rest_y, _ = middle_of(rest, orange)
+
+        # The picture hand, from the left, then from the right.
+        for side in (-1, 1):
+            assert cue(do="pat", count=2, side=side)["ok"]
+            x, most, shots = first_in(skin, 1.2)
+            print(f"picture hand from {side}: first at x {x}, face at {rest_x:.0f}")
+            assert x is not None and (x - rest_x) * side > 10, (x, rest_x)
+            keep_shot(max(shots, key=lambda s: middle_of(s[1], skin)[2])[1], f"Pat picture {side}")
+            assert wait_for(lambda: not st()["patting"], 5, 0.1), st()
+
+        # A 3D hand that can't be read: said, and the picture pats.
+        send(c, "SetInputSettings", {"inputName": "Pat", "inputSettings": {"react_hand_3d": broken}})
+        assert wait_for(lambda: st().get("hand_3d_problem"), 10, 0.1), st()
+        assert not st()["hand_3d"]
+        assert cue(do="pat", count=1, side=1)["ok"]
+        assert first_in(skin, 1.0)[1] > 40
+        assert wait_for(lambda: not st()["patting"], 5, 0.1), st()
+
+        # Our 3D hand, over the 2D character, its skin coloured red.
+        send(c, "SetInputSettings", {"inputName": "Pat", "inputSettings": {
+            "react_hand_3d": hand3d, "react_hand_tint": json.dumps({"skin": [1, 0.02, 0.02]})}})
+        assert wait_for(lambda: st()["hand_3d"] and not st().get("hand_3d_problem"), 10, 0.1), st()
+        # From the left, its arm back towards the left the whole time.
+        assert cue(do="pat", count=2, side=-1)["ok"]
+        x, most, shots = first_in(reddish, 1.4)
+        xs = [middle_of(rows, reddish) for _, rows in shots]
+        xs = [x for x, _, n in xs if n > 150]
+        print(f"3D hand from the left over a 2D character: in {len(xs)} looks, x "
+              f"{[round(x) for x in xs]}, most {most} pixels")
+        assert xs and max(xs) < rest_x - 5, (xs, rest_x)
+        assert all(middle_of(rows, skin)[2] < 20 for _, rows in shots)      # not the picture
+        keep_shot(max(shots, key=lambda s: middle_of(s[1], reddish)[2])[1], "Pat 3D hand on 2D")
+        assert wait_for(lambda: not st()["patting"], 5, 0.1), st()
+
+        # A 3D thing thrown: in the air, a hit.
+        hits = st()["hits"]
+        t = cue(do="throw", item=0, side=1, size=1, strength=1)
+        assert t["ok"], t
+        x, most, shots = first_in(green, 1.0)
+        assert most > 60, most
+        keep_shot(max(shots, key=lambda s: middle_of(s[1], green)[2])[1], "Thrown 3D thing")
+        assert wait_for(lambda: st()["hits"] == hits + 1, 3, 0.05), st()
+
+        # One of chat's emotes, by its file: thrown, kept for next time.
+        t = cue(do="throw", file=emote, size=1, side=-1)
+        assert t["ok"], t
+        x, most, shots = first_in(blue, 1.0)
+        assert most > 60, most
+        keep_shot(max(shots, key=lambda s: middle_of(s[1], blue)[2])[1], "Thrown emote")
+        assert cue(do="throw", file=emote)["ok"] and st()["emotes"] == 1
+        bad = cue(do="throw", file=os.path.join(run.home, "not-there.gif"))
+        assert not bad["ok"] and "couldn't be opened" in bad["error"], bad
+        assert wait_for(lambda: st()["hits"] == hits + 3, 4, 0.05), st()
+        for name in ("Pat", "Pat camera"):
+            send(c, "RemoveInput", {"inputName": name})
+    finally:
+        c.disconnect()
+
+
 # ---- 0.8.0: your hands and arms ------------------------------------------------
 
 BODY = os.path.join(HERE, "tests", "data", "body")

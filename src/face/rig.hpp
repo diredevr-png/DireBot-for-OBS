@@ -253,6 +253,16 @@ public:
 		V3 low, high;
 		float top = 0;
 		bool found = false;
+		// How high it all reaches over a grid across it (x) and from its
+		// back to its front (z): TOP_GRID x TOP_GRID cells over [top_low,
+		// top_high], each its highest point's y (or below `low` if none) -
+		// where a hand on its head rests.
+		static constexpr int TOP_GRID = 16;
+		V3 top_low, top_high;
+		std::vector<float> tops;
+		// The highest it reaches within `reach` of (x, z) (`top` if it
+		// knows no better).
+		float top_at(float x, float z, float reach) const;
 	};
 	const HeadBox &head_box() const { return head_box_; }
 

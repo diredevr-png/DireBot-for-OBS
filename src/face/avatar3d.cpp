@@ -231,6 +231,89 @@ void ModelLoader::run()
 	}
 }
 
+PropLoader::PropLoader() : thread_([this] { run(); }) {}
+
+PropLoader::~PropLoader()
+{
+	{
+		std::lock_guard<std::mutex> l(lock_);
+		stop_ = true;
+	}
+	wake_.notify_all();
+	thread_.join();
+}
+
+void PropLoader::want(const std::vector<std::string> &paths)
+{
+	{
+		std::lock_guard<std::mutex> l(lock_);
+		want_ = paths;
+		// One let go of is loaded anew if it's wanted again.
+		for (auto it = stamps_.begin(); it != stamps_.end();)
+			if (std::find(paths.begin(), paths.end(), it->first) == paths.end())
+				it = stamps_.erase(it);
+			else
+				++it;
+	}
+	wake_.notify_all();
+}
+
+std::vector<std::shared_ptr<ModelPack>> PropLoader::take()
+{
+	std::lock_guard<std::mutex> l(lock_);
+	std::vector<std::shared_ptr<ModelPack>> out;
+	out.swap(done_);
+	return out;
+}
+
+void PropLoader::run()
+{
+	for (;;) {
+		std::string path, stamp;
+		{
+			std::unique_lock<std::mutex> l(lock_);
+			// The next one wanted that isn't loaded as it is now.
+			auto next = [&] {
+				for (const std::string &p : want_) {
+					if (p.empty())
+						continue;
+					const std::string s = file_stamp(p);
+					auto it = stamps_.find(p);
+					if (it == stamps_.end() || it->second != s) {
+						path = p;
+						stamp = s;
+						return true;
+					}
+				}
+				return false;
+			};
+			wake_.wait(l, [&] { return stop_ || next(); });
+			if (stop_)
+				return;
+			stamps_[path] = stamp;
+		}
+		auto pack = std::make_shared<ModelPack>();
+		pack->path = path;
+		auto model = std::make_shared<Model>();
+		std::string problem;
+		if (load_model(path, *model, &problem)) {
+			if (model->points > MOST_PROP_POINTS) {
+				pack->problem = "it's too detailed to throw (" + std::to_string(model->points) +
+						" points; at most " + std::to_string(MOST_PROP_POINTS) + ")";
+			} else {
+				pack->pictures = read_pictures(*model);
+				pack->model = model;
+			}
+		} else {
+			pack->problem = problem.empty() ? "it couldn't be read" : problem;
+		}
+		if (!pack->problem.empty())
+			obs_log(LOG_WARNING, "DireBot Face Avatar: a 3D thing didn't load: %s", pack->problem.c_str());
+		std::lock_guard<std::mutex> l(lock_);
+		done_.push_back(pack);
+	}
+}
+
 Avatar3D::Avatar3D()
 {
 	char *path = obs_module_file("effects/direbot-face-3d.effect");
@@ -460,15 +543,17 @@ void Avatar3D::set_lights(const View3D &v)
 	put(p_room_tint, share(l.room_up + l.room_down, studio.room_up + studio.room_down));
 }
 
-void Avatar3D::set_material(const Material &m, const View3D &v, bool outline, bool skin, bool front_only)
+void Avatar3D::set_material(const Material &m, const View3D &v, bool outline, bool skin, bool front_only,
+			    const std::vector<gs_texture_t *> *textures)
 {
 	// Everything a technique reads, every time: OBS empties them all
 	// when the technique before finishes (see effect-needs.hpp).
 	set_camera();
 	set_lights(v);
-	auto tex = [this](const TexRef &r, gs_texture_t *none) {
-		if (r.image >= 0 && r.image < (int)textures_.size() && textures_[r.image])
-			return textures_[r.image];
+	const std::vector<gs_texture_t *> &pics = textures ? *textures : textures_;
+	auto tex = [&pics](const TexRef &r, gs_texture_t *none) {
+		if (r.image >= 0 && r.image < (int)pics.size() && pics[r.image])
+			return pics[r.image];
 		return none;
 	};
 	int mode = m.shading == Shading::Toon ? 1 : m.shading == Shading::Unlit ? 2 : 0;
@@ -538,15 +623,245 @@ void Avatar3D::draw_part(size_t i, const Rig::Part &p, const char *technique)
 	(void)p;
 }
 
-gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
+void Avatar3D::draw_prop(Prop3D &prop, const View3D &v, bool see_through)
 {
-	if (!effect_ || !model_ || &rig.model() != model_.get() || !v.w || !v.h)
+	if (!(prop.opacity_ > 0.001f))
+		return;
+	static const Material plain;
+	const Model &m = *prop.model_;
+	const float was = opacity_;
+	opacity_ = v.opacity * std::min(1.0f, prop.opacity_);
+	const bool fading = opacity_ < 0.999f;
+	for (size_t i = 0; i < prop.parts_.size(); i++) {
+		Prop3D::Part &part = prop.parts_[i];
+		if (!part.vb || !part.ib)
+			continue;
+		const int mi = part.prim->material;
+		Material mat = mi >= 0 && mi < (int)m.materials.size() ? m.materials[mi] : plain;
+		if ((mat.alpha == AlphaMode::Blend || fading) != see_through)
+			continue;
+		if (mi >= 0 && mi < (int)prop.tints_.size()) {
+			const V3 t = prop.tints_[mi];
+			mat.base[0] *= t.x;
+			mat.base[1] *= t.y;
+			mat.base[2] *= t.z;
+		}
+		const bool skin = mat.name.find("skin") != std::string::npos;
+		const bool flat_look = v.look == 3 || (v.look == 0 && mat.shading == Shading::Unlit);
+		const char *technique =
+			part.bumped && v.detail && !flat_look && mat.normal_map.used() ? "DrawBumped" : "Draw";
+		part_distance_ = part.distance;
+		set_material(mat, v, false, skin, sides_shown(mat, prop.handed_) == Sides::Front, &prop.textures_);
+		gs_set_cull_mode(cull_of(mat, prop.handed_));
+		gs_load_vertexbuffer(part.vb);
+		gs_load_indexbuffer(part.ib);
+		check_(technique);
+		while (gs_effect_loop(effect_, technique))
+			gs_draw(GS_TRIS, 0, 0);
+		gs_set_cull_mode(GS_NEITHER);
+	}
+	opacity_ = was;
+}
+
+Prop3D::Prop3D(std::shared_ptr<const Model> model, const std::vector<ModelPicture> &pictures)
+	: model_(std::move(model))
+{
+	for (const ModelPicture &pic : pictures) {
+		gs_texture_t *tex = nullptr;
+		if (pic.size && !pic.levels.empty()) {
+			std::vector<const uint8_t *> data;
+			for (const auto &level : pic.levels)
+				data.push_back(level.data());
+			tex = gs_texture_create(pic.size, pic.size, GS_RGBA, (uint32_t)data.size(), data.data(), 0);
+		}
+		textures_.push_back(tex);
+	}
+	const Model &m = *model_;
+	tints_.assign(m.materials.size(), V3{1, 1, 1});
+	const std::vector<M4> world = rest_world(m);
+	bool any = false;
+	for (size_t ni = 0; ni < m.nodes.size(); ni++) {
+		const Node &node = m.nodes[ni];
+		if (node.mesh < 0 || node.mesh >= (int)m.meshes.size())
+			continue;
+		const Mesh &mesh = m.meshes[node.mesh];
+		const Skin *skin = node.skin >= 0 && node.skin < (int)m.skins.size() ? &m.skins[node.skin] : nullptr;
+		for (const Primitive &p : mesh.parts) {
+			Part part;
+			part.prim = &p;
+			part.points = p.pos.size();
+			if (!part.points || p.index.empty())
+				continue;
+			const bool weighted = skin && p.joints.size() == part.points * 4 && p.weights.size() == part.points * 4;
+			// Where each point's node (a bound one: its strongest bone, as
+			// it was bound) puts it.
+			auto at = [&](size_t k) -> M4 {
+				if (weighted) {
+					int best = 0;
+					for (int j = 1; j < 4; j++)
+						if (p.weights[k * 4 + j] > p.weights[k * 4 + best])
+							best = j;
+					const uint16_t joint = p.joints[k * 4 + best];
+					if (joint < skin->joints.size() && joint < skin->inverse_bind.size()) {
+						const int bone = skin->joints[joint];
+						if (bone >= 0 && bone < (int)world.size())
+							return world[bone] * skin->inverse_bind[joint];
+					}
+				}
+				return world[ni];
+			};
+			part.bumped = p.tangent.size() == part.points * 4;
+			part.pos.resize(part.points);
+			part.normal.resize(part.points);
+			if (part.bumped)
+				part.tangent.resize(part.points);
+			for (size_t k = 0; k < part.points; k++) {
+				const M4 w = at(k);
+				part.pos[k] = point(w, p.pos[k]);
+				part.normal[k] =
+					normalized(direction(w, k < p.normal.size() ? p.normal[k] : V3{0, 0, 1}), {0, 0, 1});
+				if (part.bumped)
+					part.tangent[k] = normalized(
+						direction(w, {p.tangent[k * 4], p.tangent[k * 4 + 1], p.tangent[k * 4 + 2]}),
+						{1, 0, 0});
+				const V3 q = part.pos[k];
+				if (!any) {
+					low_ = high_ = q;
+					any = true;
+				}
+				low_ = {std::min(low_.x, q.x), std::min(low_.y, q.y), std::min(low_.z, q.z)};
+				high_ = {std::max(high_.x, q.x), std::max(high_.y, q.y), std::max(high_.z, q.z)};
+			}
+			for (const MorphTarget &t : p.morphs) {
+				std::vector<V3> dp(part.points), dn;
+				for (size_t k = 0; k < part.points && k < t.pos.size(); k++)
+					dp[k] = direction(at(k), t.pos[k]);
+				if (t.normal.size() == part.points) {
+					dn.resize(part.points);
+					for (size_t k = 0; k < part.points; k++)
+						dn[k] = direction(at(k), t.normal[k]);
+				}
+				part.morph_pos.push_back(std::move(dp));
+				part.morph_normal.push_back(std::move(dn));
+			}
+			part.vb = make_vb(part.points, true, nullptr, part.bumped);
+			part.ib = make_ib(p.index);
+			if (part.vb) {
+				gs_vb_data *d = gs_vertexbuffer_get_data(part.vb);
+				float *uv = static_cast<float *>(d->tvarray[0].array);
+				for (size_t k = 0; k < part.points; k++) {
+					if (p.uv.size() >= (k + 1) * 2) {
+						uv[k * 2] = p.uv[k * 2];
+						uv[k * 2 + 1] = p.uv[k * 2 + 1];
+					}
+					uint8_t c[4] = {255, 255, 255, 255};
+					if (p.colour.size() >= (k + 1) * 4)
+						srgb_bytes(&p.colour[k * 4], c);
+					std::memcpy(&d->colors[k], c, 4);
+				}
+				gs_vertexbuffer_flush(part.vb);
+			}
+			if (shape_names_.size() < mesh.morph_names.size())
+				shape_names_ = mesh.morph_names;
+			parts_.push_back(std::move(part));
+		}
+	}
+	size_t shapes = shape_names_.size();
+	for (const Part &part : parts_)
+		shapes = std::max(shapes, part.morph_pos.size());
+	shapes_.assign(shapes, 0);
+	place(M4());
+}
+
+Prop3D::~Prop3D()
+{
+	for (gs_texture_t *t : textures_)
+		gs_texture_destroy(t);
+	for (Part &p : parts_) {
+		gs_vertexbuffer_destroy(p.vb);
+		gs_indexbuffer_destroy(p.ib);
+	}
+}
+
+int Prop3D::shape(const std::string &name) const
+{
+	for (size_t i = 0; i < shape_names_.size(); i++)
+		if (shape_names_[i] == name)
+			return (int)i;
+	return -1;
+}
+
+void Prop3D::set_shape(int shape, float amount)
+{
+	if (shape >= 0 && shape < (int)shapes_.size())
+		shapes_[shape] = std::isfinite(amount) ? std::min(1.0f, std::max(0.0f, amount)) : 0.0f;
+}
+
+void Prop3D::tint(int material, V3 times)
+{
+	if (material >= 0 && material < (int)tints_.size())
+		tints_[material] = times;
+}
+
+void Prop3D::place(const M4 &to_world, float opacity)
+{
+	place_ = to_world;
+	opacity_ = std::isfinite(opacity) ? std::min(1.0f, std::max(0.0f, opacity)) : 0.0f;
+	const V3 ax = direction(to_world, {1, 0, 0}), ay = direction(to_world, {0, 1, 0}),
+		 az = direction(to_world, {0, 0, 1});
+	handed_ = dot(cross(ax, ay), az) < 0 ? -1.0f : 1.0f;
+	// Normals turn as the inverse's rows-for-columns would (the same, for
+	// a turn and an even size), sized back to length 1 as they're used.
+	const M4 normals = inverse(to_world);
+	auto normal_of = [&normals](V3 n) {
+		return normalized(V3{normals.m[0] * n.x + normals.m[1] * n.y + normals.m[2] * n.z,
+				     normals.m[4] * n.x + normals.m[5] * n.y + normals.m[6] * n.z,
+				     normals.m[8] * n.x + normals.m[9] * n.y + normals.m[10] * n.z},
+				  {0, 0, 1});
+	};
+	for (Part &part : parts_) {
+		if (!part.vb)
+			continue;
+		gs_vb_data *d = gs_vertexbuffer_get_data(part.vb);
+		const bool tangents = part.bumped && d->tangents;
+		for (size_t k = 0; k < part.points; k++) {
+			V3 p = part.pos[k], n = part.normal[k];
+			for (size_t s = 0; s < part.morph_pos.size() && s < shapes_.size(); s++) {
+				const float w = shapes_[s];
+				if (w <= 0)
+					continue;
+				p = p + part.morph_pos[s][k] * w;
+				if (!part.morph_normal[s].empty())
+					n = n + part.morph_normal[s][k] * w;
+			}
+			const V3 wp = point(to_world, p), wn = normal_of(n);
+			vec3_set(&d->points[k], wp.x, wp.y, wp.z);
+			vec3_set(&d->normals[k], wn.x, wn.y, wn.z);
+			if (tangents) {
+				const V3 t = normalized(direction(to_world, part.tangent[k]), {1, 0, 0});
+				vec3_set(&d->tangents[k], t.x, t.y, t.z);
+				d->tangents[k].w = part.prim->tangent[k * 4 + 3] * handed_;
+			}
+		}
+		gs_vb_data moved = {};
+		moved.num = d->num;
+		moved.points = d->points;
+		moved.normals = d->normals;
+		moved.tangents = tangents ? d->tangents : nullptr;
+		gs_vertexbuffer_flush_direct(part.vb, &moved);
+	}
+}
+
+gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<PropAt> &props)
+{
+	const bool character =
+		rig && model_ && &rig->model() == model_.get() && rig->parts().size() == parts_.size();
+	if (!effect_ || !v.w || !v.h || (!character && props.empty()))
 		return nullptr;
-	const std::vector<Rig::Part> &posed = rig.parts();
-	if (posed.size() != parts_.size())
-		return nullptr;
+	static const std::vector<Rig::Part> nothing;
+	const std::vector<Rig::Part> &posed = character ? rig->parts() : nothing;
 	// The posed points onto the graphics card.
-	for (size_t i = 0; i < parts_.size(); i++) {
+	for (size_t i = 0; i < posed.size(); i++) {
 		Part &part = parts_[i];
 		const Rig::Part &p = posed[i];
 		if (!part.vb || p.pos.size() != part.points)
@@ -618,7 +933,7 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 
-	if (v.hide_behind_head && head_.vb && head_.ib) {
+	if (character && v.hide_behind_head && head_.vb && head_.ib) {
 		gs_matrix_push();
 		const matrix4 head = obs_matrix(v.head);
 		gs_matrix_mul(&head);
@@ -635,7 +950,8 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 	}
 
 	static const Material plain;
-	const Model &m = *model_;
+	static const Model no_model;
+	const Model &m = character ? *model_ : no_model;
 	auto material_of = [&](size_t i) -> const Material & {
 		const int mi = posed[i].prim->material;
 		return mi >= 0 && mi < (int)m.materials.size() ? m.materials[mi] : plain;
@@ -680,6 +996,17 @@ gs_texture_t *Avatar3D::draw(const Rig &rig, const View3D &v)
 		gs_set_cull_mode(cull_of(mat, posed[i].handed));
 		draw_part(i, posed[i], technique_of(i));
 		gs_set_cull_mode(GS_NEITHER);
+	}
+	// Anything with it, each put where it goes (the same one may be in
+	// several places): its solid parts, then its see-through ones.
+	for (const PropAt &at : props) {
+		if (!at.prop)
+			continue;
+		for (size_t k = 0; k < at.shapes.size(); k++)
+			at.prop->set_shape((int)k, at.shapes[k]);
+		at.prop->place(at.place, at.opacity);
+		draw_prop(*at.prop, v, false);
+		draw_prop(*at.prop, v, true);
 	}
 	std::stable_sort(blended.begin(), blended.end(), [&](size_t a, size_t b) {
 		const int qa = material_of(a).queue, qb = material_of(b).queue;

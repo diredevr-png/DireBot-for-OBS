@@ -29,6 +29,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #include <obs-module.h>
@@ -89,6 +90,22 @@ constexpr size_t MOST_LAYERS = 12;
 // (React::play's; under it, its own animations' numbers).
 constexpr size_t MOST_THROW_PICTURES = 24, MOST_MOTIONS = 32;
 constexpr int MOTION_IDS = 10000;
+// Chat's emotes thrown (by their pictures' files): the newest this many
+// kept, numbered from EMOTE_IDS for React.
+constexpr size_t MOST_EMOTES = 64;
+constexpr int EMOTE_IDS = 1000;
+// The 3D headpat hand: how tall a head it's made for (its file's units,
+// metres), how far towards its side from the middle of the top of the
+// head its palm rests (a share of the head's width), how far back (a
+// share of its depth) and how far round there it looks for the highest
+// point under its palm (a share of its height).
+constexpr float HAND_HEAD = 0.22f, HAND_OVER = 0.0f, HAND_BACK = 0.05f, HAND_REACH = 0.18f;
+// How tall the 3D hand looks for its width (a picture hand's is its
+// picture's), where a picture's top edge cuts its head: as our cartoon
+// hand's, so as much of it shows.
+constexpr float HAND_3D_TALL = 0.8f;
+// 3D things over the character: drawn nearly straight on (a narrow view).
+constexpr float OVERLAY_FOV = 0.35f;
 // How much bigger than its spot an eye or the mouth is drawn: room round
 // it for its soft edge.
 constexpr float PIECE_ROOM = 1.25f;
@@ -207,6 +224,13 @@ struct Picture {
 		return small[((size_t)y * small_w + x) * 4 + 3] / 255.0f;
 	}
 
+	// An animated GIF on `ns` (to its next picture, if it's time), on OBS's
+	// graphics thread.
+	void animate(uint64_t ns)
+	{
+		if (image.loaded && image.is_animated_gif && gs_image_file_tick(&image, ns))
+			gs_image_file_update_texture(&image);
+	}
 	gs_texture_t *texture() const { return image.loaded ? image.texture : nullptr; }
 	float width() const { return image.loaded ? (float)image.cx : 0; }
 	float height() const { return image.loaded ? (float)image.cy : 0; }
@@ -225,6 +249,53 @@ PicturePtr load_picture(const PicturePtr &old, const char *want)
 bool loaded(const PicturePtr &p)
 {
 	return p && p->texture();
+}
+
+// The 3D headpat hand (assets/react-hand.glb: a right hand, its palm's
+// middle at 0, its fingers along -x, its thumb along +y, its palm facing
+// +z) as it pats a head, the head's facing way (x right as the picture
+// shows it, y up, z towards you), from the picture's left (side < 0) or
+// right: palm down, its fingers across the top of the head (tipped down
+// over its far side) and a little towards you, its back tipped towards
+// you, its forearm back and up over its side - a right hand from the
+// left, a left one (mirrored) from the right, so its thumb is on the far
+// side.
+M4 hand_turn(float side)
+{
+	// From the right, flat: fingers to the picture's left, thumb away.
+	M4 m;
+	const float flat[16] = {1, 0, 0, 0, 0, 0, -1, 0, 0, -1, 0, 0, 0, 0, 0, 1};
+	std::copy(flat, flat + 16, m.m);
+	m = matrix_of(axis_angle({0, 0, 1}, 12 * RAD) * axis_angle({0, 1, 0}, 25 * RAD) *
+		      axis_angle({1, 0, 0}, 30 * RAD)) *
+	    m;
+	if (side < 0) {
+		M4 flip;
+		flip.m[0] = -1;
+		m = flip * m;
+	}
+	return m;
+}
+
+// A colour multiplier from DireBot ([r, g, b], linear; 1, 1, 1 as made).
+V3 tint_of(const json &j)
+{
+	if (!j.is_array() || j.size() != 3)
+		return {1, 1, 1};
+	float c[3];
+	for (int i = 0; i < 3; i++)
+		c[i] = j[i].is_number() ? clampf(j[i].get<float>(), 0, 4) : 1.0f;
+	return {c[0], c[1], c[2]};
+}
+
+// A 3D file (not a picture), by its name's end.
+bool is_3d_file(const std::string &file)
+{
+	std::string end = file.size() >= 5 ? file.substr(file.size() - 5) : file;
+	for (char &c : end)
+		c = (char)std::tolower((unsigned char)c);
+	return end.size() >= 4 && (end.compare(end.size() - 4, 4, ".glb") == 0 || end == ".gltf" ||
+				   end.compare(end.size() - 4, 4, ".vrm") == 0);
 }
 
 struct Layer {
@@ -1124,6 +1195,36 @@ struct FaceAvatar {
 	// files it plays, by name.
 	std::vector<PicturePtr> throw_pics;
 	PicturePtr hand_pic, hit_pic;
+	// ...each thing's file (a 3D one has no picture), the 3D headpat hand's
+	// (used if it's loaded, else hand_pic) and its skin's and sleeve's
+	// colours; the 3D files loaded (or why not); and chat's emotes thrown,
+	// the newest kept (EMOTE_IDS + where).
+	std::vector<std::string> throw_files;
+	std::string hand3d_file;
+	// A picture of the hand: where it touches the head and where its wrist
+	// is (shares of its width and height, as it comes from the left), and
+	// how wide it is (heads, at size 1).
+	struct HandPlace {
+		float touch[2] = {0.5f, 1}, wrist[2] = {0.2f, 1};
+		float width = 0.85f;
+	};
+	HandPlace hand_place;
+	V3 hand_skin{1, 1, 1}, hand_sleeve{1, 1, 1};
+	std::set<std::string> props_ready;
+	std::map<std::string, std::string> prop_problems;
+	struct Emote {
+		PicturePtr pic;
+		uint64_t used = 0;
+	};
+	std::vector<Emote> emotes;
+	uint64_t emotes_used = 0;
+	// The 3D files themselves (OBS's graphics thread): loaded on their own
+	// thread, onto the graphics card; and drawn over the character (things
+	// thrown, a 2D character's 3D hand), this frame's.
+	PropLoader prop_loader;
+	std::map<std::string, std::unique_ptr<Prop3D>> props3d;
+	std::unique_ptr<Avatar3D> overlay3d;
+	gs_texture_t *overlay_tex = nullptr;
 	struct NamedMotion {
 		std::string name, file, problem;
 		std::shared_ptr<const Motion> motion;
@@ -1147,6 +1248,7 @@ struct FaceAvatar {
 		bool arms = false, motions = false, three_d = false, busy = false, placed = false;
 		int hits = 0, flying = 0;
 		float head_px = 0;
+		Hand hand; // the headpat's hand now
 	};
 	ReactState react_state;
 	// ...and how it sounds, for FaceGetState (under state_lock).
@@ -1234,6 +1336,8 @@ struct FaceAvatar {
 		body_worker.stop();
 		obs_enter_graphics();
 		avatar3d.reset();
+		overlay3d.reset();
+		props3d.clear();
 		for (Shot &shot : shots)
 			gs_texrender_destroy(shot.tex);
 		gs_texrender_destroy(small);
@@ -1910,6 +2014,174 @@ struct FaceAvatar {
 		return axis_angle({0, 1, 0}, turn * RAD);
 	}
 
+	// Newly loaded 3D things (react.hpp's: the headpat hand, things to
+	// throw) onto the graphics card, and those no longer wanted let go of
+	// (graphics thread, pictures_lock held).
+	void pick_props()
+	{
+		for (const std::shared_ptr<ModelPack> &pack : prop_loader.take()) {
+			props3d.erase(pack->path);
+			props_ready.erase(pack->path);
+			prop_problems.erase(pack->path);
+			if (pack->model) {
+				props3d[pack->path] = std::make_unique<Prop3D>(pack->model, pack->pictures);
+				props_ready.insert(pack->path);
+			} else {
+				prop_problems[pack->path] = pack->problem;
+			}
+		}
+		for (auto it = props3d.begin(); it != props3d.end();) {
+			const bool wanted = it->first == hand3d_file ||
+					    std::find(throw_files.begin(), throw_files.end(), it->first) != throw_files.end();
+			if (wanted) {
+				++it;
+				continue;
+			}
+			props_ready.erase(it->first);
+			it = props3d.erase(it);
+		}
+	}
+
+	// The 3D headpat hand, if it's loaded (graphics thread).
+	Prop3D *hand_3d()
+	{
+		if (hand3d_file.empty())
+			return nullptr;
+		auto it = props3d.find(hand3d_file);
+		return it == props3d.end() ? nullptr : it->second.get();
+	}
+
+	// Thing `n` thrown (react.hpp's Flying::picture), if it's a 3D one.
+	Prop3D *thrown_3d(int n)
+	{
+		if (n < 0 || n >= (int)throw_files.size() || !is_3d_file(throw_files[n]))
+			return nullptr;
+		auto it = props3d.find(throw_files[n]);
+		return it == props3d.end() ? nullptr : it->second.get();
+	}
+
+	// The 3D hand as react.hpp's Hand has it, round where its palm rests
+	// (the hand's own units: as big as a hand for a head HAND_HEAD tall),
+	// `side` the side it comes from as the world has it: its wrist bent
+	// up, its skin and sleeve coloured.
+	PropAt hand_at(Prop3D &hand, const M4 &rest_place, float side)
+	{
+		const Hand &h = react_now.hand;
+		PropAt p;
+		p.prop = &hand;
+		p.place = rest_place * scaled(h.size / HAND_HEAD) * hand_turn(side);
+		p.opacity = h.opacity;
+		const int lift = hand.shape("lift");
+		if (lift >= 0) {
+			p.shapes.assign((size_t)lift + 1, 0);
+			p.shapes[lift] = h.lift;
+		}
+		const std::vector<Material> &mats = hand.model().materials;
+		for (size_t i = 0; i < mats.size(); i++) {
+			const std::string &n = mats[i].name;
+			hand.tint((int)i, n.find("skin") != std::string::npos     ? hand_skin
+					  : n.find("sleeve") != std::string::npos ? hand_sleeve
+										  : V3{1, 1, 1});
+		}
+		return p;
+	}
+
+	// The 3D headpat hand on a 3D character's head: its palm on the top of
+	// it (where it's highest under the palm), a little to its side and
+	// back; lifted off it and out to its side as it comes and goes. It
+	// moves with the head.
+	PropAt hand_on_head(Prop3D &hand, Quat facing, bool wear)
+	{
+		const Hand &h = react_now.hand;
+		const Model &m = *model_now;
+		const Rig::HeadBox &hb = rig->head_box();
+		float tall, wide, deep, crown;
+		V3 mid;
+		if (hb.found) {
+			tall = hb.high.y - hb.low.y;
+			wide = hb.high.x - hb.low.x;
+			deep = hb.high.z - hb.low.z;
+			mid = (hb.low + hb.high) * 0.5f;
+			crown = hb.top;
+		} else {
+			// No head bone: from its eyes (its head 2.8 times as tall as
+			// they're apart), up to the top of it all.
+			const V3 le = rotate(facing, spots3d.spot[0].at), re = rotate(facing, spots3d.spot[1].at);
+			const float gap = length(le - re);
+			tall = gap > 1e-6f ? 2.8f * gap : 0.3f * std::max(1e-4f, m.high.y - m.low.y);
+			wide = 0.7f * tall;
+			deep = 0.85f * tall;
+			mid = (le + re) * 0.5f - V3{0, 0.1f * tall, 0.4f * deep};
+			crown = rotate(facing, m.high).y;
+			for (int c = 0; c < 8; c++)
+				crown = std::max(crown, rotate(facing, V3{c & 1 ? m.high.x : m.low.x,
+									  c & 2 ? m.high.y : m.low.y,
+									  c & 4 ? m.high.z : m.low.z})
+								.y);
+		}
+		// Worn and mirrored, the picture is the world turned round.
+		const float side = wear && mirror ? -h.side : h.side;
+		const float cx = mid.x + side * HAND_OVER * wide, cz = mid.z - HAND_BACK * deep;
+		const float cy = hb.found ? hb.top_at(cx, cz, HAND_REACH * tall) : crown;
+		const V3 at{cx + side * h.away * tall, cy + h.rise * tall, cz};
+		const M4 rest = rig->head_frame() * matrix_of(conj(facing)) * moved(at) * scaled(tall);
+		return hand_at(hand, rest, side);
+	}
+
+	// Things 3D over the character, round where its face is drawn (heads,
+	// as react.hpp has them): things thrown, and a 2D character's 3D hand
+	// (`hand_too`) - drawn now, put over it by draw_reactions.
+	void draw_overlay(uint32_t w, uint32_t h, bool hand_too)
+	{
+		overlay_tex = nullptr;
+		const ReactOut &r = react_now;
+		if (!face_known || !w || !h || !(head_px >= 2))
+			return;
+		// The world: a head 1 across, the picture's middle at 0, y up.
+		const float k = 1 / head_px;
+		auto world_of = [&](float x, float y) {
+			return V3{(face_px[0] + x * head_px - w * 0.5f) * k, -(face_px[1] + y * head_px - h * 0.5f) * k, 0};
+		};
+		std::vector<PropAt> with;
+		for (const Flying &fl : r.flying) {
+			Prop3D *prop = thrown_3d(fl.picture);
+			if (!prop || !(fl.opacity > 0.001f))
+				continue;
+			const V3 lo = prop->low(), hi = prop->high();
+			const float across = std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 1e-6f});
+			M4 squash;
+			squash.m[0] = fl.squash_x;
+			squash.m[5] = fl.squash_y;
+			PropAt p;
+			p.prop = prop;
+			// Turned clockwise as the picture shows it: about its way.
+			p.place = moved(world_of(fl.x, fl.y)) * squash * matrix_of(axis_angle(fl.axis, -fl.angle)) *
+				  scaled(fl.size / across) * moved((lo + hi) * -0.5f);
+			p.opacity = fl.opacity;
+			with.push_back(p);
+		}
+		Prop3D *hand = hand_too && r.hand.shown ? hand_3d() : nullptr;
+		if (hand)
+			with.push_back(hand_at(*hand, moved(world_of(r.hand.x, r.hand.y)), r.hand.side));
+		if (with.empty())
+			return;
+		if (!overlay3d)
+			overlay3d = std::make_unique<Avatar3D>();
+		View3D v;
+		v.w = w;
+		v.h = h;
+		v.fov = OVERLAY_FOV;
+		const float dist = (h * k * 0.5f) / std::tan(OVERLAY_FOV / 2);
+		v.view = moved({0, 0, -dist});
+		v.near = dist * 0.2f;
+		v.far = dist * 5;
+		v.lights = look3d.lights;
+		v.look = model_now ? look3d.look : 0;
+		v.smooth = !easy;
+		v.soft_skin = 0.5f;
+		overlay_tex = overlay3d->draw(nullptr, v, with);
+	}
+
 	// A newly loaded 3D character onto the graphics card, and its rig
 	// (made anew when how it swings or faces changes).
 	void pick_model()
@@ -2223,7 +2495,14 @@ struct FaceAvatar {
 				state3d.materials[i].skin = skin_now[i];
 		}
 		v.skin = &skin_now;
-		gs_texture_t *tex = show ? avatar3d->draw(*rig, v) : nullptr;
+		// The 3D headpat hand on its head, drawn with it (its hair hides
+		// what's in it).
+		std::vector<PropAt> with;
+		Prop3D *hand = react_now.hand.shown ? hand_3d() : nullptr;
+		if (hand && face_known)
+			with.push_back(hand_on_head(*hand, facing, wear));
+		gs_texture_t *tex = show ? avatar3d->draw(rig.get(), v, with) : nullptr;
+		draw_overlay(w, h, false);
 		{
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d.shown = tex != nullptr;
@@ -2507,7 +2786,7 @@ struct FaceAvatar {
 		v.look = look3d.look;
 		v.outline = look3d.outline;
 		v.smooth = true;
-		gs_texture_t *tex = avatar3d->draw(still, v);
+		gs_texture_t *tex = avatar3d->draw(&still, v);
 		if (!tex)
 			return no("It couldn't be drawn.");
 		gs_texrender_t *flat_pic = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
@@ -2772,6 +3051,7 @@ struct FaceAvatar {
 		const Shown::Out o = shown.now();
 		const bool wear = worn && cw && ch;
 		pick_model();
+		pick_props();
 		upload_masks();
 		if (rig && model_now) {
 			draw_3d(cam, cw, ch, w, h, o, wear);
@@ -2799,6 +3079,7 @@ struct FaceAvatar {
 			if (at.shown)
 				flat_tex = draw_flat(cut, cw, ch, o, *pic, shapes[which].get(), at.scale);
 			react_place_2d(at, *pic, w, h);
+			draw_overlay(w, h, true);
 		}
 		{
 			std::lock_guard<std::mutex> l2(state_lock);
@@ -2864,8 +3145,12 @@ struct FaceAvatar {
 		react_view.bottom = ((float)h - y) / head_px;
 		react_view.head_top = clampf(head_top, 0.2f, 3);
 		// (Called while drawing, its pictures' lock held.)
-		react_view.hand_tall = loaded(hand_pic) ? (float)hand_pic->height() / std::max(1.0f, (float)hand_pic->width())
-							: 1.25f;
+		// (How tall the hand is above where it touches, for its width.)
+		react_view.hand_tall =
+			hand_3d()	   ? HAND_3D_TALL
+			: loaded(hand_pic) ? (float)hand_pic->height() / std::max(1.0f, (float)hand_pic->width()) *
+						     hand_place.touch[1] * hand_place.width / 0.85f
+					   : 1.25f;
 		face_known = true;
 	}
 
@@ -2874,21 +3159,21 @@ struct FaceAvatar {
 	void draw_reactions()
 	{
 		const ReactOut &r = react_now;
-		if (!face_known || (r.flying.empty() && !r.hand.shown && r.bursts.empty()))
+		if (!face_known || (r.flying.empty() && !r.hand.shown && r.bursts.empty() && !overlay_tex))
 			return;
 		gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 		// A picture `across` heads wide (as tall as its shape says), its
-		// middle - or its bottom edge's middle - at (x, y) heads, turned
-		// clockwise `angle` and squashed (sx, sy) in its own ways.
+		// middle at (x, y) heads, turned clockwise `angle` and squashed
+		// (sx, sy) in its own ways.
 		auto sprite = [&](const PicturePtr &pic, float x, float y, float across, float angle, float opacity,
-				  float sx, float sy, bool from_bottom) {
+				  float sx, float sy) {
 			if (!loaded(pic) || !(opacity > 0.001f) || !(across > 0))
 				return;
 			const float wpx = across * head_px * sx,
 				    hpx = across * head_px * pic->height() / std::max(1.0f, pic->width()) * sy;
 			const float cx = face_px[0] + x * head_px, cy = face_px[1] + y * head_px;
 			const float co = std::cos(angle), si = std::sin(angle);
-			const float ox = -wpx / 2, oy = from_bottom ? -hpx : -hpx / 2;
+			const float ox = -wpx / 2, oy = -hpx / 2;
 			if (!std::isfinite(cx + cy + wpx + hpx + co + si))
 				return;
 			matrix4 m;
@@ -2909,15 +3194,77 @@ struct FaceAvatar {
 			gs_matrix_pop();
 		};
 		for (const Burst &b : r.bursts)
-			sprite(hit_pic, b.x, b.y, b.size, 0, b.opacity, 1, 1, false);
+			sprite(hit_pic, b.x, b.y, b.size, 0, b.opacity, 1, 1);
+		// Each moving picture on to its next look once a frame (an animated
+		// GIF), however many are in the air.
+		std::set<Picture *> animated;
 		for (const Flying &f : r.flying) {
-			const PicturePtr none;
-			const PicturePtr &pic =
-				f.picture >= 0 && f.picture < (int)throw_pics.size() ? throw_pics[f.picture] : none;
-			sprite(pic, f.x, f.y, f.size, f.angle, f.opacity, f.squash_x, f.squash_y, false);
+			const PicturePtr &pic = thrown_picture(f.picture);
+			if (pic && animated.insert(pic.get()).second)
+				pic->animate((uint64_t)(frame_dt * 1e9));
+			sprite(pic, f.x, f.y, f.size, f.angle, f.opacity, f.squash_x, f.squash_y);
 		}
-		if (r.hand.shown)
-			sprite(hand_pic, r.hand.x, r.hand.y, r.hand.size, r.hand.angle, r.hand.opacity, 1, 1, true);
+		// Things 3D (draw_overlay), as drawn: see-through round them.
+		if (overlay_tex) {
+			gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+			gs_effect_t *base = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+			gs_effect_set_texture(gs_effect_get_param_by_name(base, "image"), overlay_tex);
+			while (gs_effect_loop(base, "Draw"))
+				gs_draw_sprite(overlay_tex, 0, gs_texture_get_width(overlay_tex),
+					       gs_texture_get_height(overlay_tex));
+			gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE,
+						   GS_BLEND_INVSRCALPHA);
+		}
+		// A picture of the hand (no 3D one).
+		if (r.hand.shown && !hand_3d())
+			draw_hand_picture(r.hand);
+	}
+
+	// A picture of the patting hand: where it touches at react.hpp's
+	// (x, y), turned at its wrist - as it is from the left, flipped from
+	// the right.
+	void draw_hand_picture(const Hand &hand)
+	{
+		const PicturePtr &pic = hand_pic;
+		if (!loaded(pic) || !(hand.opacity > 0.001f))
+			return;
+		const HandPlace &hp = hand_place;
+		const bool flip = hand.side > 0;
+		const float wpx = hand.size * hp.width * head_px,
+			    hpx = wpx * pic->height() / std::max(1.0f, pic->width());
+		const float tx = (flip ? 1 - hp.touch[0] : hp.touch[0]) * wpx, ty = hp.touch[1] * hpx;
+		const float px = (flip ? 1 - hp.wrist[0] : hp.wrist[0]) * wpx, py = hp.wrist[1] * hpx;
+		const float sx = face_px[0] + hand.x * head_px, sy = face_px[1] + hand.y * head_px;
+		const float co = std::cos(hand.angle), si = std::sin(hand.angle);
+		if (!std::isfinite(sx + sy + wpx + hpx + co + si) || !(wpx > 0))
+			return;
+		// Its touch on (sx, sy) as it rests, turned about its wrist.
+		matrix4 m;
+		vec4_set(&m.x, co * wpx, si * wpx, 0, 0);
+		vec4_set(&m.y, -si * hpx, co * hpx, 0, 0);
+		vec4_set(&m.z, 0, 0, 1, 0);
+		vec4_set(&m.t, sx + px - tx - (co * px - si * py), sy + py - ty - (si * px + co * py), 0, 1);
+		vec4 clip;
+		vec4_set(&clip, 0, 0, 1, 1);
+		gs_effect_set_texture(p_image, pic->texture());
+		gs_effect_set_float(p_opacity, std::min(1.0f, hand.opacity));
+		gs_effect_set_vec4(p_clip, &clip);
+		gs_matrix_push();
+		gs_matrix_mul(&m);
+		check("Picture");
+		while (gs_effect_loop(effect, "Picture"))
+			gs_draw_quadf(pic->texture(), flip ? GS_FLIP_U : 0, 1, 1);
+		gs_matrix_pop();
+	}
+
+	// Thing `n` thrown's picture (react.hpp's Flying::picture): one of the
+	// things to throw, or one of chat's emotes (null: none, or a 3D one).
+	const PicturePtr &thrown_picture(int n) const
+	{
+		static const PicturePtr none;
+		if (n >= EMOTE_IDS && n < EMOTE_IDS + (int)emotes.size())
+			return emotes[n - EMOTE_IDS].pic;
+		return n >= 0 && n < (int)throw_pics.size() ? throw_pics[n] : none;
 	}
 
 	// Your hands and arms, followed on a 3D VRM character in its own spot
@@ -3103,6 +3450,7 @@ struct FaceAvatar {
 		react_state.hits = react_hits;
 		react_state.busy = react_now.busy;
 		react_state.flying = (int)react_now.flying.size();
+		react_state.hand = react_now.hand;
 		if (os_gettime_ns() - last_render > 500'000'000ULL)
 			showing_now = false;
 	}
@@ -3275,6 +3623,7 @@ struct FaceAvatar {
 			old_motions = motions;
 		}
 		const json throws = json::parse(obs_data_get_string(settings, "react_items"), nullptr, false);
+		std::vector<std::string> next_files, wanted_3d;
 		if (throws.is_array())
 			for (const json &row : throws) {
 				if (next_throws.size() >= MOST_THROW_PICTURES)
@@ -3282,6 +3631,13 @@ struct FaceAvatar {
 				const std::string file = row.is_object() && row.contains("file") && row["file"].is_string()
 								 ? row["file"].get<std::string>()
 								 : "";
+				next_files.push_back(file);
+				// A 3D thing: loaded on its own thread (prop_loader).
+				if (is_3d_file(file)) {
+					next_throws.push_back(nullptr);
+					wanted_3d.push_back(file);
+					continue;
+				}
 				PicturePtr pic;
 				for (const PicturePtr &old : old_throws)
 					if (old && old->path == file)
@@ -3290,6 +3646,30 @@ struct FaceAvatar {
 			}
 		next_hand = load_picture(next_hand, obs_data_get_string(settings, "react_hand"));
 		next_hit = load_picture(next_hit, obs_data_get_string(settings, "react_hit"));
+		// The 3D headpat hand, and its skin's and sleeve's colours.
+		const char *hand3d_setting = obs_data_get_string(settings, "react_hand_3d");
+		const std::string hand3d_now = hand3d_setting ? hand3d_setting : "";
+		if (!hand3d_now.empty())
+			wanted_3d.insert(wanted_3d.begin(), hand3d_now);
+		const json tints = json::parse(obs_data_get_string(settings, "react_hand_tint"), nullptr, false);
+		const V3 skin_tint = tints.is_object() ? tint_of(tints.value("skin", json())) : V3{1, 1, 1};
+		const V3 sleeve_tint = tints.is_object() ? tint_of(tints.value("sleeve", json())) : V3{1, 1, 1};
+		prop_loader.want(wanted_3d);
+		HandPlace place_now;
+		const json hp = json::parse(obs_data_get_string(settings, "react_hand_place"), nullptr, false);
+		if (hp.is_object()) {
+			auto two = [&hp](const char *key, float *out) {
+				const json &j = hp.contains(key) ? hp[key] : json();
+				if (j.is_array() && j.size() == 2 && j[0].is_number() && j[1].is_number()) {
+					out[0] = clampf(j[0].get<float>(), 0, 1);
+					out[1] = clampf(j[1].get<float>(), 0, 1);
+				}
+			};
+			two("touch", place_now.touch);
+			two("wrist", place_now.wrist);
+			if (hp.contains("width") && hp["width"].is_number())
+				place_now.width = clampf(hp["width"].get<float>(), 0.2f, 4);
+		}
 		const json moves_json = json::parse(obs_data_get_string(settings, "react_moves"), nullptr, false);
 		int motion_id = 0;
 		{
@@ -3365,6 +3745,11 @@ struct FaceAvatar {
 			}
 			layers.swap(wearing);
 			throw_pics.swap(next_throws);
+			throw_files.swap(next_files);
+			hand3d_file = hand3d_now;
+			hand_skin = skin_tint;
+			hand_sleeve = sleeve_tint;
+			hand_place = place_now;
 			hand_pic.swap(next_hand);
 			hit_pic.swap(next_hit);
 			motions.swap(next_motions);
@@ -3758,10 +4143,24 @@ struct FaceAvatar {
 			}
 		} else if (what == "throw") {
 			Throw t;
-			t.picture = (int)std::floor(num("item", 0));
-			{
+			const std::string file = str("file");
+			if (!file.empty()) {
+				// One of chat's emotes, by its picture's file.
+				t.picture = emote_number(file);
+				if (t.picture < 0)
+					return no("That emote's picture couldn't be opened.");
+			} else {
+				t.picture = (int)std::floor(num("item", 0));
 				std::lock_guard<std::mutex> l(pictures_lock);
-				if (t.picture < 0 || t.picture >= (int)throw_pics.size() || !loaded(throw_pics[t.picture]))
+				if (t.picture < 0 || t.picture >= (int)throw_pics.size())
+					return no("That thing to throw has no picture - pick one in DireBot.");
+				const std::string &its = throw_files[t.picture];
+				if (is_3d_file(its) && !props_ready.count(its)) {
+					auto why = prop_problems.find(its);
+					return no(why != prop_problems.end() ? "That 3D thing can't be thrown: " + why->second + "."
+									     : "That 3D thing is still loading - try again in a moment.");
+				}
+				if (!is_3d_file(its) && !loaded(throw_pics[t.picture]))
 					return no("That thing to throw has no picture - pick one in DireBot.");
 			}
 			t.side = num("side", 0);
@@ -3783,6 +4182,7 @@ struct FaceAvatar {
 			Pat p;
 			p.count = (int)std::lround(clampf(num("count", 5), 1, (float)MOST_PATS));
 			p.size = num("size", 1);
+			p.side = num("side", 0);
 			p.face = data.contains("face") ? str("face") : std::string("happy");
 			bool three_d;
 			own_face(p.face, three_d);
@@ -3797,6 +4197,48 @@ struct FaceAvatar {
 		return answer;
 	}
 
+	// One of chat's emotes thrown, by its picture's file (DireBot keeps
+	// them, small): its number for React (EMOTE_IDS + where it's kept) -
+	// opened the first time, the newest MOST_EMOTES kept (the one thrown
+	// longest ago makes room); -1 if it can't be opened.
+	int emote_number(const std::string &file)
+	{
+		{
+			std::lock_guard<std::mutex> l(pictures_lock);
+			for (size_t i = 0; i < emotes.size(); i++)
+				if (emotes[i].pic && emotes[i].pic->path == file && loaded(emotes[i].pic)) {
+					emotes[i].used = ++emotes_used;
+					return EMOTE_IDS + (int)i;
+				}
+		}
+		// Opened (onto the graphics card) with no lock held: the graphics
+		// thread holds its own while it draws, then takes pictures_lock.
+		PicturePtr pic = std::make_shared<Picture>(file);
+		if (!loaded(pic))
+			return -1;
+		PicturePtr old;
+		int n;
+		{
+			std::lock_guard<std::mutex> l(pictures_lock);
+			size_t at = emotes.size();
+			if (emotes.size() >= MOST_EMOTES) {
+				at = 0;
+				for (size_t i = 1; i < emotes.size(); i++)
+					if (emotes[i].used < emotes[at].used)
+						at = i;
+				old = std::move(emotes[at].pic);
+			} else {
+				emotes.emplace_back();
+			}
+			emotes[at].pic = pic;
+			emotes[at].used = ++emotes_used;
+			n = EMOTE_IDS + (int)at;
+		}
+		// The one let go of closes here, no lock held.
+		old.reset();
+		return n;
+	}
+
 	json state(bool with_points)
 	{
 		const VoiceOptions mic_levels = voice.options();
@@ -3807,7 +4249,9 @@ struct FaceAvatar {
 		bool shaped;
 		json lights_json, views_json = json::array();
 		json react_moves_json = json::array(), react_items_json = json::array();
-		bool react_hand_ok = false, react_hit_ok = false;
+		bool react_hand_ok = false, react_hit_ok = false, react_hand_3d = false;
+		std::string react_hand_problem;
+		int react_emotes = 0;
 		int view_index;
 		{
 			std::lock_guard<std::mutex> l(pictures_lock);
@@ -3832,9 +4276,27 @@ struct FaceAvatar {
 					row["problem"] = nm.problem;
 				react_moves_json.push_back(row);
 			}
-			for (const PicturePtr &pic : throw_pics)
-				react_items_json.push_back({{"loaded", loaded(pic)}});
+			for (size_t i = 0; i < throw_pics.size(); i++) {
+				const std::string &file = i < throw_files.size() ? throw_files[i] : std::string();
+				if (!is_3d_file(file)) {
+					react_items_json.push_back({{"loaded", loaded(throw_pics[i])}});
+					continue;
+				}
+				// A 3D one: loaded on its own (or why not).
+				json row = {{"loaded", props_ready.count(file) > 0}, {"three_d", true}};
+				auto why = prop_problems.find(file);
+				if (why != prop_problems.end())
+					row["problem"] = why->second;
+				react_items_json.push_back(row);
+			}
 			react_hand_ok = loaded(hand_pic);
+			react_hand_3d = !hand3d_file.empty() && props_ready.count(hand3d_file) > 0;
+			if (!hand3d_file.empty()) {
+				auto why = prop_problems.find(hand3d_file);
+				if (why != prop_problems.end())
+					react_hand_problem = why->second;
+			}
+			react_emotes = (int)emotes.size();
 			react_hit_ok = loaded(hit_pic);
 			for (const auto &named : look3d.views)
 				views_json.push_back({{"name", named.first},
@@ -4030,10 +4492,21 @@ struct FaceAvatar {
 					   {"moves", react_moves_json},
 					   {"items", react_items_json},
 					   {"hand", react_hand_ok},
+					   {"hand_3d", react_hand_3d},
+					   {"emotes", react_emotes},
 					   {"hit", react_hit_ok},
 					   {"hits", rs.hits},
 					   {"flying", rs.flying},
+					   {"patting", rs.hand.shown},
 					   {"busy", rs.busy}};
+			if (!react_hand_problem.empty())
+				answer["react"]["hand_3d_problem"] = react_hand_problem;
+			if (rs.hand.shown) {
+				auto r3 = [](float v) { return std::round(v * 1000) / 1000; };
+				answer["react"]["hand_now"] = {{"side", rs.hand.side},	       {"rise", r3(rs.hand.rise)},
+							       {"away", r3(rs.hand.away)},     {"lift", r3(rs.hand.lift)},
+							       {"opacity", r3(rs.hand.opacity)}};
+			}
 		}
 		answer["camera_view"] = {{"view", view_index >= 0 ? std::to_string(view_index + 1) : "main"},
 					 {"showing", view_shown_state >= 0 ? std::to_string(view_shown_state + 1) : "main"},
@@ -4408,6 +4881,9 @@ void get_defaults(obs_data_t *settings)
 	// the patting hand, a hit's flash, VRM animation files ([{"name", "file"}]).
 	obs_data_set_default_string(settings, "react_items", "[]");
 	obs_data_set_default_string(settings, "react_hand", "");
+	obs_data_set_default_string(settings, "react_hand_3d", "");
+	obs_data_set_default_string(settings, "react_hand_tint", "{}");
+	obs_data_set_default_string(settings, "react_hand_place", "{}");
 	obs_data_set_default_string(settings, "react_hit", "");
 	obs_data_set_default_string(settings, "react_moves", "[]");
 	obs_data_set_default_string(settings, "view", "main");

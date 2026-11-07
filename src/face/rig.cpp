@@ -1141,8 +1141,10 @@ void Rig::measure_head()
 	}
 	const Quat F = options_.facing;
 	bool any_box = false, any_top = false;
+	std::vector<V3> seen;
 	auto take = [&](V3 p, bool box) {
 		const V3 f = rotate(F, p);
+		seen.push_back(f);
 		if (!any_top || f.y > head_box_.top)
 			head_box_.top = f.y;
 		any_top = true;
@@ -1190,6 +1192,49 @@ void Rig::measure_head()
 	head_box_.found = any_box && head_box_.high.y - head_box_.low.y > 1e-6f;
 	if (head_box_.found)
 		head_box_.top = std::max(head_box_.top, head_box_.high.y);
+	// The grid of how high it reaches, over all it moves (its hair too).
+	HeadBox &b = head_box_;
+	if (!b.found || seen.empty())
+		return;
+	b.top_low = b.top_high = seen[0];
+	for (const V3 &f : seen) {
+		b.top_low = {std::min(b.top_low.x, f.x), 0, std::min(b.top_low.z, f.z)};
+		b.top_high = {std::max(b.top_high.x, f.x), 0, std::max(b.top_high.z, f.z)};
+	}
+	const int G = HeadBox::TOP_GRID;
+	const float none = b.low.y - 1;
+	b.tops.assign((size_t)G * G, none);
+	const float wx = std::max(1e-6f, b.top_high.x - b.top_low.x), wz = std::max(1e-6f, b.top_high.z - b.top_low.z);
+	for (const V3 &f : seen) {
+		const int i = std::min(G - 1, std::max(0, (int)((f.x - b.top_low.x) / wx * G)));
+		const int k = std::min(G - 1, std::max(0, (int)((f.z - b.top_low.z) / wz * G)));
+		float &t = b.tops[(size_t)k * G + i];
+		t = std::max(t, f.y);
+	}
+}
+
+float Rig::HeadBox::top_at(float x, float z, float reach) const
+{
+	const int G = TOP_GRID;
+	if (!found || tops.size() != (size_t)G * G || !std::isfinite(x + z + reach))
+		return top;
+	const float wx = std::max(1e-6f, top_high.x - top_low.x), wz = std::max(1e-6f, top_high.z - top_low.z);
+	float best = low.y - 1;
+	bool any = false;
+	for (int k = 0; k < G; k++)
+		for (int i = 0; i < G; i++) {
+			// The cell's nearest point to (x, z).
+			const float x0 = top_low.x + wx * i / G, x1 = top_low.x + wx * (i + 1) / G;
+			const float z0 = top_low.z + wz * k / G, z1 = top_low.z + wz * (k + 1) / G;
+			const float dx = x < x0 ? x0 - x : x > x1 ? x - x1 : 0;
+			const float dz = z < z0 ? z0 - z : z > z1 ? z - z1 : 0;
+			const float t = tops[(size_t)k * G + i];
+			if (dx * dx + dz * dz <= reach * reach && t >= low.y) {
+				best = std::max(best, t);
+				any = true;
+			}
+		}
+	return any ? best : top;
 }
 
 std::vector<std::string> Rig::faces() const

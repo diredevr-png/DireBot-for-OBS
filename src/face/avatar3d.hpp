@@ -29,6 +29,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #pragma once
 
 #include <condition_variable>
+#include <map>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -111,6 +112,94 @@ struct View3D {
 	const std::vector<bool> *skin = nullptr;
 };
 
+// Something 3D drawn with a character or over one - a headpat's hand,
+// something thrown - as its file has it (not posed: each part where its
+// node puts it), its shapes (morph targets) set by name, put anywhere,
+// any size, mirrored or not, its materials tinted. Made, placed and drawn
+// on OBS's graphics thread.
+class Prop3D {
+public:
+	Prop3D(std::shared_ptr<const Model> model, const std::vector<ModelPicture> &pictures);
+	~Prop3D();
+	Prop3D(const Prop3D &) = delete;
+	Prop3D &operator=(const Prop3D &) = delete;
+
+	const Model &model() const { return *model_; }
+	// The box round it as made (its file's units), and the middle of it.
+	V3 low() const { return low_; }
+	V3 high() const { return high_; }
+	// A shape's number by its name (-1: none), and how much it shows (0 to 1).
+	int shape(const std::string &name) const;
+	void set_shape(int shape, float amount);
+	// Its material's colour times this (linear: 1, 1, 1 as made).
+	void tint(int material, V3 times);
+	// Where it is: its file's units -> the world (mirrored if it turns it
+	// inside out), and how much it shows (0 to 1). Its points worked out
+	// now, for the next draw (Avatar3D::draw does it, for each PropAt).
+	void place(const M4 &to_world, float opacity = 1);
+	float opacity() const { return opacity_; }
+	bool mirrored() const { return handed_ < 0; }
+
+private:
+	friend class Avatar3D;
+	struct Part {
+		const Primitive *prim = nullptr;
+		std::vector<V3> pos, normal, tangent; // as made, in its file's space
+		std::vector<std::vector<V3>> morph_pos, morph_normal;
+		gs_vertbuffer_t *vb = nullptr;
+		gs_indexbuffer_t *ib = nullptr;
+		size_t points = 0;
+		bool bumped = false;
+		float distance = 1;
+	};
+	std::shared_ptr<const Model> model_;
+	std::vector<gs_texture_t *> textures_;
+	std::vector<Part> parts_;
+	std::vector<std::string> shape_names_;
+	std::vector<float> shapes_;
+	std::vector<V3> tints_;
+	V3 low_, high_;
+	M4 place_;
+	float opacity_ = 1, handed_ = 1;
+};
+
+// Something 3D to draw: where (its file's units -> the world), how much
+// it shows, and its shapes (by Prop3D::shape's numbers; those left out
+// as made).
+struct PropAt {
+	Prop3D *prop = nullptr;
+	M4 place;
+	float opacity = 1;
+	std::vector<float> shapes;
+};
+
+// Things 3D (a headpat's hand, things to throw) loaded on a thread of
+// their own, so OBS never waits: asked for as a list of files, each
+// picked up once it's ready. One too detailed to draw quickly is said so.
+constexpr size_t MOST_PROP_POINTS = 400000;
+class PropLoader {
+public:
+	PropLoader();
+	~PropLoader();
+	PropLoader(const PropLoader &) = delete;
+	PropLoader &operator=(const PropLoader &) = delete;
+	// The files wanted now: each not loaded yet (or changed since) is
+	// loaded, in turn.
+	void want(const std::vector<std::string> &paths);
+	// Those loaded since the last call.
+	std::vector<std::shared_ptr<ModelPack>> take();
+
+private:
+	void run();
+	std::mutex lock_;
+	std::condition_variable wake_;
+	std::vector<std::string> want_;
+	std::map<std::string, std::string> stamps_; // loaded (or tried): its file's stamp then
+	std::vector<std::shared_ptr<ModelPack>> done_;
+	bool stop_ = false;
+	std::thread thread_;
+};
+
 class Avatar3D {
 public:
 	// On OBS's graphics thread, as is everything here.
@@ -123,9 +212,11 @@ public:
 	// A new character (or none) onto the graphics card.
 	void set(std::shared_ptr<const Model> model, std::vector<ModelPicture> pictures);
 	const Model *model() const { return model_.get(); }
-	// The posed character drawn, premultiplied, see-through round it; null
-	// if there's nothing to draw.
-	gs_texture_t *draw(const Rig &rig, const View3D &v);
+	// The posed character drawn, premultiplied, see-through round it, with
+	// anything 3D put with it (hidden where it's behind the character, as
+	// the character is where they're in front of it); null if there's
+	// nothing to draw. With no character (`rig` null): only those things.
+	gs_texture_t *draw(const Rig *rig, const View3D &v, const std::vector<PropAt> &props = {});
 
 private:
 	struct Part {
@@ -140,8 +231,13 @@ private:
 	void set_lights(const View3D &v);
 	// front_only: a part drawn only from its front (its edges' facings are
 	// laid side-on, not turned round: see the effect's towards_camera).
-	void set_material(const Material &m, const View3D &v, bool outline, bool skin, bool front_only);
+	// textures: the pictures it's drawn with (null: the character's).
+	void set_material(const Material &m, const View3D &v, bool outline, bool skin, bool front_only,
+			  const std::vector<gs_texture_t *> *textures = nullptr);
 	void draw_part(size_t i, const Rig::Part &p, const char *technique);
+	// A thing's parts: its solid ones, or its see-through ones (or all of
+	// it, while it fades).
+	void draw_prop(Prop3D &prop, const View3D &v, bool see_through);
 
 	gs_effect_t *effect_ = nullptr;
 	gs_eparam_t *p_cam = nullptr, *p_base_map = nullptr, *p_shade_map = nullptr, *p_emissive_map = nullptr,
