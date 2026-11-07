@@ -612,7 +612,7 @@ static void test_pats()
 		float hand_jump = 0, last_x = 0, last_y = 0, lift_jump = 0, last_lift = 0;
 		bool had_last = false;
 		Jumps j;
-		run(r, 3, view, [&](const ReactOut &o) {
+		run(r, 3.5f, view, [&](const ReactOut &o) {
 			frames++;
 			finite = finite && finite_out(o);
 			j.see(o, {"happy"});
@@ -667,6 +667,60 @@ static void test_pats()
 		CHECK(j.squint < 0.1f && j.face < 0.12f && j.place < 0.02f && j.turn < 2.5f);
 		ReactOut o = r.step(FRAME, view);
 		CHECK(!o.hand.shown && !o.busy);
+		CHECK(o.squish == 0 && o.squint == 0);
+	}
+	{
+		// Each pat squishes its head (shorter, a little wider) and it
+		// springs back a little past its own shape; once the hand has gone
+		// its eyes stay shut happily a moment, then open - its face on
+		// till then.
+		React r;
+		Pat p;
+		p.count = 3;
+		r.pat(p);
+		float most = 0, least = 0, gone_at = -1, t = 0, squish_jump = 0, last_squish = 0;
+		float squint_after_03 = -1, squint_after_13 = -1, happy_after_03 = -1;
+		bool finite = true, was_shown = false;
+		run(r, 3.5f, view, [&](const ReactOut &o) {
+			t += FRAME;
+			finite = finite && std::isfinite(o.squish);
+			most = std::max(most, o.squish);
+			least = std::min(least, o.squish);
+			squish_jump = std::max(squish_jump, std::fabs(o.squish - last_squish));
+			last_squish = o.squish;
+			if (o.hand.shown)
+				was_shown = true;
+			else if (was_shown && gone_at < 0)
+				gone_at = t;
+			if (gone_at >= 0 && squint_after_03 < 0 && t >= gone_at + 0.3f) {
+				squint_after_03 = o.squint;
+				happy_after_03 = face_amount(o, "happy");
+			}
+			if (gone_at >= 0 && squint_after_13 < 0 && t >= gone_at + 1.3f)
+				squint_after_13 = o.squint;
+		});
+		CHECK(finite);
+		CHECK(most > 0.85f && most < 1.3f);
+		CHECK(least < -0.03f && least > -0.5f);
+		CHECK(squish_jump < 0.35f);
+		CHECK(gone_at > 0);
+		CHECK(std::fabs(squint_after_03 - 0.7f) < 0.01f && happy_after_03 > 0.5f);
+		CHECK(squint_after_13 == 0);
+		CHECK(!r.step(FRAME, view).busy);
+		// Stopped: its eyes open straight away (no moment shut after).
+		React s;
+		s.pat(p);
+		run(s, 1.2f, view, [](const ReactOut &) {});
+		s.stop();
+		float shut_at_08 = -1;
+		t = 0;
+		run(s, 1.2f, view, [&](const ReactOut &o) {
+			t += FRAME;
+			if (shut_at_08 < 0 && t >= 0.95f)
+				shut_at_08 = o.squint;
+		});
+		CHECK(shut_at_08 >= 0 && shut_at_08 < 0.01f);
+		CHECK(!s.step(FRAME, view).busy);
 	}
 	{
 		// A pat: it lands, rests a moment pressing (its head giving under
@@ -889,6 +943,184 @@ static void test_pats()
 	}
 }
 
+// Things that stick (they stay where they hit, moving with its head, then
+// slide off), and bonks from above.
+static void test_sticks_and_bonks()
+{
+	ReactView view;
+	view.head_top = 0.7f;
+	{
+		// Stuck for 2 seconds: where it hit, whole, moving with its head;
+		// then sliding down a little, falling and gone.
+		React r;
+		Throw t;
+		t.picture = 1;
+		t.stick = 2;
+		t.side = 1;
+		CHECK(std::fabs(r.throw_at(t) - 0.5f) < 0.11f);
+		float t_now = 0, hit_x = 0, hit_y = 0, follow_err = 0, slid = 0, faded = 1;
+		int stuck_frames = 0;
+		bool hit = false, fine = true, upright = true;
+		run(r, 3.6f, view, [&](const ReactOut &o) {
+			t_now += FRAME;
+			fine = fine && finite_out(o);
+			for (const Flying &f : o.flying) {
+				if (f.stuck) {
+					stuck_frames++;
+					fine = fine && f.opacity == 1;
+					// Where it hit, as its head is moved and tipped.
+					const float a = o.roll * 3.14159265f / 180;
+					if (!hit) {
+						hit = true;
+						hit_x = (f.x - o.dx) * std::cos(a) + (f.y - o.dy) * std::sin(a);
+						hit_y = -(f.x - o.dx) * std::sin(a) + (f.y - o.dy) * std::cos(a);
+					} else if (t_now < 2.0f) {
+						// Standing nearly upright once it's settled.
+						if (t_now > 0.8f) {
+							const float turn = std::remainder(f.angle - a, 2 * 3.14159265f);
+							upright = upright && std::fabs(turn) <= 0.3f + 1e-3f;
+						}
+						const float x = (f.x - o.dx) * std::cos(a) + (f.y - o.dy) * std::sin(a);
+						const float y = -(f.x - o.dx) * std::sin(a) + (f.y - o.dy) * std::cos(a);
+						follow_err = std::max({follow_err, std::fabs(x - hit_x), std::fabs(y - hit_y)});
+					} else {
+						const float y = -(f.x - o.dx) * std::sin(a) + (f.y - o.dy) * std::cos(a);
+						slid = std::max(slid, y - hit_y);
+					}
+				} else if (hit && f.hit) {
+					faded = std::min(faded, f.opacity);
+				}
+			}
+			if (t_now > 0.9f && t_now < 2.3f)
+				fine = fine && r.stuck() == 1;
+		});
+		CHECK(fine && hit);
+		CHECK(std::abs(stuck_frames - (int)std::lround(2.0f / FRAME)) <= 2);
+		CHECK(upright);
+		CHECK(follow_err < 0.002f);
+		CHECK(slid > 0.15f && slid < 0.2f);
+		CHECK(faded < 0.05f);
+		CHECK(r.flying() == 0 && r.stuck() == 0);
+		CHECK(!r.step(FRAME, view).busy);
+	}
+	{
+		// Never more than MOST_STUCK at once (the oldest falls first), and
+		// stop() makes them all fall.
+		React r;
+		Throw t;
+		t.stick = 10;
+		for (int i = 0; i < MOST_WAITING; i++)
+			CHECK(r.throw_at(t) > 0);
+		int most = 0;
+		run(r, 4, view, [&](const ReactOut &) { most = std::max(most, r.stuck()); });
+		CHECK(most == MOST_STUCK);
+		r.stop();
+		ReactOut o = r.step(FRAME, view);
+		CHECK(r.stuck() == 0);
+		bool falling = !o.flying.empty();
+		for (const Flying &f : o.flying)
+			falling = falling && !f.stuck;
+		CHECK(falling);
+		run(r, 1.5f, view, [](const ReactOut &) {});
+		CHECK(r.flying() == 0 && !r.step(FRAME, view).busy);
+		// Odd numbers: never stuck, or no longer than MOST_STICK.
+		React q;
+		t.stick = std::numeric_limits<float>::quiet_NaN();
+		q.throw_at(t);
+		t.stick = -3;
+		q.throw_at(t);
+		int stuck = 0;
+		run(q, 1, view, [&](const ReactOut &) { stuck = std::max(stuck, q.stuck()); });
+		CHECK(stuck == 0);
+		t.stick = 1000;
+		q.throw_at(t);
+		run(q, 1, view, [](const ReactOut &) {});
+		CHECK(q.stuck() == 1);
+		run(q, MOST_STICK - 0.4f, view, [](const ReactOut &) {});
+		CHECK(q.stuck() == 0);
+	}
+	{
+		// A bonk: over its head (rising and tipping back), then down on
+		// top of it - its head nodded down and squished - and off to its
+		// side.
+		React r;
+		Throw t;
+		t.picture = 2;
+		t.above = true;
+		t.side = 1;
+		CHECK(std::fabs(r.throw_at(t) - 0.5f) < 0.11f);
+		float t_now = 0, first_y = 0, highest = 10, tipped = 0, hit_y = 0, nod = 0, squish = 0, after_x = 0;
+		float x_drift = 0, start_x = 0;
+		int hits = 0;
+		bool first = true, fine = true, same_size = true;
+		run(r, 1.6f, view, [&](const ReactOut &o) {
+			t_now += FRAME;
+			fine = fine && finite_out(o);
+			hits += o.hits;
+			if (o.hits)
+				hit_y = o.flying.empty() ? 0 : o.flying[0].y;
+			nod = std::min(nod, o.pitch);
+			squish = std::max(squish, o.squish);
+			if (o.flying.empty())
+				return;
+			const Flying &f = o.flying[0];
+			if (!f.hit) {
+				if (first) {
+					first_y = f.y;
+					start_x = f.x;
+					first = false;
+				}
+				highest = std::min(highest, f.y);
+				tipped = std::min(tipped, f.angle);
+				x_drift = std::max(x_drift, std::fabs(f.x - start_x));
+				same_size = same_size && std::fabs(f.size - 0.45f) < 1e-4f;
+			} else if (t_now > 1.0f) {
+				after_x = f.x;
+			}
+		});
+		CHECK(fine && hits == 1);
+		CHECK(first_y < -0.7f - 0.2f);
+		CHECK(highest < first_y - 0.1f);
+		CHECK(tipped < -0.5f); // tipped back, away from its right
+		CHECK(x_drift < 1e-4f && same_size); // straight down, with room
+		CHECK(std::fabs(hit_y - (-0.7f + 0.08f)) < 0.05f);
+		CHECK(nod < -8);
+		CHECK(squish > 0.5f);
+		CHECK(after_x > 0.4f); // off to its right
+		run(r, 1.5f, view, [](const ReactOut &) {});
+		CHECK(!r.step(FRAME, view).busy);
+		// No room above its head in the picture (its head up to the top
+		// edge): it comes in slantwise from its other side, never more
+		// than half of it out of the picture.
+		ReactView tight = view;
+		tight.top = -0.75f;
+		React q;
+		q.throw_at(t);
+		ReactOut o = q.step(FRAME, tight);
+		CHECK(o.flying.size() == 1);
+		bool inside = true;
+		float least_y = 10;
+		run(q, 0.45f, tight, [&](const ReactOut &o) {
+			for (const Flying &f : o.flying)
+				if (!f.hit) {
+					inside = inside && f.y >= tight.top - 1e-3f;
+					least_y = std::min(least_y, f.y);
+				}
+		});
+		CHECK(inside);
+		CHECK(o.flying[0].x < -0.6f); // from its left: it bounces off to its right
+		CHECK(least_y < -0.7f + 0.08f - 0.05f);
+		// A narrow picture: it starts in it across too.
+		ReactView narrow = tight;
+		narrow.left = -0.7f;
+		narrow.right = 0.7f;
+		React n;
+		n.throw_at(t);
+		o = n.step(FRAME, narrow);
+		CHECK(o.flying.size() == 1 && o.flying[0].x >= -0.7f + 0.45f * 0.6f - 1e-4f);
+	}
+}
+
 // Thrown and patted at once, with a face and a move: it all adds up and
 // settles.
 static void test_all_at_once()
@@ -937,6 +1169,7 @@ int main()
 	test_moves();
 	test_throws();
 	test_pats();
+	test_sticks_and_bonks();
 	test_all_at_once();
 	std::printf("unit_react: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;

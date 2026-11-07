@@ -157,6 +157,11 @@ struct Drive {
 	float squint = 0;
 	std::vector<MoveNow> body;
 	V3 knock;
+	// Its head squished by a headpat (react.hpp's ReactOut::squish: 0 not
+	// at all, 1 the most): its head and all on it 10% shorter along its
+	// own up and 5% wider, from where it sits on its neck (one with no
+	// head bone: all of it, from its bottom, half as much).
+	float squish = 0;
 	// Your arms, hands and fingers (arms.hpp), if followed: a VRM's arms
 	// as yours (a move on cue takes over from them as much as it shows),
 	// its hand by its head where yours is by yours.
@@ -229,8 +234,11 @@ public:
 	bool auto_chain() const { return auto_chain_; }
 	int upright_parts() const { return (int)upright_.size(); }
 	// What your eyes and mouth ride on: the model -> the world as its head
-	// is now (its head bone's, or all of it turned).
+	// is now (its head bone's, or all of it turned) - squished too, if a
+	// headpat squishes it (Drive::squish).
 	M4 head_frame() const;
+	// The squish on it now (the world -> the world; none: as it is).
+	const M4 &squish() const { return squish_; }
 
 	// The faces it makes on cue, for the page: VRM's own (happy, angry,
 	// sad, relaxed, surprised - those it has) and its file's other
@@ -317,6 +325,7 @@ private:
 	void play_builtin(BuiltIn b, float t, float amount);
 	void play_own(int animation, float t, float amount);
 	void measure_head();
+	void squish_head(const Drive &d);
 	void stand_upright(const Drive &d);
 	Quat head_turn_now() const;
 	void skin();
@@ -392,6 +401,9 @@ private:
 	// A VRM animation's expressions this frame (name -> strength).
 	std::map<std::string, float> move_faces_;
 	HeadBox head_box_;
+	// Its head bone and all that hangs off it (squished with it).
+	std::vector<int> head_tree_;
+	M4 squish_;
 	float floor_ = 0; // its lowest, the facing model's way
 	// Its shapes by name (lower case): mesh and morph.
 	std::map<std::string, std::vector<std::pair<int, int>>> morph_by_name_;

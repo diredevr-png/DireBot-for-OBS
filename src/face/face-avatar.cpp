@@ -1098,7 +1098,13 @@ struct FaceAvatar {
 		float scale = 1, angle = 0; // the source's pixels a character pixel; radians
 		float yaw = 0, pitch = 0;   // degrees
 		float opacity = 1;
+		// Squished by a headpat (react.hpp: 0 not at all, 1 the most):
+		// shorter and a little wider, from its bottom edge.
+		float squish = 0;
 	};
+	// How much shorter and wider a picture character is, squished all the
+	// way (all of it squishes, so less than a 3D character's head).
+	static constexpr float SQUISH_TALL_2D = 0.05f, SQUISH_WIDE_2D = 0.03f;
 	Placed placed_now;
 	bool showing_now = false;
 	uint64_t last_render = 0;
@@ -1249,6 +1255,8 @@ struct FaceAvatar {
 		int hits = 0, flying = 0;
 		float head_px = 0;
 		Hand hand; // the headpat's hand now
+		float squint = 0, squish = 0;
+		int stuck = 0;
 	};
 	ReactState react_state;
 	// ...and how it sounds, for FaceGetState (under state_lock).
@@ -1826,6 +1834,7 @@ struct FaceAvatar {
 			react_shift[1] = rn.dy * head_px;
 			at.x += react_shift[0];
 			at.y += react_shift[1];
+			at.squish = std::isfinite(rn.squish) ? clampf(rn.squish, -0.5f, 1.2f) : 0;
 			return at;
 		}
 		react_shift[0] = react_shift[1] = 0;
@@ -1970,6 +1979,13 @@ struct FaceAvatar {
 		gs_matrix_translate3f(at.x, at.y, 0);
 		gs_matrix_rotaa4f(0, 0, 1, at.angle);
 		gs_matrix_scale3f(at.scale, at.scale, 1);
+		if (at.squish != 0) {
+			// Squished from its bottom edge (a headpat).
+			const float bottom = CH - at.ay;
+			gs_matrix_translate3f(0, bottom, 0);
+			gs_matrix_scale3f(1 + SQUISH_WIDE_2D * at.squish, 1 - SQUISH_TALL_2D * at.squish, 1);
+			gs_matrix_translate3f(0, -bottom, 0);
+		}
 		gs_matrix_translate3f(-at.ax - TURN_PAD * CW, -at.ay - TURN_PAD * CH, 0);
 		check("Turn");
 		while (gs_effect_loop(effect, "Turn"))
@@ -2124,7 +2140,12 @@ struct FaceAvatar {
 		const float cx = mid.x + side * HAND_OVER * wide, cz = mid.z - HAND_BACK * deep;
 		const float cy = hb.found ? hb.top_at(cx, cz, HAND_REACH * tall) : crown;
 		const V3 at{cx + side * h.away * tall, cy + h.rise * tall, cz};
-		const M4 rest = rig->head_frame() * matrix_of(conj(facing)) * moved(at) * scaled(tall);
+		// On its head as a headpat squishes it - the hand itself not
+		// squished.
+		const M4 &sq = rig->squish();
+		M4 rest = inverse(sq) * rig->head_frame() * matrix_of(conj(facing)) * moved(at) * scaled(tall);
+		const V3 o = move_of(rest);
+		rest = moved(point(sq, o) - o) * rest;
 		return hand_at(hand, rest, side);
 	}
 
@@ -2448,6 +2469,7 @@ struct FaceAvatar {
 		// world's units: its picture's right and up, and towards you).
 		d.faces = react_now.faces;
 		d.squint = react_now.squint;
+		d.squish = react_now.squish;
 		for (const BodyMove &bm : react_now.body) {
 			MoveNow mv;
 			mv.time = bm.time;
@@ -3127,7 +3149,11 @@ struct FaceAvatar {
 			ey = (ly + ry) / 2;
 			tall = std::max(2.8f * std::hypot(rx - lx, ry - ly), 0.05f * char_h);
 		}
-		const float u = (ex - CX - at.ax) * at.scale, v = (ey + 0.1f * tall - CY - at.ay) * at.scale;
+		// (Squished by a headpat: from its bottom edge.)
+		const float bottom = canvas.h * char_h - at.ay;
+		const float u = (ex - CX - at.ax) * (1 + SQUISH_WIDE_2D * at.squish) * at.scale,
+			    v = (bottom + (ey + 0.1f * tall - CY - at.ay - bottom) * (1 - SQUISH_TALL_2D * at.squish)) *
+				at.scale;
 		const float x = at.x + co * u - si * v, y = at.y + si * u + co * v;
 		head_px = tall * at.scale;
 		if (!(head_px >= 2) || !std::isfinite(x + y))
@@ -3451,6 +3477,11 @@ struct FaceAvatar {
 		react_state.busy = react_now.busy;
 		react_state.flying = (int)react_now.flying.size();
 		react_state.hand = react_now.hand;
+		react_state.squint = react_now.squint;
+		react_state.squish = react_now.squish;
+		react_state.stuck = 0;
+		for (const Flying &f : react_now.flying)
+			react_state.stuck += f.stuck;
 		if (os_gettime_ns() - last_render > 500'000'000ULL)
 			showing_now = false;
 	}
@@ -4170,14 +4201,29 @@ struct FaceAvatar {
 			bool three_d;
 			own_face(t.face, three_d);
 			t.face_time = num("face_seconds", 1.5f);
-			float when;
+			// (0.8.1) Stuck to it a while, a bonk from above, and a
+			// barrage: `count` of it, one after another.
+			t.stick = num("stick", 0);
+			t.above = str("from") == "above";
+			const int count = (int)std::lround(clampf(num("count", 1), 1, (float)MOST_WAITING));
+			float when = -1;
+			int thrown = 0;
 			{
 				std::lock_guard<std::mutex> l(react_lock);
-				when = react.throw_at(t);
+				for (int i = 0; i < count; i++) {
+					const float w = react.throw_at(t);
+					if (w < 0)
+						break;
+					if (!thrown)
+						when = w;
+					thrown++;
+				}
 			}
-			if (when < 0)
+			if (!thrown)
 				return no("Too much is being thrown at once - try again in a moment.");
 			answer["hits_in"] = std::round(when * 1000) / 1000;
+			answer["thrown"] = thrown;
+			answer["every"] = THROW_GAP;
 		} else if (what == "pat") {
 			Pat p;
 			p.count = (int)std::lround(clampf(num("count", 5), 1, (float)MOST_PATS));
@@ -4497,7 +4543,10 @@ struct FaceAvatar {
 					   {"hit", react_hit_ok},
 					   {"hits", rs.hits},
 					   {"flying", rs.flying},
+					   {"stuck", rs.stuck},
 					   {"patting", rs.hand.shown},
+					   {"squint", std::round(rs.squint * 1000) / 1000},
+					   {"squish", std::round(rs.squish * 1000) / 1000},
 					   {"busy", rs.busy}};
 			if (!react_hand_problem.empty())
 				answer["react"]["hand_3d_problem"] = react_hand_problem;

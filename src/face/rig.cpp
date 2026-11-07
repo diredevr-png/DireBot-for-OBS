@@ -1139,6 +1139,10 @@ void Rig::measure_head()
 			}
 		}
 	}
+	head_tree_.clear();
+	for (size_t i = 0; i < m.nodes.size(); i++)
+		if (under[i])
+			head_tree_.push_back((int)i);
 	const Quat F = options_.facing;
 	bool any_box = false, any_top = false;
 	std::vector<V3> seen;
@@ -1995,7 +1999,46 @@ void Rig::pose(const Drive &d)
 					world_from(n);
 				}
 	}
+	squish_head(d);
 	skin();
+}
+
+// Squished by a headpat (Drive::squish): shorter along its head's own up
+// as it is now and a little wider, from where its head sits on its neck -
+// its hair and all on its head with it (after they've swung: they swing
+// as if it weren't). With no head bone, all of it from its bottom, half
+// as much.
+void Rig::squish_head(const Drive &d)
+{
+	squish_ = M4();
+	const float s = std::isfinite(d.squish) ? std::max(-0.5f, std::min(1.2f, d.squish)) : 0.0f;
+	if (std::fabs(s) < 1e-4f)
+		return;
+	const Model &m = *model_;
+	const V3 up_model = rotate(conj(options_.facing), {0, 1, 0});
+	const bool head = head_ >= 0 && !head_tree_.empty();
+	const M4 frame = head ? world_[head_] * inverse(rest_world_[head_]) : root_;
+	const V3 up = normalized(direction(frame, up_model), {0, 1, 0});
+	const float k = head ? 1.0f : 0.5f;
+	const float along = 1 - 0.10f * k * s, across = 1 + 0.05f * k * s;
+	// Pinned where its head meets its neck (or at its bottom).
+	const V3 at = head ? move_of(world_[head_]) : point(root_, {pivot_.x, m.low.y, pivot_.z});
+	// `across` times all of it, and along its up (along - across) more.
+	M4 st = scaled(across);
+	const float extra = along - across;
+	const float u[3] = {up.x, up.y, up.z};
+	for (int r = 0; r < 3; r++)
+		for (int c = 0; c < 3; c++)
+			st.at(r, c) += extra * u[r] * u[c];
+	squish_ = moved(at) * st * moved(at * -1.0f);
+	if (head) {
+		for (int n : head_tree_)
+			world_[n] = squish_ * world_[n];
+	} else {
+		root_ = squish_ * root_;
+		for (M4 &w : world_)
+			w = squish_ * w;
+	}
 }
 
 void Rig::skin()

@@ -2169,6 +2169,66 @@ def test_pats_from_a_side_3d_things_and_emotes(run):
         bad = cue(do="throw", file=os.path.join(run.home, "not-there.gif"))
         assert not bad["ok"] and "couldn't be opened" in bad["error"], bad
         assert wait_for(lambda: st()["hits"] == hits + 3, 4, 0.05), st()
+        assert wait_for(lambda: not st()["busy"], 5, 0.1), st()
+
+        # A pat squishes its head (springing back), and its eyes stay shut
+        # a moment after the hand has gone.
+        assert cue(do="pat", count=2, side=1)["ok"]
+        seen = []
+        end = time.time() + 3
+        while time.time() < end:
+            now = st()
+            seen.append((now["patting"], now["squish"], now["squint"]))
+            time.sleep(0.03)
+        print(f"pat: squish {max(q for _, q, _ in seen)} to {min(q for _, q, _ in seen)}")
+        assert max(q for _, q, _ in seen) > 0.6 and min(q for _, q, _ in seen) < -0.02
+        gone = next(i for i in range(1, len(seen)) if seen[i - 1][0] and not seen[i][0])
+        assert seen[gone][2] > 0.6 and seen[-1][2] == 0, seen[gone:]
+
+        # Stuck: an emote where it hit a while, then off; a stop drops one
+        # at once.
+        hits = st()["hits"]
+        assert cue(do="throw", file=emote, stick=2, side=1)["ok"]
+        assert wait_for(lambda: st()["stuck"] == 1, 1.5, 0.05), st()
+        time.sleep(1.0)
+        shot = screenshot(c, "Pat")
+        assert middle_of(shot, blue)[2] > 40
+        keep_shot(shot, "Stuck emote")
+        assert wait_for(lambda: st()["stuck"] == 0, 3, 0.05), st()
+        assert cue(do="throw", file=emote, stick=10)["ok"]
+        assert wait_for(lambda: st()["stuck"] == 1, 1.5, 0.05), st()
+        assert cue(do="stop")["ok"]
+        assert wait_for(lambda: st()["stuck"] == 0, 0.5, 0.02), st()
+        assert wait_for(lambda: not st()["busy"], 5, 0.1), st()
+
+        # A bonk: the 3D ball over its head first, then down on it - its
+        # head squished.
+        hits = st()["hits"]
+        assert cue(do="throw", item=0, size=1, **{"from": "above"})["ok"]
+        shots = quick_shots(c, "Pat", 0.4)
+        ys = [middle_of(rows, green) for _, rows in shots]
+        ys = [y for _, y, n in ys if n > 40]
+        print(f"bonk: the ball at y {[round(y) for y in ys]}, the face at {rest_y:.0f}")
+        assert ys and ys[0] < rest_y - 40, (ys, rest_y)
+        keep_shot(min(shots, key=lambda s: middle_of(s[1], green)[1] if middle_of(s[1], green)[2] > 40
+                       else 1e9)[1], "Bonk wind-up")
+        assert wait_for(lambda: st()["hits"] == hits + 1, 2, 0.05), st()
+        assert wait_for(lambda: not st()["busy"], 5, 0.1), st()
+        # (Again, watched closely as it lands: the squish is quick.)
+        assert cue(do="throw", item=0, size=1, **{"from": "above"})["ok"]
+        squished = 0
+        end = time.time() + 1.2
+        while time.time() < end:
+            squished = max(squished, st()["squish"])
+            time.sleep(0.01)
+        assert st()["hits"] == hits + 2 and squished > 0.3, (st(), squished)
+        assert wait_for(lambda: not st()["busy"], 5, 0.1), st()
+
+        # A barrage: five, one after another.
+        hits = st()["hits"]
+        t = cue(do="throw", file=emote, count=5, side=-1)
+        assert t["ok"] and t["thrown"] == 5 and abs(t["every"] - 0.1) < 1e-6, t
+        assert wait_for(lambda: st()["hits"] == hits + 5, 3, 0.05), st()
         for name in ("Pat", "Pat camera"):
             send(c, "RemoveInput", {"inputName": name})
     finally:

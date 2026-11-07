@@ -35,6 +35,17 @@ constexpr float FACE_IN = 0.25f, FACE_OUT = 0.4f, TAKE_OVER = 0.3f;
 constexpr float MOVE_TAKE_OVER = 0.3f;
 // How long a throw takes to fall away after it hits.
 constexpr float FALL_TIME = 0.75f;
+// A thing stuck to it slides down this far (heads) over its last moment
+// stuck (seconds), then falls.
+constexpr float STICK_SLIDE = 0.6f, STICK_DROP = 0.18f;
+// As it sticks it turns to stand nearly upright (within this, radians)
+// this fast (seconds).
+constexpr float STICK_TILT = 0.3f, STICK_TURN = 0.15f;
+// A bonk: its wind-up (seconds; the rest of FLY_TIME it comes down), how
+// far it rises meanwhile (heads) and how far it tips back (radians).
+constexpr float BONK_WIND = 0.36f, BONK_RISE = 0.12f, BONK_TIP = 0.55f;
+// How far above its head a bonk comes down from (heads), with room.
+constexpr float BONK_HIGH = 0.9f;
 // The flash where one hits.
 constexpr float FLASH_TIME = 0.32f;
 // The "ouch": shut fast, held, then opened slowly.
@@ -59,6 +70,13 @@ constexpr float PAT_SQUINT = 0.7f, PAT_PRESS = 0.035f, PAT_NOD = 4.0f, PAT_LEAN 
 // hand shows (a share of its height), its bottom edge never lower than
 // this (heads from the middle of its face: about its eyebrows).
 constexpr float PAT_SHOWS = 0.45f, PAT_LOWEST = -0.25f;
+// Once the hand has gone its eyes stay shut happily this long, then open
+// over this long (seconds).
+constexpr float PAT_HAPPY_HOLD = 0.6f, PAT_HAPPY_OPEN = 0.45f;
+// Its head's squish follows each pat's give on a spring: how fast it
+// swings (about four times a second) and how soon it settles - so it
+// springs back a little past its own shape, like a squeezed toy.
+constexpr float SQUISH_W = 24.0f, SQUISH_DAMP = 0.35f;
 // The knock-back springs: how fast they swing and how soon they settle
 // (swung out in a tenth of a second, settled in two thirds), and the most
 // each can be pushed.
@@ -258,6 +276,7 @@ float React::throw_at(const Throw &t)
 	it.t.size = finite(t.size) ? clampf(t.size, 0.2f, 3.0f) : 1.0f;
 	it.t.face_time = finite(t.face_time) ? clampf(t.face_time, 0.1f, 10.0f) : 1.5f;
 	it.t.side = finite(t.side) ? t.side : 0.0f;
+	it.t.stick = finite(t.stick) ? clampf(t.stick, 0, MOST_STICK) : 0.0f;
 	waiting_.push_back(it);
 	return leaves + FLY_TIME;
 }
@@ -296,8 +315,10 @@ void React::pat(const Pat &p)
 	pat_count_ = count;
 	pat_leave_ = PAT_ENTER + (count - 1 + PAT_LEAVE_AT) * PAT_TIME;
 	pats_done_ = 0;
+	after_ = -1;
+	hurry_after_ = false;
 	if (!pat_.face.empty())
-		face(pat_.face, pat_leave_ + PAT_LEAVE * 0.5f);
+		face(pat_.face, pat_leave_ + PAT_LEAVE + PAT_HAPPY_HOLD + PAT_HAPPY_OPEN * 0.5f);
 }
 
 // The hand `t` seconds into a headpat, before it leaves: coming in over
@@ -350,8 +371,14 @@ void React::stop()
 		if (a.out_at < 0)
 			a.out_at = time_;
 	waiting_.clear();
+	// Its eyes open now, after a headpat (not kept shut a moment).
+	hurry_after_ = true;
+	if (after_ >= 0)
+		after_ = std::max(after_, PAT_HAPPY_HOLD);
 	// What's in the air falls away (no hit).
 	for (Item &it : flying_) {
+		// Stuck ones fall off now.
+		unstick(it);
 		if (it.hit)
 			continue;
 		const float u = clamp01(it.at / FLY_TIME);
@@ -370,6 +397,34 @@ void React::launch(Item &it, const ReactView &view)
 	const Throw &t = it.t;
 	it.side = t.side < 0 ? -1.0f : t.side > 0 ? 1.0f : (random01() < 0.5f ? -1.0f : 1.0f);
 	it.size0 = 0.45f * t.size;
+	if (t.above) {
+		// A bonk: it shows up over its head (as big as it is: it isn't
+		// thrown from where you watch) and comes down on the top of it -
+		// from as high as the picture has room for. It bounces off to
+		// `side`.
+		it.x1 = random(-0.12f, 0.12f);
+		it.y1 = -clampf(finite(view.head_top) ? view.head_top : 0.6f, 0.2f, 3) + 0.08f;
+		// From up to BONK_HIGH over its head - all of it in the picture,
+		// wind-up and all. A head up to the picture's top edge (a
+		// character filling it) leaves less room: then it comes down
+		// slantwise from above its other side as well, as far again.
+		const float highest = view.top + it.size0 * 0.6f + BONK_RISE;
+		const float room = clampf(it.y1 - highest, 0, BONK_HIGH);
+		it.y0 = it.y1 - room;
+		it.x0 = it.x1 - it.side * (BONK_HIGH - room);
+		// (In the picture across, too, when there's room for it.)
+		const float lo = view.left + it.size0 * 0.6f, hi = view.right - it.size0 * 0.6f;
+		if (lo < hi)
+			it.x0 = clampf(it.x0, lo, hi);
+		it.arc = 0;
+		it.spin = 0;
+		it.angle = 0;
+		it.axis = {0, 0, 1};
+		it.x = it.x0;
+		it.y = it.y0;
+		it.size = it.size0;
+		return;
+	}
 	// From just past the picture's side, somewhere about level with its
 	// face (thrown from where you watch: big at first)...
 	const float big = it.size0 * 2.5f;
@@ -407,13 +462,23 @@ void React::hit(Item &it, ReactOut &out)
 	auto push = [&](Spring &s, float peak) {
 		s.speed += peak * KNOCK_W * 1.5f;
 	};
-	push(yaw_, k * (9.0f * ux + 10.0f * it.x1));
-	push(pitch_, k * (8.0f - 10.0f * it.y1 - 3.0f * uy));
-	push(roll_, k * (6.0f * ux));
-	push(dx_, k * 0.06f * ux);
-	push(dy_, k * 0.025f * uy);
-	// Its swinging parts thrown the way it went, and back.
-	out.knock = out.knock + V3{ux * 2.2f * k, -uy * 1.2f * k, -2.6f * k};
+	if (t.above) {
+		// Bonked on top: its head knocked down (a nod), tipped a little,
+		// and squished; its hair thrown down.
+		push(pitch_, -k * 11.0f);
+		push(roll_, k * random(-4.0f, 4.0f));
+		push(dy_, k * 0.05f);
+		squish_speed_ += k * 30.0f;
+		out.knock = out.knock + V3{0, -2.4f * k, -0.6f * k};
+	} else {
+		push(yaw_, k * (9.0f * ux + 10.0f * it.x1));
+		push(pitch_, k * (8.0f - 10.0f * it.y1 - 3.0f * uy));
+		push(roll_, k * (6.0f * ux));
+		push(dx_, k * 0.06f * ux);
+		push(dy_, k * 0.025f * uy);
+		// Its swinging parts thrown the way it went, and back.
+		out.knock = out.knock + V3{ux * 2.2f * k, -uy * 1.2f * k, -2.6f * k};
+	}
 	// The flash, the "ouch" and its face.
 	Flash f;
 	f.x = it.x1;
@@ -426,12 +491,49 @@ void React::hit(Item &it, ReactOut &out)
 	ouch_ = 0;
 	if (!t.face.empty())
 		face(t.face, t.face_time);
-	// Bouncing off: back the way it came a little, up, then falling.
-	it.vx = -ux * random(0.8f, 1.6f) * (0.6f + 0.4f * k);
-	it.vy = -random(1.6f, 2.6f);
-	it.spin = -it.spin * 0.6f;
+	// Bouncing off: back the way it came a little, up, then falling (a
+	// bonk: up and off to its side, spinning).
+	if (t.above) {
+		it.vx = it.side * random(0.6f, 1.2f);
+		it.vy = -random(2.0f, 2.8f);
+		it.spin = it.side * random(4.0f, 8.0f);
+	} else {
+		it.vx = -ux * random(0.8f, 1.6f) * (0.6f + 0.4f * k);
+		it.vy = -random(1.6f, 2.6f);
+		it.spin = -it.spin * 0.6f;
+	}
 	it.x = it.x1;
 	it.y = it.y1;
+	// Or stuck where it hit a while - turning to stand nearly upright
+	// (the nearest way round), as if it had landed so.
+	if (t.stick > 0) {
+		it.stuck = true;
+		it.stuck_at = time_;
+		it.stuck_till = it.at + t.stick;
+		it.stuck_from = it.angle;
+		const float tilt = random(-STICK_TILT, STICK_TILT);
+		it.stuck_angle = it.angle - std::remainder(it.angle - tilt, 2 * PI_F);
+	}
+}
+
+void React::unstick(Item &it)
+{
+	if (!it.stuck)
+		return;
+	it.stuck = false;
+	// Falling from where it is now (its fade starts again).
+	it.hit_at = it.at;
+	it.vx = random(-0.3f, 0.3f);
+	it.vy = 0.4f;
+	it.spin = random(-3.0f, 3.0f);
+}
+
+int React::stuck() const
+{
+	int n = 0;
+	for (const Item &it : flying_)
+		n += it.stuck;
+	return n;
 }
 
 ReactOut React::step(float dt, const ReactView &view)
@@ -459,16 +561,45 @@ ReactOut React::step(float dt, const ReactView &view)
 		it.at += dt;
 		if (!it.hit) {
 			const float u = clamp01(it.at / FLY_TIME);
-			it.x = it.x0 + (it.x1 - it.x0) * u;
-			it.y = it.y0 + (it.y1 - it.y0) * u - it.arc * 4 * u * (1 - u);
-			// Smaller as it goes away from you, towards its face.
-			it.size = it.size0 / (0.4f + 0.6f * u);
-			it.angle += it.spin * dt;
+			if (it.t.above) {
+				// A bonk: rising a little and tipping back (away from
+				// the side it'll bounce off to), then coming down,
+				// faster as it falls, swinging forward.
+				const float top = it.y0 - BONK_RISE;
+				if (it.at < BONK_WIND) {
+					const float w = smooth(it.at / BONK_WIND);
+					it.x = it.x0;
+					it.y = it.y0 - BONK_RISE * w;
+					it.angle = -it.side * BONK_TIP * w;
+				} else {
+					const float d = clamp01((it.at - BONK_WIND) / (FLY_TIME - BONK_WIND));
+					it.x = it.x0 + (it.x1 - it.x0) * d * d;
+					it.y = top + (it.y1 - top) * d * d;
+					it.angle = -it.side * BONK_TIP * (1 - 1.4f * d * d);
+				}
+				it.size = it.size0;
+			} else {
+				it.x = it.x0 + (it.x1 - it.x0) * u;
+				it.y = it.y0 + (it.y1 - it.y0) * u - it.arc * 4 * u * (1 - u);
+				// Smaller as it goes away from you, towards its face.
+				it.size = it.size0 / (0.4f + 0.6f * u);
+				it.angle += it.spin * dt;
+			}
 			if (it.at >= FLY_TIME) {
 				it.hit = true;
 				it.hit_at = FLY_TIME;
 				hit(it, out);
 			}
+		} else if (it.stuck) {
+			// Stuck where it hit; sliding down a little at the end, then
+			// falling.
+			const float slide = 1 - smooth((it.stuck_till - it.at) / STICK_SLIDE);
+			it.x = it.x1;
+			it.y = it.y1 + STICK_DROP * slide * slide;
+			it.angle = it.stuck_from +
+				   (it.stuck_angle - it.stuck_from) * smooth((it.at - it.hit_at) / STICK_TURN);
+			if (it.at >= it.stuck_till)
+				unstick(it);
 		} else {
 			it.vy += 9.0f * dt;
 			it.x += it.vx * dt;
@@ -478,10 +609,19 @@ ReactOut React::step(float dt, const ReactView &view)
 			it.size += it.size0 * 0.35f * dt;
 		}
 	}
+	// Never too many stuck at once: the one stuck longest falls first.
+	for (int n = stuck(); n > MOST_STUCK; n--) {
+		Item *oldest = nullptr;
+		for (Item &it : flying_)
+			if (it.stuck && (!oldest || it.stuck_at < oldest->stuck_at))
+				oldest = &it;
+		unstick(*oldest);
+	}
 	flying_.erase(std::remove_if(flying_.begin(), flying_.end(),
 				     [&](const Item &it) {
-					     return it.hit && (it.at - it.hit_at >= FALL_TIME ||
-							       it.y - it.size > view.bottom + 0.5f);
+					     return it.hit && !it.stuck &&
+						    (it.at - it.hit_at >= FALL_TIME ||
+						     it.y - it.size > view.bottom + 0.5f);
 				     }),
 		      flying_.end());
 	for (const Item &it : flying_) {
@@ -493,7 +633,15 @@ ReactOut React::step(float dt, const ReactView &view)
 		f.angle = it.angle;
 		f.axis = it.axis;
 		f.hit = it.hit;
-		if (it.hit) {
+		f.stuck = it.stuck;
+		if (it.stuck) {
+			// Squashed flat against it a moment, then a little flat while
+			// it's stuck there.
+			const float e = std::max(0.0f, 1 - (it.at - it.hit_at) / 0.14f);
+			f.opacity = 1;
+			f.squash_x = 1.06f + 0.29f * e;
+			f.squash_y = 0.95f - 0.25f * e;
+		} else if (it.hit) {
 			const float tt = it.at - it.hit_at;
 			f.opacity = 1 - smooth((tt - (it.dropped ? 0.0f : 0.25f)) / (it.dropped ? 0.3f : FALL_TIME - 0.25f));
 			// Squashed flat against its face a moment, then springing back.
@@ -503,8 +651,9 @@ ReactOut React::step(float dt, const ReactView &view)
 				f.squash_y = 1 - 0.3f * e;
 			}
 		} else {
-			// Fading in as it comes in from the side.
-			f.opacity = smooth(it.at / 0.08f);
+			// Fading in as it comes in from the side (a bonk: over its
+			// head).
+			f.opacity = smooth(it.at / (it.t.above ? 0.15f : 0.08f));
 		}
 		out.flying.push_back(f);
 	}
@@ -674,11 +823,13 @@ ReactOut React::step(float dt, const ReactView &view)
 			p.rise = f.rise + (PAT_FROM_RISE - f.rise) * e;
 			p.lift = f.lift + (0.6f - f.lift) * e;
 			p.opacity = f.opacity * (1 - smooth((u - 0.4f) / 0.6f));
-			p.squint = f.squint * (1 - smooth(u * 1.6f));
+			p.squint = f.squint;
 			p.press = f.press * (1 - smooth((t - pat_leave_) / 0.15f));
 			p.lean = f.lean * (1 - e);
 			if (u >= 1) {
 				patting_ = false;
+				// Its eyes stay shut happily a moment.
+				after_ = f.squint > 0.001f ? hurry_after_ ? PAT_HAPPY_HOLD : 0 : -1;
 				p = PatPose();
 			}
 		}
@@ -726,6 +877,40 @@ ReactOut React::step(float dt, const ReactView &view)
 		squint = std::max(squint, p.squint);
 		last_pose_ = p;
 	}
+	// The squish: each pat's give, on a spring (in small steps, steady at
+	// any frame rate).
+	{
+		const float target = patting_ ? last_pose_.press : 0.0f;
+		for (float left = dt; left > 1e-6f;) {
+			const float h = std::min(left, 1.0f / 240);
+			squish_speed_ += (-SQUISH_W * SQUISH_W * (squish_ - target) - 2 * SQUISH_DAMP * SQUISH_W * squish_speed_) * h;
+			squish_ += squish_speed_ * h;
+			left -= h;
+		}
+		if (!patting_ && std::fabs(squish_) < 2e-3f && std::fabs(squish_speed_) < 0.05f)
+			squish_ = squish_speed_ = 0;
+		out.squish = clampf(squish_, -0.5f, 1.2f);
+	}
+	// After a headpat: its eyes kept shut a moment, then opening.
+	if (after_ >= 0) {
+		after_ += dt;
+		squint = std::max(squint, PAT_SQUINT * (1 - smooth((after_ - PAT_HAPPY_HOLD) / PAT_HAPPY_OPEN)));
+		if (after_ >= PAT_HAPPY_HOLD + PAT_HAPPY_OPEN)
+			after_ = -1;
+	}
+	// What's stuck to it moves with its head as these moves move it (and
+	// tips with it).
+	{
+		const float a = out.roll * PI_F / 180, co = std::cos(a), si = std::sin(a);
+		for (Flying &f : out.flying) {
+			if (!f.stuck)
+				continue;
+			const float x = f.x, y = f.y;
+			f.x = x * co - y * si + out.dx;
+			f.y = x * si + y * co + out.dy;
+			f.angle += a;
+		}
+	}
 	shown_ = out.hand.shown;
 	out.squint = squint;
 
@@ -736,7 +921,8 @@ ReactOut React::step(float dt, const ReactView &view)
 	if (!settling)
 		yaw_ = pitch_ = roll_ = dx_ = dy_ = Spring();
 	out.busy = settling || !faces_.empty() || !acts_.empty() || !flying_.empty() || !waiting_.empty() ||
-		   patting_ || !flashes_.empty() || ouch_ >= 0 || out.hits > 0;
+		   patting_ || !flashes_.empty() || ouch_ >= 0 || out.hits > 0 || after_ >= 0 || squish_ != 0 ||
+		   squish_speed_ != 0;
 	return out;
 }
 

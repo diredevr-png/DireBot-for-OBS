@@ -32,13 +32,17 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //     hits its face - its head knocked back where it hits (a spring: it
 //     snaps back and settles), its hair and ears thrown about, a flash
 //     where it hit, an "ouch" (its eyes screwed shut a moment, and a face
-//     if one is picked) - then it bounces off and falls away.
+//     if one is picked) - then it bounces off and falls away; or it sticks
+//     there a while, moving with its head, then slides off. Or a bonk: up
+//     over its head, a moment's wind-up, and down on top of it - its head
+//     knocked down and squished.
 //   - A headpat: a hand coming in from a side, over the top of its head,
 //     palm down, and patting it - lifted from the wrist and let fall, a
-//     couple of times a second - its head dipping with each pat and
-//     leaning into the hand, its hair bouncing, while it squints happily
-//     (and makes a face, if one is picked). A 3D hand on its head (or a
-//     picture of one, turned at its wrist).
+//     couple of times a second - its head dipping and squishing with each
+//     pat (springing back) and leaning into the hand, its hair bouncing,
+//     while it squints happily (and makes a face, if one is picked), its
+//     eyes kept shut a moment after the hand has gone. A 3D hand on its
+//     head (or a picture of one, turned at its wrist).
 //
 // Where things are is in "heads" (the height of its head on the picture)
 // from the middle of its face (where it would be without these moves), x
@@ -89,7 +93,19 @@ struct Throw {
 	float size = 1;
 	std::string face;
 	float face_time = 1.5f;
+	// Stuck to it where it hits this long (seconds, up to MOST_STICK; 0:
+	// it bounces off), moving with its head; then it slides down a little
+	// and falls away.
+	float stick = 0;
+	// A bonk: up over its head (a moment's wind-up, tipping back) and
+	// down on top of it, rather than thrown from a side. Its head is
+	// knocked down and squished, and it bounces off to a side.
+	bool above = false;
 };
+// The longest a thing stays stuck to it, and at most this many stuck at
+// once (one more and the one stuck longest falls away).
+constexpr float MOST_STICK = 10;
+constexpr int MOST_STUCK = 12;
 
 // A headpat: the hand's picture (the caller's number), how many pats,
 // how big the hand is (1: as big as a hand is for a head), its face
@@ -130,6 +146,8 @@ struct Flying {
 	// A 3D one turns `angle` about this way (as the picture shows it: x
 	// right, y up, z out of the picture towards you).
 	V3 axis{0, 0, 1};
+	// Stuck to it now (Throw::stick).
+	bool stuck = false;
 };
 
 // The patting hand: shown, its picture, the side it comes from (-1 the
@@ -163,6 +181,11 @@ struct ReactOut {
 	float yaw = 0, pitch = 0, roll = 0;
 	// ...and moved (heads; + right, + down).
 	float dx = 0, dy = 0;
+	// Its head squished by a headpat: 0 not at all, 1 a pat's most -
+	// shorter and a little wider, from where it sits on its neck (a
+	// picture: from its bottom edge) - and a little under 0 as it springs
+	// back up past its own shape.
+	float squish = 0;
 	// The body moves playing (rig.hpp plays them), oldest first: one
 	// easing out as the next takes over.
 	std::vector<BodyMove> body;
@@ -204,6 +227,8 @@ public:
 	// Thrown: how many seconds until it hits (DireBot plays the hit's
 	// sound then), or -1 if too many are waiting already.
 	float throw_at(const Throw &t);
+	// How many are stuck to it now, for tests and FaceGetState.
+	int stuck() const;
 	void pat(const Pat &p);
 	// Everything eased off (quickly) and nothing waiting.
 	void stop();
@@ -238,6 +263,12 @@ private:
 		bool hit = false;
 		bool dropped = false; // stopped before it hit: it only falls away
 		float hit_at = 0;     // `at` when it hit
+		// Stuck to it (Throw::stick) until `at` reaches `stuck_till`;
+		// `stuck_at`, when it stuck (for the oldest to go first).
+		bool stuck = false;
+		float stuck_till = 0, stuck_at = 0;
+		// Its turn as it stuck, and the one it settles to.
+		float stuck_from = 0, stuck_angle = 0;
 		float vx = 0, vy = 0, x = 0, y = 0, size0 = 1, size = 1;
 	};
 	struct Spring {
@@ -248,6 +279,8 @@ private:
 	float random(float lo, float hi) { return lo + (hi - lo) * random01(); }
 	void launch(Item &it, const ReactView &view);
 	void hit(Item &it, ReactOut &out);
+	// Off it now (stuck), falling away.
+	void unstick(Item &it);
 
 	uint32_t state_;
 	float time_ = 0;
@@ -281,6 +314,12 @@ private:
 	PatPose last_pose_, from_, leave_from_;
 	bool shown_ = false;
 	float blend_ = 1;
+	// After a headpat: how long since its hand went (-1: not now) - its
+	// eyes stay shut happily a moment, then open.
+	float after_ = -1;
+	bool hurry_after_ = false; // stopped: its eyes open straight away
+	// The squish (a spring after the head's give under the hand).
+	float squish_ = 0, squish_speed_ = 0;
 	struct Flash {
 		float x = 0, y = 0, at = 0, size = 0.6f;
 	};
