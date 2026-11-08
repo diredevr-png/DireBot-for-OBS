@@ -15,6 +15,7 @@ tests/test_real_face.py).
 import json
 import os
 import shutil
+import struct
 import time
 
 import pytest
@@ -315,5 +316,79 @@ def test_a_move_that_stays_and_its_companion_bolting(run):
         assert wait_for(lambda: st()["model"]["file"] == other and st()["model"]["shown"], 20, 0.1), st()["model"]
         assert st()["model"]["animation"] == "idle" and st()["stay"]["on"] is False, st()
         send(c, "RemoveInput", {"inputName": "Ride"})
+    finally:
+        c.disconnect()
+
+
+def with_vertex_colour(path, rgb):
+    """The .glb at `path` again, its first part's points each coloured
+    `rgb` (COLOR_0, floats - linear, as glTF has it)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    n = struct.unpack_from("<I", data, 12)[0]
+    doc = json.loads(data[20:20 + n])
+    blob = bytearray(data[20 + n + 8:])
+    prim = doc["meshes"][0]["primitives"][0]
+    count = doc["accessors"][prim["attributes"]["POSITION"]]["count"]
+    while len(blob) % 4:
+        blob.append(0)
+    doc["bufferViews"].append({"buffer": 0, "byteOffset": len(blob), "byteLength": count * 12, "target": 34962})
+    blob.extend(struct.pack("<%df" % (count * 3), *(list(rgb) * count)))
+    doc["accessors"].append({"bufferView": len(doc["bufferViews"]) - 1, "componentType": 5126, "count": count,
+                             "type": "VEC3"})
+    prim["attributes"]["COLOR_0"] = len(doc["accessors"]) - 1
+    doc["buffers"][0]["byteLength"] = len(blob)
+    text = json.dumps(doc).encode()
+    text += b" " * (-len(text) % 4)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(text) + 8 + len(blob)))
+        f.write(struct.pack("<II", len(text), 0x4E4F534A) + text)
+        f.write(struct.pack("<II", len(blob), 0x004E4942) + bytes(blob))
+
+
+def test_vertex_colours_are_linear_like_the_base_colour(run):
+    """glTF's COLOR_0 is linear, as its base colour is (and as three.js
+    reads it): a ball coloured 0.1 by its points looks the same as one
+    whose material is 0.1 - not 0.1 to the power 2.2, near black. (The
+    Northern outfit's fur shells and the beard carry their shading in
+    COLOR_0.) Packed into bytes as sRGB for the GPU, then back."""
+    camera = os.path.join(run.home, "camera.png")
+    if not os.path.exists(camera):
+        camera_picture(camera)
+    by_material = os.path.join(run.home, "grey-by-material.glb")
+    by_points = os.path.join(run.home, "grey-by-points.glb")
+    write_glb(by_material, [ball_points(0, 0.1, 0, 0.1, 0.1, 0.1) + ((0.1, 0.1, 0.1), 0.6)])
+    write_glb(by_points, [ball_points(0, 0.1, 0, 0.1, 0.1, 0.1) + ((1, 1, 1), 0.6)])
+    with_vertex_colour(by_points, (0.1, 0.1, 0.1))
+    settings = {"source": "Grey camera", "width": W, "height": H, "size": 60, "framing": "whole",
+                "model": by_material, "mirror": False, "smoothing": 100, "follow_move": 0, "follow_grow": 0,
+                "follow_tilt": 0, "bend": 0, "body_follow": 0, **STILL}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+
+    def st():
+        return vendor(c, "FaceGetState", {"source": "Grey"})
+
+    def mean():
+        rows = screenshot(c, "Grey")
+        got = [px for row in rows for px in row if drawn(px)]
+        return len(got), [sum(px[k] for px in got) / max(1, len(got)) for k in range(3)]
+    try:
+        send(c, "CreateScene", {"sceneName": "Greys"})
+        send(c, "CreateInput", {"sceneName": "Greys", "inputName": "Grey camera", "inputKind": "image_source",
+                                "inputSettings": {"file": camera}})
+        send(c, "CreateInput", {"sceneName": "Greys", "inputName": "Grey", "inputKind": "direbot_face_avatar",
+                                "inputSettings": settings})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Greys"})
+        assert wait_for(lambda: st()["model"]["shown"] and st()["model"]["file"] == by_material, 30, 0.2), st()
+        time.sleep(0.4)
+        n1, a = mean()
+        send(c, "SetInputSettings", {"inputName": "Grey", "inputSettings": {"model": by_points}})
+        assert wait_for(lambda: st()["model"]["shown"] and st()["model"]["file"] == by_points, 30, 0.2), st()
+        time.sleep(0.4)
+        n2, b = mean()
+        print(f"a 0.1 grey ball: by its material {a} ({n1} px), by its points {b} ({n2} px)")
+        assert n1 > 500 and abs(n1 - n2) < n1 * 0.02, (n1, n2)
+        assert all(abs(x - y) <= 3 for x, y in zip(a, b)), (a, b)
+        send(c, "RemoveInput", {"inputName": "Grey"})
     finally:
         c.disconnect()
