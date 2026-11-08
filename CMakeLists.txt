@@ -88,7 +88,8 @@ target_sources(
 # body and hand models (data/face) on the same engine (body.cpp), the
 # arm and finger maths after Kalidokit's (arms.cpp).
 # 0.9.0: your hands found on their own, as MediaPipe's Hand Landmarker
-# finds them - Google's palm finder (data/face) on the same engine.
+# finds them - Google's palm finder (data/face) on the same engine; hand
+# signs and face moves that set things off (signs.cpp).
 target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE
@@ -106,6 +107,7 @@ target_sources(
     src/face/face-avatar.cpp
     src/face/body.cpp
     src/face/arms.cpp
+    src/face/signs.cpp
     deps/mikktspace/mikktspace.c
     src/face/nn/net.cpp
     src/face/nn/kernels.cpp

@@ -54,6 +54,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "look-pace.hpp"
 #include "model.hpp"
 #include "rig.hpp"
+#include "signs.hpp"
 #include "tracker.hpp"
 #include "voice.hpp"
 
@@ -900,6 +901,21 @@ std::string data_file(const char *name, bool needed)
 void save_rest_task(void *param);
 void save_profile_task(void *param);
 void save_arms_task(void *param);
+void send_signs_task(void *param);
+
+// Where the vendor events go (set_emit).
+std::mutex emit_lock;
+Emit emit_now;
+void emit_event(const std::string &type, const json &data)
+{
+	Emit e;
+	{
+		std::lock_guard<std::mutex> l(emit_lock);
+		e = emit_now;
+	}
+	if (e)
+		e(type, data);
+}
 
 // Where its mouth comes from: your camera, your mic, or both - the mic
 // while you talk, the camera between (smiles, a mouth held open).
@@ -1059,6 +1075,23 @@ struct FaceAvatar {
 	uint64_t body_seen_looks = 0, body_given_ns = 0;
 	BodyWorker::State body_seen;
 	ArmsNow arms_now;
+	// Hand signs and face moves that set things off (signs.hpp): on, with
+	// a hand sign to watch for, with anything to; watching while it's
+	// hidden too; and the rules, from the settings (UI thread), taken on
+	// the graphics thread.
+	std::atomic<bool> signs_on{false}, signs_hands{false}, signs_any{false}, signs_hidden{false};
+	std::mutex signs_lock;
+	std::vector<SignRule> signs_new;
+	bool signs_changed = false;
+	// Graphics thread: the watch, whether it wants your hands looked at
+	// now, the body look it last saw, when a picture last went to the
+	// trackers, and the camera held shown while it looks with the avatar
+	// hidden.
+	SignWatch signs;
+	bool signs_hands_wanted = false;
+	uint64_t signs_body_looks = 0;
+	uint64_t last_look_ns = 0;
+	obs_source_t *hidden_cam = nullptr;
 	// Only on OBS's graphics thread (video_tick and video_render).
 	Shown shown;
 	// Your moves through the tuning, and what it does by itself on top
@@ -1325,12 +1358,16 @@ struct FaceAvatar {
 	ArmsSeen arms_seen_state;
 	bool arms_wanted_state = false;
 	const char *arms_why_state = "off";
+	// ...and the signs it watches for (under state_lock).
+	SignsSeen signs_state;
+	size_t signs_rules_state = 0;
+	bool signs_hands_state = false, signs_looking_state = false, looking_hidden_state = false;
 
 	// How often your hands and arms are looked at, at most (seconds).
 	float arms_every() const
 	{
-		return arms_hands ? (arms_light ? LIGHT_HANDS_EVERY : HANDS_EVERY)
-				  : (arms_light ? LIGHT_ARMS_EVERY : ARMS_EVERY);
+		return arms_hands || signs_hands ? (arms_light ? LIGHT_HANDS_EVERY : HANDS_EVERY)
+						 : (arms_light ? LIGHT_ARMS_EVERY : ARMS_EVERY);
 	}
 
 	explicit FaceAvatar(obs_source_t *source)
@@ -1405,6 +1442,11 @@ struct FaceAvatar {
 			obs_source_release(m);
 		}
 		obs_weak_source_release(mic);
+		if (hidden_cam) {
+			obs_source_dec_showing(hidden_cam);
+			obs_source_release(hidden_cam);
+			hidden_cam = nullptr;
+		}
 		worker.stop();
 		body_worker.stop();
 		obs_enter_graphics();
@@ -1578,6 +1620,7 @@ struct FaceAvatar {
 	// size into a shot (kept for the cut-outs), then shrunk from that.
 	void look(obs_source_t *cam, uint32_t cw, uint32_t ch)
 	{
+		last_look_ns = os_gettime_ns();
 		if (staged && stage) {
 			uint8_t *data = nullptr;
 			uint32_t line = 0;
@@ -1596,7 +1639,7 @@ struct FaceAvatar {
 					// Your hands and arms, maybe less often (a little
 					// early is fine: the camera's pictures come unevenly).
 					const float every = arms_every();
-					if (arms_wanted &&
+					if ((arms_wanted || signs_hands_wanted) &&
 					    (staged_ns < body_given_ns || staged_ns - body_given_ns >= (uint64_t)(every * 0.9e9f))) {
 						body_worker.give(given, (int)stage_w, (int)stage_h, staged_ns);
 						body_given_ns = staged_ns;
@@ -3430,6 +3473,93 @@ struct FaceAvatar {
 		arms_why_state = arms_why;
 	}
 
+	// Hand signs and face moves (signs.hpp): watched while it's looking at
+	// you - shown, or hidden with "while it's hidden" on - and each one
+	// held its time sent to DireBot (send_signs_task). Your face's moves
+	// as the camera reads them, through your tuning; your hands from the
+	// body worker, on for them even with "Follow my hands and arms" off
+	// (the character's arms don't move for them).
+	void step_signs(float dt, const Shown::Out &o, const FaceTune &t)
+	{
+		{
+			std::lock_guard<std::mutex> l(signs_lock);
+			if (signs_changed) {
+				signs.set_rules(std::move(signs_new));
+				signs_new.clear();
+				signs_changed = false;
+			}
+		}
+		const bool on = signs_on && !signs.rules().empty();
+		signs_hands_wanted = on && signs.wants_hands();
+		// Looking: a picture went to the trackers lately.
+		const uint64_t now = os_gettime_ns();
+		const bool looking = last_look_ns && now - last_look_ns < 500'000'000ULL;
+		const bool fresh = body_seen.looks != signs_body_looks;
+		signs_body_looks = body_seen.looks;
+		std::vector<SignFired> fired;
+		if (!on || !looking) {
+			signs.reset();
+		} else {
+			const Body *body = signs_hands_wanted && body_seen.ready ? &body_seen.body : nullptr;
+			signs.step(dt, body, fresh, o.found && !o.holding ? o.moves : nullptr, t);
+			fired = signs.take_fired();
+		}
+		if (!fired.empty()) {
+			obs_weak_source_addref(weak_self);
+			auto *job = new std::pair<obs_weak_source_t *, std::vector<SignFired>>(weak_self, std::move(fired));
+			obs_queue_task(OBS_TASK_UI, send_signs_task, job, false);
+		}
+		std::lock_guard<std::mutex> l(state_lock);
+		signs_state = signs.seen();
+		signs_rules_state = signs.rules().size();
+		signs_hands_state = signs_hands_wanted;
+		signs_looking_state = on && looking;
+	}
+
+	// Watching for signs with the avatar hidden in OBS (a PNGtuber's, or a
+	// 2D or 3D character in a scene not on now): the camera looked at
+	// here, after tick, as drawing it would - and held "shown", so a
+	// camera set to turn off when it isn't shown keeps going. OBS's
+	// graphics thread.
+	void look_while_hidden()
+	{
+		bool shown;
+		{
+			std::lock_guard<std::mutex> l(state_lock);
+			shown = showing_now;
+		}
+		obs_source_t *cam = !shown && signs_hidden && signs_any ? get_camera() : nullptr;
+		if (cam != hidden_cam) {
+			if (hidden_cam) {
+				obs_source_dec_showing(hidden_cam);
+				obs_source_release(hidden_cam);
+			}
+			hidden_cam = cam ? obs_source_get_ref(cam) : nullptr;
+			if (hidden_cam)
+				obs_source_inc_showing(hidden_cam);
+		}
+		const uint32_t cw = cam ? obs_source_get_width(cam) : 0, ch = cam ? obs_source_get_height(cam) : 0;
+		const bool looking = cam && cw && ch;
+		if (looking) {
+			obs_enter_graphics();
+			gs_blend_state_push();
+			gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+			if (since_render > STALE) {
+				staged = false;
+				worker.forget();
+				pace.reset();
+			}
+			since_render = 0;
+			look(cam, cw, ch);
+			pick_shots();
+			gs_blend_state_pop();
+			obs_leave_graphics();
+		}
+		obs_source_release(cam);
+		std::lock_guard<std::mutex> l(state_lock);
+		looking_hidden_state = looking;
+	}
+
 	// A calibration is in the settings now (save_arms_task, on the UI
 	// thread), or one was forgotten ("").
 	void arms_saved(const std::string &text)
@@ -3483,6 +3613,7 @@ struct FaceAvatar {
 		}
 		react_hits += react_now.hits;
 		step_arms(dt);
+		step_signs(dt, o, t);
 		// The page's live bars: what the camera reads, and what it shows.
 		clock += dt;
 		float reading[TUNE_GROUPS] = {}, shows[TUNE_GROUPS] = {};
@@ -4052,7 +4183,28 @@ struct FaceAvatar {
 		arms_on = arms_on_now;
 		arms_hands = arm_o.fingers;
 		arms_light = obs_data_get_bool(settings, "arms_light");
-		body_worker.set(arms_on_now, arm_o.fingers, arms_light,
+		// Hand signs and face moves: on, what to watch for (DireBot's
+		// list), and while it's hidden too. A hand sign needs your hands
+		// looked at, with or without the arms.
+		const bool signs_on_now = obs_data_get_bool(settings, "hand_signs");
+		const char *signs_text = obs_data_get_string(settings, "signs");
+		int signs_skipped = 0;
+		std::vector<SignRule> rules = rules_from(signs_text ? signs_text : "", &signs_skipped);
+		if (signs_skipped)
+			obs_log(LOG_WARNING, "DireBot Face Avatar: %d of its hand signs couldn't be read; set them again in DireBot.",
+				signs_skipped);
+		const bool hand_rule =
+			std::any_of(rules.begin(), rules.end(), [](const SignRule &r) { return !r.face; });
+		signs_hands = signs_on_now && hand_rule;
+		signs_any = signs_on_now && !rules.empty();
+		signs_on = signs_on_now;
+		signs_hidden = obs_data_get_bool(settings, "signs_hidden");
+		{
+			std::lock_guard<std::mutex> l(signs_lock);
+			signs_new = std::move(rules);
+			signs_changed = true;
+		}
+		body_worker.set(arms_on_now || signs_hands, arm_o.fingers || signs_hands, arms_light,
 				clampf((float)obs_data_get_int(settings, "arms_smoothing") / 100.0f, 0, 1));
 		{
 			const char *cal = obs_data_get_string(settings, "arms_calibration");
@@ -4730,7 +4882,48 @@ struct FaceAvatar {
 		}
 		answer["hands_and_arms"] =
 			arms_state(with_points, arms_calibrating, arms_calibrated, arms_result);
+		answer["signs"] = signs_json();
+		answer["looking_hidden"] = looking_hidden_state;
 		return answer;
+	}
+
+	// For FaceGetState (under state_lock): the hand signs and face moves
+	// it watches for - on, looking now, whether your hands are looked at,
+	// watching while hidden - and what it sees: each hand's sign (your
+	// own left and right), up by your face or not, waving; your face's
+	// moves (0 to 1); how many it's sent, and the last one's id.
+	json signs_json() const
+	{
+		auto r = [](float v) {
+			return std::round(v * 100) / 100;
+		};
+		const SignsSeen &s = signs_state;
+		json hands = json::object();
+		const char *const sides[2] = {"left", "right"};
+		for (int k = 0; k < 2; k++) {
+			const HandNow &h = s.hands[k];
+			hands[sides[k]] = {{"found", h.found},
+					   {"sign", h.sign >= 0 ? json(HAND_SIGN_NAMES[h.sign]) : json()},
+					   {"sure", r(h.score)},
+					   {"raised", h.raised},
+					   {"waving", h.waving}};
+		}
+		json face = json::object();
+		for (int m = 0; m < FACE_MOVES; m++)
+			face[FACE_MOVE_NAMES[m]] = r(s.face.value[m]);
+		face["wink_left"] = r(s.face.wink[0]);
+		face["wink_right"] = r(s.face.wink[1]);
+		return {{"on", signs_on.load()},
+			{"rules", signs_rules_state},
+			{"watching", signs_looking_state},
+			{"hands_looked_at", signs_hands_state},
+			{"hidden", signs_hidden.load()},
+			{"looking_hidden", looking_hidden_state},
+			{"hands", hands},
+			{"face_found", s.face_found},
+			{"face", face},
+			{"sent", s.fired},
+			{"last", s.last}};
 	}
 
 	// For FaceGetState (under state_lock): your hands and arms - on, and
@@ -4923,6 +5116,22 @@ void save_arms_task(void *param)
 	obs_source_release(src);
 }
 
+// Each sign held its time, to DireBot: a FaceSign event (OBS's UI thread).
+void send_signs_task(void *param)
+{
+	std::unique_ptr<std::pair<obs_weak_source_t *, std::vector<SignFired>>> job(
+		static_cast<std::pair<obs_weak_source_t *, std::vector<SignFired>> *>(param));
+	obs_source_t *src = obs_weak_source_get_source(job->first);
+	obs_weak_source_release(job->first);
+	if (!src)
+		return;
+	const char *name = obs_source_get_name(src);
+	for (const SignFired &s : job->second)
+		emit_event("FaceSign",
+			   {{"source", name ? name : ""}, {"id", s.id}, {"what", s.what}, {"side", s.side}});
+	obs_source_release(src);
+}
+
 const char *get_name(void *)
 {
 	return text("FaceAvatar.Name");
@@ -5056,6 +5265,11 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "arms_hold", 500);
 	obs_data_set_default_int(settings, "arms_smoothing", 50);
 	obs_data_set_default_string(settings, "arms_calibration", "");
+	// Hand signs and face moves that set things off: off, none, and only
+	// while it's shown until DireBot sets them.
+	obs_data_set_default_bool(settings, "hand_signs", false);
+	obs_data_set_default_string(settings, "signs", "[]");
+	obs_data_set_default_bool(settings, "signs_hidden", false);
 }
 
 bool add_camera(void *param, obs_source_t *source)
@@ -5269,6 +5483,14 @@ obs_properties_t *get_properties(void *data)
 	obs_property_int_set_suffix(p, "%");
 	obs_properties_add_group(props, "hands_and_arms", text("FaceAvatar.HandsAndArms"), OBS_GROUP_NORMAL, arms);
 
+	// Hand signs and face moves (which ones, and what they do, are picked
+	// in DireBot).
+	obs_properties_t *signs = obs_properties_create();
+	obs_properties_add_text(signs, "signs_about", text("FaceAvatar.SignsAbout"), OBS_TEXT_INFO);
+	obs_properties_add_bool(signs, "hand_signs", text("FaceAvatar.HandSigns"));
+	obs_properties_add_bool(signs, "signs_hidden", text("FaceAvatar.SignsHidden"));
+	obs_properties_add_group(props, "signs_group", text("FaceAvatar.Signs"), OBS_GROUP_NORMAL, signs);
+
 	// The mouth from your mic.
 	obs_properties_t *heard = obs_properties_create();
 	obs_properties_add_text(heard, "mic_about", text("FaceAvatar.MicAbout"), OBS_TEXT_INFO);
@@ -5321,6 +5543,7 @@ void video_tick(void *data, float seconds)
 	auto *f = static_cast<FaceAvatar *>(data);
 	f->tick(seconds);
 	f->pick_while_hidden(seconds);
+	f->look_while_hidden();
 }
 
 void video_render(void *data, gs_effect_t *)
@@ -5382,7 +5605,7 @@ json set_rest(const json &data)
 		bool showing;
 		{
 			std::lock_guard<std::mutex> l(f->state_lock);
-			showing = f->showing_now;
+			showing = f->showing_now || f->looking_hidden_state;
 		}
 		if (!st.ready)
 			answer = fail(st.problem.empty()
@@ -5514,6 +5737,12 @@ json request(const std::string &type, const json &data)
 			return arms_request(data);
 		return fail("DireBot for OBS doesn't know that request.");
 	});
+}
+
+void set_emit(Emit emit)
+{
+	std::lock_guard<std::mutex> l(emit_lock);
+	emit_now = std::move(emit);
 }
 
 void register_source()

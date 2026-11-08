@@ -2573,6 +2573,106 @@ def test_hidden_it_still_loads_and_all_of_it_fills_its_spot(run):
         c.disconnect()
 
 
+def picture_camera(path, ppm):
+    """One of the body tracker's test photos (tests/data/body) as a PNG."""
+    w, h, px = read_ppm(os.path.join(BODY, ppm))
+    write_png(path, w, h, [px[y * w * 3:(y + 1) * w * 3] for y in range(h)])
+
+
+def test_hand_signs_send_direbot_an_event(run):
+    """0.9.0: a hand sign DireBot watches for, held its time, sends it a
+    FaceSign event (which DireBot runs a routine for) - Google's own photo
+    of a thumb up as the camera. Its hands are looked at for this with
+    "Follow my hands and arms" off: the character's arms don't follow
+    them. With "while it's hidden" on, an avatar in a scene that isn't
+    shown watches all the same (a PNGtuber's: its camera in no scene
+    that's shown either), and "Set" works there too; off, it stops."""
+    camera = os.path.join(run.home, "thumb-up.png")
+    picture_camera(camera, "thumb_up.ppm")
+    figure = os.path.join(run.home, "arms.vrm")
+    if not os.path.exists(figure):
+        arms_character(figure)
+    rules = json.dumps([{"id": "up", "what": "thumbs_up", "side": "either", "hold_ms": 300},
+                        {"id": "fist", "what": "fist", "side": "either", "hold_ms": 300},
+                        {"id": "grin", "what": "smile", "strength": 80}])
+    common = {"width": 200, "height": 200, "model": figure, "framing": "whole",
+              "hand_signs": True, "signs": rules, **STILL}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+    got = []
+
+    def on_vendor_event(data):
+        if data.vendor_name == "direbot" and data.event_type == "FaceSign":
+            got.append(data.event_data)
+    events = obsws.EventClient(host="127.0.0.1", port=run.ws_port, password="",
+                               subs=obsws.Subs.VENDORS, timeout=5)
+    events.callback.register(on_vendor_event)
+
+    def st(name):
+        return vendor(c, "FaceGetState", {"source": name})
+    try:
+        send(c, "CreateScene", {"sceneName": "Signs shown"})
+        send(c, "CreateScene", {"sceneName": "Signs not shown"})
+        send(c, "CreateInput", {"sceneName": "Signs shown", "inputName": "Signs camera",
+                                "inputKind": "image_source", "inputSettings": {"file": camera}})
+        send(c, "CreateInput", {"sceneName": "Signs shown", "inputName": "Signs",
+                                "inputKind": "direbot_face_avatar",
+                                "inputSettings": {**common, "source": "Signs camera"}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Signs shown"})
+        assert wait_for(lambda: any(e["source"] == "Signs" for e in got), 60, 0.2), st("Signs")["signs"]
+        e = next(e for e in got if e["source"] == "Signs")
+        assert e == {"source": "Signs", "id": "up", "what": "thumbs_up", "side": "right"}, e
+        s = st("Signs")
+        signs = s["signs"]
+        assert signs["on"] and signs["watching"] and signs["hands_looked_at"] and signs["rules"] == 3, signs
+        assert signs["hands"]["right"]["found"] and signs["hands"]["right"]["sign"] == "thumbs_up", signs
+        assert not signs["hands"]["left"]["found"], signs
+        assert signs["sent"] >= 1 and signs["last"] == "up", signs
+        assert signs["face_found"] is False and set(signs["face"]) >= {"mouth_open", "wink_left"}, signs
+        # Held, it's sent once - not again and again.
+        time.sleep(1.5)
+        assert sum(1 for e in got if e["source"] == "Signs") == 1, got
+        # The character's arms don't follow: they're off.
+        a = s["hands_and_arms"]
+        assert a["on"] is False and a["can"] is False and a["why_not"] == "off", a
+        assert not a["following"]["left_hand"] and not a["following"]["right_hand"], a
+        assert s["looking_hidden"] is False
+
+        # Hidden: an avatar (and its camera) in a scene that isn't shown.
+        hidden_camera = os.path.join(run.home, "thumb-up-hidden.png")
+        picture_camera(hidden_camera, "thumb_up.ppm")
+        send(c, "CreateInput", {"sceneName": "Signs not shown", "inputName": "Hidden camera",
+                                "inputKind": "image_source", "inputSettings": {"file": hidden_camera}})
+        send(c, "CreateInput", {"sceneName": "Signs not shown", "inputName": "Signs hidden",
+                                "inputKind": "direbot_face_avatar",
+                                "inputSettings": {**common, "source": "Hidden camera"}})
+        # Not watching while it's hidden until that's turned on.
+        time.sleep(2)
+        h = st("Signs hidden")
+        assert h["showing"] is False and h["looking_hidden"] is False and not h["signs"]["watching"], h["signs"]
+        assert not any(e["source"] == "Signs hidden" for e in got)
+        send(c, "SetInputSettings", {"inputName": "Signs hidden", "inputSettings": {"signs_hidden": True}})
+        assert wait_for(lambda: any(e["source"] == "Signs hidden" for e in got), 60, 0.2), \
+            st("Signs hidden")["signs"]
+        h = st("Signs hidden")
+        assert h["showing"] is False and h["looking_hidden"] is True, h
+        assert h["signs"]["watching"] and h["signs"]["looking_hidden"], h["signs"]
+        # "Set" (look straight at the camera) works hidden too.
+        assert vendor(c, "FaceSet", {"source": "Signs hidden"})["ok"] is True
+        # Off: it stops looking.
+        send(c, "SetInputSettings", {"inputName": "Signs hidden", "inputSettings": {"signs_hidden": False}})
+        assert wait_for(lambda: not st("Signs hidden")["looking_hidden"], 5, 0.1)
+        assert wait_for(lambda: not st("Signs hidden")["signs"]["watching"], 5, 0.1)
+        # Its hand signs off: nothing more is sent, nothing looked at.
+        send(c, "SetInputSettings", {"inputName": "Signs", "inputSettings": {"hand_signs": False}})
+        assert wait_for(lambda: not st("Signs")["signs"]["watching"], 5, 0.1)
+        assert st("Signs")["signs"]["on"] is False
+        for name in ("Signs", "Signs hidden", "Signs camera", "Hidden camera"):
+            send(c, "RemoveInput", {"inputName": name})
+    finally:
+        events.disconnect()
+        c.disconnect()
+
+
 def test_closing_obs_leaves_nothing_behind(run):
     assert run.close() == 0
     log = run.log()

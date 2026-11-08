@@ -17,6 +17,12 @@ hands.ppm: "right_hands.jpg" from the same test pictures, shrunk from
 720 x 382 to 540 x 286: two right hands, side by side (mirrored, two
 left ones). Same copyright and licence.
 
+victory.ppm, pointing_up.ppm, fist.ppm: "victory.jpg", "pointing_up.jpg"
+and "fist.jpg" from the same test pictures (the ones MediaPipe's gesture
+tests use), unchanged but for the file type: a right hand making a peace
+sign, pointing up, and a fist. Same copyright and licence. For the hand
+signs' tests (tests/unit_signs.cpp), with thumb_up.ppm.
+
 expected.json: Google MediaPipe's own answers on them (its Holistic
 Landmarker: the body's 33 points, in the picture and in metres, and any
 hands it finds; on astronaut.ppm, mirrored too, and in VIDEO mode four

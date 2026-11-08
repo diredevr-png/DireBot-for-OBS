@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds and runs the tests for DireBot for OBS that don't need OBS:
 # the unit tests (the link's, the vertical picture's, Follow me's, clean recordings', the face tracker's,
-# the face avatar's 2D and 3D characters', following your hands and arms, how their pictures shrink, what it does on cue,
-# the mouth from your mic's), then the link's
+# the face avatar's 2D and 3D characters', following your hands and arms, hand signs and face moves, how their pictures
+# shrink, what it does on cue, the mouth from your mic's), then the link's
 # network tests through obsws-python.
 # (tests/test_real_obs.py runs it inside a real OBS - see its top.)
 #   pip install pytest obsws-python websocket-client
@@ -55,6 +55,11 @@ done
 "$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-body" "$here/tests/unit_body.cpp" \
 	"$here/src/face/body.cpp" "$here/src/face/arms.cpp" "${face_obj[@]}"
 "$out/unit-body"
+# Hand signs and face moves: made hands, Google's pictures through the body
+# tracker, waves, the watch's holds and sides.
+"$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-signs" "$here/tests/unit_signs.cpp" \
+	"$here/src/face/signs.cpp" "$here/src/face/body.cpp" "$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "${face_obj[@]}"
+"$out/unit-signs"
 "$cxx" "${flags[@]}" -o "$out/unit-react" "$here/tests/unit_react.cpp" "$here/src/face/react.cpp"
 "$out/unit-react"
 "$cxx" "${flags[@]}" -O2 -o "$out/unit-pictures" "$here/tests/unit_pictures.cpp" "$here/src/face/pictures.cpp"

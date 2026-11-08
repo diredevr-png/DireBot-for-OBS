@@ -45,11 +45,17 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //                                 what it sees now; `points`: the 478
 //                                 points too ({x, y}: shares of the picture), for
 //                                 DireBot's preview
+// Vendor events:
+//   FaceSign {source, id, what, side}
+//                                 a hand sign or face move DireBot watches
+//                                 for (the "signs" setting: signs.hpp) was
+//                                 held its time
 // Everything else (pictures, spots, outfit, looks) is the source's own
 // settings, set with obs-websocket's SetInputSettings.
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -66,5 +72,10 @@ const std::vector<std::string> &requests();
 bool handles(const std::string &type);
 // On any thread; the work is done on OBS's UI thread.
 nlohmann::json request(const std::string &type, const nlohmann::json &data);
+
+// Where its vendor events go (the plugin's: obs-websocket's clients and
+// the link's), from once OBS has loaded until it closes (then nothing).
+using Emit = std::function<void(const std::string &, const nlohmann::json &)>;
+void set_emit(Emit emit);
 
 } // namespace direbot::face

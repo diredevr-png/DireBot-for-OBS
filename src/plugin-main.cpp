@@ -142,6 +142,7 @@ public:
 		// DireBot reaches them through the link or OBS's websocket.
 		vertical_.start([this](const std::string &type, const json &data) { emit(type, data); });
 		record_.start([this](const std::string &type, const json &data) { emit(type, data); });
+		face::set_emit([this](const std::string &type, const json &data) { emit(type, data); });
 		multistream_.start();
 		link_ok_ = ws_.find();
 		if (!link_ok_)
@@ -241,6 +242,7 @@ private:
 	{
 		if (closing_.exchange(true))
 			return;
+		face::set_emit(nullptr);
 		server_.begin_stop();
 		link_file_.remove();
 		poke();
