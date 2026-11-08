@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 
 import pytest
@@ -141,10 +142,13 @@ def test_obs_loads_the_add_on(obs):
         c.disconnect()
 
 
-def orange(rows):
-    """How many points are the test character's orange."""
+def count(rows, colour):
+    """How many points are near `colour`."""
     return sum(1 for row in rows for r, g, b in row
-               if r > 180 and 90 < g < 170 and b < 90)
+               if abs(r - colour[0]) < 40 and abs(g - colour[1]) < 40 and abs(b - colour[2]) < 40)
+
+
+ORANGE, BLUE, GREEN = (0xe0, 0x80, 0x30), (0x30, 0x60, 0xe0), (0x30, 0xd0, 0x40)
 
 
 def shot(c, name):
@@ -154,16 +158,15 @@ def shot(c, name):
 
 
 def test_face_avatar_pictures_open(obs):
-    """OBS's picture loader (the part OBS 33 changed): a PNG character and
-    an animated GIF one both draw."""
+    """OBS's picture loader (the part OBS 33 changed): a PNG character
+    draws, and an animated GIF thrown at it (one of chat's emotes) plays."""
     camera = os.path.join(obs.home, "camera.png")
     still = os.path.join(obs.home, "character.png")
-    moving = os.path.join(obs.home, "character.gif")
+    moving = os.path.join(obs.home, "emote.gif")
     camera_picture(camera)
     character_picture(still)
-    # Orange, then blue, half a second each.
-    write_gif(moving, 40, 40, [[1] * 1600, [2] * 1600],
-              [(0, 0, 0), (0xe0, 0x80, 0x30), (0x30, 0x60, 0xe0)], 50)
+    # Blue, then green, a fifth of a second each.
+    write_gif(moving, 40, 40, [[1] * 1600, [2] * 1600], [(0, 0, 0), BLUE, GREEN], 20)
     c = obs.client()
     try:
         c.send("CreateScene", {"sceneName": "Pictures"}, raw=True)
@@ -175,13 +178,21 @@ def test_face_avatar_pictures_open(obs):
                                "inputSettings": {"source": "Camera", "character": still}},
                raw=True)
         c.send("SetCurrentProgramScene", {"sceneName": "Pictures"}, raw=True)
-        assert wait_for(lambda: orange(shot(c, "Avatar")) > 500, 30, 0.5), obs.log()
+        assert wait_for(lambda: count(shot(c, "Avatar"), ORANGE) > 500, 30, 0.5), obs.log()
 
-        c.send("SetInputSettings", {"inputName": "Avatar",
-                                    "inputSettings": {"character": moving}}, raw=True)
-        assert wait_for(lambda: orange(shot(c, "Avatar")) > 500, 15, 0.1)
-        # It moves on to the blue picture by itself.
-        assert wait_for(lambda: orange(shot(c, "Avatar")) < 50, 5, 0.05), obs.log()
+        answer = vendor(c, "FaceReact", {"source": "Avatar", "do": "throw", "file": moving,
+                                         "stick": 10, "size": 3})
+        assert answer.get("ok"), answer
+        seen = set()
+        until = time.time() + 12
+        while time.time() < until and len(seen) < 2:
+            rows = shot(c, "Avatar")
+            if count(rows, BLUE) > 30:
+                seen.add("blue")
+            if count(rows, GREEN) > 30:
+                seen.add("green")
+            time.sleep(0.05)
+        assert seen == {"blue", "green"}, (seen, obs.log())
         assert "couldn't open a picture" not in obs.log()
         assert "no picture loader" not in obs.log()
     finally:
