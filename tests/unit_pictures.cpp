@@ -7,6 +7,7 @@
 #include "../src/face/pictures.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -162,17 +163,35 @@ static void see_through_edges()
 	const Pixels clear = filled(2, 2, 10, 200, 30, 0);
 	const ModelPicture none = picture_from(clear.data(), 2, 2);
 	CHECK(none.levels[1][0] == 10 && none.levels[1][1] == 200 && none.levels[1][2] == 30 && none.levels[1][3] == 0);
-	// Made bigger (3 across to 4): no dark fringe either.
-	Pixels three = filled(3, 3, 0, 0, 0, 0);
-	set(three, 3, 1, 1, 250, 250, 250, 255);
-	const ModelPicture grown = picture_from(three.data(), 3, 3);
-	CHECK(grown.size == 4);
-	bool white = true;
-	for (size_t i = 0; i < grown.levels[0].size(); i += 4)
+	// Made bigger smoothly (12 across to 16, a painted picture's many
+	// colours): no dark fringe either.
+	Pixels twelve = filled(12, 12, 0, 0, 0, 0);
+	for (uint32_t y = 1; y < 11; y++)
+		for (uint32_t x = 1; x < 11; x++)
+			set(twelve, 12, x, y, 250, 250, (uint8_t)(100 + y * 10 + x), 255);
+	const ModelPicture grown = picture_from(twelve.data(), 12, 12);
+	CHECK(grown.size == 16);
+	bool white = true, soft = false;
+	for (size_t i = 0; i < grown.levels[0].size(); i += 4) {
 		if (grown.levels[0][i + 3] > 0)
 			white = white && grown.levels[0][i] == 250 && grown.levels[0][i + 1] == 250;
+		soft = soft || (grown.levels[0][i + 3] > 0 && grown.levels[0][i + 3] < 255);
+	}
 	CHECK(white);
-	CHECK(at(grown.levels[0], 4, 1, 1)[3] > 0);
+	CHECK(soft); // read smoothly, not copied
+	CHECK(at(grown.levels[0], 16, 8, 8)[3] == 255);
+	// Copied (3 across, two colours): no fringe, and nothing in between.
+	Pixels three = filled(3, 3, 0, 0, 0, 0);
+	set(three, 3, 1, 1, 250, 250, 250, 255);
+	const ModelPicture copied = picture_from(three.data(), 3, 3);
+	CHECK(copied.size == 32);
+	bool clean = true;
+	for (size_t i = 0; i < copied.levels[0].size(); i += 4) {
+		const uint8_t *p = &copied.levels[0][i];
+		clean = clean && ((p[0] == 0 && p[3] == 0) || (p[0] == 250 && p[1] == 250 && p[3] == 255));
+	}
+	CHECK(clean);
+	CHECK(at(copied.levels[0], 32, 16, 16)[3] == 255 && at(copied.levels[0], 32, 2, 2)[3] == 0);
 
 	// A data picture's fourth number isn't how solid it is: a normal
 	// map's directions average plainly, whatever it holds there.
@@ -210,6 +229,92 @@ static void sizes()
 	const Pixels big = filled(4096, 4096, 90, 91, 92, 200);
 	const ModelPicture halved = picture_from(big.data(), 4096, 4096);
 	CHECK(halved.size == 2048 && at(halved.levels[0], 2048, 5, 5)[1] == 91 && at(halved.levels[0], 2048, 5, 5)[3] == 200);
+}
+
+// The graphics card's smooth read of a level (the 3D effect's: a mix of
+// the 4 nearest, wrapping round), at u, v (0 to 1 across and down).
+static std::array<int, 4> read_at(const Pixels &p, uint32_t size, float u, float v)
+{
+	const float fx = u * size - 0.5f, fy = v * size - 0.5f;
+	const int x0 = (int)std::floor(fx), y0 = (int)std::floor(fy);
+	const float tx = fx - x0, ty = fy - y0;
+	auto px = [&](int x, int y) {
+		const int n = (int)size;
+		return at(p, size, (uint32_t)(((x % n) + n) % n), (uint32_t)(((y % n) + n) % n));
+	};
+	std::array<int, 4> out{};
+	for (int c = 0; c < 4; c++)
+		out[c] = (int)std::lround((1 - tx) * (1 - ty) * px(x0, y0)[c] + tx * (1 - ty) * px(x0 + 1, y0)[c] +
+					  (1 - tx) * ty * px(x0, y0 + 1)[c] + tx * ty * px(x0 + 1, y0 + 1)[c]);
+	return out;
+}
+
+static void palettes()
+{
+	// A low-poly model's palette: one pixel for each of 10 colours, not a
+	// power of two across. Each swatch reads as exactly its colour, at its
+	// middle and well off it - smoothly squared to 16 it was up to a third
+	// the next colour.
+	Pixels strip = filled(10, 1, 0, 0, 0, 255);
+	for (uint32_t i = 0; i < 10; i++)
+		set(strip, 10, i, 0, (uint8_t)(i * 25), (uint8_t)(255 - i * 25), (uint8_t)(i % 2 ? 255 : 0), 255);
+	const ModelPicture pal = picture_from(strip.data(), 10, 1);
+	CHECK(pal.size == 128);
+	CHECK(pal.levels.size() == 8);
+	bool exact = true;
+	for (uint32_t i = 0; i < 10; i++)
+		for (float off : {0.0f, -0.3f, 0.3f})
+			for (float v : {0.02f, 0.5f, 0.98f}) {
+				const std::array<int, 4> got = read_at(pal.levels[0], pal.size, (i + 0.5f + off) / 10, v);
+				const uint8_t *want = at(strip, 10, i, 0);
+				exact = exact && got[0] == want[0] && got[1] == want[1] && got[2] == want[2] && got[3] == 255;
+			}
+	CHECK(exact);
+	// Neither side a power of two (5 x 3): every patch exact at its middle.
+	Pixels grid = filled(5, 3, 0, 0, 0, 255);
+	for (uint32_t y = 0; y < 3; y++)
+		for (uint32_t x = 0; x < 5; x++)
+			set(grid, 5, x, y, (uint8_t)(x * 60), (uint8_t)(y * 120), 77, 255);
+	const ModelPicture cells = picture_from(grid.data(), 5, 3);
+	CHECK(cells.size == 64);
+	bool every = true;
+	for (uint32_t y = 0; y < 3; y++)
+		for (uint32_t x = 0; x < 5; x++) {
+			const std::array<int, 4> got = read_at(cells.levels[0], cells.size, (x + 0.5f) / 5, (y + 0.5f) / 3);
+			every = every && got[0] == (int)(x * 60) && got[1] == (int)(y * 120) && got[2] == 77;
+		}
+	CHECK(every);
+	// A strip a power of two across (MagicaVoxel's 256 x 1): exact too.
+	Pixels voxel = filled(256, 1, 0, 0, 0, 255);
+	for (uint32_t i = 0; i < 256; i++)
+		set(voxel, 256, i, 0, (uint8_t)(i % 4 * 80), (uint8_t)(i / 4 % 4 * 80), (uint8_t)(i / 16 % 4 * 80), 255);
+	const ModelPicture vox = picture_from(voxel.data(), 256, 1);
+	CHECK(vox.size == 512);
+	bool all = true;
+	for (uint32_t i = 0; i < 256; i++) {
+		const std::array<int, 4> got = read_at(vox.levels[0], vox.size, (i + 0.5f) / 256, 0.5f);
+		all = all && got[0] == at(voxel, 256, i, 0)[0] && got[1] == at(voxel, 256, i, 0)[1] &&
+		      got[2] == at(voxel, 256, i, 0)[2];
+	}
+	CHECK(all);
+	// Already square and a power of two: kept as it is.
+	Pixels square = filled(16, 16, 9, 9, 9, 255);
+	set(square, 16, 3, 4, 200, 0, 0, 255);
+	const ModelPicture same = picture_from(square.data(), 16, 16);
+	CHECK(same.size == 16 && same.levels[0] == square);
+	// Many colours (a painted picture): read smoothly, the next power up.
+	Pixels painted = filled(20, 20, 0, 0, 0, 255);
+	for (uint32_t y = 0; y < 20; y++)
+		for (uint32_t x = 0; x < 20; x++)
+			set(painted, 20, x, y, (uint8_t)(x * 12), (uint8_t)(y * 12), 40, 255);
+	const ModelPicture smooth = picture_from(painted.data(), 20, 20);
+	CHECK(smooth.size == 32);
+	// Exactly 64 colours is still few; 65 isn't.
+	Pixels many = filled(65, 1, 0, 0, 0, 255);
+	for (uint32_t i = 0; i < 65; i++)
+		set(many, 65, i, 0, (uint8_t)i, 0, 0, 255);
+	CHECK(picture_from(many.data(), 65, 1).size == 128);
+	CHECK(picture_from(many.data(), 64, 1).size == 512);
 }
 
 static void cut_outs()
@@ -336,6 +441,7 @@ int main()
 	colours_as_light();
 	see_through_edges();
 	sizes();
+	palettes();
 	cut_outs();
 	uses();
 	std::printf("%d passed, %d failed\n", passes, failures);

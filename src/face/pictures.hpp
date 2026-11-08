@@ -72,7 +72,10 @@ struct PictureUse {
 // 0.5).
 std::vector<PictureUse> picture_uses(const Model &m);
 
-// A picture from pixels (w x h, 4 bytes a pixel, top row first).
+// A picture from pixels (w x h, 4 bytes a pixel, top row first). One of
+// only a few colours (a low-poly palette) that has to be made bigger is
+// copied pixel for pixel, and to at least 8 times across (512 at most),
+// so every colour in it stays exactly that colour.
 ModelPicture picture_from(const uint8_t *rgba, uint32_t w, uint32_t h, const PictureUse &use = PictureUse());
 
 // The share of a level's pixels (4 bytes each) that are solid: their

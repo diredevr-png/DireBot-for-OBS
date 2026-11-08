@@ -21,6 +21,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 
 namespace direbot::face {
 
@@ -167,6 +168,52 @@ std::vector<uint8_t> resized(const uint8_t *px, uint32_t w, uint32_t h, uint32_t
 	return out;
 }
 
+// A picture of only a few colours: a low-poly model's palette (often a
+// strip of one pixel for each colour, and not a power of two across) or
+// flat patches. A painted picture has far more.
+constexpr size_t FEW_COLOURS = 64;
+// Made bigger, such a picture is copied pixel for pixel, at least this
+// many times across (up to SHARP_MOST): the graphics card's smooth read
+// then lands wholly inside each colour, so a swatch's middle is exactly
+// its colour, never part of the one beside it.
+constexpr uint32_t SHARP_TIMES = 8;
+constexpr uint32_t SHARP_MOST = 512;
+
+bool few_colours(const uint8_t *px, uint32_t w, uint32_t h)
+{
+	std::vector<uint32_t> seen; // kept in order
+	uint32_t last = 0;
+	for (size_t i = 0; i < (size_t)w * h; i++) {
+		uint32_t c;
+		std::memcpy(&c, px + i * 4, 4);
+		if (i && c == last)
+			continue;
+		last = c;
+		const auto at = std::lower_bound(seen.begin(), seen.end(), c);
+		if (at != seen.end() && *at == c)
+			continue;
+		if (seen.size() == FEW_COLOURS)
+			return false;
+		seen.insert(at, c);
+	}
+	return true;
+}
+
+// Square, `to` across (no smaller than the picture): each pixel the
+// picture's pixel it lands on.
+std::vector<uint8_t> copied_up(const uint8_t *px, uint32_t w, uint32_t h, uint32_t to)
+{
+	std::vector<uint8_t> out((size_t)to * to * 4);
+	for (uint32_t y = 0; y < to; y++) {
+		const uint32_t sy = std::min<uint64_t>(h - 1, ((uint64_t)y * 2 + 1) * h / (2 * (uint64_t)to));
+		for (uint32_t x = 0; x < to; x++) {
+			const uint32_t sx = std::min<uint64_t>(w - 1, ((uint64_t)x * 2 + 1) * w / (2 * (uint64_t)to));
+			std::memcpy(&out[((size_t)y * to + x) * 4], px + ((size_t)sy * w + sx) * 4, 4);
+		}
+	}
+	return out;
+}
+
 // How many of a level's pixels have each see-through value.
 std::array<size_t, 256> count_of(const std::vector<uint8_t> &level)
 {
@@ -249,9 +296,15 @@ ModelPicture picture_from(const uint8_t *rgba, uint32_t w, uint32_t h, const Pic
 	ModelPicture pic;
 	if (!rgba || !w || !h)
 		return pic;
-	const uint32_t size = next_power(std::max(w, h));
+	uint32_t size = next_power(std::max(w, h));
+	// Made bigger with only a few colours (a palette): copied pixel for
+	// pixel, and bigger still, so no colour runs into the next.
+	const bool bigger = w <= size && h <= size && (w < size || h < size);
+	const bool sharp = bigger && few_colours(rgba, w, h);
+	if (sharp)
+		size = std::max(size, std::min(next_power(std::max(w, h) * SHARP_TIMES), SHARP_MOST));
 	pic.size = size;
-	pic.levels.push_back(resized(rgba, w, h, size, use.colour));
+	pic.levels.push_back(sharp ? copied_up(rgba, w, h, size) : resized(rgba, w, h, size, use.colour));
 	uint32_t s = size;
 	while (s > 1) {
 		uint32_t nw, nh;

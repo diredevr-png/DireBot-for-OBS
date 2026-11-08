@@ -318,7 +318,12 @@ picture as it comes from the left, and `width` in heads) says where it
 touches the head and bends - with none, the middle of its bottom edge
 touches. Things to throw can be 3D (`react_items` with a `.glb`, `.gltf`
 or `.vrm` file): loaded on a thread of their own, drawn lit in 3D,
-spinning as they fly, at most 400,000 points each. And one of chat's
+spinning as they fly, at most 400,000 points each. A model coloured from
+a small palette picture (a low-poly pack's: a few colours, often one
+pixel each and not a power of two across) keeps each colour exact: a
+picture of 64 colours or fewer that has to be made bigger is copied
+pixel for pixel, to at least 8 times across (512 at most), never
+smoothed into the colour beside it - a 3D character's too. And one of chat's
 emotes is thrown by its picture's file (`throw`'s `file`: a PNG, JPEG,
 WebP or GIF - a moving GIF moves), the newest 64 kept open. A throw can
 stick (`stick`: seconds, up to 10) - where it hits, moving and tipping
