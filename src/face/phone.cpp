@@ -846,7 +846,7 @@ void PhoneLink::Impl::run()
 		const double span = seconds_since(window);
 		std::lock_guard<std::mutex> l(lock);
 		if (span >= 1.0) {
-			state.per_second = (float)(window_packets / span);
+			state.per_second = (float)((double)window_packets / span);
 			window_packets = 0;
 			window = clock_type::now();
 		}
