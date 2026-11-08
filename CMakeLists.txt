@@ -104,6 +104,7 @@ target_sources(
     src/face/face-avatar.cpp
     src/face/body.cpp
     src/face/arms.cpp
+    src/face/companion.cpp
     deps/mikktspace/mikktspace.c
     src/face/nn/net.cpp
     src/face/nn/kernels.cpp

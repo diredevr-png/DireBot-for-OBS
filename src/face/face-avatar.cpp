@@ -50,6 +50,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "avatar2d.hpp"
 #include "avatar3d.hpp"
 #include "body.hpp"
+#include "companion.hpp"
 #include "effect-check.hpp"
 #include "look-pace.hpp"
 #include "model.hpp"
@@ -120,6 +121,12 @@ constexpr float TURN_PAD = 0.08f, FLAT_MOST = 2048;
 // Worn on your head, when it can't see you: held this long, then faded
 // over this long (seconds).
 constexpr float WORN_HOLD = 1.0f, WORN_FADE = 0.5f;
+// 0.9.0: a move that stays (a ride...) that can't land exactly where its
+// idle starts (none, or cut short): its idle cross-fades in over this
+// long (seconds). And the camera views a companion and a move that stay
+// glide to, as view_shown has them (the chosen one's number, or -1).
+constexpr float STAY_FADE = 0.5f;
+constexpr int VIEW_COMPANION = -2, VIEW_STAY = -3;
 
 const char *text(const char *key)
 {
@@ -932,6 +939,9 @@ struct FaceAvatar {
 	std::atomic<bool> mirror{true};
 	float follow_move = 0.6f, follow_grow = 0.6f, follow_tilt = 1.0f;
 	float most_move = 0.25f; // of the source's size
+	// 0.9.0: a 3D character's spot moved across the picture (a share of
+	// its width, + right): a box made wider for a companion beside it.
+	float spot_x = 0;
 	float bend = 0.85f;      // turning and nodding with you
 	bool turn_pictures = true;
 	std::atomic<bool> easy{false};
@@ -1120,6 +1130,88 @@ struct FaceAvatar {
 	// out for (-1: not yet) - 0.8.1.
 	Bounds stands3d;
 	int framed_for = -1;
+	int stands_for = -1; // the animation its box was measured in (0.9.0)
+	// 0.9.0: a companion beside it (companion.hpp): a pet of its own file,
+	// loaded on its own thread, posed by a rig of its own and drawn with
+	// the character in the same picture, patted by a hand of its own.
+	// Asked for by DireBot's FaceReact ("companion") on OBS's UI thread,
+	// under companion_lock; stepped and drawn on the graphics one.
+	struct CompanionAsk {
+		std::string file;                   // "" none
+		std::string clips[COMPANION_CLIPS]; // its animations asked for by name ("" worked out)
+		CompanionPlace place;
+		// How much it moves with the character as the character follows
+		// you about (0 it sits still, 1 with it all the way).
+		float follow = 1;
+		// The camera glides to `view` while it's here (else it stays as
+		// it is).
+		bool has_view = false;
+		CameraView view;
+		int come = 0;           // waiting for its file: 1 it comes, 2 straight there
+		uint64_t clips_seq = 1; // a new one each time its clips are asked for anew
+		// The file loaded and its clips sorted out for `ready_seq` (the
+		// graphics thread says so).
+		std::string ready;
+		uint64_t ready_seq = 0;
+	};
+	std::mutex companion_lock;
+	CompanionAsk companion_ask;
+	CompanionPlayer companion_player;  // under companion_lock
+	React companion_hand{0x51ED270Bu}; // its pats (under companion_lock)
+	ModelLoader companion_loader;
+	// ...graphics thread: loaded, rigged, measured as it sits; this frame's.
+	std::unique_ptr<Avatar3D> companion3d;
+	std::unique_ptr<Rig> companion_rig;
+	std::shared_ptr<const Model> companion_model;
+	std::string companion_path; // its file, as loaded
+	std::string companion_problem;
+	Bounds companion_box;
+	int companion_pat = -1;
+	uint64_t companion_clips_seen = 0;
+	CompanionAsk companion_shown;
+	CompanionNow companion_now;
+	Hand companion_hand_now;
+	bool companion_drawn = false;
+	float companion_tall = 0; // its height in the world, sitting, as drawn
+	M4 companion_rest;        // the character -> the world where its companion's spot is
+	// ...for FaceGetState (under state_lock).
+	struct CompanionState {
+		std::string file, problem, pat;
+		bool loaded = false, drawn = false;
+		std::vector<std::string> animations;
+		std::string clips[COMPANION_CLIPS];
+		CompanionPhase phase = CompanionPhase::Away;
+		bool busy = false, petting = false, patting = false, camera = false;
+		float size = 0; // its height in the world, sitting (0 not drawn)
+	};
+	CompanionState companion_state;
+	// 0.9.0: a move that stays - the character's own animation played
+	// once ("dragon_come"), then another looping as its idle in place of
+	// its own ("dragon_idle", riding) until it's ended by another move
+	// ("dragon_go") back to its own idle. Asked for on OBS's UI thread
+	// (under react_lock: its move goes to React with it), stepped on the
+	// graphics one.
+	struct StayAsk {
+		uint64_t seq = 0;
+		bool start = false; // false: it ends
+		std::string name;   // its idle's (for FaceGetState)
+		int move = -1;      // the move to it (or back), one of its own animations
+		float length = 0;
+		int idle = -1; // starting: the idle it stays in
+		bool has_view = false;
+		CameraView view;
+	};
+	StayAsk stay_ask; // under react_lock
+	// ...graphics thread: the newest asked for, whether its idle is in
+	// yet (or its own back), the idle it has swapped in (-1 its own), and
+	// one to swap in as soon as the rig's there (how long it's waited).
+	StayAsk stay_job;
+	uint64_t stay_seen = 0;
+	bool stay_swapped = true, stay_on = false;
+	int stay_idle_now = -1;
+	bool stay_due = false, stay_aligned = false;
+	int stay_target = -1;
+	float stay_offset = 0, stay_fade = 0, stay_age = 0, stay_ease = 0, stay_amount = 0;
 	// Hidden on every scene that's shown (OBS doesn't draw it): how long
 	// since it last looked for a newly loaded 3D character (0.8.1).
 	float since_hidden_pick = 0;
@@ -1192,6 +1284,7 @@ struct FaceAvatar {
 	bool view_started = false;
 	int view_shown_state = -1; // ...for FaceGetState (under state_lock)
 	bool view_gliding_state = false;
+	const char *view_cue_state = ""; // 0.9.0: "companion" or "stay" while one has the camera
 	std::vector<bool> skin_now;
 	std::string skin_key;
 	// What it does on cue (react.hpp): asked for by DireBot's FaceReact on
@@ -1259,8 +1352,16 @@ struct FaceAvatar {
 		Hand hand; // the headpat's hand now
 		float squint = 0, squish = 0;
 		int stuck = 0;
+		bool moving = false; // a body or head move playing (0.9.0)
 	};
 	ReactState react_state;
+	// ...and a move that stays (0.9.0): on, its idle's name, still
+	// swapping (its move playing).
+	struct StayState {
+		bool on = false, swapping = false;
+		std::string name;
+	};
+	StayState stay_state;
 	// ...and how it sounds, for FaceGetState (under state_lock).
 	VoiceOut voice_state;
 	Calibration cal_state;
@@ -1347,6 +1448,8 @@ struct FaceAvatar {
 		obs_enter_graphics();
 		avatar3d.reset();
 		overlay3d.reset();
+		companion_rig.reset();
+		companion3d.reset();
 		props3d.clear();
 		for (Shot &shot : shots)
 			gs_texrender_destroy(shot.tex);
@@ -2098,7 +2201,10 @@ struct FaceAvatar {
 	// up, its skin and sleeve coloured.
 	PropAt hand_at(Prop3D &hand, const M4 &rest_place, float side)
 	{
-		const Hand &h = react_now.hand;
+		return hand_at(hand, rest_place, side, react_now.hand);
+	}
+	PropAt hand_at(Prop3D &hand, const M4 &rest_place, float side, const Hand &h)
+	{
 		PropAt p;
 		p.prop = &hand;
 		p.place = rest_place * scaled(h.size / HAND_HEAD) * hand_turn(side);
@@ -2163,6 +2269,142 @@ struct FaceAvatar {
 		const V3 o = move_of(rest);
 		rest = moved(point(sq, o) - o) * rest;
 		return hand_at(hand, rest, side);
+	}
+
+	// 0.9.0: the 3D headpat hand on a companion (its hand's own pats,
+	// `companion_hand_now`): its palm on its "pat" node (or the top of its
+	// head bone) as the companion's posed, sized for the character's head -
+	// the character's hand - and coming from the character's side.
+	PropAt hand_on_companion(Prop3D &hand)
+	{
+		const Hand &h = companion_hand_now;
+		const M4 &w = companion_rig->world()[companion_pat];
+		// Its way up and the way its face points, square (and never
+		// mirrored: a companion on its other side is, but a hand isn't).
+		const V3 up = normalized(direction(w, {0, 1, 0}), {0, 1, 0});
+		V3 front = direction(w, {0, 0, 1});
+		front = normalized(front - up * dot(front, up), {0, 0, 1});
+		const V3 right = cross(up, front);
+		M4 frame;
+		frame.m[0] = right.x, frame.m[1] = right.y, frame.m[2] = right.z;
+		frame.m[4] = up.x, frame.m[5] = up.y, frame.m[6] = up.z;
+		frame.m[8] = front.x, frame.m[9] = front.y, frame.m[10] = front.z;
+		const V3 o = move_of(w);
+		frame.m[12] = o.x, frame.m[13] = o.y, frame.m[14] = o.z;
+		float tall = head_world;
+		if (!(tall > 1e-6f))
+			tall = 0.25f * std::max(1e-4f, companion_tall);
+		const float side = h.side;
+		const M4 rest = frame * moved({side * h.away * tall, h.rise * tall, 0}) * scaled(tall);
+		return hand_at(hand, rest, side, h);
+	}
+
+	// 0.9.0: a newly loaded companion onto the graphics card, rigged and
+	// measured as it sits (its idle's first moment), its animations
+	// sorted out as asked; and a "come" that waited for it (graphics
+	// thread, pictures_lock held).
+	void pick_companion()
+	{
+		bool fresh = false;
+		if (std::shared_ptr<ModelPack> pack = companion_loader.take()) {
+			if (!companion3d)
+				companion3d = std::make_unique<Avatar3D>();
+			companion3d->set(pack->model, std::move(pack->pictures));
+			companion_model = pack->model;
+			companion_path = pack->path;
+			companion_problem = pack->problem;
+			companion_rig.reset();
+			companion_clips_seen = 0;
+			fresh = true;
+			std::lock_guard<std::mutex> l(companion_lock);
+			companion_ask.ready.clear();
+		}
+		if (!companion_model || !companion3d || !companion3d->ready()) {
+			companion_rig.reset();
+			if (fresh) {
+				std::lock_guard<std::mutex> l(state_lock);
+				companion_state = CompanionState();
+				companion_state.file = companion_path;
+				companion_state.problem = companion_problem;
+			}
+			return;
+		}
+		const Model &m = *companion_model;
+		if (!companion_rig) {
+			RigOptions ro;
+			ro.facing = companion_facing(m);
+			// A VRM's own springs swing; a .glb's ears and tail are in its
+			// animations (no chains of its own guessed: they'd be its legs).
+			ro.springs = m.is_vrm();
+			ro.arms_down = false;
+			ro.fingers = 0;
+			ro.animation = -1;
+			companion_rig = std::make_unique<Rig>(companion_model, ro);
+			companion_pat = companion_pat_node(m);
+			companion_clips_seen = 0;
+		}
+		CompanionClips clips;
+		bool sorted = false;
+		{
+			std::lock_guard<std::mutex> l(companion_lock);
+			if (companion_ask.file != companion_path)
+				return;
+			if (companion_clips_seen != companion_ask.clips_seq) {
+				clips = companion_clips(m, companion_ask.clips);
+				companion_player.set_clips(clips);
+				companion_clips_seen = companion_ask.clips_seq;
+				sorted = true;
+			}
+			companion_ask.ready = companion_path;
+			companion_ask.ready_seq = companion_clips_seen;
+			if (companion_ask.come) {
+				companion_player.come(companion_ask.come == 2);
+				companion_ask.come = 0;
+			}
+		}
+		if (!sorted)
+			return;
+		companion_box = companion_rig->rest_bounds_in(clips[CLIP_IDLE].index);
+		std::lock_guard<std::mutex> l(state_lock);
+		CompanionState &st = companion_state;
+		st.file = companion_path;
+		st.problem = companion_problem;
+		st.loaded = true;
+		st.animations.clear();
+		for (const Animation &a : m.animations)
+			st.animations.push_back(a.name);
+		for (int k = 0; k < COMPANION_CLIPS; k++)
+			st.clips[k] = clips[k].index >= 0 ? m.animations[clips[k].index].name : "";
+		st.pat = companion_pat >= 0 ? m.nodes[companion_pat].name : "";
+	}
+
+	// 0.9.0: a move that stays, its idle swapped in where its move begins
+	// to ease out - timed so its loop starts as the move ends - or its own
+	// back as the move back ends (graphics thread, pictures_lock held, the
+	// rig there).
+	void apply_stay()
+	{
+		if (!stay_due || !rig || !model_now)
+			return;
+		const Model &m = *model_now;
+		const int own = animation_named(m, look3d.animation);
+		const int to = stay_target >= 0 ? stay_target : own;
+		const float length = to >= 0 && to < (int)m.animations.size() ? m.animations[to].length : 0;
+		float start = stay_offset + stay_age;
+		if (stay_aligned)
+			start += length - stay_ease;
+		if (length > 0) {
+			start = std::fmod(start, length);
+			if (start < 0)
+				start += length;
+		} else {
+			start = 0;
+		}
+		rig->set_animation(to, stay_fade, start);
+		stay_idle_now = stay_target;
+		stay_due = false;
+		std::lock_guard<std::mutex> l(state_lock);
+		state3d.animation = to >= 0 ? m.animations[to].name : "";
 	}
 
 	// Things 3D over the character, round where its face is drawn (heads,
@@ -2232,6 +2474,12 @@ struct FaceAvatar {
 			rig_key.clear();
 			skin_key.clear();
 			have_worn_pose = false;
+			// A move that stays is its character's (a ride in its file): a
+			// new character starts on its own idle. A companion stays.
+			stay_on = false;
+			stay_swapped = true;
+			stay_due = false;
+			stay_idle_now = -1;
 			State3D st;
 			st.file = pack->path;
 			st.problem = pack->problem;
@@ -2292,19 +2540,28 @@ struct FaceAvatar {
 					std::to_string(ro.facing.z) + "/" + std::to_string(ro.facing.w) + "/" +
 					std::to_string(ro.floppy) + "/" + (ro.springs ? "1" : "0") + "/" +
 					std::to_string(ro.fingers) + "/" + look3d.setup_text + "/" + look3d.still_faces;
-		if (rig && rig->animation() != ro.animation) {
+		// 0.9.0: a move that stays has its own idle in its place (swapped
+		// in and back by apply_stay) - its box still as it stands in its own.
+		const bool staying = stay_idle_now >= 0 || stay_due;
+		if (rig && key == rig_key && !staying && rig->animation() != ro.animation) {
 			rig->set_animation(ro.animation);
-			// As it stands in that one (its first moment).
-			stands3d = rig->rest_bounds();
-			framed_for = -1;
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d.animation = ro.animation >= 0 ? model_now->animations[ro.animation].name : "";
+		}
+		if (rig && key == rig_key && stands_for != ro.animation && !staying) {
+			// As it stands in that one (its first moment).
+			stands3d = rig->rest_bounds_in(ro.animation);
+			stands_for = ro.animation;
+			framed_for = -1;
 		}
 		if (!rig || key != rig_key) {
 			rig = std::make_unique<Rig>(model_now, ro);
 			rig_key = key;
 			stands3d = rig->rest_bounds();
+			stands_for = ro.animation;
 			framed_for = -1;
+			if (stay_idle_now >= 0)
+				rig->set_animation(stay_idle_now);
 			spots3d = face_spots(model_now, ro.facing, *look3d.setup);
 			// Your eyes and mouth are cut the shape of its spots.
 			const float eye = (spots3d.spot[0].h / std::max(1e-6f, spots3d.spot[0].w) +
@@ -2317,7 +2574,7 @@ struct FaceAvatar {
 			worker.set_cut(aspect, feather);
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d.springs = rig->springs();
-			state3d.animation = ro.animation >= 0 ? model_now->animations[ro.animation].name : "";
+			state3d.animation = rig->animation() >= 0 ? model_now->animations[rig->animation()].name : "";
 			state3d.chain = rig->auto_chain();
 			state3d.arkit = rig->arkit_parts();
 			state3d.rigged = true;
@@ -2391,8 +2648,17 @@ struct FaceAvatar {
 			// Moved in proportion to its size: its eye gap (its spots), as
 			// it's framed - seen from the camera view, gliding to a new one.
 			f = frame_own_spot(m, facing, w, h, size, head, 0, 0, grow, &stands3d);
-			const int want = look3d.view >= 0 && look3d.view < (int)look3d.views.size() ? look3d.view : -1;
-			const CameraView target = want >= 0 ? look3d.views[want].second : CameraView();
+			int want = look3d.view >= 0 && look3d.view < (int)look3d.views.size() ? look3d.view : -1;
+			CameraView target = want >= 0 ? look3d.views[want].second : CameraView();
+			// 0.9.0: while a move that stays has its own view (a ride), or a
+			// companion's here with one, the camera glides to that instead.
+			if (stay_on && stay_job.has_view) {
+				want = VIEW_STAY;
+				target = sensible_view(stay_job.view);
+			} else if (companion_now.camera && companion_shown.has_view && companion_rig) {
+				want = VIEW_COMPANION;
+				target = sensible_view(companion_shown.view);
+			}
 			if (!view_started) { // the first picture: straight there, no glide
 				view_from = view_to = view_now = target;
 				view_shown = want;
@@ -2412,9 +2678,15 @@ struct FaceAvatar {
 			const float e = view_t * view_t * view_t * (view_t * (view_t * 6 - 15) + 10);
 			view_now = view_between(view_from, view_to, e);
 			view_own_spot(f, view_now);
+			// Its spot moved across the picture (0.9.0: a box made wider
+			// for a companion, the character kept where it was).
+			move_own_spot(f, spot_x, 0);
 			{
 				std::lock_guard<std::mutex> l(state_lock);
-				view_shown_state = view_shown;
+				view_shown_state = view_shown >= 0 ? view_shown : -1;
+				view_cue_state = view_shown == VIEW_STAY        ? "stay"
+						 : view_shown == VIEW_COMPANION ? "companion"
+										: "";
 				view_gliding_state = view_t < 1;
 			}
 			const float its_gap = length(spots3d.spot[0].at - spots3d.spot[1].at) * f.world_scale;
@@ -2429,6 +2701,18 @@ struct FaceAvatar {
 			react_shift[1] = rn.dy * head_px;
 			move_own_spot(f, clampf(dx * flip, -most_move, most_move) + react_shift[0] / std::max(1u, w),
 				      clampf(dy, -most_move, most_move) + react_shift[1] / std::max(1u, h));
+			// Where a companion's spot is: the character's as it's framed,
+			// following you as much as it's asked to (not knocked about
+			// with it).
+			if (companion_rig && companion_now.shown) {
+				const float k = clampf(companion_shown.follow, 0, 1);
+				Framing fc =
+					frame_own_spot(m, facing, w, h, size, head, 0, 0, mix(1, grow, k), &stands3d);
+				view_own_spot(fc, view_now);
+				move_own_spot(fc, spot_x + k * clampf(dx * flip, -most_move, most_move),
+					      k * clampf(dy, -most_move, most_move));
+				companion_rest = fc.place;
+			}
 			// Your head's turn (held, then easing ahead when it can't see
 			// you), its own sway on top; its body takes some of it. And on
 			// cue: knocked back, nodding, shaking (as the picture shows it:
@@ -2510,6 +2794,29 @@ struct FaceAvatar {
 			d.knock = (right * k.x + f.up * k.y + toward * k.z) * head_world;
 		}
 		rig->pose(d);
+		// 0.9.0: its companion beside it, on its floor, posed as it comes,
+		// sits, is patted and goes - drawn with it (only in its own spot).
+		std::vector<Avatar3D::Other> others;
+		companion_drawn = false;
+		if (!wear && companion_rig && companion3d && companion_now.shown &&
+		    companion_shown.file == companion_path) {
+			const Model &cm = *companion_model;
+			Drive cd;
+			cd.dt = frame_dt;
+			cd.look = false;
+			cd.expressions = false;
+			cd.breathe_whole = false;
+			cd.place = companion_place(companion_box, companion_facing(cm), stands3d, facing,
+						   companion_rest, companion_shown.place);
+			cd.upright = cd.place;
+			cd.has_upright = true;
+			cd.body = companion_now.moves;
+			companion_rig->pose(cd);
+			others.push_back({companion3d.get(), companion_rig.get()});
+			companion_drawn = true;
+			companion_tall = (companion_box.high.y - companion_box.low.y) *
+					 length(V3{cd.place.m[4], cd.place.m[5], cd.place.m[6]});
+		}
 		v.fov = f.fov;
 		v.near = f.near;
 		v.far = f.far;
@@ -2539,7 +2846,17 @@ struct FaceAvatar {
 		Prop3D *hand = react_now.hand.shown ? hand_3d() : nullptr;
 		if (hand && face_known)
 			with.push_back(hand_on_head(*hand, facing, wear));
-		gs_texture_t *tex = show ? avatar3d->draw(rig.get(), v, with) : nullptr;
+		// ...and on its companion's head, its own pats.
+		Prop3D *pet_hand = companion_drawn && companion_hand_now.shown && companion_pat >= 0 ? hand_3d()
+												     : nullptr;
+		if (pet_hand)
+			with.push_back(hand_on_companion(*pet_hand));
+		gs_texture_t *tex = show ? avatar3d->draw(rig.get(), v, with, others) : nullptr;
+		{
+			std::lock_guard<std::mutex> l(state_lock);
+			companion_state.drawn = companion_drawn && tex != nullptr;
+			companion_state.size = companion_drawn ? companion_tall : 0;
+		}
 		draw_overlay(w, h, false);
 		{
 			std::lock_guard<std::mutex> l(state_lock);
@@ -3089,6 +3406,8 @@ struct FaceAvatar {
 		const Shown::Out o = shown.now();
 		const bool wear = worn && cw && ch;
 		pick_model();
+		pick_companion();
+		apply_stay();
 		pick_props();
 		upload_masks();
 		if (rig && model_now) {
@@ -3374,6 +3693,46 @@ struct FaceAvatar {
 		arms_pending = false;
 	}
 
+	// 0.9.0: a move that stays, on from where it was: its move's time as
+	// React plays it, and its idle (or its own back) due where the move
+	// begins to ease out - at once if the move's gone (cut short by
+	// another, stopped) or there's none (graphics thread).
+	void step_stay(float dt)
+	{
+		if (stay_due)
+			stay_age += dt;
+		if (stay_swapped)
+			return;
+		bool found = false;
+		float t = 0, amount = 0;
+		for (const BodyMove &bm : react_now.body)
+			if (stay_job.move >= 0 && bm.move == stay_job.move) {
+				found = true;
+				t = bm.time;
+				amount = bm.amount;
+			}
+		const float ease = move_ease_out(stay_job.length);
+		const float from = stay_job.length - ease;
+		// Cut short by another move (easing out before its time): its idle
+		// comes in under that one now.
+		const bool cut = found && t > move_ease_in(stay_job.length) && amount < stay_amount - 1e-4f;
+		stay_amount = found ? amount : 0;
+		if (found && t < from && !cut)
+			return;
+		if (cut)
+			found = false;
+		stay_swapped = true;
+		stay_due = true;
+		stay_age = 0;
+		stay_target = stay_job.start ? stay_job.idle : -1;
+		// Landing on its idle's start as the move ends - unless the move
+		// isn't there to cover it: a cross-fade then.
+		stay_aligned = found;
+		stay_ease = ease;
+		stay_offset = found ? t - from : 0;
+		stay_fade = found ? ease : STAY_FADE;
+	}
+
 	void tick(float dt)
 	{
 		drawn = false;
@@ -3412,9 +3771,29 @@ struct FaceAvatar {
 		const Shown::Glide &g = o.steady;
 		alive_now = alive.step(dt, o.found, g.yaw, g.pitch, g.angle / RAD, tuned_now);
 		// What it does on cue (react.hpp), round where its face was drawn.
+		bool moving;
 		{
 			std::lock_guard<std::mutex> l(react_lock);
 			react_now = react.step(dt, react_view);
+			moving = react.moving();
+			// A move that stays, newly asked for (its move went to React
+			// with it, so it plays from this step).
+			if (stay_ask.seq != stay_seen) {
+				stay_seen = stay_ask.seq;
+				stay_job = stay_ask;
+				stay_swapped = false;
+				stay_amount = 0;
+				stay_on = stay_job.start;
+			}
+		}
+		step_stay(dt);
+		{
+			std::lock_guard<std::mutex> l(companion_lock);
+			companion_now = companion_player.step(dt);
+			companion_hand_now = companion_hand.step(dt, ReactView()).hand;
+			if (!companion_now.shown)
+				companion_hand_now.shown = false;
+			companion_shown = companion_ask;
 		}
 		react_hits += react_now.hits;
 		step_arms(dt);
@@ -3491,6 +3870,15 @@ struct FaceAvatar {
 		breath_state = alive_now.breath;
 		react_state.hits = react_hits;
 		react_state.busy = react_now.busy;
+		react_state.moving = moving;
+		companion_state.phase = companion_now.phase;
+		companion_state.busy = companion_now.busy;
+		companion_state.petting = companion_now.petting;
+		companion_state.patting = companion_hand_now.shown;
+		companion_state.camera = companion_now.camera;
+		stay_state.on = stay_on;
+		stay_state.swapping = !stay_swapped || stay_due;
+		stay_state.name = stay_on ? stay_job.name : "";
 		react_state.flying = (int)react_now.flying.size();
 		react_state.hand = react_now.hand;
 		react_state.squint = react_now.squint;
@@ -3524,6 +3912,8 @@ struct FaceAvatar {
 		{
 			std::lock_guard<std::mutex> l(pictures_lock);
 			pick_model();
+			pick_companion();
+			apply_stay();
 		}
 		obs_leave_graphics();
 	}
@@ -3822,6 +4212,7 @@ struct FaceAvatar {
 			follow_grow = clampf((float)obs_data_get_int(settings, "follow_grow") / 100.0f, 0, 1);
 			follow_tilt = clampf((float)obs_data_get_int(settings, "follow_tilt") / 100.0f, 0, 1);
 			most_move = clampf((float)obs_data_get_int(settings, "most_move") / 100.0f, 0, 0.5f);
+			spot_x = clampf((float)obs_data_get_double(settings, "spot_x") / 100.0f, -0.5f, 0.5f);
 			show_camera = obs_data_get_bool(settings, "show_camera");
 			worn_size = clampf((float)obs_data_get_int(settings, "worn_size") / 100.0f, 0.5f, 3.0f);
 		}
@@ -4257,8 +4648,258 @@ struct FaceAvatar {
 		} else if (what == "stop") {
 			std::lock_guard<std::mutex> l(react_lock);
 			react.stop();
+		} else if (what == "companion") {
+			return companion_to(data);
+		} else if (what == "stay") {
+			return stay_to(data);
 		} else {
 			return no("DireBot for OBS doesn't know that.");
+		}
+		return answer;
+	}
+
+	// 0.9.0: its companion (companion.hpp), as DireBot's FaceReact asks:
+	//   {"do": "companion", "action": "come", "file": ..., "clips": {"come":
+	//    "", "idle": "", ...}, "place": {"size", "side", "made_for",
+	//    "distance", "forward", "turn"}, "follow": 0-1, "view": {"yaw",
+	//    "pitch", "zoom", "x", "y"} or none, "instant": false}
+	//   {"action": "place", ...the same, nothing coming or going}
+	//   {"action": "go", "scared": false, "instant": false}
+	//   {"action": "pet", "count": 5, "size": 1}
+	//   {"action": "off"}: gone at once, its file let go of.
+	// OBS's UI thread.
+	json companion_to(const json &data)
+	{
+		auto str = [](const json &j, const char *key) {
+			auto it = j.find(key);
+			return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
+		};
+		auto num = [](const json &j, const char *key, float def) {
+			auto it = j.find(key);
+			return it != j.end() && it->is_number() ? (float)it->get<double>() : def;
+		};
+		auto flag = [](const json &j, const char *key) {
+			auto it = j.find(key);
+			return it != j.end() && it->is_boolean() && it->get<bool>();
+		};
+		auto no = [](const std::string &words) {
+			return json{{"ok", false}, {"error", words}};
+		};
+		const std::string action = str(data, "action");
+		json answer = {{"ok", true}};
+		// Where it goes and how it's seen, as asked (each kept sensible).
+		auto take_place = [&](CompanionAsk &a) {
+			auto pl = data.find("place");
+			if (pl != data.end() && pl->is_object()) {
+				CompanionPlace p;
+				p.size = num(*pl, "size", p.size);
+				p.side = num(*pl, "side", p.side);
+				p.made_for = num(*pl, "made_for", p.made_for);
+				p.distance = num(*pl, "distance", p.distance);
+				p.forward = num(*pl, "forward", p.forward);
+				p.turn = num(*pl, "turn", p.turn);
+				a.place = sensible_place(p);
+			}
+			if (data.contains("follow"))
+				a.follow = clampf(num(data, "follow", 1), 0, 1);
+			auto vw = data.find("view");
+			if (vw != data.end()) {
+				a.has_view = vw->is_object();
+				if (a.has_view) {
+					CameraView v;
+					v.yaw = num(*vw, "yaw", 0);
+					v.pitch = num(*vw, "pitch", 0);
+					v.zoom = num(*vw, "zoom", 1);
+					v.x = num(*vw, "x", 0);
+					v.y = num(*vw, "y", 0);
+					a.view = sensible_view(v);
+				}
+			}
+			auto cl = data.find("clips");
+			if (cl != data.end() && cl->is_object()) {
+				bool changed = false;
+				for (int k = 0; k < COMPANION_CLIPS; k++) {
+					const std::string name = str(*cl, companion_clip_name(k));
+					changed = changed || name != a.clips[k];
+					a.clips[k] = name;
+				}
+				if (changed)
+					a.clips_seq++;
+			}
+		};
+		if (action == "come" || action == "place") {
+			const std::string file = str(data, "file");
+			if (file.empty())
+				return no("Pick the companion's file (a .glb or .vrm) in DireBot.");
+			if (!is_3d_file(file))
+				return no("A companion is a 3D file: a .glb, .gltf or .vrm.");
+			bool loaded_now;
+			{
+				std::lock_guard<std::mutex> l(state_lock);
+				loaded_now = state3d.loaded;
+			}
+			std::lock_guard<std::mutex> l(companion_lock);
+			CompanionAsk &a = companion_ask;
+			if (file != a.file) {
+				// Another one: the one there goes at once.
+				companion_player.reset();
+				companion_hand.stop();
+				a.come = 0;
+				a.file = file;
+				a.clips_seq++;
+			}
+			take_place(a);
+			companion_loader.want(file);
+			const bool ready = a.ready == file && a.ready_seq == a.clips_seq;
+			if (action == "come") {
+				const bool instant = flag(data, "instant");
+				bool came = true;
+				if (ready && !a.come)
+					came = companion_player.come(instant);
+				else
+					a.come = instant ? 2 : 1;
+				answer["came"] = came;
+				answer["loading"] = !ready;
+			}
+			answer["phase"] = companion_phase_name(companion_player.phase());
+			if (!loaded_now)
+				answer["why"] =
+					"It shows beside a 3D character - this one isn't (or isn't loaded yet).";
+		} else if (action == "go") {
+			std::lock_guard<std::mutex> l(companion_lock);
+			// Still loading: it never comes.
+			bool went = companion_ask.come != 0;
+			companion_ask.come = 0;
+			went = companion_player.go(flag(data, "scared"), flag(data, "instant")) || went;
+			companion_hand.stop();
+			answer["went"] = went;
+			answer["phase"] = companion_phase_name(companion_player.phase());
+		} else if (action == "pet") {
+			std::lock_guard<std::mutex> l(companion_lock);
+			if (!companion_player.pet()) {
+				answer["pets"] = false;
+				answer["why"] = companion_player.phase() == CompanionPhase::Away
+							? "The companion isn't here - bring it first."
+							: "The companion is still coming or going.";
+				return answer;
+			}
+			Pat p;
+			p.count = (int)std::lround(clampf(num(data, "count", 5), 1, (float)MOST_PATS));
+			p.size = num(data, "size", 1);
+			// The character's hand: from its side of the companion.
+			p.side = -companion_ask.place.side;
+			p.face = "";
+			companion_hand.pat(p);
+			answer["pets"] = true;
+		} else if (action == "off") {
+			std::lock_guard<std::mutex> l(companion_lock);
+			companion_player.reset();
+			companion_hand.stop();
+			const uint64_t seq = companion_ask.clips_seq;
+			companion_ask = CompanionAsk();
+			companion_ask.clips_seq = seq + 1;
+			companion_loader.want("");
+		} else {
+			return no("DireBot for OBS doesn't know that.");
+		}
+		return answer;
+	}
+
+	// 0.9.0: a move that stays, as DireBot's FaceReact asks:
+	//   {"do": "stay", "action": "start", "move": "dragon_come", "idle":
+	//    "dragon_idle", "view": {...} or none, "companion": "scared"}
+	//   {"action": "end", "move": "dragon_go"}
+	// Its moves are the character's own animations ("" none: straight to
+	// its idle, cross-faded). "companion": its companion goes as it starts
+	// ("go" or "scared"). OBS's UI thread.
+	json stay_to(const json &data)
+	{
+		auto str = [&data](const char *key) {
+			auto it = data.find(key);
+			return it != data.end() && it->is_string() ? it->get<std::string>() : std::string();
+		};
+		auto num = [](const json &j, const char *key, float def) {
+			auto it = j.find(key);
+			return it != j.end() && it->is_number() ? (float)it->get<double>() : def;
+		};
+		auto no = [](const std::string &words) {
+			return json{{"ok", false}, {"error", words}};
+		};
+		// One of its own animations by name (any case): its number and
+		// length, or -1.
+		auto own = [this](const std::string &name, float &length) {
+			length = 0;
+			if (name.empty())
+				return -1;
+			std::lock_guard<std::mutex> l(state_lock);
+			for (size_t i = 0; i < state3d.animations.size(); i++) {
+				const std::string &n = state3d.animations[i];
+				bool same = n.size() == name.size();
+				for (size_t c = 0; same && c < n.size(); c++)
+					same = std::tolower((unsigned char)n[c]) ==
+					       std::tolower((unsigned char)name[c]);
+				if (same) {
+					length = i < state3d.animation_lengths.size() ? state3d.animation_lengths[i]
+										      : 0;
+					return (int)i;
+				}
+			}
+			return -1;
+		};
+		const std::string action = str("action");
+		if (action != "start" && action != "end")
+			return no("DireBot for OBS doesn't know that.");
+		{
+			std::lock_guard<std::mutex> l(state_lock);
+			if (!state3d.loaded)
+				return no(
+					"Moves that stay are a 3D character's - this one isn't (or isn't loaded yet).");
+		}
+		StayAsk a;
+		a.start = action == "start";
+		const std::string move = str("move");
+		a.move = own(move, a.length);
+		if (!move.empty() && a.move < 0)
+			return no("This character has no animation called \"" + move + "\".");
+		if (a.start) {
+			const std::string idle = str("idle");
+			float idle_length;
+			a.idle = own(idle, idle_length);
+			if (a.idle < 0)
+				return no(idle.empty() ? "Pick the animation it stays in."
+						       : "This character has no animation called \"" + idle + "\".");
+			a.name = idle;
+			auto vw = data.find("view");
+			a.has_view = vw != data.end() && vw->is_object();
+			if (a.has_view) {
+				CameraView v;
+				v.yaw = num(*vw, "yaw", 0);
+				v.pitch = num(*vw, "pitch", 0);
+				v.zoom = num(*vw, "zoom", 1);
+				v.x = num(*vw, "x", 0);
+				v.y = num(*vw, "y", 0);
+				a.view = sensible_view(v);
+			}
+		}
+		{
+			std::lock_guard<std::mutex> l(react_lock);
+			a.seq = stay_ask.seq + 1;
+			if (!a.start) {
+				a.name = stay_ask.name;
+				a.has_view = false;
+			}
+			stay_ask = a;
+			if (a.move >= 0)
+				react.play(a.move, a.length);
+		}
+		json answer = {{"ok", true}};
+		const std::string scare = str("companion");
+		if (a.start && (scare == "go" || scare == "scared")) {
+			std::lock_guard<std::mutex> l(companion_lock);
+			companion_ask.come = 0;
+			companion_player.go(scare == "scared");
+			companion_hand.stop();
+			answer["companion"] = companion_phase_name(companion_player.phase());
 		}
 		return answer;
 	}
@@ -4319,6 +4960,12 @@ struct FaceAvatar {
 		std::string react_hand_problem;
 		int react_emotes = 0;
 		int view_index;
+		std::string companion_file_state;
+		{
+			std::lock_guard<std::mutex> l(companion_lock);
+			companion_file_state = companion_ask.file;
+		}
+		const bool companion_loading_state = companion_loader.busy();
 		{
 			std::lock_guard<std::mutex> l(pictures_lock);
 			for (int i = 0; i < PARTS; i++)
@@ -4567,7 +5214,8 @@ struct FaceAvatar {
 					   {"patting", rs.hand.shown},
 					   {"squint", std::round(rs.squint * 1000) / 1000},
 					   {"squish", std::round(rs.squish * 1000) / 1000},
-					   {"busy", rs.busy}};
+					   {"busy", rs.busy},
+					   {"moving", rs.moving}};
 			if (!react_hand_problem.empty())
 				answer["react"]["hand_3d_problem"] = react_hand_problem;
 			if (rs.hand.shown) {
@@ -4578,9 +5226,40 @@ struct FaceAvatar {
 			}
 		}
 		answer["camera_view"] = {{"view", view_index >= 0 ? std::to_string(view_index + 1) : "main"},
-					 {"showing", view_shown_state >= 0 ? std::to_string(view_shown_state + 1) : "main"},
+					 {"showing",
+					  view_shown_state >= 0 ? std::to_string(view_shown_state + 1) : "main"},
 					 {"gliding", view_gliding_state},
+					 {"cue", view_cue_state},
 					 {"views", views_json}};
+		{
+			// 0.9.0: its companion (its file, loaded or why not, its
+			// animations and which it uses for what, where a headpat's hand
+			// lands, and what it's doing), and a move that stays.
+			const CompanionState &cs = companion_state;
+			json anims = json::array(), clips = json::object();
+			for (const std::string &n : cs.animations)
+				anims.push_back({{"name", n}});
+			for (int k = 0; k < COMPANION_CLIPS; k++)
+				clips[companion_clip_name(k)] = cs.clips[k];
+			answer["companion"] = {{"file", companion_file_state},
+					       {"loaded", cs.loaded && cs.file == companion_file_state},
+					       {"loading", companion_loading_state},
+					       {"problem", cs.file == companion_file_state ? cs.problem : ""},
+					       {"animations", anims},
+					       {"clips", clips},
+					       {"pat", cs.pat},
+					       {"phase", companion_phase_name(cs.phase)},
+					       {"shown", cs.phase != CompanionPhase::Away},
+					       {"drawn", cs.drawn},
+					       {"busy", cs.busy},
+					       {"petting", cs.petting},
+					       {"patting", cs.patting},
+					       {"camera", cs.camera},
+					       {"height", r(cs.size, 1e4f)}};
+			answer["stay"] = {{"on", stay_state.on},
+					  {"swapping", stay_state.swapping},
+					  {"idle", stay_state.name}};
+		}
 		{
 			const State3D &st = state3d;
 			json values = json::object();
@@ -4899,6 +5578,8 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "outfit", "[]");
 	obs_data_set_default_string(settings, "model", "");
 	obs_data_set_default_int(settings, "model_turn", 0);
+	// 0.9.0: its spot moved across the picture (room beside it for a companion).
+	obs_data_set_default_double(settings, "spot_x", 0);
 	obs_data_set_default_string(settings, "look", "auto");
 	obs_data_set_default_int(settings, "outline", 0);
 	obs_data_set_default_int(settings, "floppy", 50);
@@ -5111,6 +5792,8 @@ obs_properties_t *get_properties(void *data)
 	}
 	p = obs_properties_add_int_slider(m3, "view_glide", text("FaceAvatar.ViewGlide"), 0, 3000, 50);
 	obs_property_int_set_suffix(p, " ms");
+	p = obs_properties_add_float_slider(m3, "spot_x", text("FaceAvatar.SpotX"), -50, 50, 0.1);
+	obs_property_float_set_suffix(p, "%");
 	obs_properties_add_group(props, "model3d", text("FaceAvatar.Model3D"), OBS_GROUP_NORMAL, m3);
 
 	// Its lights (a 3D character's).

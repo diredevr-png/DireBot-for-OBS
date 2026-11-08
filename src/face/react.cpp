@@ -111,11 +111,20 @@ bool finite(float v)
 // out (quicker for a short one).
 float envelope(float u, float length)
 {
-	const float in = std::min(0.3f, length * 0.35f), out = std::min(0.45f, length * 0.45f);
-	return smooth(u / in) * smooth((length - u) / out);
+	return smooth(u / move_ease_in(length)) * smooth((length - u) / move_ease_out(length));
 }
 
 } // namespace
+
+float move_ease_in(float length)
+{
+	return std::max(1e-4f, std::min(0.3f, length * 0.35f));
+}
+
+float move_ease_out(float length)
+{
+	return std::max(1e-4f, std::min(0.45f, length * 0.45f));
+}
 
 const char *builtin_name(BuiltIn b)
 {

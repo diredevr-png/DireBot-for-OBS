@@ -57,6 +57,13 @@ done
 "$out/unit-body"
 "$cxx" "${flags[@]}" -o "$out/unit-react" "$here/tests/unit_react.cpp" "$here/src/face/react.cpp"
 "$out/unit-react"
+# A companion beside the 3D character (0.9.0): its comings and goings and
+# where it goes, over a real (made-up) file.
+"$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-companion" "$here/tests/unit_companion.cpp" \
+	"$here/src/face/companion.cpp" "$here/src/face/model.cpp" "$here/src/face/rig.cpp" "$here/src/face/alive.cpp" \
+	"$here/src/face/react.cpp" "$here/src/face/voice.cpp" "$here/src/face/setup.cpp" "$here/src/face/tracker.cpp" \
+	"$here/src/face/pose.cpp" "${face_obj[@]}" "$out/mikktspace.o"
+"$out/unit-companion"
 "$cxx" "${flags[@]}" -O2 -o "$out/unit-pictures" "$here/tests/unit_pictures.cpp" "$here/src/face/pictures.cpp"
 "$out/unit-pictures"
 "$cxx" "${flags[@]}" -O2 -o "$out/unit-voice" "$here/tests/unit_voice.cpp" "$here/src/face/voice.cpp" \

@@ -186,10 +186,20 @@ public:
 	// measure; its swinging parts start again at rest after. Not found:
 	// no points.
 	Bounds rest_bounds();
+	// 0.9.0: its box as it stands in the first moment of one of its own
+	// animations (-1: none) - what plays now left as it is (a companion
+	// measured as it sits; a character as it stands while a move that
+	// stays has it riding).
+	Bounds rest_bounds_in(int animation);
 	// Another of its own animations (or -1 none), from its start: no need
-	// to start again.
-	void set_animation(int which);
+	// to start again. 0.9.0: cross-faded from the one before over `fade`
+	// seconds (0: straight there), the new one from `start` seconds into
+	// it - so a move that ends where an idle starts lands on it.
+	void set_animation(int which, float fade = 0, float start = 0);
 	int animation() const { return options_.animation; }
+	// Seconds into its animation now, and whether one is still fading out.
+	float animation_time() const { return anim_time_; }
+	bool animation_fading() const { return fade_from_ >= 0; }
 	// Swinging parts back at rest (when it's put somewhere new).
 	void settle();
 
@@ -202,6 +212,10 @@ public:
 		// times `handed` (-1 for a part mirrored by its node or bones).
 		std::vector<V3> tangent;
 		float handed = 1;
+		// 0.9.0: every bone it hangs from shrunk to almost nothing (a
+		// mount kept hidden in its rider's file until a move brings it
+		// out): not worked out, and not drawn (`pos` empty).
+		bool hidden = false;
 	};
 	const std::vector<Part> &parts() const { return parts_; }
 	const std::vector<M4> &world() const { return world_; }
@@ -371,6 +385,14 @@ private:
 	float spring_time_ = 0;
 	float anim_time_ = 0;          // seconds into its animation
 	std::vector<char> anim_turns_; // a node its animation turns
+	// 0.9.0: the animation it's fading from (-1: none), how far into it,
+	// and how far into the fade (seconds, of `fade_length_`).
+	int fade_from_ = -1;
+	float fade_from_time_ = 0, fade_t_ = 0, fade_length_ = 0;
+	// Each part's joints (its skin's numbers) that move any of its points,
+	// for one whose bones are all shrunk away (Part::hidden).
+	std::vector<std::vector<uint16_t>> part_joints_;
+	void apply_animation(int which, float t, float amount);
 	// How much a body move holds each node this frame (0 to 1): what the
 	// rig itself does to it (arms down, fingers relaxed) is that much less.
 	std::vector<float> moved_;

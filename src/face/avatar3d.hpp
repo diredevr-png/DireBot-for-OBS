@@ -212,11 +212,21 @@ public:
 	// A new character (or none) onto the graphics card.
 	void set(std::shared_ptr<const Model> model, std::vector<ModelPicture> pictures);
 	const Model *model() const { return model_.get(); }
+	// Another posed character drawn in the same picture (0.9.0: a companion
+	// beside it, a wolf sitting by you): its own Avatar3D holds it on the
+	// graphics card, posed by its own rig; seen with the same camera and
+	// lights, each hiding the other where it's in front.
+	struct Other {
+		Avatar3D *avatar = nullptr;
+		const Rig *rig = nullptr;
+	};
 	// The posed character drawn, premultiplied, see-through round it, with
 	// anything 3D put with it (hidden where it's behind the character, as
 	// the character is where they're in front of it); null if there's
 	// nothing to draw. With no character (`rig` null): only those things.
-	gs_texture_t *draw(const Rig *rig, const View3D &v, const std::vector<PropAt> &props = {});
+	// Parts a rig hides (Rig::Part::hidden) aren't drawn.
+	gs_texture_t *draw(const Rig *rig, const View3D &v, const std::vector<PropAt> &props = {},
+			   const std::vector<Other> &others = {});
 
 private:
 	struct Part {
@@ -226,6 +236,9 @@ private:
 		bool bumped = false; // its points carry tangents (its normal map's)
 	};
 	void clear();
+	// The posed points onto the graphics card (0.9.0: parts it hides left
+	// as they were); whether `rig` is this one's character.
+	bool upload(const Rig *rig);
 	void make_head();
 	void set_camera();
 	void set_lights(const View3D &v);
