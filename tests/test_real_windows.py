@@ -234,8 +234,10 @@ def test_your_face_from_a_phone(obs):
         assert p["listening"] and p["packets"] == 0 and not st()["found"], p
         phone = PretendPhone(port=later)
         assert wait_for(lambda: st()["found"], 15, 0.2), (st()["phone"], obs.log())
+        # (How many a second is counted over a second or so.)
+        assert wait_for(lambda: st()["phone"]["per_second"] > 10, 5, 0.1), st()["phone"]
         p = st()["phone"]
-        assert p["problem"] == "" and p["shapes"] == 52 and p["per_second"] > 10, p
+        assert p["problem"] == "" and p["shapes"] == 52, p
         phone.rotation = {"x": -30.0, "y": 0.0, "z": 0.0}
         assert wait_for(lambda: abs(st()["turn"]["yaw"] - 30) < 2, 10, 0.1), st()["turn"]
         phone.shapes = {"EyeBlinkLeft": 1.0}
@@ -304,7 +306,7 @@ def test_moves_from_a_tracker_app(obs):
                                "inputKind": "direbot_face_avatar",
                                "inputSettings": dict(settings, vmc_port=busy)}, raw=True)
         assert wait_for(lambda: "Another app" in st("Tracker busy")["vmc"]["problem"], 10, 0.2), \
-            st("Tracker busy")["vmc"]
+            {k: st("Tracker busy")["vmc"][k] for k in ("problem", "listening", "port", "packets")}
         assert not st("Tracker busy")["vmc"]["listening"]
         c.send("RemoveInput", {"inputName": "Tracker busy"}, raw=True)
     finally:

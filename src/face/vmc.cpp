@@ -867,6 +867,48 @@ bool nonblocking(sock_t s)
 }
 #endif
 
+// The last socket call failed because another socket has the port.
+bool port_in_use_error()
+{
+#ifdef _WIN32
+	const int e = WSAGetLastError();
+	return e == WSAEADDRINUSE || e == WSAEACCES;
+#else
+	return errno == EADDRINUSE;
+#endif
+}
+
+// Windows: our bind fails if any other socket has the port, whatever
+// options it used, and none can share it with ours after.
+void exclusive(sock_t s)
+{
+#ifdef _WIN32
+	BOOL on = TRUE;
+	setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char *>(&on), sizeof(on));
+#else
+	(void)s;
+#endif
+}
+
+// Another app has the port on IPv4. Asked by an IPv4 socket of our own,
+// closed again at once: Windows lets an IPv6 socket that takes IPv4 too
+// have a port an IPv4 socket has already, and then the other app gets
+// every IPv4 packet - nothing would ever come and nothing would say why.
+bool ipv4_taken(int port)
+{
+	sock_t s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (s == NO_SOCKET)
+		return false; // no IPv4 on this PC: nothing to share it with
+	exclusive(s);
+	sockaddr_in four{};
+	four.sin_family = AF_INET;
+	four.sin_addr.s_addr = htonl(INADDR_ANY);
+	four.sin_port = htons((uint16_t)port);
+	const bool taken = ::bind(s, reinterpret_cast<sockaddr *>(&four), sizeof(four)) != 0 && port_in_use_error();
+	close_socket(s);
+	return taken;
+}
+
 // A port it can't listen on is tried again this often (seconds); another
 // app sending is taken over once the first is quiet this long.
 constexpr double RETRY = 2.0, TAKE_OVER = 1.0;
@@ -1018,11 +1060,14 @@ void VmcLink::Impl::run(int port)
 			set_problem("That port can't be one - pick one from 1024 to 65535 (39539 is VMC's own).");
 			return false;
 		}
-		bool in_use = false;
+		bool in_use = ipv4_taken(port);
 		for (int family : {AF_INET6, AF_INET}) {
+			if (in_use)
+				break;
 			sock_t s = ::socket(family, SOCK_DGRAM, IPPROTO_UDP);
 			if (s == NO_SOCKET)
 				continue;
+			exclusive(s);
 			sockaddr_storage here{};
 			socklen_t here_len = 0;
 			if (family == AF_INET6) {
@@ -1044,11 +1089,7 @@ void VmcLink::Impl::run(int port)
 				here_len = sizeof(sockaddr_in);
 			}
 			if (::bind(s, reinterpret_cast<sockaddr *>(&here), here_len) != 0) {
-#ifdef _WIN32
-				in_use = in_use || WSAGetLastError() == WSAEADDRINUSE || WSAGetLastError() == WSAEACCES;
-#else
-				in_use = in_use || errno == EADDRINUSE;
-#endif
+				in_use = port_in_use_error();
 				close_socket(s);
 				continue;
 			}
