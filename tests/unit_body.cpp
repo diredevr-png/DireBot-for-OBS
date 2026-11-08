@@ -1,9 +1,12 @@
 // Unit tests for following your hands and arms (src/face/body.cpp,
-// src/face/arms.cpp): each body and hand model on our engine against
-// Google's own runtime (LiteRT), the body tracker against MediaPipe's
-// Holistic Landmarker on the same pictures (tests/data/body - see
-// tools/body-expected.py), following and losing a body, the hand gates,
-// then the arm and finger solver: which way each part points, mirrored
+// src/face/arms.cpp): each body and hand model and the palm finder on our
+// engine against Google's own runtime (LiteRT), the body tracker against
+// MediaPipe's Holistic Landmarker on the same pictures, hands found on
+// their own against its Hand Landmarker on Google's own pictures of hands
+// (tests/data/body - see tools/body-expected.py), the palm finder's steps,
+// following and losing a body, the body model less often than the hands,
+// the hand gates, your back to the camera turned round, your arm to your
+// hand, then the arm and finger solver: which way each part points, mirrored
 // or not, the elbow's hinge, reach and arms held out, by your head, each
 // finger joint's bend and its limits, a hand seen twice before it moves
 // anything, hold-and-fade, and calibration.
@@ -61,6 +64,7 @@ static bool near3(V3 a, V3 b, float by)
 static const std::string ROOT = DIREBOT_SOURCE_DIR;
 static const std::string TASK = ROOT + "/data/face/holistic_landmarker.task";
 static const std::string LITE = ROOT + "/data/face/hand_landmark_lite.tflite";
+static const std::string PALM = ROOT + "/data/face/palm_detection_full.tflite";
 static const std::string DATA = ROOT + "/tests/data/body/";
 constexpr float PI = 3.14159265f;
 
@@ -121,6 +125,18 @@ static const Picture &astronaut()
 static const Picture &camera()
 {
 	static const Picture p = read_pnm(DATA + "camera.pgm");
+	return p;
+}
+
+static const Picture &thumb_up()
+{
+	static const Picture p = read_pnm(DATA + "thumb_up.ppm");
+	return p;
+}
+
+static const Picture &two_hands()
+{
+	static const Picture p = read_pnm(DATA + "hands.ppm");
 	return p;
 }
 
@@ -304,15 +320,35 @@ static void test_models(bool plain)
 		std::printf("unit_body: %s model%s within %.2g of LiteRT\n", full ? "hand" : "light hand", how, g.most);
 		CHECK(g.most < 2e-3);
 	}
+
+	// The palm finder: its surest anchors.
+	nn::Net palm;
+	const std::vector<uint8_t> palm_file = read_file(PALM);
+	CHECK(!palm_file.empty() && load_net(palm, palm_file, "", plain));
+	if (palm.loaded()) {
+		fill(palm, m["palm"], 1.0f / 255, 0);
+		palm.run();
+		const bool boxes_first = vision::elements(palm.output_shape(0)) == 2016 * 18;
+		const float *boxes = palm.output(boxes_first ? 0 : 1), *scores = palm.output(boxes_first ? 1 : 0);
+		Gap g;
+		for (const json &b : m["palm"]["best"]) {
+			const int i = b["anchor"];
+			g.take(scores[i], b["score"].get<double>());
+			for (int k = 0; k < 18; k++)
+				g.take(boxes[i * 18 + k], b["box"][k].get<double>());
+		}
+		std::printf("unit_body: palm finder%s within %.2g of LiteRT\n", how, g.most);
+		CHECK(g.most < 2e-3);
+	}
 }
 
 // --- The body tracker, against MediaPipe -----------------------------------
 
-static bool load(BodyTracker &t, bool plain = false)
+static bool load(BodyTracker &t, bool plain = false, bool palm = false)
 {
 	t.set_plain(plain);
 	std::string problem;
-	const bool ok = t.load_files(TASK, LITE, &problem);
+	const bool ok = t.load_files(TASK, LITE, &problem, palm ? PALM : "");
 	if (!ok)
 		std::fprintf(stderr, "unit_body: %s\n", problem.c_str());
 	CHECK(ok && t.ready());
@@ -496,6 +532,13 @@ static void test_without_models()
 	CHECK(problem.find("missing") != std::string::npos);
 	CHECK(!t.load_files(TASK, ROOT + "/no/such/hand_landmark_lite.tflite", &problem));
 	CHECK(problem.find("missing") != std::string::npos);
+	CHECK(!t.load_files(TASK, LITE, &problem, ROOT + "/no/such/palm_detection_full.tflite"));
+	CHECK(problem.find("palm finder") != std::string::npos);
+	// The light hand model isn't a palm finder.
+	CHECK(!t.load_files(TASK, LITE, &problem, LITE));
+	CHECK(problem.find("palm finder") != std::string::npos);
+	// Without one, it still loads: a hand is only looked for at a wrist.
+	CHECK(t.load_files(TASK, LITE, &problem) && t.ready() && !t.has_palm());
 	// The face models' file isn't the body's.
 	CHECK(!t.load_files(ROOT + "/data/face/face_landmarker.task", "", &problem));
 	CHECK(problem.find("holistic_landmarker.task") != std::string::npos);
@@ -521,6 +564,411 @@ static void test_speed()
 	std::sort(ms.begin(), ms.end());
 	std::printf("unit_body: a look following a body (its hands looked for): %.1f ms (median of 8)\n",
 		    ms[ms.size() / 2]);
+}
+
+// --- Hands found on their own -----------------------------------------
+
+// MediaPipe's SSD anchors, the palm finder's answers read as MediaPipe
+// reads them, and its hand square from a palm.
+static void test_palm_steps()
+{
+	// The body finder's 2254 and the palm finder's 2016, in MediaPipe's order.
+	const std::vector<float> body = ssd_anchors(224, {8, 16, 32, 32, 32});
+	const std::vector<float> palm = ssd_anchors(192, {8, 16, 16, 16});
+	CHECK(body.size() == 2254 * 2 && palm.size() == 2016 * 2);
+	CHECK(near(palm[0], 0.5 / 24, 1e-6) && near(palm[1], 0.5 / 24, 1e-6) && palm[2] == palm[0]);
+	// Stride 8: 24 x 24 spots, 2 each; then stride 16: 12 x 12, 6 each.
+	CHECK(near(palm[2 * 2 * 24], 0.5 / 24, 1e-6) && near(palm[2 * 2 * 24 + 1], 1.5 / 24, 1e-6));
+	CHECK(near(palm[2 * 1152], 0.5 / 12, 1e-6) && near(palm[2 * 1152 + 12], 1.5 / 12, 1e-6));
+	CHECK(near(palm.back(), 11.5 / 12, 1e-6));
+
+	// Three finds: two overlapping (merged, weighted by how sure), one not
+	// sure enough. A 640 x 480 picture: the square round it is 640 across,
+	// 80 above and below it.
+	std::vector<float> boxes(2016 * 18, 0), scores(2016, -10);
+	auto put = [&](int i, float cx, float cy, float size, float score) {
+		const float ax = palm[i * 2], ay = palm[i * 2 + 1];
+		float *b = &boxes[i * 18];
+		b[0] = (cx - ax) * 192;
+		b[1] = (cy - ay) * 192;
+		b[2] = b[3] = size * 192;
+		for (int k = 0; k < 7; k++) {
+			b[4 + k * 2] = (cx - ax) * 192;
+			b[5 + k * 2] = (cy - ay + (k == 0 ? 0.05f : k == 2 ? -0.05f : 0)) * 192;
+		}
+		scores[i] = std::log(score / (1 - score));
+	};
+	put(300, 0.5f, 0.5f, 0.1f, 0.9f);
+	put(301, 0.52f, 0.5f, 0.1f, 0.6f);  // overlaps the first: merged into it
+	put(1500, 0.2f, 0.3f, 0.08f, 0.4f); // not sure enough
+	put(1600, 0.8f, 0.6f, 0.05f, 0.7f); // on its own
+	const std::vector<BodyTracker::Palm> found = read_palms(boxes.data(), scores.data(), palm, 192, 640, 480);
+	CHECK(found.size() == 2);
+	if (found.size() == 2) {
+		const BodyTracker::Palm &a = found[0], &b = found[1];
+		CHECK(near(a.score, 0.9, 1e-5) && near(b.score, 0.7, 1e-5));
+		// (0.5 * 0.9 + 0.52 * 0.6) / 1.5 = 0.508 of 640 across; 0.5 of it
+		// down, less the 80 above the picture.
+		CHECK(near(a.x + a.w / 2, 0.508 * 640, 0.01) && near(a.y + a.h / 2, 0.5 * 640 - 80, 0.01));
+		CHECK(near(a.w, 64, 0.01) && near(a.h, 64, 0.01));
+		CHECK(near(a.keys[0], 0.508 * 640, 0.01) && near(a.keys[1], 0.55 * 640 - 80, 0.01));
+		CHECK(near(b.x + b.w / 2, 0.8 * 640, 0.01) && near(b.y + b.h / 2, 0.6 * 640 - 80, 0.01));
+	}
+
+	// The hand square: upright (wrist below the middle knuckle), 2.6 times
+	// the palm, moved half the palm towards the fingers.
+	BodyTracker::Palm up;
+	up.x = 100, up.y = 100, up.w = 40, up.h = 40;
+	up.keys[0] = 120, up.keys[1] = 135; // wrist
+	up.keys[4] = 120, up.keys[5] = 105; // middle knuckle
+	float sq[5];
+	palm_square(up, sq);
+	CHECK(near(sq[0], 120, 1e-3) && near(sq[1], 100, 1e-3) && near(sq[2], 104, 1e-3) && near(sq[3], 104, 1e-3));
+	CHECK(near(sq[4], 0, 1e-5));
+	// Pointing right (fingers to the picture's right): turned a quarter,
+	// moved right.
+	BodyTracker::Palm right = up;
+	right.keys[0] = 105, right.keys[1] = 120;
+	right.keys[4] = 135, right.keys[5] = 120;
+	palm_square(right, sq);
+	CHECK(near(sq[4], PI / 2, 1e-5) && near(sq[0], 140, 1e-3) && near(sq[1], 120, 1e-3));
+}
+
+// The hand points found against MediaPipe's: the most and the average
+// distance (pixels), and the hand's size (its points' box, the longer side).
+struct HandGap {
+	double most = 1e9, average = 1e9, size = 0;
+};
+
+static HandGap hand_gap(const HandSeen &h, const json &theirs)
+{
+	HandGap g;
+	if (!h.found || theirs["points"].size() != HAND_POINTS)
+		return g;
+	float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+	g.most = g.average = 0;
+	for (int i = 0; i < HAND_POINTS; i++) {
+		const double x = theirs["points"][i][0].get<double>(), y = theirs["points"][i][1].get<double>();
+		const double d = std::hypot(h.points[i].x - x, h.points[i].y - y);
+		g.most = std::max(g.most, d);
+		g.average += d / HAND_POINTS;
+		x0 = std::min(x0, (float)x), y0 = std::min(y0, (float)y);
+		x1 = std::max(x1, (float)x), y1 = std::max(y1, (float)y);
+	}
+	g.size = std::max(x1 - x0, y1 - y0);
+	return g;
+}
+
+// Which of ours is MediaPipe's hand: the side whose wrist is nearest.
+static int side_of(const Body &b, const json &theirs)
+{
+	int best = -1;
+	double near_best = 1e9;
+	for (int s = 0; s < 2; s++) {
+		if (!b.hands[s].found)
+			continue;
+		const double d = std::hypot(b.hands[s].points[0].x - theirs["points"][0][0].get<double>(),
+					    b.hands[s].points[0].y - theirs["points"][0][1].get<double>());
+		if (d < near_best)
+			near_best = d, best = s;
+	}
+	return best;
+}
+
+// Hands with no body in the picture, found by the palm finder: the same
+// hands MediaPipe's Hand Landmarker finds, each its own side by the hand
+// model's own left or right. Followed from their own points, look after
+// look, they're where MediaPipe's are to a pixel or so. (On a hand's very
+// first look, from the palm finder's square, MediaPipe's points here are a
+// few pixels off ours - up to about a tenth of the hand - though each of
+// its steps is as body.cpp has it: its runtime's numbers, not ours. A
+// hand followed from its second look on is the same.) No hands where it
+// finds none - the palm finder on, a body in the picture.
+static void test_found_on_their_own()
+{
+	BodyTracker t;
+	if (!load(t, false, true))
+		return;
+	CHECK(t.has_palm());
+	t.set_body_every(1.0f / 15);
+	const Picture flipped = mirrored(two_hands());
+	const struct {
+		const char *name;
+		const Picture &picture;
+	} pictures[] = {{"thumb_up", thumb_up()}, {"hands", two_hands()}, {"hands_mirrored", flipped}};
+	for (const auto &pc : pictures) {
+		const json &w = expected()["hands"][pc.name];
+		CHECK(pc.picture.w == w["w"].get<int>() && pc.picture.h == w["h"].get<int>());
+		t.forget();
+		const Held f = frame_of(pc.picture);
+		const Body &b = t.look(f.frame, 0);
+		CHECK(!b.found && b.palm);
+		const int count = (int)b.hands[0].found + (int)b.hands[1].found;
+		CHECK(count == (int)w["first"].size());
+		for (const json &theirs : w["first"]) {
+			const int s = side_of(b, theirs);
+			CHECK(s >= 0);
+			if (s < 0)
+				continue;
+			const HandSeen &h = b.hands[s];
+			const HandGap g = hand_gap(h, theirs);
+			std::printf(
+				"unit_body: %s, first look: a hand %.1f px from MediaPipe's at most (%.1f on average; "
+				"the hand %.0f px), %.2f sure it's a right hand (MediaPipe %.2f)\n",
+				pc.name, g.most, g.average, g.size, h.handedness, theirs["right"].get<double>());
+			CHECK(h.from == HandFrom::Palm && h.gate == HandGate::Ok && h.presence >= 0.5f);
+			CHECK((h.handedness > 0.5f) == (theirs["right"].get<double>() > 0.5));
+			CHECK(g.average < 0.05 * g.size && g.most < 0.12 * g.size);
+		}
+		// One hand: its own side. Two: one each side, the surer right
+		// hand the right.
+		if (count == 1)
+			CHECK(b.hands[1].found == (b.hands[1].handedness > 0.5f || !b.hands[0].found));
+		if (count == 2)
+			CHECK(b.hands[1].handedness >= b.hands[0].handedness);
+		// Looks running (30 a second, smoothing off): each followed.
+		const int looks = w["looks"].get<int>();
+		const double step = w["ms"].get<double>() / 1000;
+		const Body *last = &b;
+		int fresh = 1, palm_runs = 1;
+		for (int i = 1; i < looks; i++) {
+			last = &t.look(f.frame, i * step);
+			fresh += last->fresh;
+			palm_runs += last->palm;
+		}
+		// The body model every other look; the palm finder not again (no
+		// hand lost, under half a second).
+		CHECK(fresh == 3 && palm_runs == 1);
+		CHECK((int)last->hands[0].found + (int)last->hands[1].found == (int)w["followed"].size());
+		for (const json &theirs : w["followed"]) {
+			const int s = side_of(*last, theirs);
+			CHECK(s >= 0);
+			if (s < 0)
+				continue;
+			const HandGap g = hand_gap(last->hands[s], theirs);
+			std::printf("unit_body: %s, followed %d looks: a hand %.2f px from MediaPipe's at most "
+				    "(%.2f on average)\n",
+				    pc.name, looks, g.most, g.average);
+			CHECK(last->hands[s].tracked && last->hands[s].from == HandFrom::Followed);
+			CHECK(g.most < 2.5 && g.average < 1);
+		}
+	}
+	// Mirrored, the hands change sides.
+	{
+		t.forget();
+		const Held a = frame_of(two_hands()), m = frame_of(flipped);
+		const Body ba = t.look(a.frame, 0);
+		t.forget();
+		const Body &bm = t.look(m.frame, 0);
+		CHECK(ba.hands[1].found && bm.hands[0].found);
+		if (ba.hands[1].found && bm.hands[0].found)
+			// (Google's picture is of two right hands: mirrored, two left ones.)
+			for (int s = 0; s < 2; s++) {
+				const float x = two_hands().w - 1 - ba.hands[s].points[0].x;
+				CHECK(near(bm.hands[0].points[0].x, x, 3) || near(bm.hands[1].points[0].x, x, 3));
+				CHECK(ba.hands[s].handedness > 0.5f && bm.hands[s].handedness < 0.5f);
+			}
+	}
+	// No hands where MediaPipe finds none: a body (the hands looked for at
+	// its wrists too) and the palm finder on.
+	for (const char *name : {"astronaut", "camera"}) {
+		CHECK(expected()["hands"][name]["first"].empty());
+		t.forget();
+		const Held f = frame_of(std::string(name) == "camera" ? camera() : astronaut());
+		for (int i = 0; i < 4; i++) {
+			const Body &b = t.look(f.frame, i / 30.0);
+			CHECK(b.found && !b.hands[0].found && !b.hands[1].found);
+		}
+	}
+	// How lit a hand is: thumb_up's is a lit hand on a light wall.
+	t.forget();
+	const Held f = frame_of(thumb_up());
+	const Body &b = t.look(f.frame, 0);
+	const HandSeen &h = b.hands[1];
+	CHECK(h.found && h.light > 0.25f && h.light < 0.8f && h.around > 0.4f);
+	std::printf("unit_body: thumb_up: the hand %.2f lit, round it %.2f\n", h.light, h.around);
+}
+
+// Light mode: the lighter hand model finds and follows the same hands.
+static void test_found_light()
+{
+	BodyTracker t;
+	if (!load(t, false, true))
+		return;
+	t.set_light(true);
+	const Held f = frame_of(two_hands());
+	for (int i = 0; i < 4; i++) {
+		const Body &b = t.look(f.frame, i / 15.0);
+		CHECK(b.hands[0].found && b.hands[1].found);
+	}
+}
+
+// The body model at most every set_body_every (a little early is fine);
+// the hands every look. Between, the body is the last look's, and why a
+// hand wasn't found at a wrist stays as that look had it. Hands off, the
+// hands between are the last look's too.
+static void test_body_less_often()
+{
+	BodyTracker t;
+	if (!load(t, false, true))
+		return;
+	t.set_body_every(1.0f / 15);
+	const Held f = frame_of(camera());
+	const Body first = t.look(f.frame, 10);
+	CHECK(first.found && first.fresh && first.searched && first.palm);
+	const Body &second = t.look(f.frame, 10 + 1.0 / 30);
+	CHECK(second.found && !second.fresh && !second.palm);
+	for (int i = 0; i < BODY_POINTS; i++)
+		CHECK(second.points[i].x == first.points[i].x && second.points[i].y == first.points[i].y);
+	for (int s = 0; s < 2; s++)
+		CHECK(second.hands[s].gate == first.hands[s].gate);
+	CHECK(t.look(f.frame, 10 + 2.0 / 30).fresh);
+	// The clock going back: a body look straight away.
+	CHECK(t.look(f.frame, 5).fresh);
+	// Every look (0).
+	t.set_body_every(0);
+	CHECK(t.look(f.frame, 5 + 1.0 / 30).fresh && t.look(f.frame, 5 + 2.0 / 30).fresh);
+	// The palm finder twice a second while a hand isn't followed (here, a
+	// blank wall: no body, no hands).
+	t.set_body_every(1.0f / 15);
+	Picture wall = camera();
+	std::fill(wall.rgb.begin(), wall.rgb.end(), (uint8_t)150);
+	const Held blank = frame_of(wall);
+	int palm_runs = 0;
+	for (int i = 0; i < 30; i++)
+		palm_runs += t.look(blank.frame, 6 + i / 30.0).palm;
+	CHECK(palm_runs == 2);
+	// Hands off: no palm finder, no following.
+	t.set_hands(false);
+	t.forget();
+	const Held two = frame_of(two_hands());
+	const Body &off = t.look(two.frame, 0);
+	CHECK(!off.palm && !off.hands[0].found && !off.hands[1].found);
+}
+
+// Your back to the camera (the body model's left and right swapped): your
+// left shoulder on the picture's left, well past side-on. Swapped back -
+// each pair of points, in the picture and in metres, and how likely each
+// is in sight. Facing the camera, or side-on, it's left as it is.
+static void test_turned_round()
+{
+	Point p[BODY_POINTS], w[BODY_POINTS];
+	float seen[BODY_POINTS];
+	auto fill_body = [&](float left_x, float right_x) {
+		for (int i = 0; i < BODY_POINTS; i++) {
+			p[i] = {320, 240, 0};
+			w[i] = {0, 0, 0};
+			seen[i] = 0.9f;
+		}
+		p[BODY_LEFT_SHOULDER] = {left_x, 300, 1};
+		p[BODY_RIGHT_SHOULDER] = {right_x, 300, 2};
+		w[BODY_LEFT_SHOULDER] = {0.2f, -0.4f, 0};
+		w[BODY_RIGHT_SHOULDER] = {-0.2f, -0.4f, 0};
+		p[BODY_LEFT_WRIST] = {left_x + 40, 200, 0};
+		seen[BODY_LEFT_WRIST] = 0.3f;
+		seen[BODY_RIGHT_WRIST] = 0.8f;
+	};
+	fill_body(400, 240); // facing the camera: your left on the picture's right
+	CHECK(!turn_back_round(p, w, seen));
+	CHECK(p[BODY_LEFT_SHOULDER].x == 400);
+	fill_body(318, 330); // side-on, a little past (your head says your shoulders are 72 across)
+	CHECK(!turn_back_round(p, w, seen));
+	fill_body(240, 400); // turned round
+	CHECK(turn_back_round(p, w, seen));
+	CHECK(p[BODY_LEFT_SHOULDER].x == 400 && p[BODY_RIGHT_SHOULDER].x == 240);
+	CHECK(p[BODY_LEFT_SHOULDER].z == 2 && p[BODY_RIGHT_SHOULDER].z == 1);
+	CHECK(w[BODY_LEFT_SHOULDER].x == -0.2f && w[BODY_RIGHT_SHOULDER].x == 0.2f);
+	CHECK(p[BODY_RIGHT_WRIST].x == 280 && seen[BODY_RIGHT_WRIST] == 0.3f && seen[BODY_LEFT_WRIST] == 0.8f);
+	// Shoulders it isn't sure of: left as they are.
+	fill_body(240, 400);
+	seen[BODY_LEFT_SHOULDER] = 0.2f;
+	CHECK(!turn_back_round(p, w, seen));
+}
+
+// A body facing the camera (640 x 480, 400 pixels a metre): shoulders 160
+// apart, its left arm (on the picture's right) hanging down.
+static Body arm_body()
+{
+	Body b;
+	b.found = true;
+	b.w = 640, b.h = 480;
+	auto put = [&](int i, float x, float y, float z = 0) {
+		b.points[i] = {320 + x * 400, 200 + y * 400, 0};
+		b.world[i] = {x, y, z};
+		b.seen[i] = 0.95f;
+	};
+	put(BODY_NOSE, 0, -0.25f);
+	put(BODY_LEFT_SHOULDER, 0.2f, 0);
+	put(BODY_RIGHT_SHOULDER, -0.2f, 0);
+	put(BODY_LEFT_ELBOW, 0.28f, 0.27f);
+	put(BODY_LEFT_WRIST, 0.3f, 0.52f);
+	put(BODY_RIGHT_ELBOW, -0.28f, 0.27f);
+	put(BODY_RIGHT_WRIST, -0.3f, 0.5f);
+	for (int i : {BODY_LEFT_PINKY, BODY_LEFT_INDEX, BODY_LEFT_THUMB})
+		put(i, 0.3f, 0.55f);
+	return b;
+}
+
+static void put_hand_at(Body &b, int side, float x, float y)
+{
+	HandSeen &h = b.hands[side];
+	h.found = true;
+	h.presence = 0.97f;
+	for (int i = 0; i < HAND_POINTS; i++)
+		h.points[i] = {x, y - (i ? 40.0f : 0.0f), 0}; // the palm 40 pixels long, fingers up
+}
+
+// Your arm to your hand: the wrist to a hand found away from the body
+// model's, its elbow worked out from your shoulder - the arm as long as it
+// was, bent the way it was; a hand at the wrist only nudges it; a hand out
+// of the arm's reach moves nothing.
+static void test_arm_to_hand()
+{
+	auto length3 = [](Point a, Point b) {
+		return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z));
+	};
+	// Raised by your face: the body model had it hanging down.
+	Body b = arm_body();
+	const Body was = b;
+	put_hand_at(b, 0, 320 + 0.25f * 400, 200 - 0.2f * 400);
+	arm_to_hand(b, 0);
+	const Point &s = b.world[BODY_LEFT_SHOULDER], &e = b.world[BODY_LEFT_ELBOW], &wr = b.world[BODY_LEFT_WRIST];
+	CHECK(near(b.points[BODY_LEFT_WRIST].x, 420, 1e-3) && near(b.points[BODY_LEFT_WRIST].y, 120, 1e-3));
+	CHECK(near(wr.x, 0.25, 1e-4) && near(wr.y, -0.2, 1e-4));
+	CHECK(near(b.points[BODY_LEFT_INDEX].y - b.points[BODY_LEFT_WRIST].y, 12, 1e-3)); // its hand points with it
+	const float upper = length3(was.world[BODY_LEFT_SHOULDER], was.world[BODY_LEFT_ELBOW]);
+	const float fore = length3(was.world[BODY_LEFT_ELBOW], was.world[BODY_LEFT_WRIST]);
+	CHECK(near(length3(s, e), upper, 1e-3) && near(length3(e, wr), fore, 1e-3));
+	// Bent out to the side, as the body model's elbow was; in the picture too.
+	CHECK(e.x > wr.x && e.y > wr.y);
+	CHECK(near(b.points[BODY_LEFT_ELBOW].x, 320 + e.x * 400, 0.5) &&
+	      near(b.points[BODY_LEFT_ELBOW].y, 200 + e.y * 400, 0.5));
+	CHECK(b.seen[BODY_LEFT_WRIST] >= 0.95f);
+	// The other arm: untouched.
+	CHECK(b.world[BODY_RIGHT_ELBOW].x == was.world[BODY_RIGHT_ELBOW].x &&
+	      b.points[BODY_RIGHT_WRIST].x == was.points[BODY_RIGHT_WRIST].x);
+	// A hand at the wrist (less than its palm away): the wrist nudged to
+	// it, its elbow as it was.
+	Body at = arm_body();
+	put_hand_at(at, 0, was.points[BODY_LEFT_WRIST].x + 10, was.points[BODY_LEFT_WRIST].y);
+	arm_to_hand(at, 0);
+	CHECK(near(at.points[BODY_LEFT_WRIST].x, was.points[BODY_LEFT_WRIST].x + 10, 1e-3));
+	CHECK(near(at.world[BODY_LEFT_WRIST].x, was.world[BODY_LEFT_WRIST].x + 10.0f / 400, 1e-5));
+	CHECK(at.world[BODY_LEFT_ELBOW].x == was.world[BODY_LEFT_ELBOW].x &&
+	      at.points[BODY_LEFT_ELBOW].y == was.points[BODY_LEFT_ELBOW].y);
+	// Out of the arm's reach (another person's hand): nothing moves.
+	Body far = arm_body();
+	put_hand_at(far, 0, 639, 470);
+	far.points[BODY_LEFT_SHOULDER].x = 100; // ...this far from your shoulder
+	const Body far_was = far;
+	put_hand_at(far, 0, 639, 470);
+	arm_to_hand(far, 0);
+	CHECK(far.points[BODY_LEFT_WRIST].x == far_was.points[BODY_LEFT_WRIST].x &&
+	      far.world[BODY_LEFT_ELBOW].y == far_was.world[BODY_LEFT_ELBOW].y);
+	// No body, or no hand: nothing.
+	Body none = arm_body();
+	arm_to_hand(none, 0);
+	CHECK(none.points[BODY_LEFT_WRIST].x == was.points[BODY_LEFT_WRIST].x);
 }
 
 // --- Fingers --------------------------------------------------------------
@@ -1338,6 +1786,12 @@ int main()
 	test_pixel_layouts();
 	test_follows_and_loses();
 	test_hand_gates();
+	test_palm_steps();
+	test_found_on_their_own();
+	test_found_light();
+	test_body_less_often();
+	test_turned_round();
+	test_arm_to_hand();
 	test_without_models();
 	test_finger_bends();
 	test_arm_directions();

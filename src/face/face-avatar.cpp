@@ -66,8 +66,12 @@ namespace {
 // How often it looks for your face at most, in seconds ("Easy on my PC":
 // half as often) - at each new picture the camera sends, up to that.
 constexpr float LOOK_EVERY = 1.0f / 30, EASY_LOOK_EVERY = 1.0f / 15;
-// ...and for your hands and arms (light mode: less often, and a lighter
-// hand model). The character eases between looks (ArmSolver::EASE).
+// ...and for your hands: up to as often as your face (each followed from
+// where it was, so they keep up with quick moves); your body - where your
+// shoulders and elbows are - less often (light mode: both less often, and
+// a lighter hand model). Arms only (fingers not followed): the body's.
+// The character eases between looks (ArmSolver::EASE).
+constexpr float HANDS_EVERY = 1.0f / 30, LIGHT_HANDS_EVERY = 1.0f / 15;
 constexpr float ARMS_EVERY = 1.0f / 15, LIGHT_ARMS_EVERY = 1.0f / 10;
 // Not drawn for this long (not shown): what it saw last is too old.
 constexpr float STALE = 0.5f;
@@ -643,10 +647,15 @@ private:
 // Your body and hands (body.hpp), on a thread of their own as your face
 // is. Its models load the first time "Follow my hands and arms" is on;
 // while it's off nothing goes to it. OBS hands it a copy of the picture
-// the face tracker gets, at most every ARMS_EVERY (light: LIGHT_ARMS_EVERY).
+// the face tracker gets, at most every HANDS_EVERY (light:
+// LIGHT_HANDS_EVERY; arms only, ARMS_EVERY and LIGHT_ARMS_EVERY); the body
+// model runs every ARMS_EVERY (light: LIGHT_ARMS_EVERY) of them.
 class BodyWorker {
 public:
-	BodyWorker(std::string task, std::string lite) : task_(std::move(task)), lite_(std::move(lite))
+	BodyWorker(std::string task, std::string lite, std::string palm)
+		: task_(std::move(task)),
+		  lite_(std::move(lite)),
+		  palm_(std::move(palm))
 	{
 		thread_ = std::thread([this] { run(); });
 	}
@@ -706,12 +715,24 @@ public:
 		wake_.notify_one();
 	}
 
+	// For "Check my camera": how often each of your hands (your own left
+	// and right) was found over the last few seconds' looks (0 to 1), and
+	// how lit it was when it was (its palm, and just round it: 0 black to
+	// 1 white).
+	struct HandsSeen {
+		float found = 0;
+		bool lit = false;
+		float light = 0, around = 0;
+	};
+	static constexpr float FOUND_TIME = 1.5f, LIT_TIME = 0.5f;
 	struct State {
 		Body body;
 		uint64_t ns = 0, looks = 0;
-		bool on = false, loading = false, ready = false;
+		bool on = false, loading = false, ready = false, palm = false;
 		std::string problem;
-		float rate = 0, ms = 0;
+		float rate = 0, ms = 0; // looks a second (at your hands), and how long each takes
+		float body_rate = 0;    // ...of them, the body model's
+		HandsSeen hands[2];
 	};
 	void state(State &out) const
 	{
@@ -722,9 +743,13 @@ public:
 		out.on = on_;
 		out.loading = loading_;
 		out.ready = ready_;
+		out.palm = palm_ready_;
 		out.problem = problem_;
 		out.rate = rate_;
 		out.ms = ms_;
+		out.body_rate = body_rate_;
+		out.hands[0] = hands_seen_[0];
+		out.hands[1] = hands_seen_[1];
 	}
 
 private:
@@ -734,8 +759,9 @@ private:
 		bool loaded = false;
 		std::vector<uint8_t> rgba;
 		uint64_t window_start = os_gettime_ns();
-		int window_looks = 0;
+		int window_looks = 0, window_body = 0;
 		double window_ms = 0;
+		uint64_t seen_ns = 0;
 		for (;;) {
 			bool load = false, look = false, forget = false, hands, light;
 			float smoothing;
@@ -767,11 +793,12 @@ private:
 			}
 			if (load) {
 				std::string problem;
-				loaded = tracker.load_files(task_, lite_, &problem);
+				loaded = tracker.load_files(task_, lite_, &problem, palm_);
 				if (!loaded)
 					obs_log(LOG_WARNING, "DireBot Face Avatar: %s", problem.c_str());
 				std::lock_guard<std::mutex> l(lock_);
 				ready_ = loaded;
+				palm_ready_ = tracker.has_palm();
 				problem_ = problem;
 				loading_ = false;
 			}
@@ -779,35 +806,60 @@ private:
 				tracker.forget();
 			tracker.set_hands(hands);
 			tracker.set_light(light);
+			tracker.set_body_every(hands ? (light ? LIGHT_ARMS_EVERY : ARMS_EVERY) : 0);
 			tracker.set_smoothing(smoothing);
 			look = look && loaded;
 			if (look) {
 				const Frame frame{rgba.data(), w, h, w * 4, false};
 				tracker.look(frame, (double)ns / 1e9);
 				window_looks++;
+				window_body += tracker.body().fresh;
 				window_ms += tracker.body().ms;
 			}
 			const uint64_t now = os_gettime_ns();
 			std::lock_guard<std::mutex> l(lock_);
+			if (forget) {
+				seen_ns = 0;
+				hands_seen_[0] = hands_seen_[1] = HandsSeen();
+			}
 			if (look) {
 				body_ = tracker.body();
 				body_ns_ = ns;
 				looks_++;
+				// How often each hand's found, and how lit, eased over the
+				// camera's time.
+				const float dt = seen_ns && ns > seen_ns ? std::min(1.0f, (float)((ns - seen_ns) / 1e9))
+									 : 0;
+				const float k = 1 - std::exp(-dt / FOUND_TIME), kl = 1 - std::exp(-dt / LIT_TIME);
+				for (int side = 0; side < 2; side++) {
+					const HandSeen &hand = body_.hands[side];
+					HandsSeen &hs = hands_seen_[side];
+					hs.found = seen_ns ? hs.found + ((hand.found ? 1.0f : 0.0f) - hs.found) * k
+							   : (hand.found ? 1.0f : 0.0f);
+					if (hand.found) {
+						const float a = hs.lit ? kl : 1;
+						hs.light += (hand.light - hs.light) * a;
+						hs.around += (hand.around - hs.around) * a;
+						hs.lit = true;
+					}
+				}
+				seen_ns = ns;
 			} else if (forget) {
 				body_ = Body();
 				looks_++;
 			}
 			if (now - window_start >= 2'000'000'000ULL) {
 				rate_ = window_looks * 1e9f / (float)(now - window_start);
+				body_rate_ = window_body * 1e9f / (float)(now - window_start);
 				ms_ = window_looks ? (float)(window_ms / window_looks) : 0;
 				window_start = now;
-				window_looks = 0;
+				window_looks = window_body = 0;
 				window_ms = 0;
 			}
 		}
 	}
 
-	const std::string task_, lite_;
+	const std::string task_, lite_, palm_;
 	mutable std::mutex lock_;
 	std::condition_variable wake_;
 	std::thread thread_;
@@ -819,9 +871,10 @@ private:
 	uint64_t in_ns_ = 0;
 	Body body_;
 	uint64_t body_ns_ = 0, looks_ = 0;
-	bool loading_ = false, ready_ = false;
+	bool loading_ = false, ready_ = false, palm_ready_ = false;
 	std::string problem_;
-	float rate_ = 0, ms_ = 0;
+	float rate_ = 0, ms_ = 0, body_rate_ = 0;
+	HandsSeen hands_seen_[2];
 };
 
 // Where the face models are: data/face, next to the add-on.
@@ -833,8 +886,9 @@ std::string models_path()
 	return out;
 }
 
-// ...and the body models (Google's holistic one, and a lighter hand
-// model for light mode - without it, light mode uses the full one).
+// ...and the body models (Google's holistic one; a lighter hand model for
+// light mode - without it, light mode uses the full one; and the palm
+// finder - without it, a hand is only looked for at your wrist).
 std::string data_file(const char *name, bool needed)
 {
 	char *path = obs_module_file(name);
@@ -905,6 +959,7 @@ struct FaceAvatar {
 	// Its size from the settings - or, worn on your head, the camera's.
 	std::atomic<uint32_t> width{1080}, height{1080};
 	std::atomic<uint32_t> cam_w{0}, cam_h{0};
+	std::atomic<float> cam_fps{0}; // the camera's new pictures a second (LookPace::rate)
 	// The pictures: loaded on the UI thread, drawn on the graphics one.
 	std::mutex pictures_lock;
 	PicturePtr body, body_left, body_right, own_face;
@@ -1271,6 +1326,13 @@ struct FaceAvatar {
 	bool arms_wanted_state = false;
 	const char *arms_why_state = "off";
 
+	// How often your hands and arms are looked at, at most (seconds).
+	float arms_every() const
+	{
+		return arms_hands ? (arms_light ? LIGHT_HANDS_EVERY : HANDS_EVERY)
+				  : (arms_light ? LIGHT_ARMS_EVERY : ARMS_EVERY);
+	}
+
 	explicit FaceAvatar(obs_source_t *source)
 		: self(source),
 		  weak_self(obs_source_get_weak_source(source)),
@@ -1282,7 +1344,8 @@ struct FaceAvatar {
 				 obs_queue_task(OBS_TASK_UI, save_rest_task, job, false);
 			 }),
 		  body_worker(data_file("face/holistic_landmarker.task", true),
-			      data_file("face/hand_landmark_lite.tflite", false))
+			      data_file("face/hand_landmark_lite.tflite", false),
+			      data_file("face/palm_detection_full.tflite", false))
 	{
 		skin_colour = lab_of(0.8f, 0.62f, 0.5f);
 		char *path = obs_module_file("effects/direbot-face.effect");
@@ -1520,7 +1583,9 @@ struct FaceAvatar {
 			uint32_t line = 0;
 			bool gave = false;
 			if (gs_stagesurface_map(stage, &data, &line)) {
-				if (pace.give(same_as_given(data, line))) {
+				const bool go = pace.give(same_as_given(data, line));
+				cam_fps = pace.rate();
+				if (go) {
 					const size_t row = (size_t)stage_w * 4;
 					given.resize(row * stage_h);
 					for (uint32_t y = 0; y < stage_h; y++)
@@ -1528,9 +1593,9 @@ struct FaceAvatar {
 					rgba.assign(given.begin(), given.end());
 					worker.give(rgba, (int)stage_w, (int)stage_h, staged_ns);
 					gave = true;
-					// Your hands and arms, less often (a little early is
-					// fine: the camera's pictures come unevenly).
-					const float every = arms_light ? LIGHT_ARMS_EVERY : ARMS_EVERY;
+					// Your hands and arms, maybe less often (a little
+					// early is fine: the camera's pictures come unevenly).
+					const float every = arms_every();
 					if (arms_wanted &&
 					    (staged_ns < body_given_ns || staged_ns - body_given_ns >= (uint64_t)(every * 0.9e9f))) {
 						body_worker.give(given, (int)stage_w, (int)stage_h, staged_ns);
@@ -4518,6 +4583,7 @@ struct FaceAvatar {
 						  {"room", r(lit.room, 100)}};
 			check["camera_width"] = cam_w.load();
 			check["camera_height"] = cam_h.load();
+			check["camera_fps"] = r(cam_fps.load(), 10);
 			answer["camera_check"] = check;
 		}
 		answer["style"] = drawn_style ? "drawn" : "real";
@@ -4692,7 +4758,10 @@ struct FaceAvatar {
 			  {"loading", bs.loading},
 			  {"ready", bs.ready},
 			  {"looks_per_second", r(bs.rate, 10)},
+			  {"most_per_second", r(1 / arms_every(), 10)},
+			  {"body_per_second", r(bs.body_rate, 10)},
 			  {"ms", r(bs.ms, 10)},
+			  {"palm_finder", bs.palm},
 			  {"found", b.found},
 			  {"following",
 			   {{"left_arm", yours(arms_seen_state.arm, 0)},
@@ -4704,6 +4773,19 @@ struct FaceAvatar {
 			  {"calibration", result}};
 		if (!bs.problem.empty())
 			a["problem"] = bs.problem;
+		// How often each of your hands was found over the last few seconds,
+		// and how lit it was when it was.
+		json hands_seen = json::object();
+		for (int you = 0; you < 2; you++) {
+			const BodyWorker::HandsSeen &hs = bs.hands[you];
+			json h = {{"found", r(hs.found, 100)}};
+			if (hs.lit) {
+				h["light"] = r(hs.light, 100);
+				h["around"] = r(hs.around, 100);
+			}
+			hands_seen[you ? "right" : "left"] = h;
+		}
+		a["hands_seen"] = hands_seen;
 		// What of you is in the picture: a point counts if the body model
 		// thinks it's in sight and it's inside the picture.
 		json framing = {{"found", b.found}};
@@ -4721,6 +4803,7 @@ struct FaceAvatar {
 			framing["wrists"] = both(BODY_LEFT_WRIST, BODY_RIGHT_WRIST);
 			framing["hips"] = both(BODY_LEFT_HIP, BODY_RIGHT_HIP);
 			framing["hands"] = (int)b.hands[0].found + (int)b.hands[1].found;
+			framing["turned"] = b.turned;
 			// Your shoulders' width and their middle's height (shares of
 			// the picture): too close, too far, too low.
 			const Point &sl = b.points[BODY_LEFT_SHOULDER], &sr = b.points[BODY_RIGHT_SHOULDER];

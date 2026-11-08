@@ -87,6 +87,8 @@ target_sources(
 # 0.8.0: its arms, hands and fingers follow yours - Google's MediaPipe
 # body and hand models (data/face) on the same engine (body.cpp), the
 # arm and finger maths after Kalidokit's (arms.cpp).
+# 0.9.0: your hands found on their own, as MediaPipe's Hand Landmarker
+# finds them - Google's palm finder (data/face) on the same engine.
 target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE

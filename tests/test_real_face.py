@@ -456,6 +456,10 @@ def test_it_looks_at_each_new_picture(run):
         s = quick()
         fps = send(c, "GetStats")["activeFps"]
         assert max(5.0, 0.8 * min(fps, 30)) <= s["looks_per_second"] <= 31, (s, fps)
+        # The camera check's count of new pictures a second (0.9.0): one
+        # each frame OBS draws.
+        cam = s["camera_check"]["camera_fps"]
+        assert 0.8 * min(fps, 60) <= cam <= fps + 2, (cam, fps)
         # You move: it sees where you went within a few frames (two to read
         # the picture back and look, one to pick it up; a frame is up to
         # 1/30 s here, longer on a busy machine), not a look or two behind.
@@ -1471,6 +1475,8 @@ def test_alive_when_still_tuning_and_camera_check(run):
         face_area = box["w"] * cw * box["h"] * ch
         room = 96 / 255 * (W * H - face_area) / (cw * ch - face_area)
         assert 0.15 < light["face"] and abs(light["room"] - room) < 0.04, (light, room)
+        # A photo sends no new pictures (0.9.0: the camera's own count).
+        assert check["camera_fps"] < 1, check
 
         # Gone: it holds your look a moment, then eases into its idle.
         send(c, "SetSceneItemEnabled", {"sceneName": "Alive camera", "sceneItemId": photo,
@@ -2303,7 +2309,9 @@ def test_hands_and_arms_follow_you(run):
     check), and your body's points; calibrating with no hand up gives up
     and says so; forgetting it clears the source's own; a character that
     can't follow says why; light mode looks fewer times. A bone copying its
-    arm's turn (VRM's node constraints) goes round with it."""
+    arm's turn (VRM's node constraints) goes round with it. From 0.9.0: how
+    often it looks at most, the body model's share, the palm finder and
+    how often each hand was found."""
     camera = os.path.join(run.home, "astronaut.png")
     body_camera(camera)
     figure = os.path.join(run.home, "arms.vrm")
@@ -2368,6 +2376,12 @@ def test_hands_and_arms_follow_you(run):
         a = arms(points=True)
         assert a["on"] and a["can"] and a["why_not"] == "" and "problem" not in a, a
         assert 2 < a["looks_per_second"] <= 16 and a["ms"] > 0, a
+        # 0.9.0: hands up to 30 looks a second, the body model half that;
+        # the palm finder loaded. (A photo isn't a new picture each frame,
+        # so it's looked at less.)
+        assert a["most_per_second"] == 30 and a["palm_finder"] is True, a
+        assert 0 < a["body_per_second"] <= a["looks_per_second"] + 0.5, a
+        assert a["hands_seen"] == {"left": {"found": 0}, "right": {"found": 0}}, a
         # No hands in this photo (MediaPipe finds none either).
         assert not a["following"]["left_hand"] and not a["following"]["right_hand"], a
         f = a["framing"]
@@ -2442,11 +2456,15 @@ def test_hands_and_arms_follow_you(run):
         assert wait_for(lambda: arms()["hands"] is False, 5, 0.05), arms()
         nope = vendor(c, "FaceArms", {"source": "Arms", "do": "calibrate"})
         assert not nope["ok"] and "hands" in nope["error"], nope
-        # Light mode looks about 10 times a second.
+        # Light mode: hands at most 15 looks a second (a photo, fewer).
         change("Arms", {"arms_light": True, "arms_hands": True})
         assert wait_for(lambda: arms()["light"], 5, 0.1)
         time.sleep(3)
         assert arms()["looks_per_second"] <= 11, arms()
+        assert arms()["most_per_second"] == 15, arms()
+        # Arms only: the body model on each look, at most 15 a second.
+        change("Arms", {"arms_light": False, "arms_hands": False})
+        assert wait_for(lambda: arms()["most_per_second"] == 15 and not arms()["light"], 5, 0.1), arms()
 
         # Off: its arms hang by its sides again.
         change("Arms", {"follow_arms": False})

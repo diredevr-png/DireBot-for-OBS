@@ -13,16 +13,25 @@ body tracker (src/face/body.cpp) against:
   - "models": each model on its own through LiteRT (Google's own TFLite
     runtime) on a piece of astronaut.ppm, for our engine to match number
     for number: the body finder, the body model, the hand-square model,
-    the hand model and the lighter hand model (data/face).
+    the hand model, the lighter hand model and the palm finder (data/face).
+  - "hands": MediaPipe's Hand Landmarker (its palm finder, then its hand
+    model; the same two models as data/face, put together as its .task) on
+    thumb_up.ppm, hands.ppm and hands.ppm mirrored: each hand's 21 points
+    and how sure it is it's a right hand, on a first look (IMAGE mode) and
+    after six looks running (VIDEO mode: each hand followed from its own
+    points from the second look) - and on astronaut.ppm and camera.pgm,
+    where it finds none.
 
 Test only - MediaPipe and LiteRT are never part of DireBot for OBS:
     pip install mediapipe ai-edge-litert
     python tools/body-expected.py
 
-The pictures (tests/data/body/README.md) have no hands MediaPipe finds:
-the hand steps are checked on the hand models' numbers here, and against
-MediaPipe on photos with hands by hand (tests/data/body/README.md).
+Holistic finds no hands on astronaut.ppm and camera.pgm: the hand steps
+from the body are checked on the hand models' numbers, and the hands
+found on their own (the palm finder, then the hand model) on Google's own
+pictures of hands, thumb_up.ppm and hands.ppm (tests/data/body/README.md).
 """
+import io
 import json
 import os
 import zipfile
@@ -37,6 +46,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TASK = os.path.join(ROOT, "data", "face", "holistic_landmarker.task")
 LITE = os.path.join(ROOT, "data", "face", "hand_landmark_lite.tflite")
+PALM = os.path.join(ROOT, "data", "face", "palm_detection_full.tflite")
 DATA = os.path.join(ROOT, "tests", "data", "body")
 
 
@@ -87,6 +97,47 @@ def following(px, looks=4, ms=67):
     return {"ms": ms, "looks": out}
 
 
+def hand_task():
+    """MediaPipe's Hand Landmarker's .task from data/face's own files: the
+    palm finder (the same model as the hand_detector.tflite in Google's
+    hand_landmarker.task) and the hand model from holistic_landmarker.task."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as z:
+        z.writestr("hand_detector.tflite", open(PALM, "rb").read())
+        z.writestr("hand_landmarks_detector.tflite",
+                   zipfile.ZipFile(TASK).read("hand_landmarks_detector.tflite"))
+    return out.getvalue()
+
+
+def hands(px, looks=6, ms=33):
+    """MediaPipe's Hand Landmarker (two hands at most) on a picture: a first
+    look, and `looks` looks running `ms` apart. Each hand: its 21 points
+    (picture pixels) and how sure the hand model is that it's a right hand
+    (its own number: MediaPipe calls a hand "Right" when it's over 0.5)."""
+    h, w = px.shape[:2]
+    image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(px))
+    task = hand_task()
+
+    def each(res):
+        out = []
+        for hd, lm in zip(res.handedness, res.hand_landmarks):
+            right = hd[0].score if hd[0].category_name == "Right" else 1 - hd[0].score
+            out.append({"right": r(right), "points": [[r(p.x * w), r(p.y * h)] for p in lm]})
+        return out
+    landmarker = vision.HandLandmarker.create_from_options(vision.HandLandmarkerOptions(
+        base_options=mpt.BaseOptions(model_asset_buffer=task), running_mode=vision.RunningMode.IMAGE,
+        num_hands=2))
+    first = each(landmarker.detect(image))
+    landmarker.close()
+    landmarker = vision.HandLandmarker.create_from_options(vision.HandLandmarkerOptions(
+        base_options=mpt.BaseOptions(model_asset_buffer=task), running_mode=vision.RunningMode.VIDEO,
+        num_hands=2))
+    for i in range(looks):
+        res = landmarker.detect_for_video(image, i * ms)
+    landmarker.close()
+    return {"w": w, "h": h, "first": first, "looks": looks, "ms": ms, "followed": each(res)}
+
+
 def run(model, inp):
     net = Interpreter(model_content=model)
     net.allocate_tensors()
@@ -127,22 +178,37 @@ def models(astronaut):
         sizes = [int(np.prod(s)) for s in shapes]
         out[key] = {"from": [150, 200], "size": 224, "sizes": sizes,
                     "outputs": [[r(v, 6) for v in o] for o in hand]}
+    # The palm finder: 192 x 192 from (160, 160), 0 to 1. Its 8 surest
+    # anchors: the score (before the sigmoid) and the 18 box numbers.
+    palm, shapes = run(open(PALM, "rb").read(), px[160:352, 160:352] / 255)
+    boxes, scores = (palm[0], palm[1]) if shapes[0][-1] == 18 else (palm[1], palm[0])
+    best = np.argsort(-scores)[:8]
+    out["palm"] = {"from": [160, 160], "size": 192,
+                   "best": [{"anchor": int(i), "score": r(scores[i]),
+                             "box": [r(v) for v in boxes[i * 18:(i + 1) * 18]]} for i in best]}
     return out
 
 
 def main():
     astronaut = read_pnm(os.path.join(DATA, "astronaut.ppm"))
     camera = read_pnm(os.path.join(DATA, "camera.pgm"))
+    thumb = read_pnm(os.path.join(DATA, "thumb_up.ppm"))
+    two = read_pnm(os.path.join(DATA, "hands.ppm"))
     result = {"pictures": {"astronaut": holistic(astronaut),
                            "mirrored": holistic(astronaut[:, ::-1].copy()),
                            "camera": holistic(camera)},
               "following": following(astronaut),
               "models": models(astronaut),
+              "hands": {"thumb_up": hands(thumb), "hands": hands(two),
+                        "hands_mirrored": hands(two[:, ::-1].copy()),
+                        "astronaut": hands(astronaut), "camera": hands(camera)},
               "mediapipe": mp.__version__}
     with open(os.path.join(DATA, "expected.json"), "w") as f:
         json.dump(result, f, separators=(",", ":"))
     for name, p in result["pictures"].items():
         print(name, "found" if p["found"] else "not found", "hands:", len(p["left_hand"]), len(p["right_hand"]))
+    for name, p in result["hands"].items():
+        print(name, "hands found by the palm finder:", len(p["first"]), "then", len(p["followed"]))
 
 
 if __name__ == "__main__":

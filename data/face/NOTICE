@@ -56,3 +56,20 @@ Model card: https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarke
 The file is Google's, unchanged, as downloaded from
 https://storage.googleapis.com/mediapipe-assets/hand_landmark_lite.tflite
 sha256 d7fde8ac11f8ce03f8663775bfc323f4fc9f2a38062b4f4efa142874ef5b2a48
+
+---
+
+palm_detection_full.tflite - Google MediaPipe Hands, the palm finder
+Copyright The MediaPipe Authors (Google LLC)
+Licensed under the Apache License, Version 2.0 (LICENSE in this folder).
+
+Finds hands anywhere in the picture (BlazePalm, full): the same model as
+the hand_detector.tflite in Google's hand_landmarker.task (its answers
+are the same to the last bit; only the file's notes differ). That
+task's hand model is the same as holistic_landmarker.task's (the same
+answers), so only its palm finder is added here.
+Model card: https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker
+
+The file is Google's, unchanged, as downloaded from
+https://storage.googleapis.com/mediapipe-assets/palm_detection_full.tflite
+sha256 1b14e9422c6ad006cde6581a46c8b90dd573c07ab7f3934b5589e7cea3f89a54

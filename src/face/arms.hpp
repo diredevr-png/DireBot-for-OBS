@@ -112,7 +112,7 @@ class ArmSolver {
 public:
 	// A found arm or hand comes back over BACK seconds; a lost one, after
 	// its hold, rests over FADE. Each frame eases towards the newest look
-	// over about EASE seconds (looks come 10 to 20 a second; OBS draws 60).
+	// over about EASE seconds (looks come 10 to 30 a second; OBS draws 60).
 	static constexpr float BACK = 0.25f, FADE = 0.6f, EASE = 0.06f;
 	// A hand (or arm) must be found this many looks running.
 	static constexpr int STREAK = 2;
