@@ -2076,6 +2076,20 @@ struct FaceAvatar {
 		return it == props3d.end() ? nullptr : it->second.get();
 	}
 
+	// How tall thing `n` thrown is drawn for its size across (react.hpp's
+	// Throw::tall): a 3D one's height over its longest side, as
+	// draw_overlay sizes it; a picture's height over its width (pictures_lock
+	// held).
+	float drawn_tall(int n)
+	{
+		if (Prop3D *prop = thrown_3d(n)) {
+			const V3 lo = prop->low(), hi = prop->high();
+			return (hi.y - lo.y) / std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 1e-6f});
+		}
+		const PicturePtr &pic = thrown_picture(n);
+		return loaded(pic) ? (float)pic->height() / std::max(1.0f, (float)pic->width()) : 1.0f;
+	}
+
 	// The 3D hand as react.hpp's Hand has it, round where its palm rests
 	// (the hand's own units: as big as a hand for a head HAND_HEAD tall),
 	// `side` the side it comes from as the world has it: its wrist bent
@@ -4193,6 +4207,10 @@ struct FaceAvatar {
 				}
 				if (!is_3d_file(its) && !loaded(throw_pics[t.picture]))
 					return no("That thing to throw has no picture - pick one in DireBot.");
+			}
+			{
+				std::lock_guard<std::mutex> l(pictures_lock);
+				t.tall = drawn_tall(t.picture);
 			}
 			t.side = num("side", 0);
 			t.strength = num("strength", 1);

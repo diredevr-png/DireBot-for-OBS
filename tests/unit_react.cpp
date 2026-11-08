@@ -1043,6 +1043,10 @@ static void test_sticks_and_bonks()
 		// A bonk: over its head (rising and tipping back), then down on
 		// top of it - its head nodded down and squished - and off to its
 		// side.
+		// It lands with its bottom on the top of its head (a fifth of it
+		// into the hair), not its middle - that hid its forehead and eyes.
+		ReactView roomy = view;
+		roomy.top = -2.5f;
 		React r;
 		Throw t;
 		t.picture = 2;
@@ -1050,15 +1054,17 @@ static void test_sticks_and_bonks()
 		t.side = 1;
 		CHECK(std::fabs(r.throw_at(t) - 0.5f) < 0.11f);
 		float t_now = 0, first_y = 0, highest = 10, tipped = 0, hit_y = 0, nod = 0, squish = 0, after_x = 0;
-		float x_drift = 0, start_x = 0;
+		float x_drift = 0, start_x = 0, flash_y = 0;
 		int hits = 0;
 		bool first = true, fine = true, same_size = true;
-		run(r, 1.6f, view, [&](const ReactOut &o) {
+		run(r, 1.6f, roomy, [&](const ReactOut &o) {
 			t_now += FRAME;
 			fine = fine && finite_out(o);
 			hits += o.hits;
-			if (o.hits)
+			if (o.hits) {
 				hit_y = o.flying.empty() ? 0 : o.flying[0].y;
+				flash_y = o.bursts.empty() ? 0 : o.bursts[0].y;
+			}
 			nod = std::min(nod, o.pitch);
 			squish = std::max(squish, o.squish);
 			if (o.flying.empty())
@@ -1083,12 +1089,36 @@ static void test_sticks_and_bonks()
 		CHECK(highest < first_y - 0.1f);
 		CHECK(tipped < -0.5f); // tipped back, away from its right
 		CHECK(x_drift < 1e-4f && same_size); // straight down, with room
-		CHECK(std::fabs(hit_y - (-0.7f + 0.08f)) < 0.05f);
+		const float half = 0.45f / 2;
+		CHECK(std::fabs(hit_y - (-0.7f - half * 0.6f)) < 1e-3f);
+		CHECK(std::fabs(flash_y - -0.7f) < 1e-3f); // the flash on the top of its head
 		CHECK(nod < -8);
 		CHECK(squish > 0.5f);
 		CHECK(after_x > 0.4f); // off to its right
-		run(r, 1.5f, view, [](const ReactOut &) {});
-		CHECK(!r.step(FRAME, view).busy);
+		run(r, 1.5f, roomy, [](const ReactOut &) {});
+		CHECK(!r.step(FRAME, roomy).busy);
+		// Twice as tall as it's wide (a bottle): higher, its bottom on
+		// its head all the same.
+		React b;
+		Throw bottle = t;
+		bottle.tall = 2;
+		b.throw_at(bottle);
+		float bottle_y = 0;
+		run(b, 0.6f, roomy, [&](const ReactOut &o) {
+			if (o.hits)
+				bottle_y = o.flying[0].y;
+		});
+		CHECK(std::fabs(bottle_y - (-0.7f - 2 * half * 0.6f)) < 1e-3f);
+		// Not as much room over its head: it comes down slantwise.
+		React s;
+		s.throw_at(t);
+		const float s_x = s.step(FRAME, view).flying[0].x;
+		float s_hit_x = s_x;
+		run(s, 0.6f, view, [&](const ReactOut &o) {
+			if (o.hits)
+				s_hit_x = o.flying[0].x;
+		});
+		CHECK(s_hit_x - s_x > 0.1f);
 		// No room above its head in the picture (its head up to the top
 		// edge): it comes in slantwise from its other side, never more
 		// than half of it out of the picture.

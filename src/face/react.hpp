@@ -101,6 +101,10 @@ struct Throw {
 	// down on top of it, rather than thrown from a side. Its head is
 	// knocked down and squished, and it bounces off to a side.
 	bool above = false;
+	// How tall it's drawn for `size` across: a picture's height over its
+	// width, a 3D thing's height over its longest side (a bonk lands
+	// with its bottom on the top of its head).
+	float tall = 1;
 };
 // The longest a thing stays stuck to it, and at most this many stuck at
 // once (one more and the one stuck longest falls away).
@@ -270,6 +274,9 @@ private:
 		// Its turn as it stuck, and the one it settles to.
 		float stuck_from = 0, stuck_angle = 0;
 		float vx = 0, vy = 0, x = 0, y = 0, size0 = 1, size = 1;
+		// Where it touches as it hits, for the flash (a bonk: the top of
+		// its head, under its bottom; else its middle).
+		float touch_y = 0;
 	};
 	struct Spring {
 		float value = 0, speed = 0;

@@ -330,7 +330,8 @@ stick (`stick`: seconds, up to 10) - where it hits, moving and tipping
 with its head, then sliding down and falling off; at most 12 stuck at once,
 the one stuck longest falling first - and come as a bonk (`from`:
 `above`): it shows up over its head, rises a little tipping back, and
-comes down on top of it, its head nodded down and squished. `count` (1-16)
+comes down on top of it - its bottom onto the top of its head, however
+tall its picture or model is - its head nodded down and squished. `count` (1-16)
 throws a barrage of it, one after another; `stop` makes what's stuck fall
 off.
 

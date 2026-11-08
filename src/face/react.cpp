@@ -44,8 +44,10 @@ constexpr float STICK_TILT = 0.3f, STICK_TURN = 0.15f;
 // A bonk: its wind-up (seconds; the rest of FLY_TIME it comes down), how
 // far it rises meanwhile (heads) and how far it tips back (radians).
 constexpr float BONK_WIND = 0.36f, BONK_RISE = 0.12f, BONK_TIP = 0.55f;
-// How far above its head a bonk comes down from (heads), with room.
-constexpr float BONK_HIGH = 0.9f;
+// How far above its head a bonk comes down from (heads), with room; and
+// how much of it (of its height) comes down into the top of its head -
+// hair and all - as it lands on it.
+constexpr float BONK_HIGH = 0.9f, BONK_SINK = 0.2f;
 // The flash where one hits.
 constexpr float FLASH_TIME = 0.32f;
 // The "ouch": shut fast, held, then opened slowly.
@@ -402,13 +404,20 @@ void React::launch(Item &it, const ReactView &view)
 		// thrown from where you watch) and comes down on the top of it -
 		// from as high as the picture has room for. It bounces off to
 		// `side`.
+		// Its bottom on the top of its head (a little into it): not its
+		// middle, which hid its forehead and eyes.
+		const float half = 0.5f * it.size0 * clampf(finite(t.tall) ? t.tall : 1, 0.05f, 4);
+		const float top = -clampf(finite(view.head_top) ? view.head_top : 0.6f, 0.2f, 3);
+		// (A head up to the picture's top edge: no higher than its
+		// wind-up allows, so at least half of it always shows.)
 		it.x1 = random(-0.12f, 0.12f);
-		it.y1 = -clampf(finite(view.head_top) ? view.head_top : 0.6f, 0.2f, 3) + 0.08f;
+		it.y1 = std::max(top - half * (1 - 2 * BONK_SINK), view.top + BONK_RISE);
+		it.touch_y = it.y1 + half * (1 - 2 * BONK_SINK);
 		// From up to BONK_HIGH over its head - all of it in the picture,
 		// wind-up and all. A head up to the picture's top edge (a
 		// character filling it) leaves less room: then it comes down
 		// slantwise from above its other side as well, as far again.
-		const float highest = view.top + it.size0 * 0.6f + BONK_RISE;
+		const float highest = view.top + half * 1.2f + BONK_RISE;
 		const float room = clampf(it.y1 - highest, 0, BONK_HIGH);
 		it.y0 = it.y1 - room;
 		it.x0 = it.x1 - it.side * (BONK_HIGH - room);
@@ -434,6 +443,7 @@ void React::launch(Item &it, const ReactView &view)
 	// ...to somewhere on its face, over an arc (flatter the harder).
 	it.x1 = random(-0.22f, 0.22f);
 	it.y1 = random(-0.22f, 0.12f);
+	it.touch_y = it.y1;
 	it.arc = random(0.35f, 0.75f) / (0.6f + 0.4f * t.strength);
 	// Spinning the way it flies.
 	it.spin = -it.side * random(5.0f, 10.0f);
@@ -482,7 +492,7 @@ void React::hit(Item &it, ReactOut &out)
 	// The flash, the "ouch" and its face.
 	Flash f;
 	f.x = it.x1;
-	f.y = it.y1;
+	f.y = it.touch_y;
 	f.at = time_;
 	f.size = it.size0 * 1.4f;
 	flashes_.push_back(f);
