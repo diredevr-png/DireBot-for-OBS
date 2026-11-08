@@ -220,14 +220,14 @@ def test_your_face_from_a_phone(obs):
         return vendor(c, "FaceGetState", {"source": "Phone"})
     phone = ifm = None
     try:
-        c.send("CreateScene", {"sceneName": "Phone"}, raw=True)
-        c.send("CreateInput", {"sceneName": "Phone", "inputName": "Phone",
+        c.send("CreateScene", {"sceneName": "Phone scene"}, raw=True)
+        c.send("CreateInput", {"sceneName": "Phone scene", "inputName": "Phone",
                                "inputKind": "direbot_face_avatar",
                                "inputSettings": {"character": body, "face_from": "phone",
                                                  "phone_app": "vtube_studio", "smoothing": 0,
                                                  "phone_address": "127.0.0.1:%d" % later}},
                raw=True)
-        c.send("SetCurrentProgramScene", {"sceneName": "Phone"}, raw=True)
+        c.send("SetCurrentProgramScene", {"sceneName": "Phone scene"}, raw=True)
         assert wait_for(lambda: st()["phone"]["listening"], 10, 0.2), st()["phone"]
         time.sleep(3)       # asked a few times, nobody there
         p = st()["phone"]
@@ -280,8 +280,10 @@ def test_moves_from_a_tracker_app(obs):
         assert wait_for(lambda: st()["vmc"]["listening"], 10, 0.2), st()["vmc"]
         app = PretendVmcApp(port)
         assert wait_for(lambda: st()["found"], 15, 0.2), (st()["vmc"], obs.log())
+        # (How many a second is counted over a second or so.)
+        assert wait_for(lambda: st()["vmc"]["per_second"] > 10, 5, 0.1), st()["vmc"]
         v = st()["vmc"]
-        assert v["problem"] == "" and v["from"] == "this PC" and v["per_second"] > 10, v
+        assert v["problem"] == "" and v["from"] == "this PC", v
         assert v["sends"]["perfect_sync"] and v["using"]["face"], v
         app.turns["Head"] = unity_turn([0, 1, 0], -30)
         assert wait_for(lambda: abs(st()["turn"]["yaw"] + 30) < 2, 10, 0.1), st()["turn"]
