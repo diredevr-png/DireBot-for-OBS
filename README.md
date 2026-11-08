@@ -404,7 +404,10 @@ and thread, opened while any face avatar has it on and closed when none
 does). It only ever notices that a key went down or came up and how many
 are held - never which one - so what you type (a password, a chat
 message) can't be told from what it keeps: counts, in memory only,
-never saved or logged. Elsewhere it reads nothing and says so.
+never saved or logged. Elsewhere it reads nothing and says so. Pads
+are XInput's: Xbox pads, and others through Steam Input or DS4Windows
+(up to four). A game running as administrator may keep its input from
+an OBS that isn't (Windows' UIPI).
 
 Which it uses (`game_device`): `auto` whichever you used last (a few
 presses or a moment's playing switches it, so a stray key doesn't),
