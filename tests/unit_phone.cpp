@@ -21,8 +21,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // camera's (Tracker::take), and the link talking to a pretend phone on
 // this machine - VTube Studio's way and iFacialMocap's.
 
-#include "face/phone.hpp"
-#include "face/tracker.hpp"
+#include "../src/face/phone.hpp"
+#include "../src/face/tracker.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
