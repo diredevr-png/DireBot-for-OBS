@@ -17,6 +17,7 @@ import json
 import math
 import os
 import shutil
+import socket
 import struct
 import threading
 import time
@@ -2669,6 +2670,225 @@ def test_hand_signs_send_direbot_an_event(run):
         for name in ("Signs", "Signs hidden", "Signs camera", "Hidden camera"):
             send(c, "RemoveInput", {"inputName": name})
     finally:
+        events.disconnect()
+        c.disconnect()
+
+
+# Apple's 52 face moves (ARKit), as VTube Studio's phone app names them.
+ARKIT = ["EyeBlinkLeft", "EyeLookDownLeft", "EyeLookInLeft", "EyeLookOutLeft", "EyeLookUpLeft",
+         "EyeSquintLeft", "EyeWideLeft", "EyeBlinkRight", "EyeLookDownRight", "EyeLookInRight",
+         "EyeLookOutRight", "EyeLookUpRight", "EyeSquintRight", "EyeWideRight", "JawForward",
+         "JawRight", "JawLeft", "JawOpen", "MouthClose", "MouthFunnel", "MouthPucker", "MouthLeft",
+         "MouthRight", "MouthSmileLeft", "MouthSmileRight", "MouthFrownLeft", "MouthFrownRight",
+         "MouthDimpleLeft", "MouthDimpleRight", "MouthStretchLeft", "MouthStretchRight",
+         "MouthRollLower", "MouthRollUpper", "MouthShrugLower", "MouthShrugUpper", "MouthPressLeft",
+         "MouthPressRight", "MouthLowerDownLeft", "MouthLowerDownRight", "MouthUpperUpLeft",
+         "MouthUpperUpRight", "BrowDownLeft", "BrowDownRight", "BrowInnerUp", "BrowOuterUpLeft",
+         "BrowOuterUpRight", "CheekPuff", "CheekSquintLeft", "CheekSquintRight", "NoseSneerLeft",
+         "NoseSneerRight", "TongueOut"]
+
+
+class PretendPhone:
+    """A phone app on this machine, about 60 looks a second. VTube Studio's
+    way (and MeowFace's): asked on its port, it sends to the ports asked for
+    for as long as asked. iFacialMocap's: a hello on its port, then lines
+    back to where the hello came from."""
+
+    def __init__(self, way="vtube_studio", port=0):
+        self.way = way
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", port))
+        self.sock.settimeout(1 / 60)
+        self.port = self.sock.getsockname()[1]
+        self.asked = []
+        self.found = True
+        self.sending = True
+        self.rotation = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self.shapes = {}
+        self.stopping = False
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def packet(self):
+        moves = {k: self.shapes.get(k, 0.0) for k in ARKIT}
+        r = self.rotation
+        if self.way == "ifacialmocap":
+            # Its newer lines: name&value (0 to 100), its head turned
+            # (degrees: x nodding, y turning, z tilting) and placed.
+            parts = ["%s&%d" % (k[0].lower() + k[1:], round(v * 100)) for k, v in moves.items()]
+            parts.append("=head#%.2f,%.2f,%.2f,0,0,-0.4" % (-r["y"], r["x"], -r["z"]))
+            return ("|".join(parts) + "|").encode()
+        return json.dumps({
+            "Timestamp": int(time.time() * 1000), "Hotkey": -1, "FaceFound": self.found,
+            "Rotation": r, "Position": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "EyeLeft": {"x": 0.0, "y": 0.0, "z": 0.0}, "EyeRight": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "BlendShapes": [{"k": k, "v": v} for k, v in moves.items()]}).encode()
+
+    def run(self):
+        to, until = [], 0.0
+        while not self.stopping:
+            try:
+                data, sender = self.sock.recvfrom(65536)
+                if self.way == "ifacialmocap":
+                    self.asked.append(data.decode())
+                    to, until = [sender], time.time() + 1e9
+                else:
+                    ask = json.loads(data)
+                    self.asked.append(ask)
+                    to = [(sender[0], p) for p in ask["ports"]]
+                    until = time.time() + float(ask["time"])
+            except (socket.timeout, ValueError):
+                pass
+            if self.sending and to and time.time() < until:
+                for where in to:
+                    self.sock.sendto(self.packet(), where)
+
+    def close(self):
+        self.stopping = True
+        self.thread.join(5)
+        self.sock.close()
+
+
+def test_your_face_from_a_phone(run):
+    """0.9.0: "Your face comes from: a phone app". The face avatar asks a
+    phone (here a pretend one on this machine) the way VTube Studio's app
+    and MeowFace want, and takes its looks as a camera's: the turn, the
+    moves (Apple's left and right swapped to ours), "Set" - even hidden,
+    as the phone sends whether it's shown or not - and a face move that
+    sets something off. No camera is needed, and it isn't worn on your head
+    (there's no camera picture to wear it on). Stopped, your face is lost;
+    a bad address says so; and iFacialMocap's way works too."""
+    body = os.path.join(run.home, "phone-character.png")
+    character_picture(body)
+    phone = PretendPhone()
+    rules = json.dumps([{"id": "wink", "what": "wink", "side": "either", "strength": 60}])
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+    got = []
+
+    def on_vendor_event(data):
+        if data.vendor_name == "direbot" and data.event_type == "FaceSign":
+            got.append(data.event_data)
+    events = obsws.EventClient(host="127.0.0.1", port=run.ws_port, password="",
+                               subs=obsws.Subs.VENDORS, timeout=5)
+    events.callback.register(on_vendor_event)
+
+    def st():
+        return vendor(c, "FaceGetState", {"source": "Phone avatar"})
+    try:
+        send(c, "CreateScene", {"sceneName": "Phone"})
+        send(c, "CreateInput", {"sceneName": "Phone", "inputName": "Phone avatar",
+                                "inputKind": "direbot_face_avatar",
+                                "inputSettings": {"character": body, "face_from": "phone",
+                                                  "phone_app": "meowface", "smoothing": 0,
+                                                  "phone_address": "127.0.0.1:%d" % phone.port,
+                                                  "hand_signs": True, "signs": rules, **STILL}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Phone"})
+        assert wait_for(lambda: st()["found"], 20, 0.1), st()
+        s = st()
+        p = s["phone"]
+        assert s["face_from"] == "phone" and s["camera"] == "", s
+        assert p["on"] and p["listening"] and p["way"] == "vtube_studio" and p["problem"] == "", p
+        assert p["phone"] == "127.0.0.1:%d" % phone.port and p["port"] > 0, p
+        assert p["found"] and p["shapes"] == 52 and p["others"] == 0 and p["unread"] == 0, p
+        assert 0 <= p["since"] < 0.5, p
+        # Asked VTube Studio's way, for 3 seconds at a time, about every
+        # second (it sends for as long as it's asked).
+        ask = phone.asked[0]
+        assert ask == {"messageType": "iOSTrackingDataRequest", "time": 3, "sentBy": "DireBot",
+                       "ports": [p["port"]]}, ask
+        time.sleep(3.2)
+        assert 3 <= len(phone.asked) <= 6, len(phone.asked)
+        p = st()["phone"]
+        assert 40 <= p["per_second"] <= 70 and p["packets"] > 150, p
+        # About 60 looks a second (each as a camera's picture would be).
+        assert 40 <= st()["looks_per_second"] <= 70, st()
+
+        # Its turn: VTube Studio's x is the other way round to ours.
+        phone.rotation = {"x": -30.0, "y": 10.0, "z": 0.0}
+        assert wait_for(lambda: abs(st()["turn"]["yaw"] - 30) < 2, 5, 0.05), st()["turn"]
+        s = st()
+        assert abs(s["turn"]["pitch"] - 10) < 2 and abs(s["turn"]["roll"]) < 2, s["turn"]
+        assert s["turned"] == 1 and s["shown"] > 0.5, s
+        check = s["camera_check"]
+        assert check["seen"] and abs(check["facing"]["yaw"] - 30) < 2, check
+        assert "light" not in check, check  # no picture to light
+        # Its moves: Apple's "left" eye is your right one.
+        phone.shapes = {"EyeBlinkLeft": 1.0, "JawOpen": 0.5}
+        assert wait_for(lambda: st()["moves"]["eyeBlinkRight"] > 0.9, 5, 0.05), st()["moves"]
+        m = st()["moves"]
+        assert m["eyeBlinkLeft"] < 0.1 and abs(m["jawOpen"] - 0.5) < 0.05, m
+        # ...and a wink sets off what DireBot watches for (your right eye).
+        assert wait_for(lambda: got, 10, 0.1), st()["signs"]
+        assert got[0] == {"source": "Phone avatar", "id": "wink", "what": "wink", "side": "right"}, got
+        phone.shapes = {}
+        # Not worn on your head: there's no camera picture for it.
+        send(c, "SetInputSettings", {"inputName": "Phone avatar", "inputSettings": {"worn": True}})
+        assert wait_for(lambda: st()["worn"] is False, 5, 0.1)
+        assert st()["found"]
+
+        # "Set": the way you face now is straight on.
+        assert vendor(c, "FaceSet", {"source": "Phone avatar"})["ok"]
+        assert wait_for(lambda: st()["set"] and not st()["setting"], 10, 0.1), st()
+        assert wait_for(lambda: abs(st()["turn"]["yaw"]) < 2 and abs(st()["turn"]["pitch"]) < 2, 5, 0.05)
+        # Hidden: the phone still sends, and "Set" works all the same.
+        item = send(c, "GetSceneItemId", {"sceneName": "Phone",
+                                          "sourceName": "Phone avatar"})["sceneItemId"]
+        send(c, "SetSceneItemEnabled", {"sceneName": "Phone", "sceneItemId": item,
+                                        "sceneItemEnabled": False})
+        assert wait_for(lambda: not st()["showing"], 5, 0.1)
+        assert st()["found"]
+        assert vendor(c, "FaceSet", {"source": "Phone avatar"})["ok"]
+        assert wait_for(lambda: st()["set"] and not st()["setting"], 10, 0.1), st()
+        send(c, "SetSceneItemEnabled", {"sceneName": "Phone", "sceneItemId": item,
+                                        "sceneItemEnabled": True})
+
+        # The phone not finding your face, then stopping altogether.
+        phone.found = False
+        assert wait_for(lambda: not st()["found"], 5, 0.05)
+        assert st()["phone"]["since"] < 0.5 and not st()["phone"]["found"]
+        phone.found = True
+        assert wait_for(lambda: st()["found"], 5, 0.05)
+        phone.sending = False
+        assert wait_for(lambda: not st()["found"], 5, 0.05)
+        time.sleep(1.2)
+        assert st()["phone"]["since"] > 1
+        answer = vendor(c, "FaceSet", {"source": "Phone avatar"})
+        assert not answer["ok"] and "stopped sending" in answer["error"], answer
+        phone.sending = True
+        assert wait_for(lambda: st()["found"], 5, 0.05)
+
+        # An address that can't be one.
+        send(c, "SetInputSettings", {"inputName": "Phone avatar",
+                                     "inputSettings": {"phone_address": "my phone!"}})
+        assert wait_for(lambda: "isn't an address" in st()["phone"]["problem"], 5, 0.1), st()["phone"]
+        assert wait_for(lambda: not st()["found"], 5, 0.05)
+        answer = vendor(c, "FaceSet", {"source": "Phone avatar"})
+        assert not answer["ok"] and "isn't sending" in answer["error"], answer
+
+        # iFacialMocap's way: its hello, and its lines back to our port 49983.
+        ifm = PretendPhone("ifacialmocap")
+        try:
+            send(c, "SetInputSettings", {"inputName": "Phone avatar",
+                                         "inputSettings": {"phone_app": "ifacialmocap",
+                                                           "phone_address": "127.0.0.1:%d" % ifm.port}})
+            assert wait_for(lambda: st()["found"], 10, 0.1), st()["phone"]
+            p = st()["phone"]
+            assert p["way"] == "ifacialmocap" and p["port"] == 49983 and p["shapes"] == 52, p
+            assert ifm.asked[0].startswith("iFacialMocap_sahuasouryya9218sauhuiayeta91555dy3719")
+            ifm.rotation = {"x": -30.0, "y": 0.0, "z": 0.0}
+            ifm.shapes = {"EyeBlinkLeft": 1.0}
+            # (against "Set", made with the phone's face turned 30 round)
+            assert wait_for(lambda: st()["moves"]["eyeBlinkRight"] > 0.9, 5, 0.05), st()["moves"]
+        finally:
+            ifm.close()
+
+        # Back to the camera: the phone isn't asked any more.
+        send(c, "SetInputSettings", {"inputName": "Phone avatar", "inputSettings": {"face_from": "camera"}})
+        assert wait_for(lambda: not st()["phone"]["on"] and not st()["phone"]["listening"], 5, 0.1)
+        assert st()["face_from"] == "camera"
+        send(c, "RemoveInput", {"inputName": "Phone avatar"})
+    finally:
+        phone.close()
         events.disconnect()
         c.disconnect()
 

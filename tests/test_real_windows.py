@@ -19,6 +19,7 @@ import base64
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -28,7 +29,7 @@ import pytest
 
 obsws = pytest.importorskip("obsws_python")
 
-from test_real_face import camera_picture, character_picture, read_bmp, write_gif  # noqa: E402
+from test_real_face import PretendPhone, camera_picture, character_picture, read_bmp, write_gif  # noqa: E402
 from test_real_obs import VERSION, free_port, vendor, wait_for  # noqa: E402
 
 ROOT = os.environ.get("DIREBOT_OBS_ROOT", "")
@@ -196,4 +197,59 @@ def test_face_avatar_pictures_open(obs):
         assert "couldn't open a picture" not in obs.log()
         assert "no picture loader" not in obs.log()
     finally:
+        c.disconnect()
+
+
+def test_your_face_from_a_phone(obs):
+    """0.9.0: your face from a phone app, on Windows' own sockets. A pretend
+    phone on this machine, asked VTube Studio's way: its turn and a wink
+    come through. Asked before the phone is there (Windows then reports
+    "nobody's listening" on the socket's next read), it keeps listening and
+    finds the phone once it's there. And iFacialMocap's way, on its port
+    49983."""
+    body = os.path.join(obs.home, "phone-character.png")
+    character_picture(body)
+    # A port nothing listens on yet: the phone comes there later.
+    spare = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    spare.bind(("127.0.0.1", 0))
+    later = spare.getsockname()[1]
+    spare.close()
+    c = obs.client()
+
+    def st():
+        return vendor(c, "FaceGetState", {"source": "Phone"})
+    phone = ifm = None
+    try:
+        c.send("CreateScene", {"sceneName": "Phone"}, raw=True)
+        c.send("CreateInput", {"sceneName": "Phone", "inputName": "Phone",
+                               "inputKind": "direbot_face_avatar",
+                               "inputSettings": {"character": body, "face_from": "phone",
+                                                 "phone_app": "vtube_studio", "smoothing": 0,
+                                                 "phone_address": "127.0.0.1:%d" % later}},
+               raw=True)
+        c.send("SetCurrentProgramScene", {"sceneName": "Phone"}, raw=True)
+        assert wait_for(lambda: st()["phone"]["listening"], 10, 0.2), st()["phone"]
+        time.sleep(3)       # asked a few times, nobody there
+        p = st()["phone"]
+        assert p["listening"] and p["packets"] == 0 and not st()["found"], p
+        phone = PretendPhone(port=later)
+        assert wait_for(lambda: st()["found"], 15, 0.2), (st()["phone"], obs.log())
+        p = st()["phone"]
+        assert p["problem"] == "" and p["shapes"] == 52 and p["per_second"] > 10, p
+        phone.rotation = {"x": -30.0, "y": 0.0, "z": 0.0}
+        assert wait_for(lambda: abs(st()["turn"]["yaw"] - 30) < 2, 10, 0.1), st()["turn"]
+        phone.shapes = {"EyeBlinkLeft": 1.0}
+        assert wait_for(lambda: st()["moves"]["eyeBlinkRight"] > 0.9, 10, 0.1), st()["moves"]
+
+        ifm = PretendPhone("ifacialmocap")
+        c.send("SetInputSettings", {"inputName": "Phone", "inputSettings": {
+            "phone_app": "ifacialmocap", "phone_address": "127.0.0.1:%d" % ifm.port}}, raw=True)
+        assert wait_for(lambda: st()["phone"]["way"] == "ifacialmocap" and st()["found"], 15, 0.2), \
+            st()["phone"]
+        assert st()["phone"]["port"] == 49983
+        c.send("RemoveInput", {"inputName": "Phone"}, raw=True)
+    finally:
+        for p in (phone, ifm):
+            if p:
+                p.close()
         c.disconnect()

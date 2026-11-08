@@ -18,6 +18,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "tracker.hpp"
 #include "files.hpp"
+#include "phone.hpp"
 #include "vision.hpp"
 
 #include <algorithm>
@@ -112,6 +113,7 @@ struct Tracker::Impl {
 
 	float amount = 0.5f;
 	OneEuro filters[POINTS][3];
+	OneEuro phone_filters[6]; // a phone's head: its turns and places
 	bool filtering = false;
 
 	// "Set"
@@ -128,7 +130,9 @@ struct Tracker::Impl {
 	bool points(const Frame &pic);
 	void smooth(double seconds);
 	void lost();
+	void finish(int w, int h);
 	void keep_rest();
+	void phone_points(const PhoneLook &look, double seconds);
 };
 
 namespace {
@@ -394,6 +398,22 @@ void Tracker::Impl::lost()
 	face.found = false;
 }
 
+// Found: "Set" keeps it while it's setting, and its turn and moves are
+// against "Set".
+void Tracker::Impl::finish(int w, int h)
+{
+	face.found = true;
+	face.w = w;
+	face.h = h;
+	if (setting > 0)
+		keep_rest();
+	face.turn = rest.set ? turn_since(face.pose, rest.pose) : turn_of(face.pose);
+	for (int i = 0; i < EXPRESSIONS; i++) {
+		const float r = rest.set ? rest.expressions[i] : 0;
+		face.moves[i] = r < 0.98f ? std::min(1.0f, std::max(0.0f, (face.expressions[i] - r) / (1 - r))) : 0;
+	}
+}
+
 void Tracker::Impl::keep_rest()
 {
 	for (int i = 0; i < 16; i++)
@@ -502,19 +522,115 @@ const Face &Tracker::look(const Frame &pic, double seconds)
 		std::copy(m.shapes.output(0), m.shapes.output(0) + EXPRESSIONS, face.expressions);
 		// Step 6: the head in 3D.
 		m.geometry.pose(&face.points[0].x, pic.w, pic.h, face.pose);
-		face.found = true;
-		face.w = pic.w;
-		face.h = pic.h;
-		if (m.setting > 0)
-			m.keep_rest();
-		face.turn = m.rest.set ? turn_since(face.pose, m.rest.pose) : turn_of(face.pose);
-		for (int i = 0; i < EXPRESSIONS; i++) {
-			const float r = m.rest.set ? m.rest.expressions[i] : 0;
-			face.moves[i] = r < 0.98f ? std::min(1.0f, std::max(0.0f, (face.expressions[i] - r) / (1 - r)))
-						  : 0;
-		}
+		m.finish(pic.w, pic.h);
 	} else {
 		m.lost();
+	}
+	face.ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+	return face;
+}
+
+// The head as the phone says, smoothed as the slider says (a One Euro
+// filter on each of its turns and places, their speeds counted in face
+// sizes a second as the points' are: a face is about 15 cm across, and a
+// degree turns it about a 90th of that), then the face at rest (Google's,
+// in centimetres) turned and placed so, seen through MediaPipe's camera
+// (pose.hpp: 63 degrees from top to bottom) as a picture PHONE_W x
+// PHONE_H: its points as the face mesh model would give them, its depth
+// too (on x's scale, against the face's middle). The pose is the one it
+// was turned and placed by.
+void Tracker::Impl::phone_points(const PhoneLook &look, double seconds)
+{
+	const double far_now = look.far ? std::max<double>(PHONE_NEAREST, -look.z) : PHONE_FAR;
+	double v[6] = {look.turn.yaw,
+		       look.turn.pitch,
+		       look.turn.roll,
+		       look.placed ? look.x : 0.0,
+		       look.placed ? look.y : 0.0,
+		       far_now};
+	if (amount >= 0) {
+		if (!filtering) {
+			for (auto &f : phone_filters)
+				f = OneEuro();
+			filtering = true;
+		}
+		double min_cutoff, beta;
+		vision::smoothing_of(amount, MIN_CUTOFF, BETA, min_cutoff, beta);
+		const int64_t ns = (int64_t)std::llround(seconds * 1e9);
+		for (int k = 0; k < 6; k++)
+			v[k] = phone_filters[k].apply(ns, k < 3 ? 1.0 / 90 : 1.0 / 15, (float)v[k], min_cutoff, beta);
+	}
+	const double yaw = v[0] * PI / 180, pitch = -v[1] * PI / 180, roll = -v[2] * PI / 180;
+	// Ry(yaw) Rx(-pitch) Rz(-roll), as pose.cpp's turn_from reads it.
+	const double cy = std::cos(yaw), sy = std::sin(yaw), cx = std::cos(pitch), sx = std::sin(pitch),
+		     cz = std::cos(roll), sz = std::sin(roll);
+	const double ry[9] = {cy, 0, sy, 0, 1, 0, -sy, 0, cy}, rx[9] = {1, 0, 0, 0, cx, -sx, 0, sx, cx},
+		     rz[9] = {cz, -sz, 0, sz, cz, 0, 0, 0, 1};
+	double ryx[9], r[9];
+	auto mul = [](const double *a, const double *b, double *out) {
+		for (int i = 0; i < 3; i++)
+			for (int j = 0; j < 3; j++)
+				out[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+	};
+	mul(ry, rx, ryx);
+	mul(ryx, rz, r);
+	const double far = std::max<double>(PHONE_NEAREST, v[5]);
+	const double t[3] = {v[3], v[4], -far};
+	for (int row = 0; row < 3; row++) {
+		for (int c = 0; c < 3; c++)
+			face.pose[row * 4 + c] = (float)r[row * 3 + c];
+		face.pose[row * 4 + 3] = (float)t[row];
+	}
+	face.pose[12] = face.pose[13] = face.pose[14] = 0;
+	face.pose[15] = 1;
+	const std::vector<float> &at_rest = geometry.rest();
+	const double near_h = 2 * std::tan(0.5 * PHONE_FOV * PI / 180), near_w = near_h * PHONE_W / PHONE_H;
+	const size_t n = std::min<size_t>(at_rest.size() / 3, POINTS);
+	for (size_t i = 0; i < n; i++) {
+		const float *p = &at_rest[i * 3];
+		double c[3];
+		for (int k = 0; k < 3; k++)
+			c[k] = r[k * 3] * p[0] + r[k * 3 + 1] * p[1] + r[k * 3 + 2] * p[2] + t[k];
+		const double d = std::max(1.0, -c[2]);
+		face.points[i].x = (float)((c[0] / d + near_w / 2) / near_w * PHONE_W);
+		face.points[i].y = (float)((1 - (c[1] / d + near_h / 2) / near_h) * PHONE_H);
+		face.points[i].z = (float)((d - far) / far * PHONE_W / near_w);
+	}
+	// The irises (468 on): in the middle of each eye.
+	auto middle = [&](int a, int b) {
+		const Point &pa = face.points[a], &pb = face.points[b];
+		return Point{(pa.x + pb.x) / 2, (pa.y + pb.y) / 2, (pa.z + pb.z) / 2};
+	};
+	const Point right = middle(RIGHT_EYE_OUTER, RIGHT_EYE_INNER), left = middle(LEFT_EYE_OUTER, LEFT_EYE_INNER);
+	for (int i = 0; i < 5; i++) {
+		face.points[RIGHT_IRIS + i] = right;
+		face.points[LEFT_IRIS + i] = left;
+	}
+	std::copy(std::begin(face.points), std::end(face.points), raw);
+}
+
+const Face &Tracker::take(const PhoneLook &look, double seconds)
+{
+	Impl &m = *impl_;
+	const auto start = std::chrono::steady_clock::now();
+	Face &face = m.face;
+	face.searched = false;
+	// A camera's square (and its smoothing) is no use from here on.
+	m.following = false;
+	if (m.pic_w != PHONE_W || m.pic_h != PHONE_H) {
+		m.pic_w = PHONE_W;
+		m.pic_h = PHONE_H;
+		m.filtering = false;
+	}
+	if (!m.ready || !m.geometry.loaded() || !look.found) {
+		m.lost();
+		face.presence = 0;
+	} else {
+		m.phone_points(look, seconds);
+		face.presence = 1;
+		std::copy(look.expressions, look.expressions + EXPRESSIONS, face.expressions);
+		face.expressions[0] = 0;
+		m.finish(PHONE_W, PHONE_H);
 	}
 	face.ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
 	return face;

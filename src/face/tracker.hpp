@@ -143,6 +143,13 @@ struct Layout {
 };
 Layout layout_of(const Face &face);
 
+// A face from a phone (phone.hpp) is seen as through a camera of this
+// size, MediaPipe's (63 degrees from top to bottom), this far away (cm)
+// when the phone doesn't say - and never nearer than this.
+constexpr int PHONE_W = 960, PHONE_H = 540;
+constexpr float PHONE_FOV = 63, PHONE_FAR = 45, PHONE_NEAREST = 12;
+struct PhoneLook;
+
 class Tracker {
 public:
 	Tracker();
@@ -159,6 +166,11 @@ public:
 	// Looks at a new picture. `seconds`: when the camera took it (any
 	// clock that only goes forward), for the smoothing.
 	const Face &look(const Frame &picture, double seconds);
+	// ...or takes your face from a phone (phone.hpp) instead: its moves as
+	// they come, its head's turn and place as a camera would see them
+	// (PHONE_W x PHONE_H), so "Set", the smoothing and everything after
+	// work as they do for a camera. Lost when it doesn't see you.
+	const Face &take(const PhoneLook &look, double seconds);
 	const Face &face() const;
 
 	// The next look starts with the face finder (a new camera, a while

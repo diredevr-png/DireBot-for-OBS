@@ -53,6 +53,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "effect-check.hpp"
 #include "look-pace.hpp"
 #include "model.hpp"
+#include "phone.hpp"
 #include "rig.hpp"
 #include "signs.hpp"
 #include "tracker.hpp"
@@ -423,6 +424,19 @@ public:
 		wake_.notify_one();
 	}
 
+	// Your face from a phone app (phone.hpp; the link's thread), and when
+	// it came: worked on as a picture would be - the newest only.
+	void give_phone(const PhoneLook &look, uint64_t ns)
+	{
+		{
+			std::lock_guard<std::mutex> l(lock_);
+			phone_in_ = look;
+			phone_ns_ = ns;
+			have_phone_ = true;
+		}
+		wake_.notify_one();
+	}
+
 	void forget()
 	{
 		std::lock_guard<std::mutex> l(lock_);
@@ -515,6 +529,7 @@ private:
 			problem_ = problem;
 		}
 		std::vector<uint8_t> rgba;
+		PhoneLook phone;
 		Pieces pieces;
 		Light light;
 		uint64_t window_start = os_gettime_ns();
@@ -523,12 +538,12 @@ private:
 		for (;;) {
 			int w = 0, h = 0;
 			uint64_t ns = 0;
-			bool look = false, forget = false, start = false, load = false;
+			bool look = false, from_phone = false, forget = false, start = false, load = false;
 			std::string text;
 			float aspect[PARTS], soft;
 			{
 				std::unique_lock<std::mutex> l(lock_);
-				wake_.wait(l, [this] { return stop_ || have_ || load_rest_ || start_rest_; });
+				wake_.wait(l, [this] { return stop_ || have_ || have_phone_ || load_rest_ || start_rest_; });
 				if (stop_)
 					return;
 				if (load_rest_) {
@@ -548,6 +563,11 @@ private:
 					ns = in_ns_;
 					have_ = false;
 					look = true;
+				} else if (have_phone_) {
+					phone = phone_in_;
+					ns = phone_ns_;
+					have_phone_ = false;
+					look = from_phone = true;
 				}
 				forget = forget_;
 				forget_ = false;
@@ -569,7 +589,12 @@ private:
 			}
 			tracker.set_smoothing(smoothing_);
 			const bool was_setting = tracker.setting();
-			if (look && ok) {
+			if (look && ok && from_phone) {
+				// No picture: no eyes and mouth to cut out, nothing lit.
+				tracker.take(phone, (double)ns / 1e9);
+				pieces = Pieces();
+				light = Light();
+			} else if (look && ok) {
 				const Frame frame{rgba.data(), w, h, w * 4, false};
 				tracker.look(frame, (double)ns / 1e9);
 				cut_pieces(tracker.face(), aspect, soft, pieces);
@@ -627,11 +652,13 @@ private:
 	mutable std::mutex lock_;
 	std::condition_variable wake_;
 	std::thread thread_;
-	bool stop_ = false, have_ = false, forget_ = false, load_rest_ = false, start_rest_ = false;
+	bool stop_ = false, have_ = false, have_phone_ = false, forget_ = false, load_rest_ = false, start_rest_ = false;
 	bool pending_ = false, setting_ = false;
 	std::vector<uint8_t> in_;
 	int in_w_ = 0, in_h_ = 0;
 	uint64_t in_ns_ = 0;
+	PhoneLook phone_in_;
+	uint64_t phone_ns_ = 0;
 	std::string rest_text_;
 	Face face_;
 	Pieces pieces_;
@@ -1055,6 +1082,14 @@ struct FaceAvatar {
 	float body_follow = 0.3f;
 
 	Worker worker;
+	// Your face from a phone app instead of the camera (phone.hpp, 0.9.0):
+	// "face_from" in the settings. The link asks the phone and hands each
+	// look to the worker, on a thread of its own. The camera, if one is
+	// picked, is then only looked at for your hands. Graphics thread: the
+	// phone sent a look lately.
+	std::atomic<bool> from_phone{false};
+	PhoneLink phone;
+	bool phone_live = false;
 	// Your hands and arms (body.hpp, arms.hpp), on a 3D VRM character in
 	// its own spot: looked for on their own thread, followed on the
 	// graphics one. On and light mode from the settings.
@@ -1363,6 +1398,11 @@ struct FaceAvatar {
 	size_t signs_rules_state = 0;
 	bool signs_hands_state = false, signs_looking_state = false, looking_hidden_state = false;
 
+	// The camera is looked at for your face - or, with your face from a
+	// phone, only for your hands (the arms, or a hand sign). Graphics
+	// thread.
+	bool camera_wanted() const { return !from_phone || arms_wanted || signs_hands_wanted; }
+
 	// How often your hands and arms are looked at, at most (seconds).
 	float arms_every() const
 	{
@@ -1380,6 +1420,11 @@ struct FaceAvatar {
 				 auto *job = new std::pair<obs_weak_source_t *, std::string>(weak, text);
 				 obs_queue_task(OBS_TASK_UI, save_rest_task, job, false);
 			 }),
+		  phone([this](const PhoneLook &look, uint64_t) {
+			  // On OBS's clock, as the camera's pictures are.
+			  if (from_phone)
+				  worker.give_phone(look, os_gettime_ns());
+		  }),
 		  body_worker(data_file("face/holistic_landmarker.task", true),
 			      data_file("face/hand_landmark_lite.tflite", false),
 			      data_file("face/palm_detection_full.tflite", false))
@@ -1447,6 +1492,8 @@ struct FaceAvatar {
 			obs_source_release(hidden_cam);
 			hidden_cam = nullptr;
 		}
+		from_phone = false;
+		phone.stop();
 		worker.stop();
 		body_worker.stop();
 		obs_enter_graphics();
@@ -1633,8 +1680,12 @@ struct FaceAvatar {
 					given.resize(row * stage_h);
 					for (uint32_t y = 0; y < stage_h; y++)
 						std::memcpy(&given[y * row], data + (size_t)y * line, row);
-					rgba.assign(given.begin(), given.end());
-					worker.give(rgba, (int)stage_w, (int)stage_h, staged_ns);
+					// (Your face from a phone: the camera is only for your
+					// hands.)
+					if (!from_phone) {
+						rgba.assign(given.begin(), given.end());
+						worker.give(rgba, (int)stage_w, (int)stage_h, staged_ns);
+					}
 					gave = true;
 					// Your hands and arms, maybe less often (a little
 					// early is fine: the camera's pictures come unevenly).
@@ -1660,7 +1711,8 @@ struct FaceAvatar {
 			stage = gs_stagesurface_create(sw, sh, GS_RGBA);
 			stage_w = sw;
 			stage_h = sh;
-			worker.forget();
+			if (!from_phone)
+				worker.forget();
 			body_worker.forget();
 			reset_arms = true;
 		}
@@ -1717,6 +1769,10 @@ struct FaceAvatar {
 			held_ns = 0;
 		}
 		looked_shot = -1;
+		if (from_phone) { // no picture: nothing cut out
+			used_shot = -1;
+			return;
+		}
 		if (seen.ns)
 			for (int i = 0; i < SHOTS; i++)
 				if (shots[i].tex && shots[i].ns == seen.ns)
@@ -2016,7 +2072,9 @@ struct FaceAvatar {
 		for (const Layer &layer : layers)
 			if (layer.behind)
 				draw_picture(layer.picture, layer.place, char_w, char_h, 1);
-		const bool real = !drawn_style;
+		// (From a phone there's no picture to cut yours from: its own
+		// drawn face moves with yours.)
+		const bool real = !drawn_style && !from_phone;
 		const float showing = real && seen.ready && have_spots && cam && held.found ? o.shown : 0;
 		// The character's spot for each of yours: the camera's first eye
 		// is on the viewer's left - unless mirrored.
@@ -3158,10 +3216,11 @@ struct FaceAvatar {
 		const uint32_t w = wear ? cw : width.load(), h = wear ? ch : height.load();
 		drawing = true;
 		gs_blend_state_push();
-		if (cam && cw && ch) {
+		if (cam && cw && ch && camera_wanted()) {
 			if (since_render > STALE) {
 				staged = false;
-				worker.forget();
+				if (!from_phone)
+					worker.forget();
 				pace.reset();
 			}
 			since_render = 0;
@@ -3493,7 +3552,11 @@ struct FaceAvatar {
 		signs_hands_wanted = on && signs.wants_hands();
 		// Looking: a picture went to the trackers lately.
 		const uint64_t now = os_gettime_ns();
-		const bool looking = last_look_ns && now - last_look_ns < 500'000'000ULL;
+		bool looking = last_look_ns && now - last_look_ns < 500'000'000ULL;
+		// ...or your face came from a phone lately, while it's shown (or
+		// "while it's hidden" is on).
+		if (from_phone && !looking)
+			looking = phone_live && (signs_hidden || (last_render && now - last_render < 500'000'000ULL));
 		const bool fresh = body_seen.looks != signs_body_looks;
 		signs_body_looks = body_seen.looks;
 		std::vector<SignFired> fired;
@@ -3528,7 +3591,7 @@ struct FaceAvatar {
 			std::lock_guard<std::mutex> l(state_lock);
 			shown = showing_now;
 		}
-		obs_source_t *cam = !shown && signs_hidden && signs_any ? get_camera() : nullptr;
+		obs_source_t *cam = !shown && signs_hidden && signs_any && camera_wanted() ? get_camera() : nullptr;
 		if (cam != hidden_cam) {
 			if (hidden_cam) {
 				obs_source_dec_showing(hidden_cam);
@@ -3546,7 +3609,8 @@ struct FaceAvatar {
 			gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 			if (since_render > STALE) {
 				staged = false;
-				worker.forget();
+				if (!from_phone)
+					worker.forget();
 				pace.reset();
 			}
 			since_render = 0;
@@ -3556,8 +3620,10 @@ struct FaceAvatar {
 			obs_leave_graphics();
 		}
 		obs_source_release(cam);
+		// Your face from a phone comes whether it's shown or not.
+		const bool phone_looking = from_phone && phone_live && !shown && signs_hidden && signs_any;
 		std::lock_guard<std::mutex> l(state_lock);
-		looking_hidden_state = looking;
+		looking_hidden_state = looking || phone_looking;
 	}
 
 	// A calibration is in the settings now (save_arms_task, on the UI
@@ -3589,6 +3655,10 @@ struct FaceAvatar {
 		worker.state(seen);
 		const bool fresh = seen.looks != seen_looks;
 		seen_looks = seen.looks;
+		{
+			const uint64_t now = os_gettime_ns();
+			phone_live = from_phone && seen.ns && now >= seen.ns && now - seen.ns < 600'000'000ULL;
+		}
 		if (reset_shown.exchange(false))
 			shown.reset();
 		const Shown::Out o = shown.step(seen.face, seen.rest, dt, fresh);
@@ -4159,7 +4229,23 @@ struct FaceAvatar {
 		easy = obs_data_get_bool(settings, "easy");
 		const char *style = obs_data_get_string(settings, "style");
 		drawn_style = style && std::strcmp(style, "drawn") == 0;
-		worn = obs_data_get_bool(settings, "worn");
+		// Your face from a phone app (VTube Studio's, MeowFace, or
+		// iFacialMocap), at the address its app shows - or the camera.
+		// Switched, it starts again (nothing kept from the other); a face
+		// from a phone can't be worn on your head in the camera's picture.
+		const char *face_from = obs_data_get_string(settings, "face_from");
+		const bool phone_now = face_from && std::strcmp(face_from, "phone") == 0;
+		const char *app = obs_data_get_string(settings, "phone_app");
+		const PhoneApp phone_app = app && std::strcmp(app, "ifacialmocap") == 0 ? PHONE_IFACIALMOCAP
+											 : PHONE_VTUBE_STUDIO;
+		const char *address = obs_data_get_string(settings, "phone_address");
+		if (from_phone.exchange(phone_now) != phone_now) {
+			worker.forget();
+			new_camera = true;
+			reset_shown = true;
+		}
+		phone.set(phone_app, phone_now && address ? address : "");
+		worn = obs_data_get_bool(settings, "worn") && !phone_now;
 		// Smoothing: steadier one way; the other, snappier, and the
 		// character aims further on past each look to keep up with you.
 		const float smoothing = clampf((float)obs_data_get_int(settings, "smoothing") / 100.0f, 0, 1);
@@ -4740,6 +4826,28 @@ struct FaceAvatar {
 		}
 		answer["style"] = drawn_style ? "drawn" : "real";
 		answer["worn"] = worn.load();
+		// Your face from a phone app: whether it's set to ask one, its
+		// socket, where it asks and our port, why it can't, and what came
+		// (and from where else - the phone may have another address).
+		answer["face_from"] = from_phone ? "phone" : "camera";
+		{
+			const PhoneLink::State ps = phone.state();
+			answer["phone"] = {{"on", ps.on},
+					   {"listening", ps.listening},
+					   {"way", ps.app == PHONE_IFACIALMOCAP ? "ifacialmocap" : "vtube_studio"},
+					   {"address", ps.address},
+					   {"phone", ps.phone},
+					   {"port", ps.port},
+					   {"problem", ps.problem},
+					   {"packets", ps.packets},
+					   {"per_second", r(ps.per_second, 10)},
+					   {"since", ps.since < 0 ? -1.0f : r(ps.since, 10)},
+					   {"found", ps.found},
+					   {"shapes", ps.shapes},
+					   {"others", ps.others},
+					   {"other", ps.other},
+					   {"unread", ps.unread}};
+		}
 		// (No lists of plain values: OBS only passes on lists of objects.)
 		answer["drawn"] = {{"left_eye", EYE_NAMES[drawn_state.eye[0]]},
 				   {"right_eye", EYE_NAMES[drawn_state.eye[1]]},
@@ -5270,6 +5378,10 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "hand_signs", false);
 	obs_data_set_default_string(settings, "signs", "[]");
 	obs_data_set_default_bool(settings, "signs_hidden", false);
+	// Your face from the camera until you pick a phone app (0.9.0).
+	obs_data_set_default_string(settings, "face_from", "camera");
+	obs_data_set_default_string(settings, "phone_app", "vtube_studio");
+	obs_data_set_default_string(settings, "phone_address", "");
 }
 
 bool add_camera(void *param, obs_source_t *source)
@@ -5298,6 +5410,16 @@ obs_properties_t *get_properties(void *data)
 		if (!f->camera_name.empty() && (!f->camera || obs_weak_source_expired(f->camera)))
 			obs_property_list_add_string(list, f->camera_name.c_str(), f->camera_name.c_str());
 	}
+	obs_property_t *face_from = obs_properties_add_list(props, "face_from", text("FaceAvatar.FaceFrom"),
+							    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(face_from, text("FaceAvatar.FaceFromCamera"), "camera");
+	obs_property_list_add_string(face_from, text("FaceAvatar.FaceFromPhone"), "phone");
+	obs_property_t *apps = obs_properties_add_list(props, "phone_app", text("FaceAvatar.PhoneApp"),
+						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(apps, "VTube Studio", "vtube_studio");
+	obs_property_list_add_string(apps, "MeowFace", "meowface");
+	obs_property_list_add_string(apps, "iFacialMocap", "ifacialmocap");
+	obs_properties_add_text(props, "phone_address", text("FaceAvatar.PhoneAddress"), OBS_TEXT_DEFAULT);
 	const char *pictures = "PNG (*.png);;All pictures (*.png *.jpg *.jpeg *.webp *.gif)";
 	obs_properties_add_path(props, "character", text("FaceAvatar.Character"), OBS_PATH_FILE, pictures, nullptr);
 	obs_properties_add_path(props, "character_left", text("FaceAvatar.CharacterLeft"), OBS_PATH_FILE, pictures,
@@ -5607,10 +5729,17 @@ json set_rest(const json &data)
 			std::lock_guard<std::mutex> l(f->state_lock);
 			showing = f->showing_now || f->looking_hidden_state;
 		}
+		const PhoneLink::State ps = f->phone.state();
 		if (!st.ready)
 			answer = fail(st.problem.empty()
 					      ? "The face models are still loading - try again in a moment."
 					      : "The face models couldn't be loaded - reinstall DireBot for OBS.");
+		else if (f->from_phone && (!ps.packets || ps.since < 0))
+			answer = fail("Your phone isn't sending your face yet - open its app and check the address in DireBot.");
+		else if (f->from_phone && ps.since > 1)
+			answer = fail("Your phone stopped sending your face - is its app still open, with the screen on?");
+		else if (f->from_phone)
+			f->worker.start_rest();
 		else if (!showing)
 			answer = fail("Show the face avatar in OBS first - it only looks for you while it's shown.");
 		else
