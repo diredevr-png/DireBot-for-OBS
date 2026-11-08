@@ -3127,6 +3127,223 @@ static void test_moves_on_a_vrm()
 		    2e-3f));
 }
 
+// 0.9.0: another tracker app's bones (VMC): each bone as much as it's the
+// app's, carried over bones this one hasn't, a move on cue over them, its
+// hips moved for its height, your head's turn against its chest, its eyes
+// as the app has them.
+static void test_tracked_bones()
+{
+	const float PI = 3.14159265f;
+	Figure body = make_body();
+	Builder &b = body.p.b;
+	{
+		std::vector<V3> pos;
+		std::vector<uint16_t> ix;
+		cube(pos, ix, {0, 0.05f, 0}, 0.05f);
+		const int a_pos = b.vec3s(pos), a_ix = b.indices(ix);
+		const json prim = {{"attributes", {{"POSITION", a_pos}}}, {"indices", a_ix}};
+		b.doc["meshes"].push_back({{"primitives", json::array({prim})}});
+		const int feet = b.node({{"name", "feet"}, {"mesh", (int)b.doc["meshes"].size() - 1}});
+		b.doc["scenes"][0]["nodes"].push_back(feet);
+	}
+	auto m = std::make_shared<Model>();
+	CHECK(load(b.glb(), *m));
+	RigOptions o;
+	o.springs = false;
+	Rig rig(m, o);
+	CHECK(rig.plays_motions());
+	const json &bones = b.doc["extensions"]["VRMC_vrm"]["humanoid"]["humanBones"];
+	auto node = [&](const char *n) {
+		return bones[n]["node"].get<int>();
+	};
+	rig.pose(still());
+	const V3 hips0 = move_of(rig.world()[node("hips")]);
+	const V3 idle = way_of(rig, node("leftUpperArm"), node("leftLowerArm"));
+	CHECK(idle.y < -0.8f); // down by its side
+	// Its left arm up 60 and its upper chest twisted (which this one
+	// hasn't: its neck and shoulders take it), as the app has them.
+	const Quat up60 = axis_angle({0, 0, 1}, 60 * PI / 180), twist = axis_angle({0, 1, 0}, 30 * PI / 180);
+	Drive d = still();
+	d.tracked.bones = {{"leftUpperArm", up60, 1}, {"upperChest", twist, 1}};
+	rig.pose(d);
+	const V3 arm = way_of(rig, node("leftUpperArm"), node("leftLowerArm"));
+	CHECK(near3(arm, rotate(twist * up60, {1, 0, 0}), 2e-3f));
+	// (Its right arm, not sent: down by its side, turned with the chest.)
+	CHECK(way_of(rig, node("rightUpperArm"), node("rightLowerArm")).y < -0.8f);
+	// Half of it: half way from how it stands.
+	d.tracked.bones[0].amount = 0.5f;
+	d.tracked.bones[1].amount = 0;
+	rig.pose(d);
+	const V3 half = way_of(rig, node("leftUpperArm"), node("leftLowerArm"));
+	const V3 full_flat = rotate(up60, {1, 0, 0});
+	CHECK(std::fabs(std::asin(half.y) - (std::asin(idle.y) + std::asin(full_flat.y)) / 2) < 5 * PI / 180);
+	// Bones with no turn that's a turn: left as they are.
+	d.tracked.bones = {{"leftUpperArm", Quat{NAN, 0, 0, 1}, 1}};
+	rig.pose(d);
+	CHECK(way_of(rig, node("leftUpperArm"), node("leftLowerArm")).y < -0.8f);
+
+	// A move on cue over it: the arm where the move has it.
+	const Quat down30 = axis_angle({0, 0, 1}, -30 * PI / 180);
+	Motion mo;
+	const std::vector<uint8_t> file = make_motion({{"leftUpperArm", down30}}, {0, 1, 0});
+	CHECK(load_motion(file.data(), file.size(), "", mo));
+	MoveNow mv;
+	mv.motion = std::make_shared<const Motion>(mo);
+	mv.time = 1;
+	mv.amount = 1;
+	d.tracked.bones = {{"leftUpperArm", up60, 1}};
+	d.body = {mv};
+	rig.pose(d);
+	CHECK(near3(way_of(rig, node("leftUpperArm"), node("leftLowerArm")), rotate(down30, {1, 0, 0}), 2e-3f));
+	d.body.clear();
+
+	// Its hips: moved as far for its height (1 m: as far as said), across
+	// to its left (+x) and down - turned as well, as an app sends them.
+	d.tracked.bones = {{"hips", axis_angle({0, 1, 0}, 10 * PI / 180), 1}};
+	d.tracked.hips = {0.1f, -0.2f, 0};
+	d.tracked.hips_amount = 1;
+	rig.pose(d);
+	CHECK(near3(move_of(rig.world()[node("hips")]) - hips0, {0.1f, -0.2f, 0}, 2e-3f));
+	d.tracked.hips_amount = 0.5f;
+	rig.pose(d);
+	CHECK(near3(move_of(rig.world()[node("hips")]) - hips0, {0.05f, -0.1f, 0}, 2e-3f));
+	// A move on cue holding its hips: where the move has them.
+	d.tracked.hips_amount = 1;
+	{
+		Motion still_hips;
+		const std::vector<uint8_t> f2 = make_motion({{"hips", Quat{}}}, {0, 1, 0});
+		CHECK(load_motion(f2.data(), f2.size(), "", still_hips));
+		MoveNow hold;
+		hold.motion = std::make_shared<const Motion>(still_hips);
+		hold.time = 1;
+		hold.amount = 1;
+		d.body = {hold};
+		rig.pose(d);
+		CHECK(near3(move_of(rig.world()[node("hips")]), hips0, 2e-3f));
+		d.body.clear();
+	}
+	d.tracked.hips_amount = 0;
+	d.tracked.bones.clear();
+	rig.pose(d);
+	CHECK(near3(move_of(rig.world()[node("hips")]), hips0, 1e-5f));
+
+	// Your head from a camera turns against the world: with the app's
+	// body twisted 30 degrees, your head straight on is still straight on
+	// (the neck turns back by as much)...
+	d.tracked.bones = {{"upperChest", twist, 1}};
+	rig.pose(d);
+	const V3 nose_twisted = direction(rig.world()[body.p.head], {0, 0, 1});
+	CHECK(near3(nose_twisted, rotate(twist, {0, 0, 1}), 2e-3f));
+	d.tracked.torso = 1;
+	d.tracked.chest = twist;
+	rig.pose(d);
+	CHECK(near3(direction(rig.world()[body.p.head], {0, 0, 1}), {0, 0, 1}, 2e-3f));
+	// ...turned 20 to its left, 20 to its left of the world.
+	d.head = axis_angle({0, 1, 0}, 20 * PI / 180);
+	rig.pose(d);
+	CHECK(near3(direction(rig.world()[body.p.head], {0, 0, 1}),
+		    {std::sin(20 * PI / 180), 0, std::cos(20 * PI / 180)}, 2e-3f));
+	// Its own body doesn't follow your head as well (the app's has it).
+	d.body_follow = 1;
+	d.body_yaw = 10;
+	rig.pose(d);
+	CHECK(near3(direction(rig.world()[body.spine], {0, 0, 1}), {0, 0, 1}, 1e-4f));
+	d = still();
+
+	// Its eyes as the app has them: our look from your face not as well.
+	Person p = make_person(false);
+	auto pm = std::make_shared<Model>();
+	CHECK(load(p.b.glb(), *pm));
+	Rig eyes(pm, o);
+	Drive e = still();
+	e.moves[move_of_name("eyeLookOutLeft")] = 1;
+	e.moves[move_of_name("eyeLookInRight")] = 1;
+	eyes.pose(e);
+	const V3 looked = rotate(quat_of(eyes.world()[p.leye]), {0, 0, 1});
+	CHECK(looked.x > 0.03f);                                    // (4 degrees: test_head_and_eyes)
+	const Quat app_look = axis_angle({0, 1, 0}, -5 * PI / 180); // towards its right
+	e.tracked.bones = {{"leftEye", app_look, 1}, {"rightEye", app_look, 1}};
+	e.tracked.eyes = true;
+	eyes.pose(e);
+	CHECK(near3(rotate(quat_of(eyes.world()[p.leye]), {0, 0, 1}), rotate(app_look, {0, 0, 1}), 2e-3f));
+	CHECK(near3(rotate(quat_of(eyes.world()[p.reye]), {0, 0, 1}), rotate(app_look, {0, 0, 1}), 2e-3f));
+	// No legs under its hips (a bust: its lowest is its head): its hips
+	// still step across, as far as a whole figure its size would.
+	{
+		Drive h = still();
+		eyes.pose(h);
+		const V3 at0 = move_of(eyes.world()[p.hips]);
+		h.tracked.hips = {0.2f, 0, 0};
+		h.tracked.hips_amount = 1;
+		eyes.pose(h);
+		const V3 moved = move_of(eyes.world()[p.hips]) - at0;
+		CHECK(moved.x > 0.005f && moved.x < 0.2f && near(moved.y, 0, 1e-5) && near(moved.z, 0, 1e-5));
+	}
+
+	// VRM 0.x (it faces -z): the same turn, the same way as you see it.
+	Person p0 = make_person(true);
+	auto m0 = std::make_shared<Model>();
+	CHECK(load(p0.b.glb(), *m0));
+	RigOptions o0 = o;
+	o0.facing = axis_angle({0, 1, 0}, PI);
+	Rig rig0(m0, o0);
+	Drive d0 = still();
+	const Quat look = axis_angle({0, 1, 0}, 40 * PI / 180);
+	d0.tracked.bones = {{"neck", look, 1}};
+	rig0.pose(d0);
+	const V3 nose = rotate(o0.facing, direction(rig0.world()[p0.head], {0, 0, -1}));
+	CHECK(near3(nose, {std::sin(40 * PI / 180), 0, std::cos(40 * PI / 180)}, 2e-3f));
+	// Not a VRM's bones: nothing.
+	Builder plain;
+	std::vector<V3> pos;
+	std::vector<uint16_t> ix;
+	cube(pos, ix);
+	const json prim = {{"attributes", {{"POSITION", plain.vec3s(pos)}}}, {"indices", plain.indices(ix)}};
+	plain.doc["meshes"].push_back({{"primitives", json::array({prim})}});
+	plain.doc["scenes"][0]["nodes"].push_back(plain.node({{"name", "hips"}, {"mesh", 0}}));
+	auto pm2 = std::make_shared<Model>();
+	CHECK(load(plain.glb(), *pm2));
+	Rig plain_rig(pm2, o);
+	Drive dp = still();
+	plain_rig.pose(dp);
+	const M4 before = plain_rig.world()[0];
+	dp.tracked.bones = {{"hips", up60, 1}};
+	dp.tracked.hips = {0.3f, 0, 0};
+	dp.tracked.hips_amount = 1;
+	plain_rig.pose(dp);
+	CHECK(near3(move_of(plain_rig.world()[0]), move_of(before), 1e-6f));
+	CHECK(near3(direction(plain_rig.world()[0], {1, 0, 0}), direction(before, {1, 0, 0}), 1e-6f));
+}
+
+static void test_faces_from_names()
+{
+	// A face by VRM's name made from ARKit's shapes (for a character made
+	// for them, a 2D one, the hand signs' face moves).
+	float moves[EXPRESSIONS] = {};
+	face_into_moves("happy", 1, moves);
+	CHECK(moves[move_of_name("mouthSmileLeft")] > 0.3f && moves[move_of_name("mouthSmileRight")] > 0.3f);
+	float half[EXPRESSIONS] = {};
+	face_into_moves("happy", 0.5f, half);
+	CHECK(near(half[move_of_name("mouthSmileLeft")], moves[move_of_name("mouthSmileLeft")] * 0.5f, 1e-5));
+	// Each as much as it was or more.
+	float more[EXPRESSIONS] = {};
+	more[move_of_name("mouthSmileLeft")] = 1;
+	face_into_moves("happy", 0.5f, more);
+	CHECK(more[move_of_name("mouthSmileLeft")] == 1);
+	float sad[EXPRESSIONS] = {};
+	face_into_moves("sad", 1, sad);
+	CHECK(sad[move_of_name("mouthFrownLeft")] > 0.2f || sad[move_of_name("browInnerUp")] > 0.2f);
+	// Not one of VRM's, or none of it: nothing.
+	float none[EXPRESSIONS] = {};
+	face_into_moves("Heart_Eyes", 1, none);
+	face_into_moves("happy", 0, none);
+	face_into_moves("happy", NAN, none);
+	bool all_zero = true;
+	for (float v : none)
+		all_zero = all_zero && v == 0;
+	CHECK(all_zero);
+}
+
 static void test_wave_and_cheer()
 {
 	Figure body = make_body();
@@ -3999,6 +4216,8 @@ int main()
 	test_arms_follow();
 	test_motion_reading();
 	test_moves_on_a_vrm();
+	test_tracked_bones();
+	test_faces_from_names();
 	test_wave_and_cheer();
 	test_own_move_once();
 	test_faces_on_cue();

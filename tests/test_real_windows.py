@@ -29,7 +29,7 @@ import pytest
 
 obsws = pytest.importorskip("obsws_python")
 
-from test_real_face import PretendPhone, camera_picture, character_picture, read_bmp, write_gif  # noqa: E402
+from test_real_face import PretendPhone, PretendVmcApp, camera_picture, character_picture, read_bmp, unity_turn, write_gif  # noqa: E402
 from test_real_obs import VERSION, free_port, vendor, wait_for  # noqa: E402
 
 ROOT = os.environ.get("DIREBOT_OBS_ROOT", "")
@@ -252,4 +252,62 @@ def test_your_face_from_a_phone(obs):
         for p in (phone, ifm):
             if p:
                 p.close()
+        c.disconnect()
+
+
+def test_moves_from_a_tracker_app(obs):
+    """0.9.0: moves from another tracker app over VMC, on Windows' own
+    sockets (one for IPv6 and IPv4 both). A pretend tracker app on this
+    machine: its face's moves and its head's turn come through; a second
+    avatar on the same port shares it; a port another app has says so."""
+    body = os.path.join(obs.home, "vmc-character.png")
+    character_picture(body)
+    spare = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    spare.bind(("127.0.0.1", 0))
+    port = spare.getsockname()[1]
+    spare.close()
+    c = obs.client()
+
+    def st(name="Tracker app"):
+        return vendor(c, "FaceGetState", {"source": name})
+    app = taken = None
+    try:
+        c.send("CreateScene", {"sceneName": "Tracker scene"}, raw=True)
+        settings = {"character": body, "face_from": "vmc", "vmc_port": port, "smoothing": 0}
+        c.send("CreateInput", {"sceneName": "Tracker scene", "inputName": "Tracker app",
+                               "inputKind": "direbot_face_avatar", "inputSettings": settings}, raw=True)
+        c.send("SetCurrentProgramScene", {"sceneName": "Tracker scene"}, raw=True)
+        assert wait_for(lambda: st()["vmc"]["listening"], 10, 0.2), st()["vmc"]
+        app = PretendVmcApp(port)
+        assert wait_for(lambda: st()["found"], 15, 0.2), (st()["vmc"], obs.log())
+        v = st()["vmc"]
+        assert v["problem"] == "" and v["from"] == "this PC" and v["per_second"] > 10, v
+        assert v["sends"]["perfect_sync"] and v["using"]["face"], v
+        app.turns["Head"] = unity_turn([0, 1, 0], -30)
+        assert wait_for(lambda: abs(st()["turn"]["yaw"] + 30) < 2, 10, 0.1), st()["turn"]
+        app.shapes = {"EyeBlinkLeft": 1.0}
+        assert wait_for(lambda: st()["moves"]["eyeBlinkRight"] > 0.9, 10, 0.1), st()["moves"]
+        # A second avatar on the same port shares it.
+        c.send("CreateInput", {"sceneName": "Tracker scene", "inputName": "Tracker two",
+                               "inputKind": "direbot_face_avatar", "inputSettings": settings}, raw=True)
+        assert wait_for(lambda: st("Tracker two")["found"], 15, 0.2), st("Tracker two")["vmc"]
+        assert st()["vmc"]["listening"] and st()["vmc"]["problem"] == ""
+        c.send("RemoveInput", {"inputName": "Tracker two"}, raw=True)
+        c.send("RemoveInput", {"inputName": "Tracker app"}, raw=True)
+        # A port another app has: said in words.
+        taken = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        taken.bind(("0.0.0.0", 0))
+        busy = taken.getsockname()[1]
+        c.send("CreateInput", {"sceneName": "Tracker scene", "inputName": "Tracker busy",
+                               "inputKind": "direbot_face_avatar",
+                               "inputSettings": dict(settings, vmc_port=busy)}, raw=True)
+        assert wait_for(lambda: "Another app" in st("Tracker busy")["vmc"]["problem"], 10, 0.2), \
+            st("Tracker busy")["vmc"]
+        assert not st("Tracker busy")["vmc"]["listening"]
+        c.send("RemoveInput", {"inputName": "Tracker busy"}, raw=True)
+    finally:
+        if app:
+            app.close()
+        if taken:
+            taken.close()
         c.disconnect()

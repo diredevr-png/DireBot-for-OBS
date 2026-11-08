@@ -362,6 +362,22 @@ V3 nearest_on(V3 a, V3 b, V3 p)
 
 } // namespace
 
+void face_into_moves(const std::string &face, float amount, float moves[EXPRESSIONS])
+{
+	const float k = clamp01(amount);
+	if (!(k > 0))
+		return;
+	for (const Recipe &r : recipes()) {
+		if (r.face != face)
+			continue;
+		for (const auto &part : r.parts) {
+			const int m = arkit_move(part.first);
+			if (m > 0)
+				moves[m] = std::max(moves[m], clamp01(part.second * k));
+		}
+	}
+}
+
 int guess_turn(const Model &m)
 {
 	if (m.vrm == -1)
@@ -1302,6 +1318,42 @@ void Rig::pose_bone(int node, Quat world_turn, float amount)
 	moved_[node] = 1 - (1 - moved_[node]) * (1 - clamp01(amount));
 }
 
+// Turns by VRM 1.0's bone names, each with how much of it shows (VRM's
+// normalized turns, the facing model's way): each bone it has takes its
+// own, with those of the bones above it that it hasn't (an upper chest,
+// say) so it still bends as far - as much as the most of them says.
+void Rig::pose_humanoid(const std::map<std::string, std::pair<Quat, float>> &turn)
+{
+	for (const auto &b : bones1_) {
+		Quat N;
+		float amount = 0;
+		bool any = false;
+		auto it = turn.find(b.first);
+		if (it != turn.end()) {
+			N = it->second.first;
+			amount = it->second.second;
+			any = true;
+		}
+		std::string up = b.first;
+		for (int steps = 0; steps < 16; steps++) {
+			const char *parent = humanoid_parent(up);
+			if (!parent || !*parent)
+				break;
+			up = parent;
+			if (bones1_.count(up))
+				break;
+			auto jt = turn.find(up);
+			if (jt != turn.end()) {
+				N = jt->second.first * N;
+				amount = std::max(amount, jt->second.second);
+				any = true;
+			}
+		}
+		if (any)
+			pose_bone(b.second, N, amount);
+	}
+}
+
 // A VRM animation file's moves at `t` seconds: each bone's turn carried
 // over (with those of the bones above it that this character hasn't, an
 // upper chest say, so it still bends as far), its hips moved as far for
@@ -1323,36 +1375,15 @@ void Rig::play_motion(const Motion &mo, float t, float amount)
 			moved_hips = std::isfinite(hips_at.x + hips_at.y + hips_at.z);
 		}
 	}
-	for (const auto &b : bones1_) {
-		Quat N;
-		bool any = false;
-		auto it = turn.find(b.first);
-		if (it != turn.end()) {
-			N = it->second;
-			any = true;
-		}
-		std::string up = b.first;
-		for (int steps = 0; steps < 16; steps++) {
-			const char *parent = humanoid_parent(up);
-			if (!parent || !*parent)
-				break;
-			up = parent;
-			if (bones1_.count(up))
-				break;
-			auto jt = turn.find(up);
-			if (jt != turn.end()) {
-				N = jt->second * N;
-				any = true;
-			}
-		}
-		if (any)
-			pose_bone(b.second, N, amount);
-	}
+	std::map<std::string, std::pair<Quat, float>> each;
+	for (const auto &t : turn)
+		each[t.first] = {t.second, amount};
+	pose_humanoid(each);
 	auto hips = bones1_.find("hips");
 	if (moved_hips && hips != bones1_.end() && mo.hips_rest.y > 1e-3f) {
 		const Quat F = options_.facing;
 		const int h = hips->second;
-		const float height = rotate(F, move_of(rest_world_[h])).y - floor_;
+		const float height = hips_height(h);
 		if (height > 1e-4f) {
 			const V3 by = rotate(conj(F), (hips_at - mo.hips_rest) * (height / mo.hips_rest.y));
 			const int p = model_->nodes[h].parent;
@@ -1446,6 +1477,53 @@ void Rig::play_moves(const Drive &d)
 				play_own(mv.animation, mv.time, a);
 		} else if (builtin_arms(mv.builtin)) {
 			play_builtin(mv.builtin, mv.time, a);
+		}
+	}
+}
+
+// How high its hips are over its feet (a VRM animation's or another
+// tracker app's hips are moved as far for it) - or, with no legs under
+// them (a bust, its hips at its bottom), as high as a whole figure its
+// size would have them.
+float Rig::hips_height(int hips) const
+{
+	const float over = rotate(options_.facing, move_of(rest_world_[hips])).y - floor_;
+	return over >= 0.2f * height_ ? over : 0.5f * height_;
+}
+
+// Another tracker app's bones (Drive::tracked), as much as each is the
+// app's and no move on cue holds it; its hips moved as far for this
+// character's height.
+void Rig::drive_tracked(const Drive &d)
+{
+	const TrackedBody &t = d.tracked;
+	if ((t.bones.empty() && !(t.hips_amount > 0)) || !model_->is_vrm())
+		return;
+	std::map<std::string, std::pair<Quat, float>> turn;
+	for (const TrackedBone &b : t.bones) {
+		const float a = clamp01(b.amount);
+		if (a > 0 && std::isfinite(b.turn.x + b.turn.y + b.turn.z + b.turn.w))
+			turn[b.bone] = {normalized(b.turn), a};
+	}
+	// Less of it where a move holds the bone (as much as a move does,
+	// before these are posed too).
+	for (auto &kv : turn) {
+		auto it = bones1_.find(kv.first);
+		if (it != bones1_.end())
+			kv.second.second *= 1 - moved_[it->second];
+	}
+	auto hips = bones1_.find("hips");
+	const float a = hips != bones1_.end() ? clamp01(t.hips_amount) * (1 - moved_[hips->second]) : 0.0f;
+	pose_humanoid(turn);
+	if (a > 0 && std::isfinite(t.hips.x + t.hips.y + t.hips.z)) {
+		const Quat F = options_.facing;
+		const int h = hips->second;
+		const float height = hips_height(h);
+		if (height > 1e-4f) {
+			const V3 by = rotate(conj(F), t.hips * height);
+			const int p = model_->nodes[h].parent;
+			const V3 local = p >= 0 ? direction(inverse(rest_world_[p]), by) : by;
+			t_[h] = t_[h] + local * a;
 		}
 	}
 }
@@ -1548,7 +1626,14 @@ void Rig::drive_head(const Drive &d)
 	auto own = [&F](Quat q) {
 		return conj(F) * q * F;
 	};
-	const Quat R = own(d.head);
+	// Your head's turn - from a camera, against the world: with another
+	// tracker app's body on it, against its chest (as much as it's the
+	// app's).
+	const float app_body = clamp01(d.tracked.torso);
+	Quat head = d.head;
+	if (app_body > 0)
+		head = slerp(Quat{}, conj(normalized(d.tracked.chest)), app_body) * head;
+	const Quat R = own(head);
 	// A breath: its chest leans back a little (below) and its shoulders
 	// rise (each turned up 3 degrees) - its arms still hanging as they
 	// did, not swung out or forward: they're turned back by as much. Not
@@ -1585,9 +1670,11 @@ void Rig::drive_head(const Drive &d)
 	// take the rest, so the head still turns just as yours.
 	Quat torso;
 	if (!torso_.empty()) {
-		const Quat follow = slerp(Quat{}, R, clamp01(d.body_follow) * 0.4f);
-		const Quat sway =
-			own(axis_angle({0, 1, 0}, d.body_yaw * RAD) * axis_angle({0, 0, 1}, d.body_roll * RAD));
+		// (Less of both as its body is another tracker app's.)
+		const float ours = 1 - app_body;
+		const Quat follow = slerp(Quat{}, R, clamp01(d.body_follow) * 0.4f * ours);
+		const Quat sway = own(axis_angle({0, 1, 0}, d.body_yaw * RAD * ours) *
+				      axis_angle({0, 0, 1}, d.body_roll * RAD * ours));
 		torso = follow * sway;
 		// The lowest bone takes 40% of the turn, the rest the others.
 		const Quat low = slerp(Quat{}, torso, torso_.size() > 1 ? 0.4f : 1.0f);
@@ -1624,7 +1711,8 @@ void Rig::drive_head(const Drive &d)
 void Rig::drive_eyes(const Drive &d)
 {
 	const Model &m = *model_;
-	if (!m.look_bones || (left_eye_ < 0 && right_eye_ < 0))
+	// (Another tracker app's eye bones turned them: as it has them.)
+	if (!m.look_bones || (left_eye_ < 0 && right_eye_ < 0) || d.tracked.eyes)
 		return;
 	static const int up_l = move_id("eyeLookUpLeft"), up_r = move_id("eyeLookUpRight"),
 			 down_l = move_id("eyeLookDownLeft"), down_r = move_id("eyeLookDownRight"),
@@ -1915,6 +2003,7 @@ void Rig::pose(const Drive &d)
 	}
 	animate(d.dt);
 	play_moves(d);
+	drive_tracked(d);
 	// Swinging parts hang as its animation has them (it may swing a tail
 	// itself), and swing from there.
 	for (Chain &c : springs_)

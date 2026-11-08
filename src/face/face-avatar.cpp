@@ -54,6 +54,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "look-pace.hpp"
 #include "model.hpp"
 #include "phone.hpp"
+#include "vmc.hpp"
 #include "rig.hpp"
 #include "signs.hpp"
 #include "tracker.hpp"
@@ -1089,7 +1090,44 @@ struct FaceAvatar {
 	// phone sent a look lately.
 	std::atomic<bool> from_phone{false};
 	PhoneLink phone;
-	bool phone_live = false;
+	bool phone_live = false; // (or from a tracker app, below)
+	// Moves from another tracker app over VMC (vmc.hpp, 0.9.0): your face
+	// ("face_from" "vmc": through the tracker, as a phone's), your body and
+	// legs ("vmc_body") and your arms, hands and fingers ("vmc_arms") on a
+	// 3D VRM character in its own spot - each the app's while it sends it,
+	// eased in and out, the rest as it was. "vmc_mirror": its left and
+	// right swapped. The link is shared by every face avatar on the port,
+	// held while any of these is on (under vmc_lock: the settings' thread
+	// sets it, the graphics thread reads it).
+	std::atomic<bool> from_vmc{false}, vmc_body{false}, vmc_arms{false}, vmc_mirror{false};
+	std::atomic<bool> vmc_rehome{false};
+	std::mutex vmc_lock;
+	std::shared_ptr<VmcLink> vmc_link;
+	// Graphics thread: what it sent and when, the face last handed over,
+	// each part's share now (body, arms, fingers: 0 ours to 1 the app's)
+	// and each bone as last sent (held while a part eases out), its hips'
+	// home, and what goes to the rig.
+	VmcSent vmc_sent;
+	double vmc_now = 0;
+	uint64_t vmc_changes = 0;
+	bool vmc_face_live = false;
+	float vmc_share[3] = {0, 0, 0};
+	Quat vmc_held[VMC_BONES];
+	bool vmc_held_has[VMC_BONES] = {};
+	V3 vmc_home;
+	bool vmc_home_set = false;
+	TrackedBody tracked_now;
+	std::vector<FaceNow> vmc_faces_now;
+	// For FaceGetState (under state_lock): what it sends, what's used.
+	VmcSends vmc_sends_state;
+	bool vmc_using_state[4] = {false, false, false, false}; // face, body, arms, fingers
+	const char *vmc_why_state = "";
+	bool face_from_camera() const { return !from_phone && !from_vmc; }
+	bool vmc_face_sending()
+	{
+		std::lock_guard<std::mutex> l(state_lock);
+		return vmc_using_state[0];
+	}
 	// Your hands and arms (body.hpp, arms.hpp), on a 3D VRM character in
 	// its own spot: looked for on their own thread, followed on the
 	// graphics one. On and light mode from the settings.
@@ -1401,7 +1439,7 @@ struct FaceAvatar {
 	// The camera is looked at for your face - or, with your face from a
 	// phone, only for your hands (the arms, or a hand sign). Graphics
 	// thread.
-	bool camera_wanted() const { return !from_phone || arms_wanted || signs_hands_wanted; }
+	bool camera_wanted() const { return face_from_camera() || arms_wanted || signs_hands_wanted; }
 
 	// How often your hands and arms are looked at, at most (seconds).
 	float arms_every() const
@@ -1494,6 +1532,11 @@ struct FaceAvatar {
 		}
 		from_phone = false;
 		phone.stop();
+		from_vmc = false;
+		{
+			std::lock_guard<std::mutex> l(vmc_lock);
+			vmc_link.reset();
+		}
 		worker.stop();
 		body_worker.stop();
 		obs_enter_graphics();
@@ -1682,7 +1725,7 @@ struct FaceAvatar {
 						std::memcpy(&given[y * row], data + (size_t)y * line, row);
 					// (Your face from a phone: the camera is only for your
 					// hands.)
-					if (!from_phone) {
+					if (face_from_camera()) {
 						rgba.assign(given.begin(), given.end());
 						worker.give(rgba, (int)stage_w, (int)stage_h, staged_ns);
 					}
@@ -1711,7 +1754,7 @@ struct FaceAvatar {
 			stage = gs_stagesurface_create(sw, sh, GS_RGBA);
 			stage_w = sw;
 			stage_h = sh;
-			if (!from_phone)
+			if (face_from_camera())
 				worker.forget();
 			body_worker.forget();
 			reset_arms = true;
@@ -1769,7 +1812,7 @@ struct FaceAvatar {
 			held_ns = 0;
 		}
 		looked_shot = -1;
-		if (from_phone) { // no picture: nothing cut out
+		if (!face_from_camera()) { // no picture: nothing cut out
 			used_shot = -1;
 			return;
 		}
@@ -2074,7 +2117,7 @@ struct FaceAvatar {
 				draw_picture(layer.picture, layer.place, char_w, char_h, 1);
 		// (From a phone there's no picture to cut yours from: its own
 		// drawn face moves with yours.)
-		const bool real = !drawn_style && !from_phone;
+		const bool real = !drawn_style && face_from_camera();
 		const float showing = real && seen.ready && have_spots && cam && held.found ? o.shown : 0;
 		// The character's spot for each of yours: the camera's first eye
 		// is on the viewer's left - unless mirrored.
@@ -2607,9 +2650,11 @@ struct FaceAvatar {
 			d.body_follow = body_follow;
 			d.body_yaw = a.body_yaw;
 			d.body_roll = a.body_roll;
-			// Your hands and arms (step_arms).
+			// Your hands and arms (step_arms), and what another tracker app
+			// sends (step_vmc) - its over your camera's.
 			d.follow_arms = arms_wanted;
 			d.arms = arms_now;
+			d.tracked = tracked_now;
 			v.w = w;
 			v.h = h;
 		} else {
@@ -2650,6 +2695,8 @@ struct FaceAvatar {
 		// about by a hit (heads a second as the picture shows it, into the
 		// world's units: its picture's right and up, and towards you).
 		d.faces = react_now.faces;
+		// (A tracker app's faces too - its happy, its own shapes.)
+		d.faces.insert(d.faces.end(), vmc_faces_now.begin(), vmc_faces_now.end());
 		d.squint = react_now.squint;
 		d.squish = react_now.squish;
 		for (const BodyMove &bm : react_now.body) {
@@ -3219,7 +3266,7 @@ struct FaceAvatar {
 		if (cam && cw && ch && camera_wanted()) {
 			if (since_render > STALE) {
 				staged = false;
-				if (!from_phone)
+				if (face_from_camera())
 					worker.forget();
 				pace.reset();
 			}
@@ -3532,6 +3579,164 @@ struct FaceAvatar {
 		arms_why_state = arms_why;
 	}
 
+	// Another tracker app (VMC): what it sent lately - your face handed to
+	// the tracker as a phone's is, your body, arms, fingers and eyes for
+	// the rig, each part eased in while the app sends it and out when it
+	// stops (held as it was last sent meanwhile). Graphics thread.
+	static constexpr float VMC_EASE = 0.25f, VMC_RECENTRE = 4.0f;
+	uint64_t vmc_given = 0;
+	V3 vmc_hips_now;
+	void step_vmc(float dt)
+	{
+		std::shared_ptr<VmcLink> link;
+		{
+			std::lock_guard<std::mutex> l(vmc_lock);
+			link = vmc_link;
+		}
+		const bool parts = vmc_body || vmc_arms;
+		const bool vrm = rig && model_now && model_now->is_vrm() && rig->plays_motions() && !worn;
+		const char *why = !link || !parts        ? ""
+				  : worn                 ? "worn"
+				  : !model_now || !rig   ? "no_3d"
+				  : !model_now->is_vrm() ? "not_vrm"
+				  : !vrm                 ? "no_bones"
+							 : "";
+		bool fresh_face = false;
+		if (link) {
+			const uint64_t ch = link->changes();
+			if (ch != vmc_changes) {
+				link->sent(vmc_sent, vmc_now);
+				vmc_changes = ch;
+			} else {
+				vmc_now = VmcLink::clock();
+			}
+			fresh_face = ch != vmc_given;
+		} else if (vmc_changes) {
+			vmc_sent = VmcSent();
+			vmc_changes = 0;
+		}
+		const VmcSends sends = link ? vmc_sends(vmc_sent, vmc_now) : VmcSends();
+		// Your face: through the tracker, its sides yours (swapped for a
+		// mirror, ours or the app's); its faces by name for the rig.
+		bool face_live = false;
+		vmc_faces_now.clear();
+		if (from_vmc && link) {
+			PhoneLook look;
+			std::vector<std::pair<std::string, float>> faces;
+			face_live = vmc_face(vmc_sent, vmc_now, look, faces);
+			if (face_live) {
+				for (const auto &fc : faces) {
+					face_into_moves(fc.first, fc.second, look.expressions);
+					if (fc.second > 0.001f)
+						vmc_faces_now.push_back(FaceNow{fc.first, fc.second});
+				}
+				if (vmc_mirror != mirror) {
+					swap_sides(look.expressions);
+					look.turn.yaw = -look.turn.yaw;
+					look.turn.roll = -look.turn.roll;
+				}
+				if (fresh_face) {
+					worker.give_phone(look, os_gettime_ns());
+					vmc_given = vmc_changes;
+				}
+			}
+		}
+		if (vmc_face_live && !face_live)
+			worker.give_phone(PhoneLook(), os_gettime_ns()); // lost
+		vmc_face_live = face_live;
+		// Your body, arms and fingers: each bone as last sent.
+		const VmcBones b = link ? vmc_bones(vmc_sent, vmc_now, vmc_mirror) : VmcBones();
+		bool sent[3] = {false, false, false};
+		for (int i = 0; i < VMC_BONES; i++) {
+			if (!b.has[i])
+				continue;
+			vmc_held[i] = b.turn[i];
+			vmc_held_has[i] = true;
+			const VmcPart part = vmc_part(i);
+			if (part == VMC_PART_BODY || part == VMC_PART_LEGS)
+				sent[0] = true;
+			else if (part == VMC_PART_ARMS)
+				sent[1] = true;
+			else if (part == VMC_PART_FINGERS)
+				sent[2] = true;
+		}
+		const bool want[3] = {vmc_body && vrm && sent[0], vmc_arms && vrm && sent[1],
+				      vmc_arms && vrm && sent[2]};
+		const float step = dt > 0 ? dt / VMC_EASE : 0;
+		for (int k = 0; k < 3; k++)
+			vmc_share[k] = clampf(
+				vmc_share[k] + clampf((want[k] ? 1.0f : 0.0f) - vmc_share[k], -step, step), 0, 1);
+		// Its hips' home: where they were as its body came in (and at
+		// Set), across and back drifting after them, so a step aside
+		// shows but it doesn't wander out of its spot.
+		if (b.has[VMC_HIPS]) {
+			const V3 at = b.at[VMC_HIPS];
+			if (!vmc_home_set || vmc_rehome.exchange(false) || vmc_share[0] <= 0) {
+				vmc_home = at;
+				vmc_home_set = true;
+			} else {
+				const float k = dt > 0 ? std::min(1.0f, dt / VMC_RECENTRE) : 0;
+				vmc_home.x += (at.x - vmc_home.x) * k;
+				vmc_home.z += (at.z - vmc_home.z) * k;
+			}
+			vmc_hips_now = at;
+		}
+		TrackedBody t;
+		if (vrm) {
+			bool torso = false;
+			for (int i = 0; i < VMC_BONES; i++) {
+				if (!vmc_held_has[i])
+					continue;
+				const VmcPart part = vmc_part(i);
+				float amount = 0;
+				if (part == VMC_PART_BODY || part == VMC_PART_LEGS)
+					amount = vmc_share[0];
+				else if (part == VMC_PART_ARMS)
+					amount = vmc_share[1];
+				else if (part == VMC_PART_FINGERS)
+					amount = vmc_share[2];
+				// Its eyes, with its face (its neck and head come through
+				// the tracker).
+				else if ((i == VMC_LEFT_EYE || i == VMC_RIGHT_EYE) && face_live && b.has[i])
+					amount = 1;
+				if (!(amount > 0))
+					continue;
+				t.bones.push_back(TrackedBone{VMC_BONE_NAMES[i], vmc_held[i], amount});
+				if (amount >= 1 && (i == VMC_LEFT_EYE || i == VMC_RIGHT_EYE))
+					t.eyes = true;
+				if (part == VMC_PART_BODY)
+					torso = true;
+			}
+			if (vmc_share[0] > 0 && vmc_home_set) {
+				const float height = vmc_home.y > 0.3f ? vmc_home.y : 0.9f;
+				const V3 by = (vmc_hips_now - vmc_home) * (1 / height);
+				t.hips = {clampf(by.x, -0.6f, 0.6f), clampf(by.y, -0.7f, 0.4f),
+					  clampf(by.z, -0.6f, 0.6f)};
+				t.hips_amount = vmc_share[0];
+			}
+			if (torso) {
+				t.torso = vmc_share[0];
+				// Your head from a camera or phone turns against the world:
+				// the app's chest's turn is taken off it (the app's own
+				// head's turn is already against its chest).
+				if (!from_vmc)
+					for (int i : {VMC_HIPS, VMC_SPINE, VMC_CHEST, VMC_UPPER_CHEST})
+						if (vmc_held_has[i])
+							t.chest = t.chest * vmc_held[i];
+			}
+		}
+		if (!link)
+			for (bool &h : vmc_held_has)
+				h = false;
+		tracked_now = std::move(t);
+		std::lock_guard<std::mutex> l(state_lock);
+		vmc_sends_state = sends;
+		vmc_using_state[0] = face_live;
+		for (int k = 0; k < 3; k++)
+			vmc_using_state[1 + k] = vmc_share[k] > 0.5f;
+		vmc_why_state = why;
+	}
+
 	// Hand signs and face moves (signs.hpp): watched while it's looking at
 	// you - shown, or hidden with "while it's hidden" on - and each one
 	// held its time sent to DireBot (send_signs_task). Your face's moves
@@ -3555,7 +3760,7 @@ struct FaceAvatar {
 		bool looking = last_look_ns && now - last_look_ns < 500'000'000ULL;
 		// ...or your face came from a phone lately, while it's shown (or
 		// "while it's hidden" is on).
-		if (from_phone && !looking)
+		if (!face_from_camera() && !looking)
 			looking = phone_live && (signs_hidden || (last_render && now - last_render < 500'000'000ULL));
 		const bool fresh = body_seen.looks != signs_body_looks;
 		signs_body_looks = body_seen.looks;
@@ -3609,7 +3814,7 @@ struct FaceAvatar {
 			gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 			if (since_render > STALE) {
 				staged = false;
-				if (!from_phone)
+				if (face_from_camera())
 					worker.forget();
 				pace.reset();
 			}
@@ -3621,7 +3826,7 @@ struct FaceAvatar {
 		}
 		obs_source_release(cam);
 		// Your face from a phone comes whether it's shown or not.
-		const bool phone_looking = from_phone && phone_live && !shown && signs_hidden && signs_any;
+		const bool phone_looking = !face_from_camera() && phone_live && !shown && signs_hidden && signs_any;
 		std::lock_guard<std::mutex> l(state_lock);
 		looking_hidden_state = looking || phone_looking;
 	}
@@ -3657,7 +3862,7 @@ struct FaceAvatar {
 		seen_looks = seen.looks;
 		{
 			const uint64_t now = os_gettime_ns();
-			phone_live = from_phone && seen.ns && now >= seen.ns && now - seen.ns < 600'000'000ULL;
+			phone_live = !face_from_camera() && seen.ns && now >= seen.ns && now - seen.ns < 600'000'000ULL;
 		}
 		if (reset_shown.exchange(false))
 			shown.reset();
@@ -3682,6 +3887,7 @@ struct FaceAvatar {
 			react_now = react.step(dt, react_view);
 		}
 		react_hits += react_now.hits;
+		step_vmc(dt);
 		step_arms(dt);
 		step_signs(dt, o, t);
 		// The page's live bars: what the camera reads, and what it shows.
@@ -4235,17 +4441,37 @@ struct FaceAvatar {
 		// from a phone can't be worn on your head in the camera's picture.
 		const char *face_from = obs_data_get_string(settings, "face_from");
 		const bool phone_now = face_from && std::strcmp(face_from, "phone") == 0;
+		const bool vmc_now_face = face_from && std::strcmp(face_from, "vmc") == 0;
 		const char *app = obs_data_get_string(settings, "phone_app");
 		const PhoneApp phone_app = app && std::strcmp(app, "ifacialmocap") == 0 ? PHONE_IFACIALMOCAP
 											 : PHONE_VTUBE_STUDIO;
 		const char *address = obs_data_get_string(settings, "phone_address");
-		if (from_phone.exchange(phone_now) != phone_now) {
+		const bool phone_changed = from_phone.exchange(phone_now) != phone_now;
+		const bool vmc_changed = from_vmc.exchange(vmc_now_face) != vmc_now_face;
+		if (phone_changed || vmc_changed) {
 			worker.forget();
 			new_camera = true;
 			reset_shown = true;
 		}
 		phone.set(phone_app, phone_now && address ? address : "");
-		worn = obs_data_get_bool(settings, "worn") && !phone_now;
+		// ...or from another tracker app (VMC), as your body and arms can
+		// be: listening on its port while any of them is.
+		vmc_body = obs_data_get_bool(settings, "vmc_body");
+		vmc_arms = obs_data_get_bool(settings, "vmc_arms");
+		vmc_mirror = obs_data_get_bool(settings, "vmc_mirror");
+		{
+			const int port = (int)obs_data_get_int(settings, "vmc_port");
+			const bool want = vmc_now_face || vmc_body || vmc_arms;
+			std::shared_ptr<VmcLink> old; // shut (if no one else holds it) once let go of
+			std::lock_guard<std::mutex> l(vmc_lock);
+			if (!want) {
+				old.swap(vmc_link);
+			} else if (!vmc_link || vmc_link->port() != port) {
+				old.swap(vmc_link);
+				vmc_link = VmcLink::open(port);
+			}
+		}
+		worn = obs_data_get_bool(settings, "worn") && !phone_now && !vmc_now_face;
 		// Smoothing: steadier one way; the other, snappier, and the
 		// character aims further on past each look to keep up with you.
 		const float smoothing = clampf((float)obs_data_get_int(settings, "smoothing") / 100.0f, 0, 1);
@@ -4829,7 +5055,7 @@ struct FaceAvatar {
 		// Your face from a phone app: whether it's set to ask one, its
 		// socket, where it asks and our port, why it can't, and what came
 		// (and from where else - the phone may have another address).
-		answer["face_from"] = from_phone ? "phone" : "camera";
+		answer["face_from"] = from_phone ? "phone" : from_vmc ? "vmc" : "camera";
 		{
 			const PhoneLink::State ps = phone.state();
 			answer["phone"] = {{"on", ps.on},
@@ -4847,6 +5073,56 @@ struct FaceAvatar {
 					   {"others", ps.others},
 					   {"other", ps.other},
 					   {"unread", ps.unread}};
+		}
+		// Another tracker app (VMC, 0.9.0): whether it listens and where,
+		// why it can't, what came (and from where), what the app sends
+		// lately part by part, and which parts the character takes from it
+		// now (or why it can't).
+		{
+			std::shared_ptr<VmcLink> link;
+			{
+				std::lock_guard<std::mutex> l(vmc_lock);
+				link = vmc_link;
+			}
+			const VmcLink::State vs = link ? link->state() : VmcLink::State();
+			VmcSent sent;
+			double at = 0;
+			if (link)
+				link->sent(sent, at);
+			const VmcSends &sn = vmc_sends_state;
+			answer["vmc"] = {{"on", (bool)link},
+					 {"face", (bool)from_vmc},
+					 {"body", (bool)vmc_body},
+					 {"arms", (bool)vmc_arms},
+					 {"mirror", (bool)vmc_mirror},
+					 {"listening", vs.listening},
+					 {"port", link ? link->port() : 0},
+					 {"problem", vs.problem},
+					 {"packets", vs.packets},
+					 {"per_second", r(vs.per_second, 10)},
+					 {"since", vs.since < 0 ? -1.0f : r(vs.since, 10)},
+					 {"from", vs.from},
+					 {"others", vs.others},
+					 {"other", vs.other},
+					 {"unread", vs.unread},
+					 {"loaded", sent.loaded},
+					 {"calibration", sent.calibration},
+					 {"sends",
+					  {{"bones", sn.bones},
+					   {"body", sn.body},
+					   {"legs", sn.legs},
+					   {"head", sn.head},
+					   {"eyes", sn.eyes},
+					   {"arms", sn.arms},
+					   {"fingers", sn.fingers},
+					   {"shapes", sn.shapes},
+					   {"perfect_sync", sn.perfect_sync}}},
+					 {"using",
+					  {{"face", vmc_using_state[0]},
+					   {"body", vmc_using_state[1]},
+					   {"arms", vmc_using_state[2]},
+					   {"fingers", vmc_using_state[3]}}},
+					 {"why_not", vmc_why_state}};
 		}
 		// (No lists of plain values: OBS only passes on lists of objects.)
 		answer["drawn"] = {{"left_eye", EYE_NAMES[drawn_state.eye[0]]},
@@ -5382,6 +5658,11 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "face_from", "camera");
 	obs_data_set_default_string(settings, "phone_app", "vtube_studio");
 	obs_data_set_default_string(settings, "phone_address", "");
+	// Nothing from another tracker app until you pick it (0.9.0).
+	obs_data_set_default_bool(settings, "vmc_body", false);
+	obs_data_set_default_bool(settings, "vmc_arms", false);
+	obs_data_set_default_bool(settings, "vmc_mirror", false);
+	obs_data_set_default_int(settings, "vmc_port", VMC_PORT);
 }
 
 bool add_camera(void *param, obs_source_t *source)
@@ -5414,12 +5695,17 @@ obs_properties_t *get_properties(void *data)
 							    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(face_from, text("FaceAvatar.FaceFromCamera"), "camera");
 	obs_property_list_add_string(face_from, text("FaceAvatar.FaceFromPhone"), "phone");
+	obs_property_list_add_string(face_from, text("FaceAvatar.FaceFromVmc"), "vmc");
 	obs_property_t *apps = obs_properties_add_list(props, "phone_app", text("FaceAvatar.PhoneApp"),
 						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(apps, "VTube Studio", "vtube_studio");
 	obs_property_list_add_string(apps, "MeowFace", "meowface");
 	obs_property_list_add_string(apps, "iFacialMocap", "ifacialmocap");
 	obs_properties_add_text(props, "phone_address", text("FaceAvatar.PhoneAddress"), OBS_TEXT_DEFAULT);
+	obs_properties_add_bool(props, "vmc_body", text("FaceAvatar.VmcBody"));
+	obs_properties_add_bool(props, "vmc_arms", text("FaceAvatar.VmcArms"));
+	obs_properties_add_bool(props, "vmc_mirror", text("FaceAvatar.VmcMirror"));
+	obs_properties_add_int(props, "vmc_port", text("FaceAvatar.VmcPort"), 1024, 65535, 1);
 	const char *pictures = "PNG (*.png);;All pictures (*.png *.jpg *.jpeg *.webp *.gif)";
 	obs_properties_add_path(props, "character", text("FaceAvatar.Character"), OBS_PATH_FILE, pictures, nullptr);
 	obs_properties_add_path(props, "character_left", text("FaceAvatar.CharacterLeft"), OBS_PATH_FILE, pictures,
@@ -5740,11 +6026,19 @@ json set_rest(const json &data)
 			answer = fail("Your phone stopped sending your face - is its app still open, with the screen on?");
 		else if (f->from_phone)
 			f->worker.start_rest();
+		else if (f->from_vmc && !f->vmc_face_sending())
+			answer = fail(
+				"Your tracker app isn't sending your face - check its VMC sending is on, to this PC's port in DireBot.");
+		else if (f->from_vmc)
+			f->worker.start_rest();
 		else if (!showing)
 			answer = fail("Show the face avatar in OBS first - it only looks for you while it's shown.");
 		else
 			f->worker.start_rest();
 		answer["setting"] = answer["ok"].get<bool>();
+		// (A tracker app's body: its hips' home is where they are now.)
+		if (answer["setting"].get<bool>())
+			f->vmc_rehome = true;
 	}
 	obs_source_release(src);
 	return answer;

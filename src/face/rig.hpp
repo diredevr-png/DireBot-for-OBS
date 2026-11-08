@@ -111,6 +111,33 @@ struct MoveNow {
 	float time = 0, amount = 0;
 };
 
+// Bones from another tracker app (vmc.hpp, 0.9.0): VRM's normalized turns
+// (the facing model's way) by VRM 1.0's names, each with how much of it is
+// the app's (0 to 1). A move on cue takes over from them as much as it
+// shows, as it does from your arms; what they leave is the rig's own (its
+// arms down, its fingers relaxed, your arms from the camera).
+struct TrackedBone {
+	std::string bone;
+	Quat turn;
+	float amount = 0;
+};
+struct TrackedBody {
+	std::vector<TrackedBone> bones;
+	// Its hips moved from where they rest, as a share of its hips' height
+	// (the facing model's way), as much as `hips_amount`.
+	V3 hips;
+	float hips_amount = 0;
+	// How much of its body (hips to chest) is the app's: its own sway and
+	// following your head that much less - and, with `chest` (the app's
+	// chest's turn against the world), your head's turn from a camera
+	// (against the world, not its chest) that much against its chest, so
+	// its head turns as yours on a body leaning as yours.
+	float torso = 0;
+	Quat chest;
+	// Its eyes are the app's (its eye bones): your looks don't turn them.
+	bool eyes = false;
+};
+
 struct Drive {
 	// Your head's turn (facing +z, y up: as it's seen in the picture,
 	// already mirrored if the picture is), against facing straight ahead.
@@ -167,6 +194,9 @@ struct Drive {
 	// its hand by its head where yours is by yours.
 	bool follow_arms = false;
 	ArmsNow arms;
+	// From another tracker app (vmc.hpp): its body, arms, fingers and eyes,
+	// as much as each is taken.
+	TrackedBody tracked;
 };
 
 // A box round what a character takes up (model space).
@@ -322,6 +352,9 @@ private:
 	void play_moves(const Drive &d);
 	void pose_bone(int node, Quat world_turn, float amount);
 	void play_motion(const Motion &mo, float t, float amount);
+	void pose_humanoid(const std::map<std::string, std::pair<Quat, float>> &turn);
+	void drive_tracked(const Drive &d);
+	float hips_height(int hips) const;
 	void play_builtin(BuiltIn b, float t, float amount);
 	void play_own(int animation, float t, float amount);
 	void measure_head();
@@ -531,6 +564,9 @@ FaceRegion face_region(const FaceSpots &fs, Quat facing);
 // +x (as the AR VTuber characters are).
 int guess_turn(const Model &m);
 
+// A face VRM names (happy, angry, sad, relaxed, surprised) made from ARKit's
+// shapes, `amount` of it, into `moves` (each as much as it is or more).
+void face_into_moves(const std::string &face, float amount, float moves[EXPRESSIONS]);
 // An ARKit move's number by its name (any case, with or without a
 // prefix like "blendShape1."), or -1.
 int arkit_move(const std::string &name);

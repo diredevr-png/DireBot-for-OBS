@@ -2893,6 +2893,286 @@ def test_your_face_from_a_phone(run):
         c.disconnect()
 
 
+def osc_text(s):
+    b = s.encode() + b"\0"
+    return b + b"\0" * (-len(b) % 4)
+
+
+def osc_message(address, *args):
+    tags, data = ",", b""
+    for a in args:
+        if isinstance(a, str):
+            tags, data = tags + "s", data + osc_text(a)
+        elif isinstance(a, int):
+            tags, data = tags + "i", data + struct.pack(">i", a)
+        else:
+            tags, data = tags + "f", data + struct.pack(">f", a)
+    return osc_text(address) + osc_text(tags) + data
+
+
+def osc_bundle(messages):
+    return b"#bundle\0" + struct.pack(">II", 0, 1) + b"".join(struct.pack(">I", len(m)) + m for m in messages)
+
+
+def unity_turn(axis, degrees):
+    """Unity's Quaternion.AngleAxis (x, y, z, w): Unity's own terms - x its
+    right, y up, z its front."""
+    n = math.sqrt(sum(v * v for v in axis))
+    s = math.sin(math.radians(degrees) / 2)
+    return [axis[0] / n * s, axis[1] / n * s, axis[2] / n * s, math.cos(math.radians(degrees) / 2)]
+
+
+# The bones a tracker app sends (Unity's names), in a T.
+VMC_BONES = ["Hips", "Spine", "Chest", "UpperChest", "Neck", "Head", "LeftEye", "RightEye",
+             "LeftUpperLeg", "LeftLowerLeg", "LeftFoot", "RightUpperLeg", "RightLowerLeg", "RightFoot",
+             "LeftShoulder", "LeftUpperArm", "LeftLowerArm", "LeftHand",
+             "RightShoulder", "RightUpperArm", "RightLowerArm", "RightHand",
+             "LeftThumbProximal", "LeftIndexProximal", "RightThumbProximal", "RightIndexProximal"]
+
+
+class PretendVmcApp:
+    """A tracker app on this machine sending VMC (as XR Animator, VSeeFace
+    or Webcam Motion Capture do), 30 frames a second: each frame its bones,
+    its face's shapes, Blend/Apply and OK, in one bundle."""
+
+    def __init__(self, port):
+        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.turns = {}
+        self.hips = [0.0, 0.9, 0.0]
+        self.shapes = {}
+        self.sending = True
+        self.stopping = False
+        self.frames = 0
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def frame(self):
+        parts = []
+        for name in VMC_BONES:
+            at = self.hips if name == "Hips" else [0.0, 0.1, 0.0]
+            q = self.turns.get(name, [0.0, 0.0, 0.0, 1.0])
+            parts.append(osc_message("/VMC/Ext/Bone/Pos", name, *[float(v) for v in at + q]))
+        for k in ARKIT:
+            parts.append(osc_message("/VMC/Ext/Blend/Val", k, float(self.shapes.get(k, 0.0))))
+        for k in ("Joy", "A", "Blink"):
+            parts.append(osc_message("/VMC/Ext/Blend/Val", k, float(self.shapes.get(k, 0.0))))
+        parts.append(osc_message("/VMC/Ext/Blend/Apply"))
+        parts.append(osc_message("/VMC/Ext/OK", 1, 3, 0))
+        parts.append(osc_message("/VMC/Ext/T", time.time() % 1000.0))
+        return osc_bundle(parts)
+
+    def run(self):
+        while not self.stopping:
+            if self.sending:
+                self.sock.sendto(self.frame(), ("127.0.0.1", self.port))
+                self.frames += 1
+            time.sleep(1 / 30)
+
+    def close(self):
+        self.stopping = True
+        self.thread.join(5)
+        self.sock.close()
+
+
+def free_udp_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def test_moves_from_a_tracker_app(run):
+    """0.9.0: moves from another tracker app over VMC (here a pretend one
+    on this machine). A 3D VRM character in its own spot takes its body
+    and its arms (each as you pick), its face going through the tracker as
+    a phone's - no camera needed: its arm up where the app has it, its
+    hips across, mirrored when asked; its face's moves and its head's turn
+    (its own left and right yours, mirrored as the character is); "Set".
+    FaceGetState says what the app sends and what's taken; stopped, your
+    face is lost and its arms and body are its own again. Two avatars on
+    one port share it; a port another app has says so; a character that
+    can't take bones says why."""
+    figure = os.path.join(run.home, "vmc.vrm")
+    arms_character(figure)
+    plain = os.path.join(run.home, "vmc-plain.glb")
+    arms_character(plain, vrm=False)
+    port = free_udp_port()
+    app = PretendVmcApp(port)
+    size = 300
+    common = {"width": size, "height": size, "size": 100, "framing": "whole", "style": "drawn",
+              "smoothing": 0, "follow_move": 0, "follow_grow": 0, "follow_tilt": 0, "body_follow": 0,
+              "face_from": "vmc", "vmc_port": port, **STILL}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+
+    def st(name="Tracker app"):
+        return vendor(c, "FaceGetState", {"source": name})
+
+    def vmc(name="Tracker app"):
+        return st(name)["vmc"]
+
+    def change(name, settings):
+        send(c, "SetInputSettings", {"inputName": name, "inputSettings": settings})
+    green = lambda px: px[1] > 90 and px[0] < 70 and px[2] < 70  # noqa: E731
+    blue = lambda px: px[2] > 90 and px[0] < 60 and px[1] < 80  # noqa: E731
+    half = size // 2
+
+    def hands(shot):
+        """Each of its arms (the picture's left one, then right): the middle
+        (x, y) of its green, and how much there is."""
+        lx, ly, ln = middle_of(shot, green, (0, 0, half, size))
+        rx, ry, rn = middle_of(shot, green, (half, 0, size, size))
+        return (lx, ly, ln), (rx, ry, rn)
+    held = None
+    try:
+        send(c, "CreateScene", {"sceneName": "Tracker scene"})
+        send(c, "CreateInput", {"sceneName": "Tracker scene", "inputName": "Tracker app",
+                                "inputKind": "direbot_face_avatar",
+                                "inputSettings": {**common, "model": figure, "vmc_body": True, "vmc_arms": True}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Tracker scene"})
+        assert wait_for(lambda: st()["model"]["shown"], 30, 0.2), st()
+        assert wait_for(lambda: vmc()["using"]["body"] and vmc()["using"]["arms"] and st()["found"], 10, 0.1), vmc()
+        s = st()
+        v = s["vmc"]
+        assert s["face_from"] == "vmc" and s["camera"] == "", s
+        assert v["on"] and v["face"] and v["body"] and v["arms"] and not v["mirror"], v
+        assert v["listening"] and v["port"] == port and v["problem"] == "", v
+        assert v["from"] == "this PC" and v["others"] == 0 and v["unread"] == 0, v
+        assert v["loaded"] == 1 and v["calibration"] == 3, v
+        assert 0 <= v["since"] < 0.5 and v["packets"] > 0, v
+        n = v["sends"]
+        assert n["bones"] == len(VMC_BONES) and n["body"] and n["legs"] and n["head"] and n["eyes"], n
+        assert n["arms"] and n["fingers"] and n["shapes"] == len(ARKIT) + 3 and n["perfect_sync"], n
+        u = v["using"]
+        assert u == {"face": True, "body": True, "arms": True, "fingers": True}, u
+        assert v["why_not"] == "", v
+        assert wait_for(lambda: 20 <= vmc()["per_second"] <= 40, 3, 0.1), vmc()
+
+        # In a T, as the app has it: both arms out at its shoulders.
+        time.sleep(0.5)
+        t_pose = screenshot(c, "Tracker app")
+        keep_shot(t_pose, "vmc-t")
+        (lx0, ly0, ln0), (rx0, ry0, rn0) = hands(t_pose)
+        assert ln0 > 10 and rn0 > 10, (ln0, rn0)
+        assert abs(ly0 - ry0) < 0.02 * size, (ly0, ry0)
+        bx0, _, bn0 = middle_of(t_pose, blue)
+        assert bn0 > 100, bn0
+        # Its left arm up 60 degrees (Unity: about its front by -60): its
+        # left arm - on the picture's right, as it faces you - goes up.
+        app.turns["LeftUpperArm"] = unity_turn([0, 0, 1], -60)
+
+        def raised(side):
+            shot = screenshot(c, "Tracker app")
+            (lx, ly, ln), (rx, ry, rn) = hands(shot)
+            if side == "right":
+                return rn > 10 and ry < ry0 - 0.08 * size and abs(ly - ly0) < 0.02 * size
+            return ln > 10 and ly < ly0 - 0.08 * size and abs(ry - ry0) < 0.02 * size
+        assert wait_for(lambda: raised("right"), 5, 0.2), hands(screenshot(c, "Tracker app"))
+        keep_shot(screenshot(c, "Tracker app"), "vmc-left-arm-up")
+        # Mirrored: the other.
+        change("Tracker app", {"vmc_mirror": True})
+        assert wait_for(lambda: vmc()["mirror"], 5, 0.1)
+        assert wait_for(lambda: raised("left"), 5, 0.2), hands(screenshot(c, "Tracker app"))
+        change("Tracker app", {"vmc_mirror": False})
+        assert wait_for(lambda: raised("right"), 5, 0.2)
+        app.turns.pop("LeftUpperArm")
+
+        # Its hips a step to its right (Unity's +x): it goes to the
+        # picture's left; then drifts back to its own spot.
+        app.hips = [0.18, 0.9, 0.0]
+        assert wait_for(lambda: middle_of(screenshot(c, "Tracker app"), blue)[0] < bx0 - 0.04 * size, 3, 0.1)
+        app.hips = [0.0, 0.9, 0.0]
+        assert wait_for(lambda: abs(middle_of(screenshot(c, "Tracker app"), blue)[0] - bx0) < 0.02 * size, 3, 0.1)
+
+        # Its face, through the tracker: its "left" eye (its own) is your
+        # right one when the character mirrors you (as it does unless you
+        # turn "Mirror me" off), its head turned to its left the same.
+        app.shapes = {"EyeBlinkLeft": 1.0, "JawOpen": 0.5}
+        assert wait_for(lambda: st()["moves"]["eyeBlinkRight"] > 0.9, 5, 0.05), st()["moves"]
+        m = st()["moves"]
+        assert m["eyeBlinkLeft"] < 0.1 and abs(m["jawOpen"] - 0.5) < 0.05, m
+        app.turns["Head"] = unity_turn([0, 1, 0], -30)
+        assert wait_for(lambda: abs(st()["turn"]["yaw"] + 30) < 2, 5, 0.05), st()["turn"]
+        assert abs(st()["turn"]["pitch"]) < 2
+        # "Mirror what the tracker app sends": then as it is.
+        change("Tracker app", {"vmc_mirror": True})
+        assert wait_for(lambda: abs(st()["turn"]["yaw"] - 30) < 2, 5, 0.05), st()["turn"]
+        assert wait_for(lambda: st()["moves"]["eyeBlinkLeft"] > 0.9, 5, 0.05), st()["moves"]
+        change("Tracker app", {"vmc_mirror": False})
+        app.shapes = {}
+        # "Set": the way it faces now is straight on.
+        assert vendor(c, "FaceSet", {"source": "Tracker app"})["ok"]
+        assert wait_for(lambda: st()["set"] and not st()["setting"], 10, 0.1), st()
+        assert wait_for(lambda: abs(st()["turn"]["yaw"]) < 2, 5, 0.05), st()["turn"]
+        app.turns.pop("Head")
+        # Not worn on your head: there's no camera picture for it.
+        change("Tracker app", {"worn": True})
+        assert wait_for(lambda: st()["worn"] is False, 5, 0.1)
+        change("Tracker app", {"worn": False})
+
+        # Two avatars on one port: they share it. One that can't take
+        # bones says why (its face still comes).
+        send(c, "CreateInput", {"sceneName": "Tracker scene", "inputName": "Tracker plain",
+                                "inputKind": "direbot_face_avatar",
+                                "inputSettings": {**common, "model": plain, "vmc_arms": True}})
+        assert wait_for(lambda: vmc("Tracker plain")["why_not"] == "not_vrm", 30, 0.2), vmc("Tracker plain")
+        p = vmc("Tracker plain")
+        assert p["listening"] and p["problem"] == "" and p["port"] == port, p
+        assert not p["using"]["arms"] and p["using"]["face"], p
+        assert vmc()["listening"] and vmc()["problem"] == ""
+        send(c, "RemoveInput", {"inputName": "Tracker plain"})
+
+        # The app stops: your face is lost and its arms are its own again
+        # (by its sides); "Set" says why it can't.
+        app.sending = False
+        assert wait_for(lambda: not st()["found"], 5, 0.05), st()
+        assert wait_for(lambda: not vmc()["using"]["arms"] and not vmc()["using"]["body"], 5, 0.1), vmc()
+        time.sleep(0.5)
+        down = screenshot(c, "Tracker app")
+        keep_shot(down, "vmc-stopped")
+        (_, ly1, ln1), (_, ry1, rn1) = hands(down)
+        assert ln1 > 5 and rn1 > 5 and ly1 > ly0 + 0.08 * size and ry1 > ry0 + 0.08 * size, (ly0, ly1, ry0, ry1)
+        answer = vendor(c, "FaceSet", {"source": "Tracker app"})
+        assert not answer["ok"] and "isn't sending your face" in answer["error"], answer
+        assert vmc()["since"] > 0.5
+        app.sending = True
+        assert wait_for(lambda: st()["found"] and vmc()["using"]["arms"], 5, 0.05), vmc()
+        # Arms off: by its sides again, while it still sends.
+        change("Tracker app", {"vmc_arms": False})
+        assert wait_for(lambda: not vmc()["using"]["arms"], 5, 0.1), vmc()
+        time.sleep(0.5)
+        (_, ly2, _), (_, ry2, _) = hands(screenshot(c, "Tracker app"))
+        assert ly2 > ly0 + 0.08 * size and ry2 > ry0 + 0.08 * size, (ly0, ly2, ry0, ry2)
+
+        # A port another app has: said in plain words.
+        held = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        held.bind(("0.0.0.0", 0))
+        taken = held.getsockname()[1]
+        change("Tracker app", {"vmc_port": taken})
+        assert wait_for(lambda: "Another app on this PC is listening on port %d" % taken in vmc()["problem"], 5, 0.1)
+        assert not vmc()["listening"] and vmc()["port"] == taken
+        assert wait_for(lambda: not st()["found"], 5, 0.05)
+        held.close()
+        held = None
+        # (It tries again every 2 seconds.)
+        assert wait_for(lambda: vmc()["listening"] and vmc()["problem"] == "", 5, 0.1), vmc()
+        change("Tracker app", {"vmc_port": port})
+        assert wait_for(lambda: st()["found"], 5, 0.05)
+
+        # Back to the camera, its body off: not listening any more.
+        change("Tracker app", {"face_from": "camera", "vmc_body": False})
+        assert wait_for(lambda: not vmc()["on"] and not vmc()["listening"], 5, 0.1), vmc()
+        assert st()["face_from"] == "camera"
+        send(c, "RemoveInput", {"inputName": "Tracker app"})
+    finally:
+        if held:
+            held.close()
+        app.close()
+        c.disconnect()
+
+
 def test_closing_obs_leaves_nothing_behind(run):
     assert run.close() == 0
     log = run.log()

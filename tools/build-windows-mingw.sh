@@ -53,7 +53,7 @@ sources=(
 	src/record/rules.cpp src/record/record.cpp src/moves/plan.cpp src/moves/move-transition.cpp
 	src/filters/blur-filter.cpp src/face/tracker.cpp src/face/pose.cpp src/face/avatar2d.cpp
 	src/face/model.cpp src/face/rig.cpp src/face/alive.cpp src/face/react.cpp src/face/voice.cpp src/face/setup.cpp src/face/pictures.cpp src/face/avatar3d.cpp src/face/face-avatar.cpp
-	src/face/body.cpp src/face/arms.cpp src/face/signs.cpp src/face/phone.cpp
+	src/face/body.cpp src/face/arms.cpp src/face/signs.cpp src/face/phone.cpp src/face/vmc.cpp
 	src/face/nn/net.cpp src/face/nn/kernels.cpp src/face/nn/kernels-sse2.cpp src/face/nn/kernels-avx2.cpp
 	src/vertical/rules.cpp src/vertical/options.cpp src/vertical/canvas.cpp src/vertical/outputs.cpp
 	src/vertical/settings.cpp src/vertical/vertical.cpp
