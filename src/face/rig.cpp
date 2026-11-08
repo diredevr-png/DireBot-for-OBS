@@ -242,6 +242,16 @@ float scale_of(const M4 &m)
 {
 	return length(V3{m.m[0], m.m[1], m.m[2]});
 }
+// Its biggest stretch any way (0.9.0: a part shrunk away is small all
+// ways, not just along one).
+float largest_scale(const M4 &m)
+{
+	return std::max({length(V3{m.m[0], m.m[1], m.m[2]}), length(V3{m.m[4], m.m[5], m.m[6]}),
+			 length(V3{m.m[8], m.m[9], m.m[10]})});
+}
+// 0.9.0: a part whose bones are all shrunk below this share of the
+// character's own size is hidden (a mount tucked away at rest, 0.001).
+constexpr float HIDDEN_SCALE = 0.01f;
 // A node by its name: a bone of a skin first, as a set-up names them.
 int node_named(const Model &m, const std::string &name)
 {
@@ -1392,6 +1402,25 @@ Bounds Rig::rest_bounds()
 	return b;
 }
 
+Bounds Rig::rest_bounds_in(int animation)
+{
+	const int was = options_.animation;
+	const float was_t = anim_time_;
+	const int was_from = fade_from_;
+	const float was_from_t = fade_from_time_, was_fade_t = fade_t_, was_fade_length = fade_length_;
+	options_.animation = animation >= 0 && animation < (int)model_->animations.size() ? animation : -1;
+	anim_time_ = 0;
+	fade_from_ = -1;
+	const Bounds b = rest_bounds();
+	options_.animation = was;
+	anim_time_ = was_t;
+	fade_from_ = was_from;
+	fade_from_time_ = was_from_t;
+	fade_t_ = was_fade_t;
+	fade_length_ = was_fade_length;
+	return b;
+}
+
 void Rig::measure_head()
 {
 	const Model &m = *model_;
@@ -1784,36 +1813,84 @@ void Rig::drive_tracked(const Drive &d)
 	}
 }
 
-void Rig::set_animation(int which)
+void Rig::set_animation(int which, float fade, float start)
 {
 	if (which < 0 || which >= (int)model_->animations.size())
 		which = -1;
-	if (which != options_.animation)
-		anim_time_ = 0;
+	if (which == options_.animation)
+		return;
+	// 0.9.0: the one before fades out from where it is (a fade already
+	// going on is taken over from where it's got to: the newest two).
+	const bool fades = std::isfinite(fade) && fade > 1e-3f && options_.animation >= 0;
+	fade_from_ = fades ? options_.animation : -1;
+	fade_from_time_ = anim_time_;
+	fade_t_ = 0;
+	fade_length_ = fades ? std::min(fade, 10.0f) : 0;
 	options_.animation = which;
+	anim_time_ = 0;
+	if (which >= 0 && std::isfinite(start) && start > 0) {
+		const float length = model_->animations[which].length;
+		anim_time_ = length > 0 ? std::fmod(start, length) : 0;
+	}
+}
+
+// One of its own animations at `t` seconds over what its nodes have now, as
+// much as `amount` (1: just as it has them).
+void Rig::apply_animation(int which, float t, float amount)
+{
+	const Animation &a = model_->animations[which];
+	const float k = clamp01(amount);
+	float v[4];
+	for (const AnimChannel &c : a.channels) {
+		if (c.node < 0 || c.node >= (int)r_.size())
+			continue;
+		sample(c, t, v);
+		if (c.path == AnimChannel::Move) {
+			const V3 to{v[0], v[1], v[2]};
+			t_[c.node] = k >= 1 ? to : t_[c.node] + (to - t_[c.node]) * k;
+		} else if (c.path == AnimChannel::Size) {
+			const V3 to{v[0], v[1], v[2]};
+			s_[c.node] = k >= 1 ? to : s_[c.node] + (to - s_[c.node]) * k;
+		} else {
+			const Quat to{v[0], v[1], v[2], v[3]};
+			r_[c.node] = k >= 1 ? to : normalized(slerp(r_[c.node], normalized(to), k));
+			anim_turns_[c.node] = 1;
+		}
+	}
 }
 
 // Its own animation, on from where it was by `dt`, over and over: the
-// nodes it moves are where it has them (the rest as they are).
+// nodes it moves are where it has them (the rest as they are). 0.9.0:
+// while the one before fades out, it's eased in over it.
 void Rig::animate(float dt)
 {
 	const Model &m = *model_;
 	anim_turns_.assign(m.nodes.size(), 0);
-	if (options_.animation < 0 || options_.animation >= (int)m.animations.size())
-		return;
-	const Animation &a = m.animations[options_.animation];
-	if (a.length > 0)
-		anim_time_ = std::fmod(anim_time_ + std::max(0.0f, std::min(dt, 1.0f)), a.length);
-	float v[4];
-	for (const AnimChannel &c : a.channels) {
-		sample(c, anim_time_, v);
-		if (c.path == AnimChannel::Move)
-			t_[c.node] = {v[0], v[1], v[2]};
-		else if (c.path == AnimChannel::Size)
-			s_[c.node] = {v[0], v[1], v[2]};
-		else
-			r_[c.node] = Quat{v[0], v[1], v[2], v[3]}, anim_turns_[c.node] = 1;
+	const float step = std::max(0.0f, std::min(dt, 1.0f));
+	const int now = options_.animation >= 0 && options_.animation < (int)m.animations.size() ? options_.animation
+												 : -1;
+	if (now >= 0 && m.animations[now].length > 0)
+		anim_time_ = std::fmod(anim_time_ + step, m.animations[now].length);
+	float into = 1;
+	if (fade_from_ >= 0 && fade_from_ < (int)m.animations.size()) {
+		fade_t_ += step;
+		const float length = m.animations[fade_from_].length;
+		if (length > 0)
+			fade_from_time_ = std::fmod(fade_from_time_ + step, length);
+		if (fade_t_ >= fade_length_) {
+			fade_from_ = -1;
+		} else {
+			const float u = clamp01(fade_t_ / std::max(1e-4f, fade_length_));
+			into = u * u * (3 - 2 * u);
+			// The old one as it has them, then the new one over it - or, the
+			// new one none, the old one easing back to how it rests.
+			apply_animation(fade_from_, fade_from_time_, now >= 0 ? 1.0f : 1 - into);
+		}
+	} else {
+		fade_from_ = -1;
 	}
+	if (now >= 0)
+		apply_animation(now, anim_time_, fade_from_ >= 0 ? into : 1.0f);
 }
 
 // A node's place in the world from its parent's (or the root), and all
@@ -2396,6 +2473,30 @@ void Rig::skin()
 		if (m.nodes[ni].mesh >= 0)
 			count += m.meshes[m.nodes[ni].mesh].parts.size();
 	parts_.resize(count);
+	// 0.9.0: each part's joints that move it, found once.
+	if (part_joints_.size() != count) {
+		part_joints_.assign(count, {});
+		size_t k = 0;
+		for (size_t ni = 0; ni < m.nodes.size(); ni++) {
+			const Node &node = m.nodes[ni];
+			if (node.mesh < 0)
+				continue;
+			for (const Primitive &p : m.meshes[node.mesh].parts) {
+				std::vector<char> used;
+				for (size_t i = 0; i < p.joints.size() && i < p.weights.size(); i++)
+					if (p.weights[i] > 0) {
+						if (p.joints[i] >= used.size())
+							used.resize((size_t)p.joints[i] + 1, 0);
+						used[p.joints[i]] = 1;
+					}
+				for (size_t j = 0; j < used.size(); j++)
+					if (used[j])
+						part_joints_[k].push_back((uint16_t)j);
+				k++;
+			}
+		}
+	}
+	const float hide_below = HIDDEN_SCALE * std::max(1e-12f, largest_scale(root_));
 	size_t at = 0;
 	std::vector<V3> mp, mn;
 	std::vector<M4> joint;
@@ -2413,10 +2514,31 @@ void Rig::skin()
 		const std::vector<float> &w = weights_[node.mesh];
 		for (size_t pi = 0; pi < mesh.parts.size(); pi++) {
 			const Primitive &p = mesh.parts[pi];
+			const std::vector<uint16_t> &uses = part_joints_[at];
 			Part &out = parts_[at++];
 			out.node = (int)ni;
 			out.part = (int)pi;
 			out.prim = &p;
+			// 0.9.0: every bone it hangs from shrunk away (or, with no
+			// bones, its node): left out - not worked out, not drawn.
+			bool hidden = true;
+			if (skin && !p.joints.empty()) {
+				hidden = !uses.empty();
+				for (uint16_t j : uses)
+					if (j < joint.size() && largest_scale(joint[j]) >= hide_below) {
+						hidden = false;
+						break;
+					}
+			} else {
+				hidden = largest_scale(world_[ni]) < hide_below;
+			}
+			out.hidden = hidden && !p.pos.empty();
+			if (out.hidden) {
+				out.pos.clear();
+				out.normal.clear();
+				out.tangent.clear();
+				continue;
+			}
 			const size_t n = p.pos.size();
 			const V3 *src_p = p.pos.data(), *src_n = p.normal.data();
 			bool morphed = false;

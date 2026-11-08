@@ -81,6 +81,11 @@ BuiltIn builtin_named(const std::string &name);
 bool builtin_arms(BuiltIn b);
 // How long it lasts (seconds).
 float builtin_length(BuiltIn b);
+// How long a move `length` seconds long eases in, and out at its end
+// (0.9.0: a move that ends in a new idle swaps it in as it starts easing
+// out, so it lands on it).
+float move_ease_in(float length);
+float move_ease_out(float length);
 
 // Something to throw: its picture (the caller's number for it), from
 // which side (-1 the picture's left, 1 its right, 0 either, at random),
@@ -240,6 +245,8 @@ public:
 	// One frame, `dt` seconds on.
 	ReactOut step(float dt, const ReactView &view);
 
+	// A body or head move playing now (0.9.0, for FaceGetState).
+	bool moving() const { return !acts_.empty(); }
 	// How many are in the air or waiting, for tests.
 	int flying() const { return (int)flying_.size(); }
 	int waiting() const { return (int)waiting_.size(); }

@@ -852,19 +852,17 @@ void Prop3D::place(const M4 &to_world, float opacity)
 	}
 }
 
-gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<PropAt> &props)
+bool Avatar3D::upload(const Rig *rig)
 {
 	const bool character =
 		rig && model_ && &rig->model() == model_.get() && rig->parts().size() == parts_.size();
-	if (!effect_ || !v.w || !v.h || (!character && props.empty()))
-		return nullptr;
-	static const std::vector<Rig::Part> nothing;
-	const std::vector<Rig::Part> &posed = character ? rig->parts() : nothing;
-	// The posed points onto the graphics card.
+	if (!character)
+		return false;
+	const std::vector<Rig::Part> &posed = rig->parts();
 	for (size_t i = 0; i < posed.size(); i++) {
 		Part &part = parts_[i];
 		const Rig::Part &p = posed[i];
-		if (!part.vb || p.pos.size() != part.points)
+		if (!part.vb || p.hidden || p.pos.size() != part.points)
 			continue;
 		gs_vb_data *d = gs_vertexbuffer_get_data(part.vb);
 		for (size_t k = 0; k < part.points; k++) {
@@ -886,29 +884,60 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 		moved.tangents = tangents ? d->tangents : nullptr;
 		gs_vertexbuffer_flush_direct(part.vb, &moved);
 	}
+	return true;
+}
+
+gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<PropAt> &props,
+			     const std::vector<Other> &others)
+{
+	const bool character = upload(rig);
+	// 0.9.0: the others beside it, each onto the graphics card too.
+	struct Drawn {
+		Avatar3D *a;
+		const std::vector<Rig::Part> *posed;
+		std::vector<float> distance;
+		bool own_outlines = false;
+		bool main = false;
+	};
+	std::vector<Drawn> all;
+	static const std::vector<Rig::Part> nothing;
+	all.push_back({this, character ? &rig->parts() : &nothing, {}, false, true});
+	for (const Other &o : others)
+		if (o.avatar && o.avatar != this && o.avatar->effect_ && o.avatar->upload(o.rig))
+			all.push_back({o.avatar, &o.rig->parts(), {}, false, false});
+	if (!effect_ || !v.w || !v.h || (!character && props.empty() && all.size() < 2))
+		return nullptr;
 
 	const uint32_t k = v.smooth && v.w * 2 <= MOST_DRAWN && v.h * 2 <= MOST_DRAWN ? 2 : 1;
 	if (!scene_)
 		scene_ = gs_texrender_create(GS_RGBA, GS_Z24_S8);
 	if (!scene_)
 		return nullptr;
-	opacity_ = v.opacity;
-	outline_share_ = v.outline;
-	height_ = v.height;
-	world_scale_ = v.world_scale;
-	fov_ = v.fov;
-
-	// Each part's distance from the camera (its middle), for the see-through
-	// parts' order and screen-sized outlines.
-	std::vector<float> distance(posed.size(), 1);
-	for (size_t i = 0; i < posed.size(); i++) {
-		const std::vector<V3> &pos = posed[i].pos;
-		V3 sum;
-		size_t n = 0;
-		for (size_t j = 0; j < pos.size(); j += 17, n++)
-			sum = sum + pos[j];
-		if (n)
-			distance[i] = std::max(1e-4f, -point(v.view, sum * (1.0f / n)).z);
+	for (Drawn &dr : all) {
+		dr.a->opacity_ = v.opacity;
+		dr.a->outline_share_ = v.outline;
+		dr.a->height_ = v.height;
+		dr.a->world_scale_ = v.world_scale;
+		dr.a->fov_ = v.fov;
+		dr.a->cam_ = v.view;
+		// Each part's distance from the camera (its middle), for the
+		// see-through parts' order and screen-sized outlines.
+		const std::vector<Rig::Part> &posed = *dr.posed;
+		dr.distance.assign(posed.size(), 1);
+		for (size_t i = 0; i < posed.size(); i++) {
+			const std::vector<V3> &pos = posed[i].pos;
+			V3 sum;
+			size_t n = 0;
+			for (size_t j = 0; j < pos.size(); j += 17, n++)
+				sum = sum + pos[j];
+			if (n)
+				dr.distance[i] = std::max(1e-4f, -point(v.view, sum * (1.0f / n)).z);
+		}
+		// A character with outlines of its own keeps the outline setting
+		// off the parts it has none on (a face, its eyes).
+		if (dr.a->model_)
+			for (const Material &mat : dr.a->model_->materials)
+				dr.own_outlines = dr.own_outlines || mat.outline != Outline::None;
 	}
 
 	gs_texrender_reset(scene_);
@@ -924,7 +953,6 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 	// camera.
 	const matrix4 view = obs_matrix(obs_view(v.view));
 	gs_matrix_set(&view);
-	cam_ = v.view;
 
 	const gs_cull_mode cull = gs_get_cull_mode();
 	gs_set_cull_mode(GS_NEITHER);
@@ -950,76 +978,90 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 	}
 
 	static const Material plain;
-	static const Model no_model;
-	const Model &m = character ? *model_ : no_model;
-	auto material_of = [&](size_t i) -> const Material & {
-		const int mi = posed[i].prim->material;
-		return mi >= 0 && mi < (int)m.materials.size() ? m.materials[mi] : plain;
+	auto material_of = [&](const Drawn &dr, size_t i) -> const Material & {
+		const int mi = (*dr.posed)[i].prim->material;
+		const Model *m = dr.a->model_.get();
+		return m && mi >= 0 && mi < (int)m->materials.size() ? m->materials[mi] : plain;
+	};
+	// Skin is the main character's (the others' materials aren't in its
+	// list).
+	auto is_skin = [&](const Drawn &dr, size_t i) {
+		const int mi = (*dr.posed)[i].prim->material;
+		return dr.main && v.skin && mi >= 0 && mi < (int)v.skin->size() && (*v.skin)[mi];
+	};
+	// With its normal map's bumps where it has one (not flat colours).
+	auto technique_of = [&](const Drawn &dr, size_t i) {
+		const Material &mat = material_of(dr, i);
+		const bool flat_look = v.look == 3 || (v.look == 0 && mat.shading == Shading::Unlit);
+		return dr.a->parts_[i].bumped && v.detail && !flat_look && mat.normal_map.used() ? "DrawBumped"
+												 : "Draw";
+	};
+	auto shows = [&](const Drawn &dr, size_t i) {
+		return !(*dr.posed)[i].hidden;
 	};
 	// Outlines (only their far side, so they show round the edges), then
 	// the solid parts over them, then the see-through ones far to near.
 	// The outline setting draws one round every part - but a character
 	// with outlines of its own keeps them off the parts it has none on (a
 	// face, its eyes).
-	bool own_outlines = false;
-	for (const Material &mat : m.materials)
-		own_outlines = own_outlines || mat.outline != Outline::None;
-	auto is_skin = [&](size_t i) {
-		const int mi = posed[i].prim->material;
-		return v.skin && mi >= 0 && mi < (int)v.skin->size() && (*v.skin)[mi];
-	};
-	// With its normal map's bumps where it has one (not flat colours).
-	auto technique_of = [&](size_t i) {
-		const bool flat_look = v.look == 3 || (v.look == 0 && material_of(i).shading == Shading::Unlit);
-		return parts_[i].bumped && v.detail && !flat_look && material_of(i).normal_map.used() ? "DrawBumped"
-												       : "Draw";
-	};
-	std::vector<size_t> blended;
+	std::vector<std::pair<size_t, size_t>> blended; // (which of `all`, its part)
 	// Outlines with both sides (their near side is left out as they're
 	// drawn), the rest with only the sides their materials show.
-	for (size_t i = 0; i < posed.size(); i++) {
-		const Material &mat = material_of(i);
-		if (mat.outline == Outline::None && (v.outline <= 0 || own_outlines))
-			continue;
-		part_distance_ = distance[i];
-		set_material(mat, v, true, false, false);
-		draw_part(i, posed[i], "Outline");
-	}
-	for (size_t i = 0; i < posed.size(); i++) {
-		const Material &mat = material_of(i);
-		if (mat.alpha == AlphaMode::Blend || v.opacity < 0.999f) {
-			blended.push_back(i);
-			continue;
+	for (Drawn &dr : all)
+		for (size_t i = 0; i < dr.posed->size(); i++) {
+			const Material &mat = material_of(dr, i);
+			if (!shows(dr, i) || (mat.outline == Outline::None && (v.outline <= 0 || dr.own_outlines)))
+				continue;
+			dr.a->part_distance_ = dr.distance[i];
+			dr.a->set_material(mat, v, true, false, false);
+			dr.a->draw_part(i, (*dr.posed)[i], "Outline");
 		}
-		part_distance_ = distance[i];
-		set_material(mat, v, false, is_skin(i), sides_shown(mat, posed[i].handed) == Sides::Front);
-		gs_set_cull_mode(cull_of(mat, posed[i].handed));
-		draw_part(i, posed[i], technique_of(i));
-		gs_set_cull_mode(GS_NEITHER);
+	for (size_t w = 0; w < all.size(); w++) {
+		Drawn &dr = all[w];
+		for (size_t i = 0; i < dr.posed->size(); i++) {
+			if (!shows(dr, i))
+				continue;
+			const Material &mat = material_of(dr, i);
+			const Rig::Part &p = (*dr.posed)[i];
+			if (mat.alpha == AlphaMode::Blend || v.opacity < 0.999f) {
+				blended.push_back({w, i});
+				continue;
+			}
+			dr.a->part_distance_ = dr.distance[i];
+			dr.a->set_material(mat, v, false, is_skin(dr, i), sides_shown(mat, p.handed) == Sides::Front);
+			gs_set_cull_mode(cull_of(mat, p.handed));
+			dr.a->draw_part(i, p, technique_of(dr, i));
+			gs_set_cull_mode(GS_NEITHER);
+		}
 	}
 	// Anything with it, each put where it goes (the same one may be in
 	// several places): its solid parts, then its see-through ones.
 	for (const PropAt &at : props) {
 		if (!at.prop)
 			continue;
-		for (size_t k = 0; k < at.shapes.size(); k++)
-			at.prop->set_shape((int)k, at.shapes[k]);
+		for (size_t n = 0; n < at.shapes.size(); n++)
+			at.prop->set_shape((int)n, at.shapes[n]);
 		at.prop->place(at.place, at.opacity);
 		draw_prop(*at.prop, v, false);
 		draw_prop(*at.prop, v, true);
 	}
-	std::stable_sort(blended.begin(), blended.end(), [&](size_t a, size_t b) {
-		const int qa = material_of(a).queue, qb = material_of(b).queue;
-		if (qa != qb)
-			return qa < qb;
-		return distance[a] > distance[b];
-	});
-	for (size_t i : blended) {
-		part_distance_ = distance[i];
-		set_material(material_of(i), v, false, is_skin(i),
-			     sides_shown(material_of(i), posed[i].handed) == Sides::Front);
-		gs_set_cull_mode(cull_of(material_of(i), posed[i].handed));
-		draw_part(i, posed[i], technique_of(i));
+	std::stable_sort(blended.begin(), blended.end(),
+			 [&](const std::pair<size_t, size_t> &a, const std::pair<size_t, size_t> &b) {
+				 const int qa = material_of(all[a.first], a.second).queue,
+					   qb = material_of(all[b.first], b.second).queue;
+				 if (qa != qb)
+					 return qa < qb;
+				 return all[a.first].distance[a.second] > all[b.first].distance[b.second];
+			 });
+	for (const auto &bi : blended) {
+		Drawn &dr = all[bi.first];
+		const size_t i = bi.second;
+		const Material &mat = material_of(dr, i);
+		const Rig::Part &p = (*dr.posed)[i];
+		dr.a->part_distance_ = dr.distance[i];
+		dr.a->set_material(mat, v, false, is_skin(dr, i), sides_shown(mat, p.handed) == Sides::Front);
+		gs_set_cull_mode(cull_of(mat, p.handed));
+		dr.a->draw_part(i, p, technique_of(dr, i));
 		gs_set_cull_mode(GS_NEITHER);
 	}
 

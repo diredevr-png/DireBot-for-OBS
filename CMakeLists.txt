@@ -116,6 +116,7 @@ target_sources(
     src/face/face-avatar.cpp
     src/face/body.cpp
     src/face/arms.cpp
+    src/face/companion.cpp
     src/face/signs.cpp
     src/face/phone.cpp
     src/face/vmc.cpp
