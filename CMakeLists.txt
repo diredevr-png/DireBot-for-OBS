@@ -30,6 +30,10 @@ if(WIN32)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32 bcrypt)
   # Windows' data protection, which locks stream keys to the Windows account.
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE crypt32)
+  # The face avatar's gaming hands: your keyboard and mouse through Raw
+  # Input on a window of its own (game pads through XInput, opened as it
+  # runs).
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE user32)
 endif()
 
 target_sources(
@@ -92,7 +96,9 @@ target_sources(
 # signs and face moves that set things off (signs.cpp); your face from a
 # phone app over your Wi-Fi (phone.cpp: its own UDP socket); moves from
 # another tracker app over VMC (vmc.cpp: our own OSC reader, its own UDP
-# socket).
+# socket); gaming hands - its hands on its own keyboard, mouse and pad as
+# you use yours (devices.cpp reads them: only that a key went down, never
+# which; gamehands.cpp moves them, after VMagicMirror's recipes).
 target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE
@@ -113,6 +119,8 @@ target_sources(
     src/face/signs.cpp
     src/face/phone.cpp
     src/face/vmc.cpp
+    src/face/devices.cpp
+    src/face/gamehands.cpp
     deps/mikktspace/mikktspace.c
     src/face/nn/net.cpp
     src/face/nn/kernels.cpp

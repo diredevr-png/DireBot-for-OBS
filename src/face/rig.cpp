@@ -871,6 +871,15 @@ void Rig::find_fingers()
 				f.side = side;
 				f.digit = thumb ? 0 : (int)(&digit - DIGITS) + 1;
 				f.joint = k;
+				if (k == 0)
+					f.spread = palm;
+				// Where it ends (its own way): its next bone, or a tip
+				// with nothing after it as long as its own bone, near
+				// enough.
+				if (next >= 0 && m.nodes[next].parent == j)
+					f.tip = m.nodes[next].t;
+				else
+					f.tip = rotate(conj(normalized(m.nodes[j].r)), m.nodes[j].t) * 0.85f;
 				fingers_.push_back(f);
 			}
 		}
@@ -984,6 +993,7 @@ void Rig::find_arms()
 			    length(cross(normalized(along), normalized(across))) > 0.3f) {
 				a.along = normalized(along);
 				a.across = normalized(across);
+				a.hand_len = length(along);
 				a.hand = true;
 			}
 		}
@@ -1015,7 +1025,8 @@ void Rig::drive_arms(const Drive &d)
 		const int up = arm_bone_[side][0], hd = arm_bone_[side][2];
 		if (!ar.ok || !(t.weight > 0) || anim_turns_[up])
 			continue;
-		const float amount = clamp01(t.weight) * (1 - moved_[up]);
+		// (Less of it as its hand is on a keyboard, mouse or pad.)
+		const float amount = clamp01(t.weight) * (1 - moved_[up]) * (1 - clamp01(d.desk[side].weight));
 		if (!(amount > 0))
 			continue;
 		V3 du = normalized(t.upper, ar.upper), df = normalized(t.fore, ar.fore);
@@ -1106,6 +1117,251 @@ void Rig::drive_arms(const Drive &d)
 		if (hd >= 0)
 			pose_bone(hd, conj(R2) * R3, amount);
 	}
+}
+
+M4 Rig::posed(int node) const
+{
+	int chain[64];
+	int count = 0;
+	for (int n = node; n >= 0 && count < 64; n = model_->nodes[n].parent)
+		chain[count++] = n;
+	M4 m;
+	for (int i = count - 1; i >= 0; i--)
+		m = m * matrix_of(t_[chain[i]], r_[chain[i]], s_[chain[i]]);
+	return m;
+}
+
+DeskBody Rig::desk_body() const
+{
+	DeskBody b;
+	const ArmRest &l = arm_rest_[0], &r = arm_rest_[1];
+	if (!l.ok || !r.ok)
+		return b;
+	b.shoulder[0] = l.shoulder;
+	b.shoulder[1] = r.shoulder;
+	b.arm = 0.5f * (l.upper_len + l.fore_len + r.upper_len + r.fore_len);
+	b.ok = b.arm > 1e-6f && std::isfinite(b.arm);
+	if (l.hand && r.hand)
+		b.hand = 0.5f * (l.hand_len + r.hand_len);
+	// Its knuckles' width and its middle finger's length, each hand's.
+	const Model &m = *model_;
+	float knuckles = 0, finger = 0;
+	int widths = 0, fingers = 0;
+	for (int side = 0; side < 2; side++) {
+		const std::string sd = side ? "right" : "left";
+		const int first = m.bone(sd + "IndexProximal"), little = m.bone(sd + "LittleProximal");
+		if (first >= 0 && little >= 0) {
+			knuckles += length(move_of(rest_world_[first]) - move_of(rest_world_[little]));
+			widths++;
+		}
+		float along = 0;
+		int joints = 0;
+		const Finger *last = nullptr;
+		for (const Finger &f : fingers_)
+			if (f.side == side && f.digit == 2) {
+				along += length(point(rest_world_[f.node], f.tip) - move_of(rest_world_[f.node]));
+				joints++;
+				last = &f;
+			}
+		if (joints == 3 && last) {
+			finger += along;
+			fingers++;
+		}
+	}
+	if (widths == 2 && std::isfinite(knuckles))
+		b.knuckles = knuckles / 2;
+	if (fingers == 2 && std::isfinite(finger))
+		b.finger = finger / 2;
+	return b;
+}
+
+// Its hands on a keyboard, mouse or pad (Drive::desk): each arm reaching
+// its wrist there from where its shoulder is now, its elbow out the way
+// the hand says (its pole), its hand turned as it says with its forearm
+// taking half the twist (as drive_arms), within a wrist's bend - then its
+// fingers bent as it says. Over anything else moving them (your arms from
+// a camera, a tracker app's), as much as each hand's weight; a move on
+// cue takes over from it as much as it shows.
+void Rig::drive_desk(const Drive &d)
+{
+	const Model &m = *model_;
+	const Quat F = options_.facing;
+	for (int side = 0; side < 2; side++) {
+		const DeskHand &t = d.desk[side];
+		const ArmRest &ar = arm_rest_[side];
+		const int up = arm_bone_[side][0], lo = arm_bone_[side][1], hd = arm_bone_[side][2];
+		if (!(t.weight > 0) || !ar.ok || up < 0 || lo < 0 || anim_turns_[up])
+			continue;
+		const float amount = clamp01(t.weight) * (1 - cue_moved_[up]);
+		if (!(amount > 0) || !std::isfinite(t.wrist.x + t.wrist.y + t.wrist.z))
+			continue;
+		// Its shoulder as it is now (the facing model's way): where its
+		// upper arm turns from, and how far what it hangs from has turned.
+		const int parent = m.nodes[up].parent;
+		const M4 pm = parent >= 0 ? posed(parent) : M4();
+		const V3 S = rotate(F, point(pm, t_[up]));
+		const Quat Q = parent >= 0 ? F * rot_of(pm) * conj(rot_of(rest_world_[parent])) * conj(F) : Quat{};
+		const Quat back = conj(normalized(Q));
+		// Reaching the wrist there (as far as it reaches), its elbow out
+		// towards the pole.
+		const float lu = ar.upper_len, lf = ar.fore_len;
+		const V3 to = t.wrist - S;
+		const V3 dir = normalized(to, {0, -1, 0});
+		const float dist = std::min((lu + lf) * 0.999f, std::max(std::fabs(lu - lf) + 1e-3f * (lu + lf), length(to)));
+		const float along = (lu * lu - lf * lf + dist * dist) / (2 * dist);
+		const float out = std::sqrt(std::max(0.0f, lu * lu - along * along));
+		V3 pole = t.pole - dir * dot(t.pole, dir);
+		if (length(pole) < 1e-3f)
+			pole = V3{0, -1, 0} - dir * dir.y;
+		pole = normalized(pole, {0, -1, 0});
+		const V3 elbow = S + dir * along + pole * out;
+		const V3 wrist = S + dir * dist;
+		// In the terms of what it hangs from.
+		const V3 du = rotate(back, normalized(elbow - S, dir));
+		const V3 df = rotate(back, normalized(wrist - elbow, dir));
+		V3 h = cross(du, df);
+		if (length(h) < 1e-4f)
+			h = rotate(back, cross(pole, dir));
+		h = normalized(h, ar.hinge);
+		const Quat R1 = frame_turn(du, h) * conj(frame_turn(ar.upper, ar.hinge));
+		Quat R2 = frame_turn(df, h) * conj(frame_turn(ar.fore, ar.fore_hinge));
+		Quat R3 = R2;
+		if (hd >= 0 && ar.hand) {
+			const V3 al = rotate(back, normalized(t.along, {0, 0, 1}));
+			const V3 ac = rotate(back, normalized(t.across, {1, 0, 0}));
+			const Quat G = frame_turn(al, ac) * conj(frame_turn(ar.along, ar.across));
+			const Quat L = normalized(conj(R2) * G);
+			const V3 axis = ar.fore;
+			const float p = L.x * axis.x + L.y * axis.y + L.z * axis.z;
+			Quat twist = normalized(Quat{axis.x * p, axis.y * p, axis.z * p, L.w});
+			if (twist.w < 0)
+				twist = {-twist.x, -twist.y, -twist.z, -twist.w};
+			Quat swing = normalized(L * conj(twist));
+			if (swing.w < 0)
+				swing = {-swing.x, -swing.y, -swing.z, -swing.w};
+			const float swing_angle = 2 * std::acos(std::min(1.0f, swing.w));
+			constexpr float WRIST_MOST = 80 * RAD;
+			if (swing_angle > WRIST_MOST)
+				swing = slerp(Quat{}, swing, WRIST_MOST / swing_angle);
+			const Quat hand_world = R2 * swing * twist;
+			R2 = R2 * slerp(Quat{}, twist, 0.5f);
+			R3 = hand_world;
+		}
+		pose_bone(up, R1, amount);
+		pose_bone(lo, conj(R1) * R2, amount);
+		if (hd >= 0)
+			pose_bone(hd, conj(R2) * R3, amount);
+	}
+	// Each finger reaching where it's asked (reach_digit).
+	float bends[2][5][3], spread[2][5] = {};
+	for (int side = 0; side < 2; side++) {
+		const DeskHand &t = d.desk[side];
+		for (int i = 0; i < 5; i++)
+			for (int j = 0; j < 3; j++)
+				bends[side][i][j] = t.bend[i][j];
+		if (t.weight > 0)
+			for (int digit = 0; digit < 5; digit++)
+				reach_digit(t, side, digit, bends[side][digit], spread[side][digit]);
+	}
+	// Its fingers: each joint bent from how its file has it at rest, about
+	// its own axis (find_fingers), as much as its hand's there.
+	for (const Finger &f : fingers_) {
+		const DeskHand &t = d.desk[f.side];
+		if (!(t.weight > 0) || anim_turns_[f.node])
+			continue;
+		const float k = clamp01(t.weight) * (1 - cue_moved_[f.node]);
+		const float bend = bends[f.side][f.digit][f.joint];
+		if (!(k > 0) || !std::isfinite(bend))
+			continue;
+		const Quat w = rot_of(rest_world_[f.node]);
+		Quat turn = axis_angle(f.axis, bend - f.has);
+		if (f.joint == 0 && spread[f.side][f.digit] != 0)
+			turn = axis_angle(f.spread, spread[f.side][f.digit]) * turn;
+		const Quat want = m.nodes[f.node].r * (conj(w) * turn * w);
+		r_[f.node] = normalized(slerp(r_[f.node], want, k));
+		moved_[f.node] = 1 - (1 - moved_[f.node]) * (1 - k);
+	}
+}
+
+// A finger's tip to where its hand asks (a pad's stick, trigger or grip):
+// starting from its bends as asked, each joint in turn (tip first, ten
+// times over) bent the most it helps within how far a joint bends - its
+// first joint swinging sideways across its palm too (a thumb's most, the
+// others' a little) - as much as its reach's weight. Its hand already
+// where its arm put it.
+void Rig::reach_digit(const DeskHand &t, int side, int digit, float bend[3], float &spread) const
+{
+	const float weight = clamp01(t.reach_weight[digit]);
+	const V3 goal_f = t.reach[digit];
+	if (!(weight > 0) || !std::isfinite(goal_f.x + goal_f.y + goal_f.z))
+		return;
+	const Model &m = *model_;
+	const Finger *f[3] = {};
+	for (const Finger &g : fingers_)
+		if (g.side == side && g.digit == digit && g.joint < 3)
+			f[g.joint] = &g;
+	int n = 0;
+	while (n < 3 && f[n] && !anim_turns_[f[n]->node] && (n == 0 || m.nodes[f[n]->node].parent == f[n - 1]->node))
+		n++;
+	if (n == 0 || m.nodes[f[0]->node].parent < 0)
+		return;
+	const int root = m.nodes[f[0]->node].parent;
+	const M4 base = posed(root);
+	const V3 goal = rotate(conj(options_.facing), goal_f);
+	const bool thumb = digit == 0;
+	const bool sideways = length(f[0]->spread) > 0.5f;
+	const float most_spread = thumb ? 0.7f : digit == 1 ? 0.35f : 0.2f;
+	float b[3] = {bend[0], bend[1], bend[2]}, s = 0;
+	for (int k = 0; k < n; k++)
+		if (!std::isfinite(b[k]))
+			return;
+	// Each joint's place and the turn from rest of what it hangs from; and
+	// its tip - with these bends.
+	V3 at[3], tip;
+	Quat moved[3];
+	auto chain = [&]() {
+		M4 now = base;
+		int parent = root;
+		for (int k = 0; k < n; k++) {
+			const Finger &g = *f[k];
+			moved[k] = rot_of(now) * conj(rot_of(rest_world_[parent]));
+			Quat turn = axis_angle(g.axis, b[k] - g.has);
+			if (k == 0 && sideways)
+				turn = axis_angle(g.spread, s) * turn;
+			const Quat w = rot_of(rest_world_[g.node]);
+			now = now * matrix_of(t_[g.node], m.nodes[g.node].r * (conj(w) * turn * w), s_[g.node]);
+			at[k] = move_of(now);
+			parent = g.node;
+		}
+		tip = point(now, f[n - 1]->tip);
+	};
+	// How far a turn about `axis` at `from` brings the tip round to the goal.
+	auto towards = [&](V3 from, V3 axis) {
+		V3 a = tip - from, g = goal - from;
+		a = a - axis * dot(a, axis);
+		g = g - axis * dot(g, axis);
+		if (length(a) < 1e-6f || length(g) < 1e-6f)
+			return 0.0f;
+		return std::atan2(dot(cross(a, g), axis), dot(a, g));
+	};
+	const float lo = thumb ? -0.4f : -0.15f, hi = thumb ? 1.3f : 1.75f;
+	for (int pass = 0; pass < 10; pass++)
+		for (int k = n - 1; k >= 0; k--) {
+			chain();
+			Quat about = moved[k];
+			if (k == 0 && sideways)
+				about = about * axis_angle(f[0]->spread, s);
+			b[k] = std::min(hi, std::max(lo, b[k] + towards(at[k], normalized(rotate(about, f[k]->axis)))));
+			if (k == 0 && sideways) {
+				chain();
+				s = std::min(most_spread, std::max(-most_spread, s + towards(at[0], normalized(rotate(moved[0], f[0]->spread)))));
+			}
+		}
+	for (int k = 0; k < n; k++)
+		if (std::isfinite(b[k]))
+			bend[k] += (b[k] - bend[k]) * weight;
+	if (std::isfinite(s))
+		spread = s * weight;
 }
 
 void Rig::settle()
@@ -2003,6 +2259,7 @@ void Rig::pose(const Drive &d)
 	}
 	animate(d.dt);
 	play_moves(d);
+	cue_moved_ = moved_;
 	drive_tracked(d);
 	// Swinging parts hang as its animation has them (it may swing a tail
 	// itself), and swing from there.
@@ -2028,6 +2285,7 @@ void Rig::pose(const Drive &d)
 	}
 	drive_head(d);
 	drive_arms(d);
+	drive_desk(d);
 	curl_fingers(d);
 	drive_eyes(d);
 	drive_expressions(d);
@@ -2321,7 +2579,8 @@ Quat head_turn(float yaw, float pitch, float tilt, bool mirror)
 	       axis_angle({1, 0, 0}, -pitch * RAD);
 }
 
-void framed_box(const Model &m, Quat facing, bool head, const Bounds *stands, V3 &middle, V3 &extent)
+bool framed_box(const Model &m, Quat facing, bool head, const Bounds *stands, V3 &middle, V3 &extent,
+		const Bounds *desk)
 {
 	if (stands && stands->found) {
 		facing_bounds(stands->low, stands->high, facing, middle, extent);
@@ -2338,15 +2597,30 @@ void framed_box(const Model &m, Quat facing, bool head, const Bounds *stands, V3
 		// Head and shoulders: about half a metre round its head.
 		middle = hb + V3{0, 0.04f, 0};
 		extent = {0.5f, 0.5f, 0.3f};
+		if (desk && desk->found) {
+			// Its hands at a desk too: down past it, its middle kept in
+			// the middle across.
+			const float top = middle.y + extent.y / 2, low = std::min(middle.y - extent.y / 2, desk->low.y);
+			const float half = std::max({extent.x / 2, middle.x - desk->low.x, desk->high.x - middle.x});
+			const float back = std::min(middle.z - extent.z / 2, desk->low.z),
+				    front = std::max(middle.z + extent.z / 2, desk->high.z);
+			middle = {middle.x, (top + low) / 2, (back + front) / 2};
+			// As it's seen from above (DESK_PITCH): taller, the desk's
+			// front coming down into sight.
+			const float t = DESK_PITCH * RAD, tall = top - low, deep = front - back;
+			extent = {2 * half, tall * std::cos(t) + deep * std::sin(t), tall * std::sin(t) + deep * std::cos(t)};
+			return true;
+		}
 	}
+	return false;
 }
 
 Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, float size, bool head, float dx, float dy,
-		       float grow, const Bounds *stands)
+		       float grow, const Bounds *stands, const Bounds *desk)
 {
 	Framing f;
 	V3 middle, extent;
-	framed_box(m, facing, head, stands, middle, extent);
+	const bool at_desk = framed_box(m, facing, head, stands, middle, extent, desk);
 	const float s = 1 / std::max(extent.x, extent.y);
 	const float aspect = (float)std::max(1u, w) / std::max(1u, h);
 	size = std::min(3.0f, std::max(0.05f, size));
@@ -2371,6 +2645,11 @@ Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, floa
 	// it", not its middle.
 	const float tall = extent.y * s;
 	const float keep_top = tall > seen_h ? (tall - seen_h) / (2 * seen_h) : 0;
+	if (at_desk) {
+		CameraView above;
+		above.pitch = DESK_PITCH;
+		view_own_spot(f, above);
+	}
 	move_own_spot(f, dx, dy + keep_top);
 	return f;
 }
@@ -2424,8 +2703,10 @@ void view_own_spot(Framing &f, const CameraView &cv)
 	f.seen_w /= v.zoom;
 	f.seen_h /= v.zoom;
 	f.view = f.view * r * moved(rotate(conj(turn), V3{-v.x * f.seen_w, v.y * f.seen_h, 0}) * -1.0f);
-	f.right = rotate(conj(turn), {1, 0, 0});
-	f.up = rotate(conj(turn), {0, 1, 0});
+	// The camera's right and up, the world's way (with any turn it had
+	// already: its desk seen from above).
+	f.right = normalized(V3{f.view.at(0, 0), f.view.at(0, 1), f.view.at(0, 2)}, {1, 0, 0});
+	f.up = normalized(V3{f.view.at(1, 0), f.view.at(1, 1), f.view.at(1, 2)}, {0, 1, 0});
 }
 
 Framing frame_worn(const Model &m, Quat facing, const WornPlace &place, const M4 &pose, float aspect)

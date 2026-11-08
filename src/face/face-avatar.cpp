@@ -50,6 +50,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "avatar2d.hpp"
 #include "avatar3d.hpp"
 #include "body.hpp"
+#include "devices.hpp"
 #include "effect-check.hpp"
 #include "look-pace.hpp"
 #include "model.hpp"
@@ -1128,6 +1129,34 @@ struct FaceAvatar {
 		std::lock_guard<std::mutex> l(state_lock);
 		return vmc_using_state[0];
 	}
+	// Gaming hands (gamehands.hpp, 0.9.0): a 3D VRM character's hands on
+	// its own keyboard, mouse and game pad as you use yours ("game_hands",
+	// off at first). Your keyboard, mouse and pads are read for every face
+	// avatar with them on (devices.hpp: only THAT a key went down, never
+	// which; nothing kept), held while they're on (under game_lock: the
+	// settings' thread sets it, the graphics thread reads it); "Show me"
+	// (DireBot's FaceGame) pretends for PRETEND_TIME seconds instead. Its
+	// props' files, each DeskProp's (obs_module_file; under pictures_lock).
+	std::atomic<bool> game_on{false}, game_show{false}, game_stop{false};
+	std::mutex game_lock;
+	std::shared_ptr<DeviceReader> game_reader;
+	GameOptions game_options;
+	std::string game_files[DESK_PROPS];
+	// Graphics thread: the hands, on a character (else why not, for the
+	// page), "Show me"'s time so far (-1 not showing), this frame's, and
+	// round its desk (the facing model's way: framed with its head).
+	GameHands game;
+	bool game_wanted = false;
+	const char *game_why = "off";
+	double game_show_t = -1;
+	DeskNow desk_now;
+	Bounds desk_bounds, framed_desk;
+	// For FaceGetState (under state_lock).
+	DeskNow desk_state;
+	DeviceState devices_state;
+	bool game_wanted_state = false, game_reading_state = false;
+	const char *game_why_state = "off";
+	double game_show_state = -1;
 	// Your hands and arms (body.hpp, arms.hpp), on a 3D VRM character in
 	// its own spot: looked for on their own thread, followed on the
 	// graphics one. On and light mode from the settings.
@@ -1536,6 +1565,12 @@ struct FaceAvatar {
 		{
 			std::lock_guard<std::mutex> l(vmc_lock);
 			vmc_link.reset();
+		}
+		game_on = false;
+		{
+			std::shared_ptr<DeviceReader> old;
+			std::lock_guard<std::mutex> l(game_lock);
+			old.swap(game_reader);
 		}
 		worker.stop();
 		body_worker.stop();
@@ -2258,8 +2293,10 @@ struct FaceAvatar {
 			}
 		}
 		for (auto it = props3d.begin(); it != props3d.end();) {
-			const bool wanted = it->first == hand3d_file ||
-					    std::find(throw_files.begin(), throw_files.end(), it->first) != throw_files.end();
+			const bool wanted =
+				it->first == hand3d_file ||
+				std::find(throw_files.begin(), throw_files.end(), it->first) != throw_files.end() ||
+				std::find(std::begin(game_files), std::end(game_files), it->first) != std::end(game_files);
 			if (wanted) {
 				++it;
 				continue;
@@ -2275,6 +2312,15 @@ struct FaceAvatar {
 		if (hand3d_file.empty())
 			return nullptr;
 		auto it = props3d.find(hand3d_file);
+		return it == props3d.end() ? nullptr : it->second.get();
+	}
+
+	// Gaming hands' prop `i` (DeskProp), if it's loaded (graphics thread).
+	Prop3D *game_prop(int i)
+	{
+		if (i < 0 || i >= DESK_PROPS || game_files[i].empty())
+			return nullptr;
+		auto it = props3d.find(game_files[i]);
 		return it == props3d.end() ? nullptr : it->second.get();
 	}
 
@@ -2555,12 +2601,17 @@ struct FaceAvatar {
 		}
 		// The shape of what's framed in its own spot, for DireBot's "Fit
 		// the OBS box to it" (0.8.1).
-		if (framed_for != look3d.framing) {
+		const bool desk_changed = desk_bounds.found != framed_desk.found ||
+					  (desk_bounds.found && (length(desk_bounds.low - framed_desk.low) > 1e-4f ||
+								 length(desk_bounds.high - framed_desk.high) > 1e-4f));
+		if (framed_for != look3d.framing || desk_changed) {
 			framed_for = look3d.framing;
+			framed_desk = desk_bounds;
 			const Model &m = *model_now;
 			const bool head = look3d.framing == 2 || (look3d.framing == 0 && m.is_vrm());
 			V3 middle, extent;
-			framed_box(m, ro.facing, head, &stands3d, middle, extent);
+			framed_box(m, ro.facing, head, &stands3d, middle, extent,
+				   desk_bounds.found ? &desk_bounds : nullptr);
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d.framed_w = extent.x;
 			state3d.framed_h = extent.y;
@@ -2599,7 +2650,8 @@ struct FaceAvatar {
 			const bool head = look3d.framing == 2 || (look3d.framing == 0 && m.is_vrm());
 			// Moved in proportion to its size: its eye gap (its spots), as
 			// it's framed - seen from the camera view, gliding to a new one.
-			f = frame_own_spot(m, facing, w, h, size, head, 0, 0, grow, &stands3d);
+			f = frame_own_spot(m, facing, w, h, size, head, 0, 0, grow, &stands3d,
+					   desk_bounds.found ? &desk_bounds : nullptr);
 			const int want = look3d.view >= 0 && look3d.view < (int)look3d.views.size() ? look3d.view : -1;
 			const CameraView target = want >= 0 ? look3d.views[want].second : CameraView();
 			if (!view_started) { // the first picture: straight there, no glide
@@ -2655,6 +2707,10 @@ struct FaceAvatar {
 			d.follow_arms = arms_wanted;
 			d.arms = arms_now;
 			d.tracked = tracked_now;
+			// Its hands on its keyboard, mouse or pad (step_game) - over
+			// those.
+			d.desk[0] = desk_now.hand[0];
+			d.desk[1] = desk_now.hand[1];
 			v.w = w;
 			v.h = h;
 		} else {
@@ -2752,6 +2808,19 @@ struct FaceAvatar {
 		Prop3D *hand = react_now.hand.shown ? hand_3d() : nullptr;
 		if (hand && face_known)
 			with.push_back(hand_on_head(*hand, facing, wear));
+		// Its keyboard, mouse and pad in front of it (step_game).
+		if (!wear)
+			for (int i = 0; i < DESK_PROPS; i++) {
+				const DeskPlace &dp = desk_now.prop[i];
+				Prop3D *prop = dp.opacity > 0.001f ? game_prop(i) : nullptr;
+				if (!prop)
+					continue;
+				PropAt p;
+				p.prop = prop;
+				p.place = f.place * matrix_of(conj(facing)) * dp.place;
+				p.opacity = dp.opacity;
+				with.push_back(p);
+			}
 		gs_texture_t *tex = show ? avatar3d->draw(rig.get(), v, with) : nullptr;
 		draw_overlay(w, h, false);
 		{
@@ -3579,6 +3648,78 @@ struct FaceAvatar {
 		arms_why_state = arms_why;
 	}
 
+	// Gaming hands: what's been done on your keyboard, mouse and pad
+	// lately (or "Show me"'s pretending), its hands put there for the rig
+	// and its keyboard, mouse and pad placed - on a 3D VRM character with
+	// arms, in its own spot. Starting again whenever what it's from
+	// changes. Graphics thread.
+	void step_game(float dt)
+	{
+		const bool wear = worn;
+		const bool vrm = model_now && model_now->is_vrm();
+		std::shared_ptr<DeviceReader> reader;
+		GameOptions go;
+		{
+			std::lock_guard<std::mutex> l(game_lock);
+			reader = game_reader;
+			go = game_options;
+		}
+		go.mirror = mirror;
+		const DeskBody body = rig && !wear ? rig->desk_body() : DeskBody();
+		game_wanted = game_on && !wear && rig && body.ok;
+		game_why = game_wanted		 ? ""
+			   : !game_on		 ? "off"
+			   : wear		 ? "worn"
+			   : !model_now || !rig ? "no_3d"
+			   : !vrm		 ? "not_vrm"
+						 : "no_arms";
+		const bool stop = game_stop.exchange(false), show = game_show.exchange(false);
+		if ((stop || !game_wanted) && game_show_t >= 0) {
+			game_show_t = -1;
+			game.reset();
+		}
+		if (show && game_wanted) {
+			game_show_t = 0;
+			game.reset();
+		}
+		const DeviceState read = reader ? reader->state() : DeviceState();
+		DeviceState s;
+		double now = 0;
+		if (game_show_t >= 0) {
+			game_show_t += dt;
+			if (game_show_t > PRETEND_TIME) {
+				game_show_t = -1;
+				game.reset();
+			} else {
+				s = pretend_devices(game_show_t);
+				now = game_show_t;
+			}
+		}
+		if (game_show_t < 0 && reader) {
+			s = read;
+			now = DeviceReader::clock();
+		}
+		game.set_options(go);
+		game.set_body(body);
+		if (game_wanted) {
+			game.step(s, now, dt);
+			desk_now = game.now();
+		} else if (desk_now.device != GameDevice::None) {
+			game.reset();
+			desk_now = DeskNow();
+		}
+		desk_bounds = Bounds();
+		desk_bounds.found = game_wanted && desk_box(body, go, desk_bounds.low, desk_bounds.high);
+		std::lock_guard<std::mutex> l(state_lock);
+		desk_state = desk_now;
+		// (Never which keys: there's nothing about them in it but how many.)
+		devices_state = read;
+		game_reading_state = (bool)reader;
+		game_wanted_state = game_wanted;
+		game_why_state = game_why;
+		game_show_state = game_show_t;
+	}
+
 	// Another tracker app (VMC): what it sent lately - your face handed to
 	// the tracker as a phone's is, your body, arms, fingers and eyes for
 	// the rig, each part eased in while the app sends it and out when it
@@ -3889,6 +4030,7 @@ struct FaceAvatar {
 		react_hits += react_now.hits;
 		step_vmc(dt);
 		step_arms(dt);
+		step_game(dt);
 		step_signs(dt, o, t);
 		// The page's live bars: what the camera reads, and what it shows.
 		clock += dt;
@@ -4173,6 +4315,19 @@ struct FaceAvatar {
 		const json tints = json::parse(obs_data_get_string(settings, "react_hand_tint"), nullptr, false);
 		const V3 skin_tint = tints.is_object() ? tint_of(tints.value("skin", json())) : V3{1, 1, 1};
 		const V3 sleeve_tint = tints.is_object() ? tint_of(tints.value("sleeve", json())) : V3{1, 1, 1};
+		// Gaming hands' keyboard, mouse and pad (ours, with the add-on),
+		// while they're on and shown.
+		std::string game_files_now[DESK_PROPS];
+		if (obs_data_get_bool(settings, "game_hands") && obs_data_get_bool(settings, "game_props"))
+			for (int i = 0; i < DESK_PROPS; i++) {
+				const std::string name = std::string("face/gaming/") + DESK_PROP_FILES[i] + ".glb";
+				char *path = obs_module_file(name.c_str());
+				game_files_now[i] = path ? path : "";
+				bfree(path);
+				if (!game_files_now[i].empty() &&
+				    std::find(wanted_3d.begin(), wanted_3d.end(), game_files_now[i]) == wanted_3d.end())
+					wanted_3d.push_back(game_files_now[i]);
+			}
 		prop_loader.want(wanted_3d);
 		HandPlace place_now;
 		const json hp = json::parse(obs_data_get_string(settings, "react_hand_place"), nullptr, false);
@@ -4266,6 +4421,7 @@ struct FaceAvatar {
 			throw_pics.swap(next_throws);
 			throw_files.swap(next_files);
 			hand3d_file = hand3d_now;
+			std::copy(std::begin(game_files_now), std::end(game_files_now), std::begin(game_files));
 			hand_skin = skin_tint;
 			hand_sleeve = sleeve_tint;
 			hand_place = place_now;
@@ -4472,6 +4628,31 @@ struct FaceAvatar {
 			}
 		}
 		worn = obs_data_get_bool(settings, "worn") && !phone_now && !vmc_now_face;
+		// Gaming hands: on (your keyboard, mouse and pads read while they
+		// are), which of them it uses, the hand your mouse is in, its own
+		// keyboard, mouse and pad shown, resting, and its desk moved.
+		{
+			GameOptions go;
+			const bool game_now = obs_data_get_bool(settings, "game_hands");
+			const char *device = obs_data_get_string(settings, "game_device");
+			go.device = device && std::strcmp(device, "keyboard") == 0 ? 1
+				    : device && std::strcmp(device, "pad") == 0    ? 2
+										   : 0;
+			const char *mouse_hand = obs_data_get_string(settings, "game_mouse");
+			go.mouse_right = !(mouse_hand && std::strcmp(mouse_hand, "left") == 0);
+			go.props = obs_data_get_bool(settings, "game_props");
+			go.rest_after = clampf((float)obs_data_get_int(settings, "game_rest"), 0, 600);
+			go.height = clampf((float)obs_data_get_int(settings, "game_height") / 100.0f, -0.4f, 0.4f);
+			go.distance = clampf((float)obs_data_get_int(settings, "game_distance") / 100.0f, -0.4f, 0.4f);
+			std::shared_ptr<DeviceReader> old; // shut (if no one else holds it) once let go of
+			std::lock_guard<std::mutex> l(game_lock);
+			game_options = go;
+			if (!game_now)
+				old.swap(game_reader);
+			else if (!game_reader)
+				game_reader = DeviceReader::open();
+			game_on = game_now;
+		}
 		// Smoothing: steadier one way; the other, snappier, and the
 		// character aims further on past each look to keep up with you.
 		const float smoothing = clampf((float)obs_data_get_int(settings, "smoothing") / 100.0f, 0, 1);
@@ -4560,6 +4741,45 @@ struct FaceAvatar {
 			rest_seen = text;
 		}
 		worker.rest_saved();
+	}
+
+	// DireBot's FaceGame (OBS's UI thread): "Show me" - its hands on its
+	// keyboard, mouse and pad as if you were typing, then playing, for
+	// PRETEND_TIME seconds - or stop that.
+	json game_to(const std::string &what)
+	{
+		auto no = [](const std::string &words) {
+			return json{{"ok", false}, {"error", words}};
+		};
+		if (what == "stop") {
+			game_stop = true;
+			return json{{"ok", true}};
+		}
+		if (what != "show")
+			return no("DireBot for OBS doesn't know that.");
+		std::string why;
+		bool showing;
+		{
+			std::lock_guard<std::mutex> l(state_lock);
+			why = game_why_state;
+			showing = showing_now;
+		}
+		if (!game_on)
+			return no("Turn on gaming hands first.");
+		if (why == "worn")
+			return no("Gaming hands show on a 3D character in its own spot - not worn on your head.");
+		if (why == "no_3d")
+			return no("Gaming hands need a 3D VRM character - pick one first.");
+		if (why == "not_vrm")
+			return no("Gaming hands need a VRM character (.vrm) - other 3D files have no arms it knows.");
+		if (why == "no_arms")
+			return no("That character has no arms it can move.");
+		if (!why.empty())
+			return no("Gaming hands are just starting - try again in a moment.");
+		if (!showing)
+			return no("The face avatar isn't shown in OBS right now - show it, then try again.");
+		game_show = true;
+		return json{{"ok", true}, {"seconds", PRETEND_TIME}};
 	}
 
 	// DireBot's FaceArms (OBS's UI thread): calibrate (hold a hand up by
@@ -4848,6 +5068,8 @@ struct FaceAvatar {
 		std::string react_hand_problem;
 		int react_emotes = 0;
 		int view_index;
+		int game_props_loaded = 0, game_props_wanted = 0;
+		std::string game_props_problem;
 		{
 			std::lock_guard<std::mutex> l(pictures_lock);
 			for (int i = 0; i < PARTS; i++)
@@ -4893,6 +5115,19 @@ struct FaceAvatar {
 			}
 			react_emotes = (int)emotes.size();
 			react_hit_ok = loaded(hit_pic);
+			// Gaming hands' keyboard, mouse and pad: how many are wanted
+			// and loaded (or why not).
+			for (int i = 0; i < DESK_PROPS; i++) {
+				const std::string &file = game_files[i];
+				if (file.empty() || (i > 0 && file == game_files[i - 1]))
+					continue;
+				game_props_wanted++;
+				if (props_ready.count(file))
+					game_props_loaded++;
+				auto why = prop_problems.find(file);
+				if (why != prop_problems.end() && game_props_problem.empty())
+					game_props_problem = DESK_PROP_FILES[i] + std::string(": ") + why->second;
+			}
 			for (const auto &named : look3d.views)
 				views_json.push_back({{"name", named.first},
 						      {"yaw", named.second.yaw},
@@ -4904,6 +5139,13 @@ struct FaceAvatar {
 		}
 		bool arms_calibrating, arms_calibrated;
 		std::string arms_result;
+		GameOptions game_o;
+		bool game_asked;
+		{
+			std::lock_guard<std::mutex> l(game_lock);
+			game_o = game_options;
+			game_asked = game_on;
+		}
 		{
 			std::lock_guard<std::mutex> l(arms_lock);
 			arms_calibrating = arms.calibrating();
@@ -5266,6 +5508,43 @@ struct FaceAvatar {
 		}
 		answer["hands_and_arms"] =
 			arms_state(with_points, arms_calibrating, arms_calibrated, arms_result);
+		// Gaming hands (0.9.0): on, whether your keyboard, mouse and pads
+		// are read here (or why not, in words), how many pads are in,
+		// which it's using and whether each was used in the last second,
+		// its hands typing and how much they're on them, "Show me", its
+		// props - never anything about which keys.
+		{
+			const DeviceState &ds = devices_state;
+			const DeskNow &dn = desk_state;
+			const bool reading = game_reading_state;
+			answer["gaming"] = {
+				{"on", game_asked},
+				{"device", game_o.device == 1 ? "keyboard" : game_o.device == 2 ? "pad" : "auto"},
+				{"mouse_hand", game_o.mouse_right ? "right" : "left"},
+				{"props", game_o.props},
+				{"rest", game_o.rest_after},
+				{"reading",
+				 {{"keyboard", reading && ds.keyboard},
+				  {"mouse", reading && ds.mouse},
+				  {"pads", reading && ds.pads},
+				  {"keyboard_problem", reading ? ds.keyboard_problem : ""},
+				  {"mouse_problem", reading ? ds.mouse_problem : ""},
+				  {"pads_problem", reading ? ds.pads_problem : ""},
+				  {"pads_in", reading ? ds.pads_in : 0}}},
+				{"shown", game_wanted_state},
+				{"why_not", game_why_state},
+				{"using", dn.device == GameDevice::Pad		 ? "pad"
+					  : dn.device == GameDevice::KeyboardMouse ? "keyboard_mouse"
+										   : "none"},
+				{"typing", dn.typing},
+				{"hands_on", r(dn.on, 100)},
+				{"used", {{"keys", dn.keys}, {"mouse", dn.mouse}, {"pad", dn.pad}}},
+				{"show_me", game_show_state >= 0},
+				{"show_left", game_show_state >= 0 ? r((float)(PRETEND_TIME - game_show_state), 10) : 0.0f},
+				{"props_loaded", game_props_loaded},
+				{"props_wanted", game_props_wanted},
+				{"props_problem", game_props_problem}};
+		}
 		answer["signs"] = signs_json();
 		answer["looking_hidden"] = looking_hidden_state;
 		return answer;
@@ -5663,6 +5942,15 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "vmc_arms", false);
 	obs_data_set_default_bool(settings, "vmc_mirror", false);
 	obs_data_set_default_int(settings, "vmc_port", VMC_PORT);
+	// Gaming hands: off until you turn them on (0.9.0) - your keyboard,
+	// mouse and pads aren't read till then.
+	obs_data_set_default_bool(settings, "game_hands", false);
+	obs_data_set_default_string(settings, "game_device", "auto");
+	obs_data_set_default_string(settings, "game_mouse", "right");
+	obs_data_set_default_bool(settings, "game_props", true);
+	obs_data_set_default_int(settings, "game_rest", 0);
+	obs_data_set_default_int(settings, "game_height", 0);
+	obs_data_set_default_int(settings, "game_distance", 0);
 }
 
 bool add_camera(void *param, obs_source_t *source)
@@ -5891,6 +6179,28 @@ obs_properties_t *get_properties(void *data)
 	obs_property_int_set_suffix(p, "%");
 	obs_properties_add_group(props, "hands_and_arms", text("FaceAvatar.HandsAndArms"), OBS_GROUP_NORMAL, arms);
 
+	// Gaming hands (3D VRM characters).
+	obs_properties_t *game = obs_properties_create();
+	obs_properties_add_text(game, "game_about", text("FaceAvatar.GameAbout"), OBS_TEXT_INFO);
+	obs_properties_add_bool(game, "game_hands", text("FaceAvatar.GameHands"));
+	obs_property_t *device = obs_properties_add_list(game, "game_device", text("FaceAvatar.GameDevice"),
+							 OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(device, text("FaceAvatar.GameDeviceAuto"), "auto");
+	obs_property_list_add_string(device, text("FaceAvatar.GameDeviceKeyboard"), "keyboard");
+	obs_property_list_add_string(device, text("FaceAvatar.GameDevicePad"), "pad");
+	obs_property_t *mouse_hand = obs_properties_add_list(game, "game_mouse", text("FaceAvatar.GameMouse"),
+							     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(mouse_hand, text("FaceAvatar.GameMouseRight"), "right");
+	obs_property_list_add_string(mouse_hand, text("FaceAvatar.GameMouseLeft"), "left");
+	obs_properties_add_bool(game, "game_props", text("FaceAvatar.GameProps"));
+	p = obs_properties_add_int_slider(game, "game_rest", text("FaceAvatar.GameRest"), 0, 600, 5);
+	obs_property_int_set_suffix(p, " s");
+	p = obs_properties_add_int_slider(game, "game_height", text("FaceAvatar.GameHeight"), -40, 40, 1);
+	obs_property_int_set_suffix(p, "%");
+	p = obs_properties_add_int_slider(game, "game_distance", text("FaceAvatar.GameDistance"), -40, 40, 1);
+	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_group(props, "gaming_hands", text("FaceAvatar.Gaming"), OBS_GROUP_NORMAL, game);
+
 	// Hand signs and face moves (which ones, and what they do, are picked
 	// in DireBot).
 	obs_properties_t *signs = obs_properties_create();
@@ -6104,6 +6414,20 @@ json arms_request(const json &data)
 	return answer;
 }
 
+// "Show me" gaming hands, or stop.
+json game_request(const json &data)
+{
+	obs_source_t *src = find_avatar(data);
+	if (!src)
+		return fail("That face avatar isn't in OBS any more.");
+	auto *f = static_cast<FaceAvatar *>(obs_obj_get_data(src));
+	const std::string what = data.contains("do") && data["do"].is_string() ? data["do"].get<std::string>()
+										: "show";
+	json answer = f ? f->game_to(what) : fail("It isn't ready yet.");
+	obs_source_release(src);
+	return answer;
+}
+
 json react_on_cue(const json &data)
 {
 	obs_source_t *src = find_avatar(data);
@@ -6132,8 +6456,8 @@ json model_front(const json &data)
 
 const std::vector<std::string> &requests()
 {
-	static const std::vector<std::string> list = {"FaceSet",	   "FaceGetState", "FaceModelFront",
-						      "FaceMicCalibrate", "FaceReact",	   "FaceArms"};
+	static const std::vector<std::string> list = {"FaceSet",   "FaceGetState", "FaceModelFront", "FaceMicCalibrate",
+						      "FaceReact", "FaceArms",	   "FaceGame"};
 	return list;
 }
 
@@ -6158,6 +6482,8 @@ json request(const std::string &type, const json &data)
 			return react_on_cue(data);
 		if (type == "FaceArms")
 			return arms_request(data);
+		if (type == "FaceGame")
+			return game_request(data);
 		return fail("DireBot for OBS doesn't know that request.");
 	});
 }

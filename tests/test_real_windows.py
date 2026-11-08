@@ -29,7 +29,8 @@ import pytest
 
 obsws = pytest.importorskip("obsws_python")
 
-from test_real_face import PretendPhone, PretendVmcApp, camera_picture, character_picture, read_bmp, unity_turn, write_gif  # noqa: E402
+from test_real_face import (PretendPhone, PretendVmcApp, arms_character, camera_picture,  # noqa: E402
+                            character_picture, middle_of, read_bmp, unity_turn, write_gif)
 from test_real_obs import VERSION, free_port, vendor, wait_for  # noqa: E402
 
 ROOT = os.environ.get("DIREBOT_OBS_ROOT", "")
@@ -314,4 +315,157 @@ def test_moves_from_a_tracker_app(obs):
             app.close()
         if taken:
             taken.close()
+        c.disconnect()
+
+
+class Typist:
+    """Windows' own SendInput, as a person at this PC: presses of keys no
+    keyboard most people have (F13 to F16, so nothing in OBS answers
+    them) and the mouse moved. Each returns how many Windows took."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.ctypes = ctypes
+        word, dword, ulong_ptr = wintypes.WORD, wintypes.DWORD, ctypes.c_size_t
+
+        class Mouse(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", dword),
+                        ("dwFlags", dword), ("time", dword), ("dwExtraInfo", ulong_ptr)]
+
+        class Key(ctypes.Structure):
+            _fields_ = [("wVk", word), ("wScan", word), ("dwFlags", dword), ("time", dword),
+                        ("dwExtraInfo", ulong_ptr)]
+
+        class Hardware(ctypes.Structure):
+            _fields_ = [("uMsg", dword), ("wParamL", word), ("wParamH", word)]
+
+        class Either(ctypes.Union):
+            _fields_ = [("mi", Mouse), ("ki", Key), ("hi", Hardware)]
+
+        class Input(ctypes.Structure):
+            _fields_ = [("type", dword), ("u", Either)]
+        self.Input = Input
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(Input), ctypes.c_int]
+        self.user32.SendInput.restype = wintypes.UINT
+        self.user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        self.user32.MapVirtualKeyW.restype = wintypes.UINT
+
+    def _send(self, inputs):
+        array = (self.Input * len(inputs))(*inputs)
+        took = self.user32.SendInput(len(inputs), array, self.ctypes.sizeof(self.Input))
+        assert took == len(inputs), "SendInput took %d of %d (error %d)" % (
+            took, len(inputs), self.ctypes.get_last_error())
+        return took
+
+    def press(self, n):
+        inputs = []
+        for i in range(n):
+            vk = 0x7C + i % 4      # F13 to F16
+            scan = self.user32.MapVirtualKeyW(vk, 0)
+            for up in (0, 2):        # (KEYEVENTF_KEYUP)
+                one = self.Input(type=1)
+                one.u.ki.wVk, one.u.ki.wScan, one.u.ki.dwFlags = vk, scan, up
+                inputs.append(one)
+        return self._send(inputs)
+
+    def move(self, dx, dy):
+        one = self.Input(type=0)
+        one.u.mi.dx, one.u.mi.dy, one.u.mi.dwFlags = dx, dy, 1   # (MOUSEEVENTF_MOVE)
+        return self._send([one])
+
+
+def test_gaming_hands_read_this_pc(obs):
+    """0.9.0: gaming hands on Windows - your keyboard and mouse read with
+    Raw Input on a hidden window of its own (while another window has the
+    focus too), pads with XInput, a VRM character's hands on its own
+    keyboard and mouse (the props from the zip). Keys pressed are counted
+    (never which), typing seen, the mouse's moves followed; turned off, the
+    keyboard and mouse are let go of and nothing more is counted."""
+    figure = os.path.join(obs.home, "gaming.vrm")
+    arms_character(figure)
+    size = 200
+    c = obs.client()
+    typist = Typist()
+
+    def gaming():
+        return vendor(c, "FaceGetState", {"source": "Gaming"})["gaming"]
+
+    def change(settings):
+        c.send("SetInputSettings", {"inputName": "Gaming", "inputSettings": settings}, raw=True)
+    red = lambda px: px[0] > 120 and px[1] < 60 and px[2] < 60  # noqa: E731
+    try:
+        c.send("CreateScene", {"sceneName": "Gaming scene"}, raw=True)
+        c.send("CreateInput", {"sceneName": "Gaming scene", "inputName": "Gaming",
+                               "inputKind": "direbot_face_avatar",
+                               "inputSettings": {"model": figure, "width": size, "height": size,
+                                                 "size": 100, "framing": "whole", "style": "drawn",
+                                                 "mirror": False, "smoothing": 0, "breathing": 0,
+                                                 "sway": 0, "eye_moves": False}}, raw=True)
+        c.send("SetCurrentProgramScene", {"sceneName": "Gaming scene"}, raw=True)
+        assert wait_for(lambda: vendor(c, "FaceGetState", {"source": "Gaming"})["model"]["shown"], 60, 0.2), \
+            obs.log()
+        g = gaming()
+        assert not g["on"] and not g["reading"]["keyboard"] and not g["reading"]["mouse"], g
+        time.sleep(0.5)
+        _, rest_y, rest_n = middle_of(shot(c, "Gaming"), red)
+        assert rest_n > 5, rest_n
+
+        change({"game_hands": True})
+        assert wait_for(lambda: gaming()["shown"] and gaming()["hands_on"] == 1, 15, 0.1), gaming()
+        assert wait_for(lambda: gaming()["reading"]["keyboard"] or gaming()["reading"]["keyboard_problem"],
+                        10, 0.1), gaming()
+        r = gaming()["reading"]
+        print("\nGaming hands read:", r)
+        assert r["keyboard"] and r["keyboard_problem"] == "", r
+        assert r["mouse"] and r["mouse_problem"] == "", r
+        assert r["pads"] or r["pads_problem"], r
+        # Its keyboard, mouse, mat, pad and sticks, from the zip, drawn.
+        assert wait_for(lambda: gaming()["props_loaded"] == gaming()["props_wanted"] == 5, 15, 0.1), gaming()
+        assert gaming()["props_problem"] == ""
+        time.sleep(0.8)
+        _, desk_y, desk_n = middle_of(shot(c, "Gaming"), red)
+        assert desk_n > 5 and rest_y - desk_y > 0.08 * size, (rest_y, desk_y)
+
+        # Keys pressed (in another window: OBS's own has the focus, or none):
+        # counted, and typing once there are a few with the mouse still.
+        assert not gaming()["used"]["keys"]
+        typist.press(2)
+        assert wait_for(lambda: gaming()["used"]["keys"], 3, 0.05), gaming()
+        assert gaming()["using"] == "keyboard_mouse"
+        typed = []
+
+        def typing():
+            typed.append(typist.press(1))
+            return gaming()["typing"]
+        assert wait_for(typing, 6, 0.15), (len(typed), gaming())
+        # (How many and that they were used - nothing about which.)
+        g = gaming()
+        assert set(g["used"]) == {"keys", "mouse", "pad"}, g
+        assert "F13" not in json.dumps(g) and "124" not in json.dumps(g["used"]), g
+        # The mouse moved: followed, and typing stops.
+        for _ in range(10):
+            typist.move(15, 0)
+            time.sleep(0.03)
+        assert wait_for(lambda: gaming()["used"]["mouse"] and not gaming()["typing"], 3, 0.05), gaming()
+
+        # Off: the keyboard and mouse let go of, and keys aren't counted.
+        change({"game_hands": False})
+        assert wait_for(lambda: not gaming()["reading"]["keyboard"] and not gaming()["reading"]["mouse"],
+                        5, 0.1), gaming()
+        assert wait_for(lambda: not gaming()["shown"], 5, 0.1), gaming()
+        time.sleep(1.2)
+        typist.press(4)
+        time.sleep(0.3)
+        g = gaming()
+        assert not g["used"]["keys"] and not g["typing"], g
+        time.sleep(0.5)
+        _, off_y, _ = middle_of(shot(c, "Gaming"), red)
+        assert abs(off_y - rest_y) < 0.04 * size, (rest_y, off_y)
+    finally:
+        try:
+            c.send("RemoveInput", {"inputName": "Gaming"}, raw=True)
+        except Exception:
+            pass
         c.disconnect()

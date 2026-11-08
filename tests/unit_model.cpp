@@ -3766,6 +3766,233 @@ static void test_arms_follow()
 	}
 }
 
+// Its hands at a desk (gamehands.hpp's DeskHand): each wrist reaching where
+// it's put from where its shoulder is now, its bones keeping their
+// lengths, its elbow out its pole's way, its hand turned as it says and
+// each finger joint bent - over your arms from the camera, as much as each
+// hand's weight; a move on cue over it. Its arms' measure for the desk,
+// and its head and shoulders framed down past its desk.
+static void test_desk_hands()
+{
+	const float PI = 3.14159265f;
+	Figure body = make_body();
+	auto m = std::make_shared<Model>();
+	CHECK(load(body.p.b.glb(), *m));
+	RigOptions o;
+	o.springs = false;
+	Rig rig(m, o);
+	auto at = [&](const Rig &r, int node) { return move_of(r.world()[node]); };
+	auto way = [&](const Rig &r, int from, int to) { return normalized(at(r, to) - at(r, from)); };
+	const int lower[2] = {m->bone("leftLowerArm"), m->bone("rightLowerArm")};
+	const int upper[2] = {m->bone("leftUpperArm"), m->bone("rightUpperArm")};
+	rig.pose(still());
+	const V3 rest_hand = at(rig, body.hand[0]);
+
+	// Its arms: from where each upper arm turns, as long as both bones.
+	const DeskBody db = rig.desk_body();
+	CHECK(db.ok && near(db.arm, 0.5, 1e-4));
+	CHECK(near3(db.shoulder[0], at(rig, upper[0]), 1e-4f) && near3(db.shoulder[1], at(rig, upper[1]), 1e-4f));
+	CHECK(db.shoulder[0].x > db.shoulder[1].x);
+
+	// Its left hand on a keyboard in front of it, down a little.
+	Drive d = still();
+	DeskHand &L = d.desk[0];
+	L.weight = 1;
+	L.wrist = db.shoulder[0] + V3{-0.05f, -0.25f, 0.28f};
+	L.along = normalized(V3{-0.1f, -0.15f, 1});
+	L.across = normalized(V3{-1, 0.2f, 0.1f});
+	L.across = normalized(L.across - L.along * dot(L.across, L.along));
+	L.pole = normalized(V3{0.45f, -1, -0.3f});
+	rig.pose(d);
+	CHECK(near3(at(rig, body.hand[0]), L.wrist, 2e-3f));
+	CHECK(near(length(at(rig, lower[0]) - at(rig, upper[0])), 0.25, 1e-4));
+	CHECK(near(length(at(rig, body.hand[0]) - at(rig, lower[0])), 0.25, 1e-4));
+	// Its elbow out and down, as its pole says (not up or in).
+	{
+		const V3 s = at(rig, upper[0]), w = at(rig, body.hand[0]), e = at(rig, lower[0]);
+		const V3 line = normalized(w - s);
+		const V3 out = e - (s + line * dot(e - s, line));
+		CHECK(length(out) > 0.05f && dot(normalized(out), L.pole) > 0.6f);
+	}
+	// Its hand as it says: its fingers along, its first finger's side across.
+	const int knuckle = body.middle[0][0], first = body.index[0][0];
+	const int little = m->bone("leftLittleProximal");
+	CHECK(dot(way(rig, body.hand[0], knuckle), L.along) > 0.995f);
+	CHECK(dot(way(rig, little, first), L.across) > 0.99f);
+	// Its other arm as it was.
+	CHECK(near3(at(rig, body.hand[1]), {-rest_hand.x, rest_hand.y, rest_hand.z}, 1e-4f));
+
+	// Its fingers bent as it says (a key pressed: more).
+	L.bend[1][0] = 0.6f;
+	L.bend[1][1] = 0.9f;
+	L.bend[2][0] = 0.3f;
+	rig.pose(d);
+	bool palm = false;
+	CHECK(near(bend_of(rig, body.hand[0], body.index[0][0], 0, &palm), 0.6 * 180 / PI, 0.5) && palm);
+	CHECK(near(bend_of(rig, body.index[0][0], body.index[0][1], 0), 0.9 * 180 / PI, 0.5));
+	CHECK(near(bend_of(rig, body.hand[0], body.middle[0][0], 0), 0.3 * 180 / PI, 0.5));
+	// (The pose again: the same - nothing builds up frame to frame.)
+	rig.pose(d);
+	CHECK(near(bend_of(rig, body.hand[0], body.index[0][0], 0), 0.6 * 180 / PI, 0.5));
+	CHECK(near3(at(rig, body.hand[0]), L.wrist, 2e-3f));
+
+	// Half its weight: part of the way there.
+	L.weight = 0.5f;
+	rig.pose(d);
+	const float to_target = length(at(rig, body.hand[0]) - L.wrist), to_rest = length(at(rig, body.hand[0]) - rest_hand);
+	CHECK(to_target > 0.05f && to_rest > 0.05f);
+	L.weight = 1;
+
+	// Out of reach: its arm straight out towards it, its hand as far as it goes.
+	const V3 far_away = db.shoulder[0] + normalized(V3{0.2f, -0.3f, 1}) * 0.8f;
+	const V3 was_wrist = L.wrist;
+	L.wrist = far_away;
+	rig.pose(d);
+	CHECK(near(length(at(rig, body.hand[0]) - at(rig, upper[0])), 0.5, 2e-3));
+	CHECK(dot(way(rig, upper[0], body.hand[0]), normalized(far_away - db.shoulder[0])) > 0.999f);
+	L.wrist = was_wrist;
+
+	// Over your arms from the camera (they yield to it)...
+	d.follow_arms = true;
+	ArmTarget &A = d.arms.side[0];
+	A.weight = 1;
+	A.upper = A.fore = {0, 1, 0};
+	rig.pose(d);
+	CHECK(near3(at(rig, body.hand[0]), L.wrist, 2e-3f));
+	// ...as much as it's there.
+	L.weight = 0;
+	rig.pose(d);
+	CHECK(near3(way(rig, upper[0], lower[0]), {0, 1, 0}, 1e-3f));
+	L.weight = 1;
+	d.follow_arms = false;
+	A.weight = 0;
+
+	// A move on cue takes it over.
+	MoveNow wave;
+	wave.builtin = BuiltIn::Wave;
+	wave.time = 0.5f;
+	wave.amount = 1;
+	d.body.push_back(wave);
+	rig.pose(d);
+	CHECK(length(at(rig, body.hand[0]) - L.wrist) > 0.02f || length(at(rig, body.hand[1]) - rest_hand) > 0.02f);
+	d.body.clear();
+	rig.pose(d);
+	CHECK(near3(at(rig, body.hand[0]), L.wrist, 2e-3f));
+
+	// Its hands measured: wrist to middle knuckle, first knuckle to little
+	// one, its middle finger (its tip as long as the bone before it, near
+	// enough).
+	CHECK(near(db.hand, 0.03, 1e-4) && near(db.knuckles, 0.06, 1e-4) && near(db.finger, 0.057, 1e-4));
+
+	// A finger reaching a spot: its tip there (the spot where it'd be bent
+	// another way), each joint bent within how far it goes.
+	// (Its tip as the rig has it: its last bone's way and length, 0.85 of it.)
+	auto tip = [&](const int j[3]) {
+		return point(rig.world()[j[2]], j == body.thumb[0] ? V3{0.01275f, 0, 0.01275f} : V3{0.017f, 0, 0});
+	};
+	auto finite3 = [](V3 v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z); };
+	for (int i = 0; i < 2; i++)
+		L.bend[i][0] = L.bend[i][1] = L.bend[i][2] = 0;
+	L.bend[1][0] = 0.5f;
+	L.bend[1][1] = 0.7f;
+	L.bend[1][2] = 0.4f;
+	rig.pose(d);
+	const V3 bent_index = tip(body.index[0]);
+	L.bend[1][0] = L.bend[1][1] = L.bend[1][2] = 0;
+	rig.pose(d);
+	const V3 straight_index = tip(body.index[0]);
+	CHECK(length(straight_index - bent_index) > 0.02f);
+	L.reach[1] = bent_index;
+	L.reach_weight[1] = 1;
+	rig.pose(d);
+	CHECK(length(tip(body.index[0]) - bent_index) < 1.5e-3f);
+	// ...its wrist where it was, the others as bent.
+	CHECK(near3(at(rig, body.hand[0]), L.wrist, 2e-3f) && near(bend_of(rig, body.hand[0], body.middle[0][0], 0), 0.3 * 180 / PI, 0.5));
+	// Sideways a little (across its palm) too.
+	const V3 across_palm = normalized(L.across);
+	L.reach[1] = bent_index + across_palm * 0.008f;
+	rig.pose(d);
+	CHECK(length(tip(body.index[0]) - L.reach[1]) < 2e-3f);
+	// Half its weight: half way.
+	L.reach[1] = bent_index;
+	L.reach_weight[1] = 0.5f;
+	rig.pose(d);
+	{
+		const V3 t = tip(body.index[0]);
+		CHECK(length(t - bent_index) > 3e-3f && length(t - straight_index) > 3e-3f);
+	}
+	// Its thumb too.
+	L.reach_weight[1] = 0;
+	L.bend[0][0] = 0.3f;
+	L.bend[0][1] = 0.4f;
+	L.bend[0][2] = 0.3f;
+	rig.pose(d);
+	const V3 bent_thumb = tip(body.thumb[0]);
+	L.bend[0][0] = L.bend[0][1] = L.bend[0][2] = 0;
+	L.reach[0] = bent_thumb;
+	L.reach_weight[0] = 1;
+	rig.pose(d);
+	CHECK(length(tip(body.thumb[0]) - bent_thumb) < 1.5e-3f);
+	// Out of its reach: as near as it gets, no joint past how far it bends.
+	L.reach[1] = L.wrist + V3{0, -1, 0};
+	L.reach_weight[1] = 1;
+	rig.pose(d);
+	for (int k = 0; k < 2; k++)
+		CHECK(bend_of(rig, k ? body.index[0][k - 1] : body.hand[0], body.index[0][k], 0) < 1.76f * 180 / PI);
+	CHECK(bend_of(rig, body.index[0][1], body.index[0][2], 0) < 1.76f * 180 / PI);
+	CHECK(finite3(tip(body.index[0])));
+	// Nowhere: bent as it says.
+	L.reach[0] = L.reach[1] = {NAN, 0, 0};
+	L.bend[1][0] = 0.6f;
+	rig.pose(d);
+	CHECK(near(bend_of(rig, body.hand[0], body.index[0][0], 0), 0.6 * 180 / PI, 0.5) && finite3(tip(body.thumb[0])));
+	L.reach_weight[0] = L.reach_weight[1] = 0;
+
+	// Nonsense: left as it is.
+	L.wrist = {NAN, 0, 0};
+	rig.pose(d);
+	const V3 h = at(rig, body.hand[0]);
+	CHECK(std::isfinite(h.x) && std::isfinite(h.y) && std::isfinite(h.z));
+
+	// Head and shoulders, with its desk: down past the desk, its middle
+	// across kept, the top of its head still in it - as it's seen from
+	// DESK_PITCH above (taller than it is).
+	V3 middle, extent, hm, he;
+	CHECK(!framed_box(*m, Quat{}, true, nullptr, hm, he));
+	Bounds desk;
+	desk.found = true;
+	desk.low = {-0.4f, 0.9f, 0.1f};
+	desk.high = {0.2f, 1.2f, 0.45f};
+	CHECK(framed_box(*m, Quat{}, true, nullptr, middle, extent, &desk));
+	const float top = hm.y + he.y / 2, tall = top - 0.9f, deep = 0.45f - (hm.z - he.z / 2);
+	const float pitch = DESK_PITCH * PI / 180;
+	CHECK(near(middle.y, (top + 0.9f) / 2, 1e-4));
+	CHECK(near(extent.y, tall * std::cos(pitch) + deep * std::sin(pitch), 1e-4) && extent.y > tall);
+	CHECK(near(middle.x, hm.x, 1e-4) && extent.x >= 2 * (hm.x + 0.4f) - 1e-4f);
+	CHECK(near(middle.z, (0.45f + hm.z - he.z / 2) / 2, 1e-4));
+	// ...not "All of it", nor without a desk.
+	V3 am, ae, bm, be;
+	CHECK(!framed_box(*m, Quat{}, false, nullptr, am, ae, &desk));
+	framed_box(*m, Quat{}, false, nullptr, bm, be);
+	CHECK(near3(am, bm, 1e-6f) && near3(ae, be, 1e-6f));
+	Bounds none;
+	CHECK(!framed_box(*m, Quat{}, true, nullptr, bm, be, &none));
+	CHECK(near3(bm, hm, 1e-6f) && near3(be, he, 1e-6f));
+	// Framed in its spot with its desk: seen from above, its camera's
+	// right and up turned with it.
+	const Framing level = frame_own_spot(*m, Quat{}, 1000, 1000, 0.8f, true, 0, 0, 1);
+	const Framing above = frame_own_spot(*m, Quat{}, 1000, 1000, 0.8f, true, 0, 0, 1, nullptr, &desk);
+	CHECK(near3(level.up, {0, 1, 0}, 1e-5f) && near3(level.right, {1, 0, 0}, 1e-5f));
+	CHECK(near(std::acos(std::min(1.0f, dot(above.up, V3{0, 1, 0}))), pitch, 1e-3));
+	CHECK(near3(above.right, {1, 0, 0}, 1e-5f));
+	// (A camera view of its own on top: both turns.)
+	Framing turned = above;
+	CameraView cv;
+	cv.pitch = 10;
+	view_own_spot(turned, cv);
+	CHECK(near(std::acos(std::min(1.0f, dot(turned.up, V3{0, 1, 0}))), pitch + 10 * PI / 180, 1e-3));
+}
+
 static void test_fingers_and_body()
 {
 	Figure body = make_body();
@@ -4214,6 +4441,7 @@ int main()
 	test_light();
 	test_fingers_and_body();
 	test_arms_follow();
+	test_desk_hands();
 	test_motion_reading();
 	test_moves_on_a_vrm();
 	test_tracked_bones();

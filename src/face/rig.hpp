@@ -63,6 +63,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <vector>
 
 #include "arms.hpp"
+#include "gamehands.hpp"
 #include "math3d.hpp"
 #include "model.hpp"
 #include "react.hpp"
@@ -197,6 +198,13 @@ struct Drive {
 	// From another tracker app (vmc.hpp): its body, arms, fingers and eyes,
 	// as much as each is taken.
 	TrackedBody tracked;
+	// Its hands on a keyboard, mouse or pad (gamehands.hpp, 0.9.0): each arm
+	// reaching its wrist there from its shoulder as it is now (its body
+	// leaning, breathing, turning with your head - the hands stay put),
+	// its hand turned and its fingers bent as it says, as much as each's
+	// weight: over your arms from the camera or a tracker app. A move on
+	// cue takes over from it as much as it shows.
+	DeskHand desk[2];
 };
 
 // A box round what a character takes up (model space).
@@ -282,6 +290,9 @@ public:
 	bool has_arms() const { return arm_bone_[0][0] >= 0 || arm_bone_[1][0] >= 0; }
 	// Its arms can follow yours (Drive::follow_arms): a VRM with arms.
 	bool follows_arms() const { return arm_rest_[0].ok || arm_rest_[1].ok; }
+	// Its shoulders and arms' length at rest, for its hands on a keyboard,
+	// mouse or pad (Drive::desk): not ok without both arms.
+	DeskBody desk_body() const;
 	bool plays_motions() const { return model_->is_vrm() && model_->bone("hips") >= 0; }
 	// Its head at rest, the facing model's way (x its right as the picture
 	// shows it, y up, z out of its face): the box round what its head
@@ -354,6 +365,10 @@ private:
 	void play_motion(const Motion &mo, float t, float amount);
 	void pose_humanoid(const std::map<std::string, std::pair<Quat, float>> &turn);
 	void drive_tracked(const Drive &d);
+	void drive_desk(const Drive &d);
+	// A node's place and turn as it's posed so far (model space).
+	M4 posed(int node) const;
+	void reach_digit(const DeskHand &t, int side, int digit, float bend[3], float &spread) const;
 	float hips_height(int hips) const;
 	void play_builtin(BuiltIn b, float t, float amount);
 	void play_own(int animation, float t, float amount);
@@ -388,6 +403,8 @@ private:
 		V3 axis;
 		float most = 0, has = 0;
 		int side = 0, digit = 0, joint = 0;
+		V3 spread; // a first joint's sideways (its palm's way: model space, at rest)
+		V3 tip;    // its next joint, or its tip (its own space)
 	};
 	std::vector<Finger> fingers_;
 	// Its spine, chest and upper chest (as it has them, lowest first) and
@@ -407,6 +424,8 @@ private:
 	// How much a body move holds each node this frame (0 to 1): what the
 	// rig itself does to it (arms down, fingers relaxed) is that much less.
 	std::vector<float> moved_;
+	// ...by the moves on cue alone (before another tracker app's bones).
+	std::vector<float> cue_moved_;
 	// The VRM humanoid's bones by VRM 1.0's names (a 0.x's thumbs too).
 	std::map<std::string, int> bones1_;
 	int arm_bone_[2][3] = {{-1, -1, -1}, {-1, -1, -1}}; // each side's upper arm, lower arm, hand
@@ -424,6 +443,7 @@ private:
 		float upper_len = 0, fore_len = 0;
 		V3 upper, fore, hinge, fore_hinge;
 		V3 along, across;
+		float hand_len = 0; // its wrist to its middle knuckle
 	};
 	ArmRest arm_rest_[2];
 	// Its head's middle and width (ear to ear, about), the facing model's
@@ -475,15 +495,24 @@ struct Framing {
 // head bone), else all of it - as it stands (`stands`, Rig::rest_bounds,
 // from 0.8.1; with a little room round it), or its file's box if not
 // given (a character made standing in a T is as wide as its arms reach
-// then).
-void framed_box(const Model &m, Quat facing, bool head, const Bounds *stands, V3 &middle, V3 &extent);
+// then). `desk`: round its head and shoulders, with its hands at a desk
+// too (gamehands.hpp's desk_box, the facing model's way) - from the top
+// of its head down past the desk, and as wide each side of it as the desk
+// reaches out either way. True when its desk is in it.
+bool framed_box(const Model &m, Quat facing, bool head, const Bounds *stands, V3 &middle, V3 &extent,
+		const Bounds *desk = nullptr);
+// Its head and shoulders and its desk are seen from this far above
+// (degrees down): the desk's top in sight, as a camera over a screen sees
+// you.
+constexpr float DESK_PITCH = 14;
 // In its own spot: the picture `w` x `h`, the character `size` of it
 // (1: as tall or as wide as the picture; up to 3, bigger than the picture,
 // its top kept in it, from 0.8.1), its middle moved by `dx`, `dy` (shares
-// of the picture, + right and down) and grown by `grow`. `head` and
-// `stands`: as framed_box.
+// of the picture, + right and down) and grown by `grow`. `head`, `stands`
+// and `desk`: as framed_box (with its desk in it, seen from DESK_PITCH
+// above).
 Framing frame_own_spot(const Model &m, Quat facing, uint32_t w, uint32_t h, float size, bool head, float dx, float dy,
-		       float grow, const Bounds *stands = nullptr);
+		       float grow, const Bounds *stands = nullptr, const Bounds *desk = nullptr);
 // Moves it on in its spot by `dx`, `dy` more (shares of the picture).
 void move_own_spot(Framing &f, float dx, float dy);
 

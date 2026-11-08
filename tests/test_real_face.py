@@ -3173,6 +3173,145 @@ def test_moves_from_a_tracker_app(run):
         c.disconnect()
 
 
+def test_gaming_hands(run):
+    """0.9.0: gaming hands. Off by default ("Show me" says to turn it on);
+    on, a 3D VRM character in its own spot puts its hands on its own
+    keyboard and mouse (its props, from the add-on's own files) - its
+    red hands from hanging by its sides up in front of it, nearer its
+    middle - or on its pad when that's picked. FaceGetState says whether your keyboard, mouse and
+    pads are read here (only on Windows: in words why not elsewhere),
+    which it's using and never which keys. "Show me" pretends a few
+    seconds of typing, a game and a pad (and stops when asked). Turned
+    off, its arms are its own again; a character that isn't a VRM says
+    why."""
+    figure = os.path.join(run.home, "gaming.vrm")
+    arms_character(figure)
+    plain = os.path.join(run.home, "gaming-plain.glb")
+    arms_character(plain, vrm=False)
+    size = 300
+    common = {"width": size, "height": size, "size": 100, "framing": "whole", "style": "drawn",
+              "mirror": False, "smoothing": 0, "follow_move": 0, "follow_grow": 0, "follow_tilt": 0,
+              "body_follow": 0, **STILL}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+
+    def st(name="Gaming"):
+        return vendor(c, "FaceGetState", {"source": name})
+
+    def gaming(name="Gaming"):
+        return st(name)["gaming"]
+
+    def game(do, name="Gaming"):
+        return vendor(c, "FaceGame", {"source": name, "do": do})
+
+    def change(settings, name="Gaming"):
+        send(c, "SetInputSettings", {"inputName": name, "inputSettings": settings})
+    red = lambda px: px[0] > 120 and px[1] < 60 and px[2] < 60  # noqa: E731
+    blue = lambda px: px[2] > 90 and px[0] < 60 and px[1] < 80  # noqa: E731
+    middle = [size // 2]
+
+    def hands(shot):
+        """Its hands: the middle (x, y) of the red each side of its body's
+        middle, and how much."""
+        m = int(middle[0])
+        return (middle_of(shot, red, (0, 0, m, size)), middle_of(shot, red, (m, 0, size, size)))
+    try:
+        send(c, "CreateScene", {"sceneName": "Gaming scene"})
+        send(c, "CreateInput", {"sceneName": "Gaming scene", "inputName": "Gaming",
+                                "inputKind": "direbot_face_avatar",
+                                "inputSettings": {**common, "model": figure}})
+        send(c, "CreateInput", {"sceneName": "Gaming scene", "inputName": "Gaming plain",
+                                "inputKind": "direbot_face_avatar",
+                                "inputSettings": {**common, "model": plain, "game_hands": True}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Gaming scene"})
+        assert wait_for(lambda: st()["model"]["shown"] and st("Gaming plain")["model"]["shown"], 30, 0.2), st()
+
+        # Off by default: nothing read, nothing shown.
+        g = gaming()
+        assert not g["on"] and not g["shown"] and g["why_not"] == "off", g
+        assert g["device"] == "auto" and g["mouse_hand"] == "right" and g["props"] and g["rest"] == 0, g
+        r = g["reading"]
+        assert not r["keyboard"] and not r["mouse"] and not r["pads"] and r["pads_in"] == 0, r
+        assert g["using"] == "none" and g["props_wanted"] == 0 and not g["show_me"], g
+        assert game("show") == {"ok": False, "error": "Turn on gaming hands first."}
+        time.sleep(0.3)
+        rest = screenshot(c, "Gaming")
+        middle[0] = middle_of(rest, blue)[0]
+        (l0, r0) = hands(rest)
+        assert l0[2] > 5 and r0[2] > 5, (l0, r0)
+
+        # On: its hands on its keyboard and mouse, up in front of it (its
+        # left on the keys, nearer its middle).
+        change({"game_hands": True})
+        assert wait_for(lambda: gaming()["shown"] and gaming()["hands_on"] == 1, 10, 0.1), gaming()
+        assert wait_for(lambda: gaming()["props_loaded"] == gaming()["props_wanted"] == 5, 10, 0.1), gaming()
+        g = gaming()
+        assert g["on"] and g["why_not"] == "" and g["using"] == "keyboard_mouse" and g["props_problem"] == "", g
+        r = g["reading"]
+        if os.name == "nt":
+            assert r["keyboard"] and r["mouse"] and r["pads"], r
+        else:
+            assert not r["keyboard"] and r["keyboard_problem"] == "Only on Windows.", r
+            assert r["mouse_problem"] == "Only on Windows." and r["pads_problem"] == "Only on Windows.", r
+        # (Only how many: nothing in it says which keys.)
+        assert set(g["used"]) == {"keys", "mouse", "pad"}, g
+        assert not any("key" in k for k in r if k not in ("keyboard", "keyboard_problem")), r
+        time.sleep(0.8)
+        on_desk = screenshot(c, "Gaming")
+        keep_shot(on_desk, "gaming-desk")
+        (l1, r1) = hands(on_desk)
+        assert l1[2] > 5 and r1[2] > 5, (l1, r1)
+        assert r0[0] - r1[0] > 0.08 * size, (l0, r0, l1, r1)  # (its left hand in, onto the keys)
+        assert l0[1] - l1[1] > 0.1 * size and r0[1] - r1[1] > 0.1 * size, (l0, r0, l1, r1)
+        # Its props drawn: without them, less of the picture's filled.
+        drawn = lambda shot: sum(1 for row in shot for px in row if max(px) > 12)  # noqa: E731
+        with_props = drawn(on_desk)
+        change({"game_props": False})
+        assert wait_for(lambda: gaming()["props_wanted"] == 0, 5, 0.1), gaming()
+        time.sleep(0.3)
+        assert drawn(screenshot(c, "Gaming")) < with_props - 200
+        change({"game_props": True})
+
+        # "Show me": a few seconds pretending, then stopped when asked.
+        a = game("show")
+        assert a["ok"] and a["seconds"] == 14, a
+        assert wait_for(lambda: gaming()["show_me"], 3, 0.05), gaming()
+        assert wait_for(lambda: gaming()["typing"], 5, 0.05), gaming()
+        g = gaming()
+        assert 0 < g["show_left"] < 14 and g["used"]["keys"], g
+        assert game("stop") == {"ok": True}
+        assert wait_for(lambda: not gaming()["show_me"], 3, 0.05), gaming()
+        assert game("dance")["error"] == "DireBot for OBS doesn't know that."
+
+        # Always the pad: its hands on it, both together in front.
+        change({"game_device": "pad"})
+        assert wait_for(lambda: gaming()["using"] == "pad" and gaming()["device"] == "pad", 5, 0.1), gaming()
+        time.sleep(1.2)
+        on_pad = screenshot(c, "Gaming")
+        keep_shot(on_pad, "gaming-pad")
+        (l2, r2) = hands(on_pad)
+        assert l2[2] > 5 and r2[2] > 5 and abs(l2[1] - r2[1]) < 0.05 * size, (l2, r2)
+        assert (r2[0] - l2[0]) < (r1[0] - l1[0]) + 0.02 * size, (l1, r1, l2, r2)
+
+        # Not a VRM: says why ("Show me" too).
+        g = gaming("Gaming plain")
+        assert g["on"] and not g["shown"] and g["why_not"] == "not_vrm", g
+        assert "VRM" in game("show", "Gaming plain")["error"]
+
+        # Off: its arms its own again, by its sides.
+        change({"game_hands": False})
+        assert wait_for(lambda: not gaming()["shown"], 5, 0.1), gaming()
+        time.sleep(0.5)
+        (l3, r3) = hands(screenshot(c, "Gaming"))
+        assert abs(l3[0] - l0[0]) < 0.03 * size and abs(r3[0] - r0[0]) < 0.03 * size, (l0, r0, l3, r3)
+    finally:
+        for name in ("Gaming", "Gaming plain"):
+            try:
+                send(c, "RemoveInput", {"inputName": name})
+            except Exception:
+                pass
+        c.disconnect()
+
+
 def test_closing_obs_leaves_nothing_behind(run):
     assert run.close() == 0
     log = run.log()

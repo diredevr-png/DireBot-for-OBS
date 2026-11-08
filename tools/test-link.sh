@@ -2,7 +2,7 @@
 # Builds and runs the tests for DireBot for OBS that don't need OBS:
 # the unit tests (the link's, the vertical picture's, Follow me's, clean recordings', the face tracker's,
 # the face avatar's 2D and 3D characters', following your hands and arms, hand signs and face moves, your face from a
-# phone, moves from another tracker app (VMC), how their pictures shrink, what it does on cue, the mouth from your mic's), then the link's
+# phone, moves from another tracker app (VMC), gaming hands, how their pictures shrink, what it does on cue, the mouth from your mic's), then the link's
 # network tests through obsws-python.
 # (tests/test_real_obs.py runs it inside a real OBS - see its top.)
 #   pip install pytest obsws-python websocket-client
@@ -70,6 +70,11 @@ done
 "$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-vmc" "$here/tests/unit_vmc.cpp" \
 	"$here/src/face/vmc.cpp" "$here/src/face/tracker.cpp" "$here/src/face/pose.cpp" "$here/src/face/voice.cpp" "${face_obj[@]}"
 "$out/unit-vmc"
+# Gaming hands: your keyboard, mouse and pads counted (never which key),
+# and its hands on its keyboard, mouse and pad as you use them.
+"$cxx" "${flags[@]}" -o "$out/unit-game" "$here/tests/unit_game.cpp" "$here/src/face/devices.cpp" \
+	"$here/src/face/gamehands.cpp"
+"$out/unit-game"
 "$cxx" "${flags[@]}" -o "$out/unit-react" "$here/tests/unit_react.cpp" "$here/src/face/react.cpp"
 "$out/unit-react"
 "$cxx" "${flags[@]}" -O2 -o "$out/unit-pictures" "$here/tests/unit_pictures.cpp" "$here/src/face/pictures.cpp"
