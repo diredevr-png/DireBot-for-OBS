@@ -34,7 +34,6 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <obs-module.h>
 #include <graphics/graphics.h>
-#include <graphics/image-file.h>
 #include <graphics/matrix4.h>
 #include <graphics/vec2.h>
 #include <graphics/vec3.h>
@@ -44,6 +43,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <plugin-support.h>
 
 #include "../link/crypto.hpp"
+#include "../obs/picture-file.hpp"
 #include "../obs/ui-call.hpp"
 #include "alive.hpp"
 #include "arms.hpp"
@@ -162,7 +162,7 @@ bool rect_from(const json &j, Rect &r)
 // would wait on the graphics thread, which may be waiting on the lock).
 struct Picture {
 	std::string path;
-	gs_image_file_t image = {};
+	PictureFile image;
 	// A small copy of it (straight colour, 4 bytes a point), for its shape.
 	std::vector<uint8_t> small;
 	int small_w = 0, small_h = 0;
@@ -170,18 +170,18 @@ struct Picture {
 
 	explicit Picture(const std::string &file) : path(file)
 	{
-		gs_image_file_init(&image, path.c_str());
+		image.open(path.c_str());
 		keep_small();
 		obs_enter_graphics();
-		gs_image_file_init_texture(&image);
+		image.init_texture();
 		obs_leave_graphics();
-		if (!image.loaded)
+		if (!image.loaded())
 			obs_log(LOG_WARNING, "DireBot Face Avatar: couldn't open a picture (is the file still there?)");
 	}
 	~Picture()
 	{
 		obs_enter_graphics();
-		gs_image_file_free(&image);
+		image.free();
 		obs_leave_graphics();
 	}
 
@@ -190,20 +190,22 @@ struct Picture {
 	void keep_small()
 	{
 		constexpr uint32_t MOST = 512;
-		if (!image.loaded || image.is_animated_gif || !image.texture_data || !image.cx || !image.cy)
+		const uint8_t *points = image.texture_data();
+		const uint32_t cx = image.cx(), cy = image.cy();
+		if (!image.loaded() || image.is_animated_gif() || !points || !cx || !cy)
 			return;
-		const bool bgra = image.format == GS_BGRA || image.format == GS_BGRX;
-		if (!bgra && image.format != GS_RGBA)
+		const gs_color_format format = image.format();
+		const bool bgra = format == GS_BGRA || format == GS_BGRX;
+		if (!bgra && format != GS_RGBA)
 			return;
-		const bool opaque = image.format == GS_BGRX;
-		const uint32_t every = std::max(1u, (std::max(image.cx, image.cy) + MOST - 1) / MOST);
-		small_w = (int)((image.cx + every - 1) / every);
-		small_h = (int)((image.cy + every - 1) / every);
+		const bool opaque = format == GS_BGRX;
+		const uint32_t every = std::max(1u, (std::max(cx, cy) + MOST - 1) / MOST);
+		small_w = (int)((cx + every - 1) / every);
+		small_h = (int)((cy + every - 1) / every);
 		small.resize((size_t)small_w * small_h * 4);
 		for (int y = 0; y < small_h; y++)
 			for (int x = 0; x < small_w; x++) {
-				const uint8_t *from =
-					image.texture_data + ((size_t)y * every * image.cx + (size_t)x * every) * 4;
+				const uint8_t *from = points + ((size_t)y * every * cx + (size_t)x * every) * 4;
 				uint8_t *to = &small[((size_t)y * small_w + x) * 4];
 				std::memcpy(to, from, 4);
 				if (opaque)
@@ -228,12 +230,12 @@ struct Picture {
 	// graphics thread.
 	void animate(uint64_t ns)
 	{
-		if (image.loaded && image.is_animated_gif && gs_image_file_tick(&image, ns))
-			gs_image_file_update_texture(&image);
+		if (image.loaded() && image.is_animated_gif() && image.tick(ns))
+			image.update_texture();
 	}
-	gs_texture_t *texture() const { return image.loaded ? image.texture : nullptr; }
-	float width() const { return image.loaded ? (float)image.cx : 0; }
-	float height() const { return image.loaded ? (float)image.cy : 0; }
+	gs_texture_t *texture() const { return image.loaded() ? image.texture() : nullptr; }
+	float width() const { return image.loaded() ? (float)image.cx() : 0; }
+	float height() const { return image.loaded() ? (float)image.cy() : 0; }
 };
 using PicturePtr = std::shared_ptr<Picture>;
 

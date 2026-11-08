@@ -355,7 +355,10 @@ By hand: close OBS, unzip `direbot-for-obs-<version>-windows-x64.zip` into
 Log Files → View Current Log** has the line
 `[direbot-for-obs] DireBot Link is on (port 4466, this PC only).`
 
-Needs OBS 31.1.1 or newer, 64-bit Windows.
+Needs OBS 31.1.1 or newer, 64-bit Windows. OBS 33 works from 0.8.2:
+OBS 33 took the picture loader the face avatar used out of OBS and put a
+new one in, and Windows wouldn't load 0.8.1 at all in OBS 33. From 0.8.2
+the add-on finds whichever loader the OBS it's in has, when it runs.
 
 ## For DireBot (and other tools)
 
@@ -435,6 +438,14 @@ photos (`tests/data/body`); `tools/body-expected.py` makes those (`pip
 install mediapipe ai-edge-litert`). Inside OBS, `test_real_face.py` has a
 VRM character follow the arms in one of those photos, a bone copying its
 arm's turn going round with it.
+
+Tests (Windows, in GitHub Actions): the Windows zip goes into a real OBS
+for Windows - 31.1.1, 32.2.2 and 33.0.1 - which has to load it and open
+a face avatar's pictures, a PNG and an animated GIF
+(`tests/test_real_windows.py`). Before that, `tools/check-obs-imports.py`
+checks every function the DLL calls is in each OBS's own `obs.dll` and
+`obs-frontend-api.dll` (one missing and Windows won't load the add-on).
+When a new OBS comes out, add it to the list in `.github/workflows/build.yaml`.
 
 ## Releasing
 

@@ -7,7 +7,7 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
     tags: ['*']
   pull_request:
   workflow_dispatch:
@@ -73,3 +73,58 @@ jobs:
           path: |
             release/*.zip
             release/SHA256SUMS.txt
+
+  windows-obs:
+    name: Windows zip in real OBS ${{ matrix.obs }}
+    needs: windows
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest OBS the add-on supports, the one before 33, and the
+        # newest. OBS 33 took functions out of obs.dll that 0.8.1 linked
+        # to, so Windows wouldn't load it: every OBS here is checked.
+        include:
+          - obs: 31.1.1
+            layout: legacy
+          - obs: 32.2.2
+            layout: legacy
+          - obs: 33.0.1
+            layout: new
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: direbot-for-obs-windows-x64-${{ github.sha }}
+          path: release
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/obs-${{ matrix.obs }}
+          key: obs-windows-${{ matrix.obs }}
+      - name: Get OBS ${{ matrix.obs }}
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP/obs-${{ matrix.obs }}"
+          if (-not (Test-Path "$dir/bin/64bit/obs64.exe")) {
+            $zip = "$env:RUNNER_TEMP/obs.zip"
+            Invoke-WebRequest -Uri "https://github.com/obsproject/obs-studio/releases/download/${{ matrix.obs }}/OBS-Studio-${{ matrix.obs }}-Windows-x64.zip" -OutFile $zip
+            Expand-Archive -Path $zip -DestinationPath $dir -Force
+          }
+          Get-ChildItem "$dir/bin/64bit/obs64.exe"
+      - name: Every function the add-on calls is in this OBS
+        shell: pwsh
+        run: |
+          $zip = (Get-ChildItem release/*.zip)[0].FullName
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP/addon" -Force
+          python tools/check-obs-imports.py "$env:RUNNER_TEMP/addon/direbot-for-obs/bin/64bit/direbot-for-obs.dll" "$env:RUNNER_TEMP/obs-${{ matrix.obs }}/bin/64bit"
+      - name: Inside OBS
+        shell: pwsh
+        env:
+          DIREBOT_OBS_ROOT: ${{ runner.temp }}/obs-${{ matrix.obs }}
+          DIREBOT_OBS_LAYOUT: ${{ matrix.layout }}
+          DIREBOT_OBS_EXPECT: ${{ matrix.obs }}
+          DIREBOT_OBS_REQUIRE: '1'
+        run: |
+          python -m pip install pytest obsws-python websocket-client
+          $env:DIREBOT_OBS_ZIP = (Get-ChildItem release/*.zip)[0].FullName
+          python -m pytest -v -s -rs tests/test_real_windows.py

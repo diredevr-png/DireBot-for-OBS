@@ -26,7 +26,7 @@ gcc -std=c17 "${flags[@]}" -c "$here/deps/mikktspace/mikktspace.c" -o "$out/mikk
 g++ -std=c++17 "${flags[@]}" -O2 -mavx2 -mfma -c "$here/src/face/nn/kernels-avx2.cpp" -o "$out/kernels-avx2.o"
 g++ -std=c++17 "${flags[@]}" -shared -o "$out/$name.so" \
 	"$here/src/plugin-main.cpp" "$here"/src/link/{crypto,ws,protocol,server}.cpp \
-	"$here"/src/obs/{websocket,meters,usage,link-file,address,keystore,settings-window,recording}.cpp \
+	"$here"/src/obs/{websocket,meters,usage,link-file,address,keystore,settings-window,recording,picture-file}.cpp \
 	"$here"/src/multistream/{multistream,places}.cpp "$here"/src/follow/{tracker,follow-cam}.cpp "$here"/src/record/{rules,record}.cpp \
 	"$here"/src/moves/{plan,move-transition}.cpp "$here"/src/filters/blur-filter.cpp \
 	"$here"/src/face/{tracker,pose,avatar2d,model,rig,alive,react,voice,setup,pictures,avatar3d,face-avatar,body,arms}.cpp "$here"/src/face/nn/{net,kernels,kernels-sse2}.cpp "$out/kernels-avx2.o" \

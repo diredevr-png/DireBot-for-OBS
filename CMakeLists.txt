@@ -48,6 +48,7 @@ target_sources(
     src/obs/keystore.cpp
     src/obs/settings-window.cpp
     src/obs/recording.cpp
+    src/obs/picture-file.cpp
 )
 
 # The vertical picture (src/vertical).
