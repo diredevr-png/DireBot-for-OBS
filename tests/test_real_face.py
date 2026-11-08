@@ -1941,24 +1941,34 @@ def test_reactions_on_cue(run):
         rest = screenshot(c, "React picture")
         rest_x, rest_y, rest_n = middle_of(rest, orange)
         assert rest_n > 10000 and middle_of(rest, red)[2] == 0 and middle_of(rest, yellow)[2] == 0
-        t = cue("React picture", do="throw", item=0, side=-1, strength=1, size=1,
-                face="", face_seconds=1)
-        assert t["ok"] and abs(t["hits_in"] - 0.5) < 0.11, t
-        shots = quick_shots(c, "React picture", 1.6)
-        seen = [(at, middle_of(rows, red), middle_of(rows, yellow)[2], middle_of(rows, orange))
-                for at, rows in shots]
-        flying = [(at, x) for at, (x, _, n), _, _ in seen if n > 40]
-        flashed = [at for at, _, n, _ in seen if n > 30]
-        moved = max(math.hypot(o[0] - rest_x, o[1] - rest_y) for _, _, _, o in seen if o[2])
-        print(f"thrown: in the air {len(flying)} of {len(shots)} looks, x "
-              f"{[round(x) for _, x in flying]}, the flash at {[round(a, 2) for a in flashed]} s, "
-              f"knocked {moved:.1f} px")
-        assert flying and flying[0][1] < rest_x - 30, (flying, rest_x)     # from its left
+        # (The flash lasts 0.32 s, fading, and a slow machine's screenshots
+        # can come further apart than it shows: one that fell between two
+        # of them is thrown again, up to three times in all.)
+        thrown = 0
+        for _ in range(3):
+            t = cue("React picture", do="throw", item=0, side=-1, strength=1, size=1,
+                    face="", face_seconds=1)
+            thrown += 1
+            assert t["ok"] and abs(t["hits_in"] - 0.5) < 0.11, t
+            shots = quick_shots(c, "React picture", 1.6)
+            seen = [(at, middle_of(rows, red), middle_of(rows, yellow)[2], middle_of(rows, orange))
+                    for at, rows in shots]
+            flying = [(at, x) for at, (x, _, n), _, _ in seen if n > 40]
+            flashed = [at for at, _, n, _ in seen if n > 30]
+            moved = max(math.hypot(o[0] - rest_x, o[1] - rest_y) for _, _, _, o in seen if o[2])
+            print(f"thrown: in the air {len(flying)} of {len(shots)} looks, x "
+                  f"{[round(x) for _, x in flying]}, the flash at {[round(a, 2) for a in flashed]} s, "
+                  f"knocked {moved:.1f} px")
+            assert flying and flying[0][1] < rest_x - 30, (flying, rest_x)     # from its left
+            if flashed:
+                break
+            assert wait_for(lambda: st("React picture")["react"]["flying"] == 0, 3, 0.05)
+            time.sleep(1.0)
         assert flashed, seen
         assert moved > 3, moved
         busiest = max(shots, key=lambda s: middle_of(s[1], red)[2])[1]
         keep_shot(busiest, "React throw")
-        assert wait_for(lambda: st("React picture")["react"]["hits"] == 1, 3, 0.05), \
+        assert wait_for(lambda: st("React picture")["react"]["hits"] == thrown, 3, 0.05), \
             st("React picture")["react"]
         assert wait_for(lambda: st("React picture")["react"]["flying"] == 0, 3, 0.05)
         time.sleep(1.0)
@@ -1971,7 +1981,7 @@ def test_reactions_on_cue(run):
         # ends it (nothing more hits).
         gaps = [cue("React picture", do="throw", item=0)["hits_in"] for _ in range(3)]
         assert gaps[1] > gaps[0] + 0.05 and gaps[2] > gaps[1] + 0.05, gaps
-        assert wait_for(lambda: st("React picture")["react"]["hits"] == 4, 4, 0.05), \
+        assert wait_for(lambda: st("React picture")["react"]["hits"] == thrown + 3, 4, 0.05), \
             st("React picture")["react"]
         answers = [cue("React picture", do="throw", item=0) for _ in range(30)]
         refused = [a for a in answers if not a["ok"]]
@@ -1982,7 +1992,7 @@ def test_reactions_on_cue(run):
         hits = st("React picture")["react"]["hits"]
         time.sleep(1.0)
         r = st("React picture")["react"]
-        assert r["hits"] == hits and r["flying"] == 0 and hits < 4 + 24, r
+        assert r["hits"] == hits and r["flying"] == 0 and hits < thrown + 3 + 24, r
 
         # A headpat: the hand comes down on top of its head, pats, and goes.
         assert middle_of(screenshot(c, "React picture"), skin)[2] == 0
@@ -2515,11 +2525,12 @@ def test_hidden_it_still_loads_and_all_of_it_fills_its_spot(run):
         # One in a scene that isn't shown, one switched off where it is.
         send(c, "CreateInput", {"sceneName": "Fill not shown", "inputName": "Fill away",
                                 "inputKind": "direbot_face_avatar", "inputSettings": common})
+        # (Switched off as it's made: made on, then switched off, OBS could
+        # draw it once in between - and it'd say it was shown.)
         item = send(c, "CreateInput", {"sceneName": "Fill shown", "inputName": "Fill off",
                                        "inputKind": "direbot_face_avatar",
-                                       "inputSettings": common})["sceneItemId"]
-        send(c, "SetSceneItemEnabled", {"sceneName": "Fill shown", "sceneItemId": item,
-                                        "sceneItemEnabled": False})
+                                       "inputSettings": common,
+                                       "sceneItemEnabled": False})["sceneItemId"]
         for name in ("Fill away", "Fill off"):
             assert wait_for(lambda: st(name)["loaded"], 20, 0.2), st(name)
             m = st(name)
