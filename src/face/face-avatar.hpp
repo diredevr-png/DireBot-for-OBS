@@ -64,6 +64,11 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 namespace direbot::face {
 
 constexpr const char *SOURCE_ID = "direbot_face_avatar";
+// 0.9.0, "DireBot Throws": a filter on your camera that what's thrown at
+// you lands on (your real face in it), for streamers without a face
+// avatar. FaceReact and FaceGetState reach it as {"source": the camera,
+// "filter": its name}.
+constexpr const char *THROWS_FILTER_ID = "direbot_throws_filter";
 
 // From obs_module_load, so scene collections find it when they load.
 void register_source();

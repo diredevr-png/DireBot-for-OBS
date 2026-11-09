@@ -500,6 +500,41 @@ tall its picture or model is - its head nodded down and squished. `count` (1-16)
 throws a barrage of it, one after another; `stop` makes what's stuck fall
 off.
 
+**What a thing does as it hits, and throws at your camera (0.9.0).** A
+row of `react_items` can say what it does as it hits (`hit`: JSON,
+`effect` `splat`, `feathers` or `pieces`, and each picture by its full
+path). A splat (`mark`, `drip`, `bits`, `seconds` 0.5-15) is left on the
+character where it hit - only on the character, never the air round it -
+spreading a little, juice (`bits`) thrown off and falling, a few drips
+(`drip`, hung from their top) running down from it; it moves and tilts
+with its head, and after `seconds` slides down a little and fades. The
+thing itself is crushed into it and never bounces off. Feathers
+(`bits`) puff out a little and drift down past its face, slowed by the
+air, swaying side to side. Pieces (`bits`, `puff`, `mark`) burst out and
+fall, two puffs grow and fade, and `mark` is left on it for `seconds`.
+`squishy` (with any of them, or none) squashes the thing flat as it hits
+and wobbles it back. At most 24 marks and 240 bits at once; a picture
+that isn't there leaves nothing (the thing is still thrown). `stop`
+fades them all at once. `FaceGetState`'s `react` says `marks` and `bits`
+(how many now), and each item's `hit` (`effect`, `loaded`).
+
+"DireBot Throws" (`direbot_throws_filter`) is a filter for a camera: the
+same throws land on your real face in it, for streamers who don't use a
+face avatar. DireBot puts it on, with `react_items`, `react_hit` and
+`camera_shake` (on to start with: the camera jolts a little as each
+thing hits, zoomed in just enough that its edges never show). It finds
+your face in the camera (held while it can't see you; until it first
+does, a guess a little above the middle), and what's thrown, and what
+it leaves, follows your head as it moves and tilts. Asleep it leaves the
+camera exactly as it is and looks at nothing: it wakes when something
+is asked of it and sleeps 4 seconds after it's all over. It's asked as a
+face avatar is, with `{"source": the camera, "filter": its name}`
+(`FaceReact` throws and `stop`; `companion` and `stay` are a face
+avatar's only; `FaceGetState` adds `camera`: `awake`, `face`, `seen`, `x`,
+`y` and `head` (pixels), `roll`, `shake`). A face avatar that reads that
+camera - to find your face, or to show it behind itself worn - always
+gets it as it is, never with the throws on it.
+
 **A companion beside it, and moves that stay (0.9.0).** A 3D character
 can have a companion: a pet of its own file (`.glb`, `.gltf` or `.vrm`,
 with its own animations) that comes in beside it - a wolf that trots in,

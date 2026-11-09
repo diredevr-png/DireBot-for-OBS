@@ -63,6 +63,7 @@ inline const std::vector<EffectNeeds> &face_2d_needs()
 {
 	static const std::vector<EffectNeeds> needs = {
 		{"Picture", {"image", "opacity", "clip"}},
+		{"Stain", {"image", "opacity"}},
 		{"Cutout",
 		 {"image", "mask_map", "body_map", "opacity", "origin", "across", "down", "mask_place", "body_place",
 		  "inside", "skin_lab", "target_lab", "mask_rows", "skin_amount"}},

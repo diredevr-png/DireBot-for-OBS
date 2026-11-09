@@ -98,6 +98,24 @@ constexpr size_t MOST_LAYERS = 12;
 // animation files, and the numbers its VRM animation files' moves go by
 // (React::play's; under it, its own animations' numbers).
 constexpr size_t MOST_THROW_PICTURES = 24, MOST_MOTIONS = 32;
+// The most pictures for what things do as they hit (0.9.0: splats,
+// drips, juice, feathers, snow...), all of them together.
+constexpr size_t MOST_EFFECT_PICTURES = 64;
+// The throws filter (0.9.0): how much of a hit's knock-back jolts the
+// camera (a person's head isn't a character's), and how long it stays
+// awake after something's asked of it (seconds).
+constexpr float CAMERA_JOLT = 0.45f;
+constexpr uint64_t AWAKE_NS = 4'000'000'000ULL;
+// A face avatar reading its camera (to find your face, or to show it
+// behind the avatar) gets it as it is: a throws filter on that camera
+// lets it through untouched - a tomato on your face would hide it from
+// the tracker, and the avatar draws its own throws. (Drawing is on OBS's
+// one graphics thread.)
+thread_local int reading_camera = 0;
+struct ReadingCamera {
+	ReadingCamera() { reading_camera++; }
+	~ReadingCamera() { reading_camera--; }
+};
 constexpr int MOTION_IDS = 10000;
 // Chat's emotes thrown (by their pictures' files): the newest this many
 // kept, numbered from EMOTE_IDS for React.
@@ -1003,6 +1021,21 @@ obs_source_t *default_mic()
 struct FaceAvatar {
 	obs_source_t *self = nullptr;
 	obs_weak_source_t *weak_self = nullptr;
+	// 0.9.0: "DireBot Throws", a filter on your camera - no character:
+	// what's thrown lands on your real face in the camera's own picture
+	// (its camera is the source it's on). Asleep (OBS draws the camera as
+	// if it weren't there) until something is thrown.
+	const bool as_filter = false;
+	// ...thrown at lately (asleep after this), whether the camera jolts as
+	// things hit, and your face as last seen in it (the camera's pixels).
+	std::atomic<uint64_t> wake_until{0};
+	std::atomic<bool> camera_shake{true};
+	struct CameraFace {
+		bool seen = false; // ever, since it woke
+		bool now = false;  // in the newest look
+		float x = 0, y = 0, head = 0, roll = 0, head_top = 0.6f;
+	};
+	CameraFace cam_face, cam_face_state; // (the copy under state_lock, for FaceGetState)
 
 	// Set on OBS's UI thread (update), read while drawing.
 	std::mutex lock, find_lock;
@@ -1247,6 +1280,7 @@ struct FaceAvatar {
 	Shot shots[SHOTS];
 	int used_shot = -1;   // the cut-outs'
 	int looked_shot = -1; // the newest look's, found or not (worn: the camera shown)
+	int newest_shot = -1; // the one look() drew this frame (0.9.0: the throws filter's camera)
 	std::atomic<bool> new_camera{false};
 	gs_texrender_t *small = nullptr; // the camera, small, for a look
 	gs_texrender_t *flat = nullptr;  // the character, flat, before it turns
@@ -1494,6 +1528,10 @@ struct FaceAvatar {
 	// colours; the 3D files loaded (or why not); and chat's emotes thrown,
 	// the newest kept (EMOTE_IDS + where).
 	std::vector<std::string> throw_files;
+	// What each thing does as it hits (0.9.0, react.hpp's HitLook, by the
+	// thing's number): its pictures by number in effect_pics.
+	std::vector<HitLook> throw_looks;
+	std::vector<PicturePtr> effect_pics;
 	std::string hand3d_file;
 	// A picture of the hand: where it touches the head and where its wrist
 	// is (shares of its width and height, as it comes from the left), and
@@ -1541,6 +1579,7 @@ struct FaceAvatar {
 		std::vector<std::string> faces, shapes;
 		bool arms = false, motions = false, three_d = false, busy = false, placed = false;
 		int hits = 0, flying = 0;
+		int marks = 0, bits = 0; // 0.9.0: left on its face, bits in the air
 		float head_px = 0;
 		Hand hand; // the headpat's hand now
 		float squint = 0, squish = 0;
@@ -1581,9 +1620,10 @@ struct FaceAvatar {
 						 : (arms_light ? LIGHT_ARMS_EVERY : ARMS_EVERY);
 	}
 
-	explicit FaceAvatar(obs_source_t *source)
+	explicit FaceAvatar(obs_source_t *source, bool filter = false)
 		: self(source),
 		  weak_self(obs_source_get_weak_source(source)),
+		  as_filter(filter),
 		  worker(models_path(),
 			 [weak = weak_self](const std::string &text) {
 				 // Saved in the settings on OBS's UI thread (save_rest_task).
@@ -1702,6 +1742,10 @@ struct FaceAvatar {
 
 	obs_source_t *get_camera()
 	{
+		if (as_filter) { // the source it's on
+			obs_source_t *parent = obs_filter_get_parent(self);
+			return parent ? obs_source_get_ref(parent) : nullptr;
+		}
 		std::lock_guard<std::mutex> l(lock);
 		return camera ? obs_weak_source_get_source(camera) : nullptr;
 	}
@@ -1919,8 +1963,16 @@ struct FaceAvatar {
 			return;
 		gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
 		gs_ortho(0.0f, (float)cw, 0.0f, (float)ch, -100.0f, 100.0f);
-		obs_source_video_render(cam);
+		if (as_filter) {
+			// The camera as the filters before this one leave it.
+			if (obs_source_process_filter_begin(self, GS_RGBA, OBS_NO_DIRECT_RENDERING))
+				obs_source_process_filter_end(self, obs_get_base_effect(OBS_EFFECT_DEFAULT), cw, ch);
+		} else {
+			ReadingCamera raw;
+			obs_source_video_render(cam);
+		}
 		gs_texrender_end(shot.tex);
+		newest_shot = slot;
 		const uint64_t ns = os_gettime_ns();
 		shot.ns = ns;
 		gs_texture_t *full = gs_texrender_get_texture(shot.tex);
@@ -2366,7 +2418,10 @@ struct FaceAvatar {
 			gs_matrix_translate3f((float)cw, 0, 0);
 			gs_matrix_scale3f(-1, 1, 1);
 		}
-		obs_source_video_render(cam);
+		{
+			ReadingCamera raw;
+			obs_source_video_render(cam);
+		}
 		gs_matrix_pop();
 	}
 
@@ -3684,6 +3739,168 @@ struct FaceAvatar {
 		drawing = false;
 	}
 
+	// 0.9.0, the throws filter: awake while something's thrown at you (and
+	// a moment after), else the camera goes by untouched.
+	bool awake()
+	{
+		if (!as_filter)
+			return false;
+		bool busy;
+		{
+			std::lock_guard<std::mutex> l(state_lock);
+			busy = react_state.busy;
+		}
+		return busy || os_gettime_ns() < wake_until.load();
+	}
+
+	// The throws filter drawing: the camera (as the filters before it
+	// leave it), what's thrown at you over your face in it, and the
+	// camera jolted a little as things hit (zoomed in just enough that its
+	// edges never show) - your face, and all that's on it, jolted with it.
+	void render_filter()
+	{
+		obs_source_t *target = obs_filter_get_target(self);
+		const uint32_t cw = target ? obs_source_get_base_width(target) : 0,
+			       ch = target ? obs_source_get_base_height(target) : 0;
+		if (reading_camera > 0 || drawing || !effect || !cw || !ch || !awake()) {
+			obs_source_skip_video_filter(self);
+			return;
+		}
+		{
+			std::lock_guard<std::mutex> l(state_lock);
+			showing_now = true;
+			last_render = os_gettime_ns();
+		}
+		cam_w = cw;
+		cam_h = ch;
+		drawing = true;
+		if (!drawn) {
+			gs_blend_state_push();
+			if (since_render > STALE) {
+				staged = false;
+				worker.forget();
+				pace.reset();
+				cam_face.now = false;
+			}
+			since_render = 0;
+			gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+			newest_shot = -1;
+			look(nullptr, cw, ch);
+			draw_on_camera(cw, ch);
+			gs_blend_state_pop();
+			drawn = true;
+		}
+		gs_texture_t *tex = have_out ? gs_texrender_get_texture(out) : nullptr;
+		if (tex) {
+			gs_effect_t *base = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+			gs_effect_set_texture(gs_effect_get_param_by_name(base, "image"), tex);
+			while (gs_effect_loop(base, "Draw"))
+				gs_draw_sprite(tex, 0, cw, ch);
+		}
+		drawing = false;
+		if (!tex)
+			obs_source_skip_video_filter(self);
+	}
+
+	// Your face in the camera's picture, for what's thrown at it: where
+	// (the middle of your eyes and mouth), how tall your head is (your
+	// forehead's top to your chin, and a little for your hair) and its
+	// tilt, from the newest look - held while it can't see you, a guess
+	// (the middle, a little high) until it first does.
+	void place_on_camera(uint32_t cw, uint32_t ch)
+	{
+		const Face &fc = seen.face;
+		if (fc.found && fc.w > 0 && fc.h > 0) {
+			const float kx = (float)cw / fc.w, ky = (float)ch / fc.h;
+			auto at = [&](int i) {
+				return std::array<float, 2>{fc.points[i].x * kx, fc.points[i].y * ky};
+			};
+			auto mid2 = [](std::array<float, 2> a, std::array<float, 2> b) {
+				return std::array<float, 2>{(a[0] + b[0]) / 2, (a[1] + b[1]) / 2};
+			};
+			const auto left = mid2(at(RIGHT_EYE_OUTER), at(RIGHT_EYE_INNER));
+			const auto right = mid2(at(LEFT_EYE_INNER), at(LEFT_EYE_OUTER));
+			const auto mouth = mid2(at(MOUTH_RIGHT), at(MOUTH_LEFT));
+			const auto top = at(10), chin = at(152);
+			const float tall = std::hypot(chin[0] - top[0], chin[1] - top[1]) * 1.25f;
+			if (tall >= 4 && std::isfinite(tall)) {
+				CameraFace f;
+				f.seen = f.now = true;
+				f.x = (left[0] + right[0] + mouth[0]) / 3;
+				f.y = (left[1] + right[1] + mouth[1]) / 3;
+				f.head = tall;
+				f.roll = std::atan2(right[1] - left[1], right[0] - left[0]);
+				// (Picture's left eye to its right: a tilt clockwise is +.)
+				f.head_top = clampf((f.y - top[1]) / tall + 0.12f, 0.2f, 1.5f);
+				cam_face = f;
+			}
+		} else {
+			cam_face.now = false;
+		}
+		if (!cam_face.seen) {
+			cam_face.x = cw * 0.5f;
+			cam_face.y = ch * 0.42f;
+			cam_face.head = ch * 0.4f;
+			cam_face.roll = 0;
+			cam_face.head_top = 0.6f;
+		}
+		{
+			std::lock_guard<std::mutex> l(state_lock);
+			cam_face_state = cam_face;
+		}
+		head_px = cam_face.head;
+		set_react_view(cam_face.x, cam_face.y, cam_face.head_top, cw, ch);
+		react_view.roll = cam_face.roll;
+		react_view.still_head = true;
+	}
+
+	// The camera and what's thrown at you into `out` (once a frame).
+	void draw_on_camera(uint32_t cw, uint32_t ch)
+	{
+		gs_texture_t *cam_tex = newest_shot >= 0 && shots[newest_shot].tex
+						? gs_texrender_get_texture(shots[newest_shot].tex)
+						: nullptr;
+		have_out = false;
+		if (!cam_tex)
+			return;
+		std::lock_guard<std::mutex> l(pictures_lock);
+		pick_props();
+		place_on_camera(cw, ch);
+		draw_overlay(cw, ch, true);
+		if (!out)
+			out = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+		if (!out)
+			return;
+		gs_texrender_reset(out);
+		if (!gs_texrender_begin(out, cw, ch))
+			return;
+		vec4 clear;
+		vec4_zero(&clear);
+		gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+		gs_ortho(0.0f, (float)cw, 0.0f, (float)ch, -100.0f, 100.0f);
+		// The jolt: the knock-back's move and tilt, about your face, as
+		// much as suits a camera, zoomed in just enough to fill it.
+		const ReactOut &r = react_now;
+		const bool shake = camera_shake.load();
+		const float dx = shake ? r.dx * head_px * CAMERA_JOLT : 0,
+			    dy = shake ? r.dy * head_px * CAMERA_JOLT : 0;
+		const float turn = shake ? r.roll * RAD * CAMERA_JOLT : 0;
+		const float zoom = cover_zoom((float)cw, (float)ch, cam_face.x, cam_face.y, dx, dy, turn);
+		gs_matrix_push();
+		gs_matrix_translate3f(cam_face.x + dx, cam_face.y + dy, 0);
+		gs_matrix_rotaa4f(0, 0, 1, turn);
+		gs_matrix_scale3f(zoom, zoom, 1);
+		gs_matrix_translate3f(-cam_face.x, -cam_face.y, 0);
+		gs_effect_t *base = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+		gs_effect_set_texture(gs_effect_get_param_by_name(base, "image"), cam_tex);
+		while (gs_effect_loop(base, "Draw"))
+			gs_draw_sprite(cam_tex, 0, cw, ch);
+		draw_reactions();
+		gs_matrix_pop();
+		gs_texrender_end(out);
+		have_out = true;
+	}
+
 	// The avatar into `out`, once a frame: the character drawn flat, then
 	// turned and placed (over the camera, worn on your head).
 	void draw_avatar(obs_source_t *cam, uint32_t cw, uint32_t ch, uint32_t w, uint32_t h)
@@ -3806,8 +4023,19 @@ struct FaceAvatar {
 	void draw_reactions()
 	{
 		const ReactOut &r = react_now;
-		if (!face_known || (r.flying.empty() && !r.hand.shown && r.bursts.empty() && !overlay_tex))
+		if (!face_known || (r.flying.empty() && !r.hand.shown && r.bursts.empty() && !overlay_tex &&
+				    r.marks.empty() && r.bits.empty()))
 			return;
+		// What's left on its face (0.9.0) first: only where the character
+		// (or the camera) is drawn - a splat on its cheek never hangs in
+		// the air past it. It's laid over what's there as much as that is
+		// there (the picture's own see-through-ness kept).
+		if (!r.marks.empty()) {
+			gs_blend_function_separate(GS_BLEND_DSTALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ZERO,
+						   GS_BLEND_ONE);
+			for (const Mark &m : r.marks)
+				draw_mark(m);
+		}
 		gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 		// A picture `across` heads wide (as tall as its shape says), its
 		// middle at (x, y) heads, turned clockwise `angle` and squashed
@@ -3862,9 +4090,52 @@ struct FaceAvatar {
 			gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE,
 						   GS_BLEND_INVSRCALPHA);
 		}
+		// The bits thrown off it as things hit (0.9.0): juice, feathers,
+		// snow, puffs of powder - in front of all of it.
+		for (const Bit &b : r.bits)
+			sprite(effect_picture(b.picture), b.x, b.y, b.size, b.angle, b.opacity, 1, 1);
 		// A picture of the hand (no 3D one).
 		if (r.hand.shown && !hand_3d())
 			draw_hand_picture(r.hand);
+	}
+
+	const PicturePtr &effect_picture(int n) const
+	{
+		static const PicturePtr none;
+		return n >= 0 && n < (int)effect_pics.size() ? effect_pics[n] : none;
+	}
+
+	// Something left on its face (react.hpp's Mark): a splat round its
+	// middle, or a drip hanging from the middle of its top edge, as long
+	// as it has run - drawn with "Stain" (premultiplied: the blend keeps
+	// it to where something is drawn already).
+	void draw_mark(const Mark &mk)
+	{
+		const PicturePtr &pic = effect_picture(mk.picture);
+		if (!loaded(pic) || !(mk.opacity > 0.001f) || !(mk.size > 0))
+			return;
+		const float wpx = mk.size * head_px;
+		const float hpx = mk.from_top ? mk.length * head_px
+					      : wpx * pic->height() / std::max(1.0f, (float)pic->width());
+		const float cx = face_px[0] + mk.x * head_px, cy = face_px[1] + mk.y * head_px;
+		const float co = std::cos(mk.angle), si = std::sin(mk.angle);
+		// Its top left corner from (cx, cy), before it's turned.
+		const float ox = -wpx / 2, oy = mk.from_top ? 0 : -hpx / 2;
+		if (!std::isfinite(cx + cy + wpx + hpx + co + si) || !(hpx > 0))
+			return;
+		matrix4 m;
+		vec4_set(&m.x, co * wpx, si * wpx, 0, 0);
+		vec4_set(&m.y, -si * hpx, co * hpx, 0, 0);
+		vec4_set(&m.z, 0, 0, 1, 0);
+		vec4_set(&m.t, cx + co * ox - si * oy, cy + si * ox + co * oy, 0, 1);
+		gs_effect_set_texture(p_image, pic->texture());
+		gs_effect_set_float(p_opacity, std::min(1.0f, mk.opacity));
+		gs_matrix_push();
+		gs_matrix_mul(&m);
+		check("Stain");
+		while (gs_effect_loop(effect, "Stain"))
+			gs_draw_quadf(pic->texture(), 0, 1, 1);
+		gs_matrix_pop();
 	}
 
 	// A picture of the patting hand: where it touches at react.hpp's
@@ -4265,6 +4536,8 @@ struct FaceAvatar {
 	// graphics thread.
 	void look_while_hidden()
 	{
+		if (as_filter)
+			return;
 		bool shown;
 		{
 			std::lock_guard<std::mutex> l(state_lock);
@@ -4363,7 +4636,7 @@ struct FaceAvatar {
 		pace.every = easy ? EASY_LOOK_EVERY : LOOK_EVERY;
 		pace.frame(dt);
 		shown.set_lead(lead);
-		if (since_find >= FIND_EVERY) {
+		if (since_find >= FIND_EVERY && !as_filter) {
 			since_find = 0;
 			obs_source_t *cam = get_camera();
 			if (cam)
@@ -4439,7 +4712,7 @@ struct FaceAvatar {
 		// The mouth from your mic: all the time ("mic"; the camera's when
 		// no sound comes in), or while you talk ("both").
 		since_mic_find += dt;
-		if (since_mic_find >= FIND_EVERY) {
+		if (since_mic_find >= FIND_EVERY && !as_filter) {
 			since_mic_find = 0;
 			bool auto_mic;
 			{
@@ -4511,6 +4784,8 @@ struct FaceAvatar {
 		react_state.hand = react_now.hand;
 		react_state.squint = react_now.squint;
 		react_state.squish = react_now.squish;
+		react_state.marks = (int)react_now.marks.size();
+		react_state.bits = (int)react_now.bits.size();
 		react_state.stuck = 0;
 		for (const Flying &f : react_now.flying)
 			react_state.stuck += f.stuck;
@@ -4539,9 +4814,14 @@ struct FaceAvatar {
 		obs_enter_graphics();
 		{
 			std::lock_guard<std::mutex> l(pictures_lock);
-			pick_model();
-			pick_companion();
-			apply_stay();
+			if (as_filter) {
+				// The throws filter's 3D things, ready before they're thrown.
+				pick_props();
+			} else {
+				pick_model();
+				pick_companion();
+				apply_stay();
+			}
 		}
 		obs_leave_graphics();
 	}
@@ -4677,12 +4957,14 @@ struct FaceAvatar {
 		// What it does on cue: the things thrown at it, the patting hand,
 		// a hit's flash (a file still used keeps its picture) and the VRM
 		// animation files it plays, each by its name.
-		std::vector<PicturePtr> old_throws, next_throws;
+		std::vector<PicturePtr> old_throws, next_throws, old_effects, next_effects;
+		std::vector<HitLook> next_looks;
 		PicturePtr next_hand, next_hit;
 		std::vector<NamedMotion> old_motions, next_motions;
 		{
 			std::lock_guard<std::mutex> l(pictures_lock);
 			old_throws = throw_pics;
+			old_effects = effect_pics;
 			next_hand = hand_pic;
 			next_hit = hit_pic;
 			old_motions = motions;
@@ -4697,6 +4979,46 @@ struct FaceAvatar {
 								 ? row["file"].get<std::string>()
 								 : "";
 				next_files.push_back(file);
+				// What it does as it hits (0.9.0): {"effect": "splat", "mark":
+				// file, "drip": file, "bits": [files], "puff": file,
+				// "seconds": 4, "squishy": false} - each picture by number.
+				HitLook look;
+				const json hit = row.is_object() && row.contains("hit") ? row["hit"] : json();
+				if (hit.is_object()) {
+					auto number = [&](const json &j) {
+						const std::string f = j.is_string() ? j.get<std::string>() : "";
+						if (f.empty())
+							return -1;
+						for (size_t i = 0; i < next_effects.size(); i++)
+							if (next_effects[i] && next_effects[i]->path == f)
+								return (int)i;
+						if (next_effects.size() >= MOST_EFFECT_PICTURES)
+							return -1;
+						PicturePtr pic;
+						for (const PicturePtr &old : old_effects)
+							if (old && old->path == f)
+								pic = old;
+						next_effects.push_back(pic ? pic : load_picture(nullptr, f.c_str()));
+						return (int)next_effects.size() - 1;
+					};
+					look.effect = effect_named(hit.value("effect", std::string()));
+					look.mark = number(hit.value("mark", json()));
+					look.drip = number(hit.value("drip", json()));
+					look.puff = number(hit.value("puff", json()));
+					const json bits = hit.value("bits", json());
+					if (bits.is_array())
+						for (const json &b : bits)
+							if (look.bits.size() < 8) {
+								const int n = number(b);
+								if (n >= 0)
+									look.bits.push_back(n);
+							}
+					const json secs = hit.value("seconds", json());
+					look.seconds = secs.is_number() ? clampf(secs.get<float>(), 0.5f, MOST_MARK)
+									: 4.0f;
+					look.squishy = hit.value("squishy", false);
+				}
+				next_looks.push_back(look);
 				// A 3D thing: loaded on its own thread (prop_loader).
 				if (is_3d_file(file)) {
 					next_throws.push_back(nullptr);
@@ -4824,6 +5146,8 @@ struct FaceAvatar {
 			layers.swap(wearing);
 			throw_pics.swap(next_throws);
 			throw_files.swap(next_files);
+			throw_looks.swap(next_looks);
+			effect_pics.swap(next_effects);
 			hand3d_file = hand3d_now;
 			std::copy(std::begin(game_files_now), std::end(game_files_now), std::begin(game_files));
 			hand_skin = skin_tint;
@@ -5274,6 +5598,9 @@ struct FaceAvatar {
 		};
 		const std::string what = str("do");
 		json answer = {{"ok", true}};
+		// The throws filter wakes (it looks for your face from now).
+		if (as_filter)
+			wake_until = os_gettime_ns() + AWAKE_NS;
 		if (what == "face") {
 			std::string name = str("face");
 			bool three_d;
@@ -5367,6 +5694,9 @@ struct FaceAvatar {
 			{
 				std::lock_guard<std::mutex> l(pictures_lock);
 				t.tall = drawn_tall(t.picture);
+				// What it does as it hits, as DireBot made it (not an emote).
+				if (file.empty() && t.picture >= 0 && t.picture < (int)throw_looks.size())
+					t.look = throw_looks[t.picture];
 			}
 			t.side = num("side", 0);
 			t.strength = num("strength", 1);
@@ -5411,6 +5741,8 @@ struct FaceAvatar {
 		} else if (what == "stop") {
 			std::lock_guard<std::mutex> l(react_lock);
 			react.stop();
+		} else if (as_filter && (what == "companion" || what == "stay")) {
+			return no("That's for a face avatar - this is a camera's throws filter.");
 		} else if (what == "companion") {
 			return companion_to(data);
 		} else if (what == "stay") {
@@ -5756,12 +6088,30 @@ struct FaceAvatar {
 			}
 			for (size_t i = 0; i < throw_pics.size(); i++) {
 				const std::string &file = i < throw_files.size() ? throw_files[i] : std::string();
+				// What it does as it hits (0.9.0), and whether all its
+				// pictures for that are loaded.
+				json hit;
+				if (i < throw_looks.size() && throw_looks[i].effect != Effect::None) {
+					const HitLook &look = throw_looks[i];
+					bool all = true;
+					for (int n : {look.mark, look.drip, look.puff})
+						all = all && (n < 0 ||
+							      (n < (int)effect_pics.size() && loaded(effect_pics[n])));
+					for (int n : look.bits)
+						all = all && n < (int)effect_pics.size() && loaded(effect_pics[n]);
+					hit = {{"effect", effect_name(look.effect)}, {"loaded", all}};
+				}
 				if (!is_3d_file(file)) {
-					react_items_json.push_back({{"loaded", loaded(throw_pics[i])}});
+					json row = {{"loaded", loaded(throw_pics[i])}};
+					if (!hit.is_null())
+						row["hit"] = hit;
+					react_items_json.push_back(row);
 					continue;
 				}
 				// A 3D one: loaded on its own (or why not).
 				json row = {{"loaded", props_ready.count(file) > 0}, {"three_d", true}};
+				if (!hit.is_null())
+					row["hit"] = hit;
 				auto why = prop_problems.find(file);
 				if (why != prop_problems.end())
 					row["problem"] = why->second;
@@ -6069,6 +6419,8 @@ struct FaceAvatar {
 					   {"hits", rs.hits},
 					   {"flying", rs.flying},
 					   {"stuck", rs.stuck},
+					   {"marks", rs.marks},
+					   {"bits", rs.bits},
 					   {"patting", rs.hand.shown},
 					   {"squint", std::round(rs.squint * 1000) / 1000},
 					   {"squish", std::round(rs.squish * 1000) / 1000},
@@ -6076,6 +6428,22 @@ struct FaceAvatar {
 					   {"moving", rs.moving}};
 			if (!react_hand_problem.empty())
 				answer["react"]["hand_3d_problem"] = react_hand_problem;
+			// The throws filter (0.9.0): awake, and your face in the camera
+			// (pixels) as last seen - `face`: in the newest look.
+			if (as_filter) {
+				const CameraFace &cf = cam_face_state;
+				auto r1 = [](float v) {
+					return std::round(v * 10) / 10;
+				};
+				answer["camera"] = {{"awake", rs.busy || os_gettime_ns() < wake_until.load()},
+						    {"face", cf.now},
+						    {"seen", cf.seen},
+						    {"x", r1(cf.x)},
+						    {"y", r1(cf.y)},
+						    {"head", r1(cf.head)},
+						    {"roll", std::round(cf.roll * 1000) / 1000},
+						    {"shake", camera_shake.load()}};
+			}
 			if (rs.hand.shown) {
 				auto r3 = [](float v) { return std::round(v * 1000) / 1000; };
 				answer["react"]["hand_now"] = {{"side", rs.hand.side},	       {"rise", r3(rs.hand.rise)},
@@ -6493,12 +6861,27 @@ const char *get_name(void *)
 	return text("FaceAvatar.Name");
 }
 
+obs_data_t *filter_settings(obs_data_t *settings);
+
+void update_filter(FaceAvatar *f, obs_data_t *settings)
+{
+	obs_data_t *safe = filter_settings(settings);
+	f->update(safe);
+	obs_data_release(safe);
+	f->camera_shake = obs_data_get_bool(settings, "camera_shake");
+}
+
 void *create(obs_data_t *settings, obs_source_t *source)
 {
 	auto *f = new FaceAvatar(source);
 	f->update(settings);
 	signal_handler_connect(obs_get_signal_handler(), "source_rename", FaceAvatar::on_rename, f);
 	return f;
+}
+
+void destroy_filter(void *data)
+{
+	delete static_cast<FaceAvatar *>(data);
 }
 
 void destroy(void *data)
@@ -6953,6 +7336,70 @@ uint32_t get_height(void *data)
 	return f->worn && f->cam_w && f->cam_h ? f->cam_h.load() : f->height.load();
 }
 
+// ---- The throws filter (0.9.0) ---------------------------------------------
+
+const char *filter_name(void *)
+{
+	return text("ThrowsFilter.Name");
+}
+
+// Its settings as the face avatar it runs on reads them: only what's
+// thrown (DireBot's react_* settings) and how it jolts the camera - never
+// a character, a phone, a tracker app, your arms, hand signs, gaming
+// hands or a mic, whatever's in them.
+obs_data_t *filter_settings(obs_data_t *settings)
+{
+	obs_data_t *safe = obs_data_create();
+	obs_data_apply(safe, settings);
+	for (const char *key : {"source", "character", "character_left", "character_right", "model", "own_face",
+				"outfit", "mic", "phone_address", "signs", "react_moves", "spots", "drawn_places"})
+		obs_data_set_string(safe, key, "");
+	obs_data_set_string(safe, "face_from", "camera");
+	obs_data_set_string(safe, "mouth_from", "camera");
+	for (const char *key : {"vmc_body", "vmc_arms", "follow_arms", "arms_hands", "game_hands", "game_props",
+				"hand_signs", "signs_hidden", "worn", "mirror"})
+		obs_data_set_bool(safe, key, false);
+	return safe;
+}
+
+void *filter_create(obs_data_t *settings, obs_source_t *source)
+{
+	auto *f = new FaceAvatar(source, true);
+	update_filter(f, settings);
+	return f;
+}
+
+void filter_update(void *data, obs_data_t *settings)
+{
+	update_filter(static_cast<FaceAvatar *>(data), settings);
+}
+
+void filter_defaults(obs_data_t *settings)
+{
+	get_defaults(settings);
+	obs_data_set_default_bool(settings, "camera_shake", true);
+}
+
+obs_properties_t *filter_properties(void *)
+{
+	obs_properties_t *props = obs_properties_create();
+	obs_properties_add_text(props, "about", text("ThrowsFilter.About"), OBS_TEXT_INFO);
+	obs_properties_add_bool(props, "camera_shake", text("ThrowsFilter.Shake"));
+	return props;
+}
+
+void filter_tick(void *data, float seconds)
+{
+	auto *f = static_cast<FaceAvatar *>(data);
+	f->tick(seconds);
+	f->pick_while_hidden(seconds);
+}
+
+void filter_render(void *data, gs_effect_t *)
+{
+	static_cast<FaceAvatar *>(data)->render_filter();
+}
+
 void video_tick(void *data, float seconds)
 {
 	auto *f = static_cast<FaceAvatar *>(data);
@@ -6990,6 +7437,17 @@ obs_source_t *find_avatar(const json &data)
 {
 	const std::string name = data.value("source", std::string());
 	obs_source_t *s = name.empty() ? nullptr : obs_get_source_by_name(name.c_str());
+	// 0.9.0: {"source": your camera, "filter": its throws filter's name}.
+	const json filter = data.contains("filter") ? data["filter"] : json();
+	if (filter.is_string()) {
+		obs_source_t *f = s ? obs_source_get_filter_by_name(s, filter.get<std::string>().c_str()) : nullptr;
+		obs_source_release(s);
+		if (f && std::strcmp(obs_source_get_unversioned_id(f), THROWS_FILTER_ID) != 0) {
+			obs_source_release(f);
+			f = nullptr;
+		}
+		return f;
+	}
 	if (s && std::strcmp(obs_source_get_unversioned_id(s), SOURCE_ID) != 0) {
 		obs_source_release(s);
 		s = nullptr;
@@ -7210,6 +7668,21 @@ void register_source()
 	info.video_render = video_render;
 	info.enum_active_sources = enum_active_sources;
 	obs_register_source(&info);
+
+	// 0.9.0: "DireBot Throws", on your camera.
+	obs_source_info filter = {};
+	filter.id = THROWS_FILTER_ID;
+	filter.type = OBS_SOURCE_TYPE_FILTER;
+	filter.output_flags = OBS_SOURCE_VIDEO;
+	filter.get_name = filter_name;
+	filter.create = filter_create;
+	filter.destroy = destroy_filter;
+	filter.update = filter_update;
+	filter.get_defaults = filter_defaults;
+	filter.get_properties = filter_properties;
+	filter.video_tick = filter_tick;
+	filter.video_render = filter_render;
+	obs_register_source(&filter);
 }
 
 } // namespace direbot::face
