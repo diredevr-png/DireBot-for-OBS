@@ -198,7 +198,7 @@ bool CompanionPlayer::come(bool instant)
 		idle_t_ = 0;
 		come_after_ = go_after_ = false;
 		if (!was_out)
-			petting_ = pet_again_ = false;
+			petting_ = pet_again_ = moving_ = false;
 		return !was_out;
 	}
 	switch (phase_) {
@@ -220,7 +220,7 @@ bool CompanionPlayer::come(bool instant)
 	default:
 		break;
 	}
-	petting_ = pet_again_ = false;
+	petting_ = pet_again_ = moving_ = false;
 	start_coming();
 	return true;
 }
@@ -301,12 +301,25 @@ bool CompanionPlayer::pet()
 	return true;
 }
 
+bool CompanionPlayer::play(int index, float length)
+{
+	if (phase_ != CompanionPhase::Out || go_after_ || moving_)
+		return false;
+	if (index < 0 || !(length > 0) || !std::isfinite(length))
+		return false;
+	move_.index = index;
+	move_.length = length;
+	moving_ = true;
+	move_t_ = 0;
+	return true;
+}
+
 void CompanionPlayer::reset()
 {
 	phase_ = CompanionPhase::Away;
-	t_ = idle_t_ = pet_t_ = 0;
+	t_ = idle_t_ = pet_t_ = move_t_ = 0;
 	going_ = CLIP_GO;
-	petting_ = pet_again_ = false;
+	petting_ = pet_again_ = moving_ = false;
 	come_after_ = go_after_ = go_scared_ = false;
 }
 
@@ -350,6 +363,7 @@ CompanionNow CompanionPlayer::step(float dt)
 				if (pet_t_ >= clips_[CLIP_PET].length)
 					petting_ = false;
 			}
+			step_move(left);
 			if (t_ + left < L) {
 				t_ += left;
 				left = 0;
@@ -366,6 +380,7 @@ CompanionNow CompanionPlayer::step(float dt)
 		}
 		if (phase_ == CompanionPhase::Out) {
 			idle_t_ = looped(idle_t_ + left, clips_[CLIP_IDLE].length);
+			step_move(left);
 			if (petting_) {
 				pet_t_ += left;
 				const float L = clips_[CLIP_PET].length;
@@ -388,10 +403,22 @@ CompanionNow CompanionPlayer::step(float dt)
 	out.shown = phase_ != CompanionPhase::Away;
 	out.busy = phase_ == CompanionPhase::Coming || phase_ == CompanionPhase::Going;
 	out.petting = petting_;
+	out.move = moving_ ? move_.index : -1;
 	out.camera = phase_ == CompanionPhase::Coming || phase_ == CompanionPhase::Out ||
 		     (phase_ == CompanionPhase::Going && (come_after_ || t_ < clips_[going_].length * 0.5f));
 	moves(out);
 	return out;
+}
+
+void CompanionPlayer::step_move(float dt)
+{
+	if (!moving_)
+		return;
+	move_t_ += dt;
+	if (move_t_ >= move_.length) {
+		moving_ = false;
+		move_t_ = 0;
+	}
 }
 
 void CompanionPlayer::moves(CompanionNow &out) const
@@ -428,6 +455,17 @@ void CompanionPlayer::moves(CompanionNow &out) const
 			else if (pet_t_ > pet.length - fo)
 				k = smooth((pet.length - pet_t_) / fo);
 			add(pet, pet_t_, k);
+		}
+		if (moving_) {
+			// One of its own moves (a howl): eased in and out over its
+			// sitting (and a pat), as react.hpp's moves are.
+			const float fi = ease_in_of(move_.length), fo = ease_out_of(move_.length);
+			float k = 1;
+			if (move_t_ < fi)
+				k = smooth(move_t_ / fi);
+			else if (move_t_ > move_.length - fo)
+				k = smooth((move_.length - move_t_) / fo);
+			add(move_, move_t_, k);
 		}
 		if (phase_ == CompanionPhase::Going) {
 			const CompanionClip &go = clips_[going_];

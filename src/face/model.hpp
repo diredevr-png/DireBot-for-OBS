@@ -111,6 +111,16 @@ struct Material {
 	float normal_scale = 1;
 	TexRef occlusion_map;
 	float occlusion_strength = 1;
+	// 0.9.0: a glowing see-through part - fire, sparks, smoke (glTF's
+	// extras.direbot.glow): a soft gas that adds its light (its emissive
+	// colour x its picture x its points' colour) to what's behind it, hides
+	// what's behind it only as much as its base colour's alpha says, and
+	// thins out where it's seen edge on (`glow_soft`, a power) - with
+	// `glow_ragged`, eating into its picture's thin places first, so its
+	// outline breaks up into wisps. Each one is drawn at its middle's depth
+	// (data/effects/direbot-face-3d.effect).
+	bool glow = false;
+	float glow_soft = 1.5f, glow_ragged = 0;
 };
 
 // Which of a part's sides are drawn (glTF's front and back): both, its

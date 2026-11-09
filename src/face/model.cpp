@@ -581,6 +581,14 @@ Material read_material(const json &doc, const json &m)
 	const json &mtoon = field(ext, "VRMC_materials_mtoon");
 	if (mtoon.is_object())
 		read_mtoon1(doc, mtoon, mat);
+	// 0.9.0: glowing gas (fire, sparks, smoke), as DireBot's companions have
+	// it - only for a see-through part.
+	const json &glow = field(field(field(m, "extras"), "direbot"), "glow");
+	if (glow.is_object() && mat.alpha == AlphaMode::Blend) {
+		mat.glow = true;
+		mat.glow_soft = std::clamp(num(glow, "soft", 1.5f), 0.0f, 16.0f);
+		mat.glow_ragged = std::clamp(num(glow, "ragged", 0.0f), 0.0f, 1.0f);
+	}
 	return mat;
 }
 

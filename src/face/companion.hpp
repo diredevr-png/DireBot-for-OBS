@@ -28,6 +28,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //     and over, being patted, going, going scared);
 //   - its comings and goings: what plays how much, frame by frame, its
 //     "come" ending exactly where its idle starts so it never jumps;
+//   - one of its own moves (a howl) played once over its sitting;
 //   - where it goes beside the character, and the node a headpat's hand
 //     lands on.
 // face-avatar.cpp loads it, poses it with a rig of its own and draws it
@@ -76,6 +77,7 @@ struct CompanionNow {
 	bool shown = false;   // drawn at all
 	bool busy = false;    // coming or going
 	bool petting = false; // its "pet" playing
+	int move = -1;        // one of its own moves playing (its animation), -1 none
 	// The camera's: on while it's here (from when it starts to come), off
 	// once it's leaving (half way through its "go"; on still if it's to
 	// come back).
@@ -102,6 +104,13 @@ public:
 	// more after). False if it isn't out, or it's coming or going; true
 	// with no "pet" (it sits on, the hand pats it).
 	bool pet();
+	// One of its own animations (`index` in its file, `length` seconds) -
+	// a howl - played once over its idle, eased in and out. False if it
+	// isn't out, or it's coming or going, or one of its moves is playing
+	// still (or the animation has no length).
+	bool play(int index, float length);
+	// The one of its own moves playing (its animation), -1 none.
+	int playing() const { return moving_ ? move_.index : -1; }
 	// Gone at once, nothing playing (a new file, say).
 	void reset();
 	CompanionNow step(float dt);
@@ -111,6 +120,7 @@ public:
 
 private:
 	void moves(CompanionNow &out) const;
+	void step_move(float dt);
 	void start_coming();
 	void start_going(bool scared);
 	CompanionClips clips_;
@@ -120,6 +130,9 @@ private:
 	int going_ = CLIP_GO; // its go or scared
 	bool petting_ = false, pet_again_ = false;
 	float pet_t_ = 0;
+	CompanionClip move_; // one of its own moves (a howl)
+	bool moving_ = false;
+	float move_t_ = 0;
 	// Asked while busy: comes back once gone, goes once here (scared?).
 	bool come_after_ = false, go_after_ = false, go_scared_ = false;
 };

@@ -224,6 +224,123 @@ def test_a_companion_comes_sits_is_patted_and_goes(run):
         c.disconnect()
 
 
+def with_animation(src, dst, name, node, path, times, values):
+    """A copy of a .glb with one more animation of its own: `node` (its
+    name) moved along `path` ("translation", "rotation") through `values`
+    (flat) at `times`."""
+    with open(src, "rb") as f:
+        data = f.read()
+    n = struct.unpack("<I", data[12:16])[0]
+    doc = json.loads(data[20:20 + n])
+    rest = data[20 + n:]
+    m = struct.unpack("<I", rest[:4])[0]
+    blob = bytearray(rest[8:8 + m])
+
+    def add(raw):
+        while len(blob) % 4:
+            blob.append(0)
+        doc["bufferViews"].append({"buffer": 0, "byteOffset": len(blob), "byteLength": len(raw)})
+        blob.extend(raw)
+        return len(doc["bufferViews"]) - 1
+    width = {"translation": 3, "rotation": 4, "scale": 3}[path]
+    doc["accessors"].append({"bufferView": add(struct.pack("<%df" % len(times), *times)), "componentType": 5126,
+                             "count": len(times), "type": "SCALAR", "min": [min(times)], "max": [max(times)]})
+    doc["accessors"].append({"bufferView": add(struct.pack("<%df" % len(values), *values)), "componentType": 5126,
+                             "count": len(values) // width, "type": "VEC%d" % width})
+    a = len(doc["accessors"])
+    index = [i for i, nd in enumerate(doc["nodes"]) if nd.get("name") == node][0]
+    doc["animations"].append({"name": name, "samplers": [{"input": a - 2, "output": a - 1, "interpolation": "LINEAR"}],
+                              "channels": [{"sampler": 0, "target": {"node": index, "path": path}}]})
+    while len(blob) % 4:
+        blob.append(0)
+    doc["buffers"][0]["byteLength"] = len(blob)
+    text = json.dumps(doc).encode()
+    text += b" " * (-len(text) % 4)
+    out = struct.pack("<4sII", b"glTF", 2, 12 + 8 + len(text) + 8 + len(blob))
+    out += struct.pack("<I4s", len(text), b"JSON") + text + struct.pack("<I4s", len(blob), b"BIN\0") + bytes(blob)
+    with open(dst, "wb") as f:
+        f.write(out)
+
+
+def test_a_companions_own_move(run):
+    """One of its own animations (a howl, not one it comes, sits, is patted
+    or goes with) played once over its sitting - only while it's out, one
+    at a time - its head raised while it plays, and back after."""
+    camera = os.path.join(run.home, "camera.png")
+    if not os.path.exists(camera):
+        camera_picture(camera)
+    howler = os.path.join(run.home, "wolf-howl.glb")
+    # The head (at 0.62 up) raised 0.35 and back over 2 s.
+    with_animation(WOLF, howler, "howl", "head", "translation", [0, 0.4, 1.6, 2.0],
+                   [0, 0.62, 0.12, 0, 0.97, 0.05, 0, 0.97, 0.05, 0, 0.62, 0.12])
+    settings = {"source": "Howl camera", "width": W, "height": H, "size": 60, "framing": "whole",
+                "model": RIDER, "animation": "idle", "mirror": False, "smoothing": 100, "follow_move": 0,
+                "follow_grow": 0, "follow_tilt": 0, "bend": 0, "body_follow": 0, "style": "drawn", **STILL}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+
+    def st():
+        return vendor(c, "FaceGetState", {"source": "Howl"})
+
+    def comp():
+        return st()["companion"]
+
+    def cue(**data):
+        return vendor(c, "FaceReact", {"source": "Howl", **data})
+
+    def its_top():
+        rows = screenshot(c, "Howl")
+        xs = columns(rows, 0, int(W * 0.42))
+        return min(y for y in range(H) if any(drawn(rows[y][x]) for x in xs)) if xs else None
+    try:
+        send(c, "CreateScene", {"sceneName": "Howls"})
+        send(c, "CreateInput", {"sceneName": "Howls", "inputName": "Howl camera",
+                                "inputKind": "image_source", "inputSettings": {"file": camera}})
+        send(c, "CreateInput", {"sceneName": "Howls", "inputName": "Howl",
+                                "inputKind": "direbot_face_avatar", "inputSettings": settings})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Howls"})
+        assert wait_for(lambda: st()["model"]["shown"], 30, 0.2), st()
+        # Not here: not.
+        answer = cue(do="companion", action="move", move="howl")
+        assert answer["ok"] and answer["moves"] is False and "isn't here" in answer["why"], answer
+        assert not cue(do="companion", action="move")["ok"]
+        assert cue(do="companion", action="come", file=howler, instant=True,
+                   place={"size": 0.7, "side": -1, "distance": 0.45})["came"]
+        assert wait_for(lambda: comp()["loaded"] and comp()["phase"] == "out", 20, 0.05), comp()
+        cs = comp()
+        assert [a["name"] for a in cs["animations"]] == ["come", "idle", "pet", "go", "scared", "howl"], cs
+        assert cs["clips"]["idle"] == "idle" and cs["moving"] == "", cs
+        time.sleep(0.5)
+        sitting = its_top()
+        # A name its file hasn't: said.
+        answer = cue(do="companion", action="move", move="yawn")
+        assert not answer["ok"] and "no animation called" in answer["error"], answer
+        # It howls (any case): its head up while it plays.
+        answer = cue(do="companion", action="move", move="HOWL")
+        assert answer["ok"] and answer["moves"] and abs(answer["length"] - 2.0) < 0.01, answer
+        assert wait_for(lambda: comp()["moving"] == "howl", 1, 0.02), comp()
+        again = cue(do="companion", action="move", move="howl")
+        assert again["moves"] is False and "busy" in again["why"], again
+        time.sleep(0.9)
+        howling = its_top()
+        print(f"its top: sitting {sitting}, howling {howling}")
+        assert sitting is not None and howling is not None and howling < sitting - 8, (sitting, howling)
+        assert wait_for(lambda: comp()["moving"] == "", 3, 0.05), comp()
+        time.sleep(0.3)
+        after = its_top()
+        assert abs(after - sitting) <= 3, (sitting, after)
+        # Again, and patted while it howls: both.
+        assert cue(do="companion", action="move", move="howl")["moves"]
+        assert cue(do="companion", action="pet", count=2)["pets"]
+        assert wait_for(lambda: comp()["moving"] == "howl" and comp()["petting"], 1, 0.02), comp()
+        # Going: the move goes with it.
+        assert cue(do="companion", action="go")["went"]
+        assert cue(do="companion", action="move", move="howl")["moves"] is False
+        assert wait_for(lambda: comp()["phase"] == "away" and comp()["moving"] == "", 6, 0.05), comp()
+        send(c, "RemoveInput", {"inputName": "Howl"})
+    finally:
+        c.disconnect()
+
+
 def test_a_move_that_stays_and_its_companion_bolting(run):
     camera = os.path.join(run.home, "camera.png")
     if not os.path.exists(camera):
@@ -392,6 +509,107 @@ def test_vertex_colours_are_linear_like_the_base_colour(run):
         send(c, "RemoveInput", {"inputName": "Grey"})
     finally:
         c.disconnect()
+
+
+def test_a_glowing_part_adds_its_light(run):
+    """0.9.0: a glowing part (fire, sparks, smoke - glTF extras
+    direbot.glow on a BLEND material) is a soft gas, as the viewer draws
+    it: its light added over what's behind it, which shows through as
+    much as its base colour's alpha lets it (soot hides it, fire hardly
+    at all), fading out round its edge. All of it at its middle's depth:
+    a puff half through a wall behind it is still drawn whole - both its
+    front and its back - not cut off where it meets the wall."""
+    # No face in the camera: no cut-outs of its eyes and mouth over the ball.
+    camera = os.path.join(run.home, "camera-empty.png")
+    camera_picture(camera, with_face=False)
+    # A grey wall, a ball half through it (its back half behind the wall).
+    wall = ([(-0.3, -0.3, -0.05), (0.3, -0.3, -0.05), (0.3, 0.3, -0.05), (-0.3, 0.3, -0.05)], [(0, 0, 1)] * 4,
+            [0, 1, 2, 0, 2, 3], (0.3, 0.3, 0.3), 0.5)
+    ball = ball_points(0, 0, 0, 0.1, 0.1, 0.1, n=48) + ((0, 0, 0), 0.5)
+    files = {}
+    for name, base, light, glow in (("clear", [0, 0, 0, 0], [0, 0, 0], None),
+                                    ("fire", [0, 0, 0, 0], [0.01, 0.01, 0.01], {"soft": 1.5}),
+                                    ("soot", [0, 0, 0, 0.8], [0, 0, 0], {"soft": 1.5})):
+        more = {"alphaMode": "BLEND", "doubleSided": True, "emissiveFactor": light,
+                "pbr": {"baseColorFactor": base}}
+        if glow is not None:
+            more["extras"] = {"direbot": {"glow": glow}}
+        files[name] = os.path.join(run.home, "glow-%s.glb" % name)
+        write_glb(files[name], [wall, ball], materials_more={1: more})
+    # The fire, and a small dark see-through card in front of its middle: drawn
+    # after it (nearer), at its own depth - nothing after a glowing part is
+    # drawn at that part's depth (it would be hidden behind it).
+    card = ([(-0.03, -0.03, 0.15), (0.03, -0.03, 0.15), (0.03, 0.03, 0.15), (-0.03, 0.03, 0.15)], [(0, 0, 1)] * 4,
+            [0, 1, 2, 0, 2, 3], (0, 0, 0), 0.5)
+    files["fire and card"] = os.path.join(run.home, "glow-fire-card.glb")
+    write_glb(files["fire and card"], [wall, ball, card],
+              materials_more={1: {"alphaMode": "BLEND", "doubleSided": True, "emissiveFactor": [0.01, 0.01, 0.01],
+                                  "pbr": {"baseColorFactor": [0, 0, 0, 0]}, "extras": {"direbot": {"glow": {"soft": 1.5}}}},
+                              2: {"alphaMode": "BLEND", "doubleSided": True, "pbr": {"baseColorFactor": [0, 0, 0, 0.95]}}})
+    settings = {"source": "Glow camera", "width": W, "height": H, "size": 60, "framing": "whole",
+                "model": files["clear"], "mirror": False, "smoothing": 100, "follow_move": 0, "follow_grow": 0,
+                "follow_tilt": 0, "bend": 0, "body_follow": 0, "look": "flat", **STILL}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+
+    def st():
+        return vendor(c, "FaceGetState", {"source": "Glow"})
+
+    shots = {}
+    try:
+        send(c, "CreateScene", {"sceneName": "Glows"})
+        send(c, "CreateInput", {"sceneName": "Glows", "inputName": "Glow camera", "inputKind": "image_source",
+                                "inputSettings": {"file": camera}})
+        send(c, "CreateInput", {"sceneName": "Glows", "inputName": "Glow", "inputKind": "direbot_face_avatar",
+                                "inputSettings": settings})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Glows"})
+        for name, path in files.items():
+            send(c, "SetInputSettings", {"inputName": "Glow", "inputSettings": {"model": path}})
+            assert wait_for(lambda: st()["model"]["shown"] and st()["model"]["file"] == path, 30, 0.2), st()
+            time.sleep(0.4)
+            shots[name] = screenshot(c, "Glow")
+        send(c, "RemoveInput", {"inputName": "Glow"})
+        send(c, "RemoveInput", {"inputName": "Glow camera"})
+    finally:
+        c.disconnect()
+    wall_rows = shots["clear"]
+
+    def grey(px):
+        return sum(px) / 3
+
+    # The ball: where the fire added light to the wall.
+    def lit(px, under):
+        return grey(px) - grey(under) > 4
+    xs = [(x, y) for y in range(H) for x in range(W) if lit(shots["fire"][y][x], wall_rows[y][x])]
+    assert len(xs) > 500, len(xs)
+    cx = sum(x for x, _ in xs) / len(xs)
+    cy = sum(y for _, y in xs) / len(xs)
+    r = max(max(x for x, _ in xs) - min(x for x, _ in xs), max(y for _, y in xs) - min(y for _, y in xs)) / 2
+    at = lambda rows, f: rows[int(cy)][int(cx + f * r)]  # noqa: E731
+    behind = grey(at(wall_rows, 0))
+    # Fire: the wall shows through untouched, its light on top - both its
+    # front and its back (0.01 is 31 of 255 written as sRGB, two layers
+    # 62), not cut where it meets the wall (its back half is behind it).
+    middle = grey(at(shots["fire"], 0)) - behind
+    print(f"fire over the wall ({behind:.0f}): +{middle:.0f} in its middle, "
+          f"+{grey(at(shots['fire'], 0.6)) - grey(at(wall_rows, 0.6)):.0f} part way out, "
+          f"+{grey(at(shots['fire'], 0.9)) - grey(at(wall_rows, 0.9)):.0f} near its edge")
+    assert 52 <= middle <= 72, middle
+    out = [grey(at(shots["fire"], f)) - grey(at(wall_rows, f)) for f in (0, 0.3, 0.6, 0.8, 0.9)]
+    assert all(a >= b - 1 for a, b in zip(out, out[1:])), out  # fading out towards its edge
+    assert out[-1] < middle * 0.5, out
+    # ...the same colour as its light (grey), the wall's grey kept.
+    px = at(shots["fire"], 0)
+    assert max(px) - min(px) <= 4, px
+    # Soot hides what's behind it (80% each side, front and back: 4% left
+    # in its middle), less and less towards its edge.
+    soot = [grey(at(shots["soot"], f)) / max(1, grey(at(wall_rows, f))) for f in (0, 0.6, 0.9)]
+    print(f"what shows through the soot: {soot}")
+    assert soot[0] < 0.1 and soot[0] < soot[1] < soot[2] and soot[2] > 0.35, soot
+    # The card in front of the fire hides its middle (dark), as it would any
+    # other part's.
+    near_middle = [grey(shots["fire and card"][int(cy) + dy][int(cx) + dx]) for dy in range(-2, 3) for dx in range(-2, 3)]
+    print(f"a dark card in front of the fire's middle: {max(near_middle):.0f} at most there")
+    assert max(near_middle) < 40, near_middle
 
 
 def test_a_ride_puts_the_gaming_desk_away(run):

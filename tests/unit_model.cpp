@@ -2037,6 +2037,53 @@ static std::vector<uint8_t> bumpy_square(const json &material, const std::vector
 	return b.glb();
 }
 
+// 0.9.0: a glowing see-through part (fire, sparks, smoke): extras.direbot.glow
+// read for a BLEND material only, its numbers kept sensible.
+static void test_glow_materials()
+{
+	{
+		Model m;
+		CHECK(load(bumpy_square({{"name", "fire"},
+					 {"alphaMode", "BLEND"},
+					 {"pbrMetallicRoughness", {{"baseColorFactor", {0.0, 0.0, 0.0, 0.2}}}},
+					 {"emissiveFactor", {0.7, 0.7, 0.7}},
+					 {"extras", {{"direbot", {{"glow", {{"soft", 1.6}, {"ragged", 0.35}}}}}}}}),
+			   m));
+		const Material &mat = m.materials[0];
+		CHECK(mat.glow && near(mat.glow_soft, 1.6, 1e-6) && near(mat.glow_ragged, 0.35, 1e-6));
+		CHECK(near(mat.base[3], 0.2, 1e-6) && near(mat.emissive[0], 0.7, 1e-6));
+	}
+	// No numbers: a smooth fade (1.5, not ragged).
+	{
+		Model m;
+		CHECK(load(bumpy_square({{"alphaMode", "BLEND"}, {"extras", {{"direbot", {{"glow", json::object()}}}}}}), m));
+		CHECK(m.materials[0].glow && near(m.materials[0].glow_soft, 1.5, 1e-6) && m.materials[0].glow_ragged == 0);
+	}
+	// Silly numbers kept sensible.
+	{
+		Model m;
+		CHECK(load(bumpy_square({{"alphaMode", "BLEND"},
+					 {"extras", {{"direbot", {{"glow", {{"soft", 1e9}, {"ragged", -3}}}}}}}}),
+			   m));
+		CHECK(m.materials[0].glow && near(m.materials[0].glow_soft, 16, 1e-6) && m.materials[0].glow_ragged == 0);
+	}
+	// Only a see-through part glows: a solid or cut-out one asking is drawn
+	// as it always was. And a plain part, or other extras, never glows.
+	for (const char *mode : {"OPAQUE", "MASK"}) {
+		Model m;
+		CHECK(load(bumpy_square({{"alphaMode", mode}, {"extras", {{"direbot", {{"glow", {{"soft", 2}}}}}}}}), m));
+		CHECK(!m.materials[0].glow);
+	}
+	{
+		Model m;
+		CHECK(load(bumpy_square({{"alphaMode", "BLEND"}, {"extras", {{"direbot", {{"glow", true}}}}}}), m));
+		CHECK(!m.materials[0].glow);
+		Model n;
+		CHECK(load(bumpy_square({{"alphaMode", "BLEND"}}), n));
+		CHECK(!n.materials[0].glow);
+	}
+}
+
 static void test_detail_maps()
 {
 	const json bumpy = {{"name", "Skin"},
@@ -4430,6 +4477,7 @@ int main()
 	test_facing_arms_and_wearing();
 	test_set_up();
 	test_obs_camera();
+	test_glow_materials();
 	test_effect_needs();
 	test_detail_maps();
 	test_lights();

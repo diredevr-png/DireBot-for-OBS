@@ -324,6 +324,73 @@ static void test_petting()
 	CHECK(!q.step(FRAME).petting);
 }
 
+// One of its own moves (a howl): played once over its sitting, eased in
+// and out, only while it's out and none of its own is playing already.
+static void test_own_moves()
+{
+	CompanionPlayer p;
+	p.set_clips(wolf_clips());
+	const int HOWL = 5;
+	CHECK(!p.play(HOWL, 4)); // not here
+	p.come();
+	p.step(FRAME);
+	CHECK(!p.play(HOWL, 4)); // still coming
+	p.come(true);
+	CHECK(!p.play(-1, 4) && !p.play(HOWL, 0) && !p.play(HOWL, std::nanf("")));
+	CHECK(p.play(HOWL, 4));
+	CHECK(!p.play(HOWL, 4)); // playing still
+	CHECK(p.playing() == HOWL);
+	CompanionNow n = p.step(0);
+	CHECK(n.move == HOWL);
+	CHECK(amount_of(n, HOWL) == 0); // eased in from nothing
+	CHECK(p.pet());                 // patted while it howls: both
+	float most = 0, last_shows = 0, most_jump = 0, t_last = -1;
+	bool time_ok = true, idle_under = true, all_sane = true;
+	int frames = 0;
+	while (p.playing() >= 0 && frames < 60 * 10) {
+		n = p.step(FRAME);
+		frames++;
+		float t = 0;
+		const float a = amount_of(n, HOWL, &t);
+		most = std::max(most, a);
+		const float s = shows(n, HOWL);
+		most_jump = std::max(most_jump, std::fabs(s - last_shows));
+		last_shows = s;
+		if (a > 0) {
+			if (t_last >= 0 && !(t >= t_last && t - t_last <= FRAME * 1.01f))
+				time_ok = false;
+			t_last = t;
+		}
+		all_sane = all_sane && sane(n);
+		idle_under = idle_under && near(amount_of(n, CLIP_IDLE), 1, 1e-6f);
+	}
+	CHECK(near(most, 1, 1e-4f));
+	CHECK(most_jump < 0.12f);
+	CHECK(time_ok && all_sane && idle_under);
+	CHECK(near(frames * FRAME, 4, 2 * FRAME));
+	CHECK(n.move == -1 && amount_of(n, HOWL) == 0);
+	// Again once it's over. Going while it plays: the go plays over it, and
+	// once gone nothing of it is left.
+	CHECK(p.play(HOWL, 4));
+	for (int f = 0; f < 30; f++)
+		p.step(FRAME);
+	CHECK(p.go());
+	CHECK(!p.play(HOWL, 4)); // going
+	n = p.step(FRAME);
+	CHECK(n.move == HOWL && amount_of(n, HOWL) > 0);
+	for (int f = 0; f < 60 * 4; f++)
+		n = p.step(FRAME);
+	CHECK(p.phase() == CompanionPhase::Away && n.move == -1 && n.moves.empty());
+	// Sent off at once mid-howl and back: nothing left of it.
+	p.come(true);
+	CHECK(p.play(HOWL, 4));
+	p.go(false, true);
+	p.come(true);
+	n = p.step(FRAME);
+	CHECK(n.move == -1 && amount_of(n, HOWL) == 0);
+	CHECK(p.play(HOWL, 4));
+}
+
 static void test_going()
 {
 	CompanionPlayer p;
@@ -812,6 +879,7 @@ int main()
 	test_clips();
 	test_coming();
 	test_petting();
+	test_own_moves();
 	test_going();
 	test_changing_its_mind();
 	test_odd_numbers();

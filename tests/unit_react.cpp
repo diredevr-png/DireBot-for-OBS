@@ -54,6 +54,12 @@ static bool finite_out(const ReactOut &o)
 		       f.opacity >= 0 && f.opacity <= 1 && ok(f.squash_x) && ok(f.squash_y);
 	for (const Burst &b : o.bursts)
 		good = good && ok(b.x) && ok(b.y) && ok(b.size) && ok(b.opacity);
+	for (const Mark &m : o.marks)
+		good = good && ok(m.x) && ok(m.y) && ok(m.size) && ok(m.angle) && ok(m.opacity) && ok(m.length) &&
+		       m.size > 0 && m.opacity > 0 && m.opacity <= 1 && (!m.from_top || m.length > 0);
+	for (const Bit &b : o.bits)
+		good = good && ok(b.x) && ok(b.y) && ok(b.size) && ok(b.angle) && ok(b.opacity) && b.size > 0 &&
+		       b.opacity > 0 && b.opacity <= 1;
 	return good;
 }
 
@@ -1192,6 +1198,263 @@ static void test_all_at_once()
 	CHECK(trace(9) != trace(10));
 }
 
+// 0.9.0: what a thing does as it hits - a splat left on its face (juice
+// thrown off, drips running down, sliding off and fading), feathers
+// floating down, pieces bursting off (some snow left a moment), a squishy
+// thing squashed flat and wobbling back.
+static void test_effects()
+{
+	CHECK(effect_named("splat") == Effect::Splat && effect_named("FEATHERS") == Effect::Feathers);
+	CHECK(effect_named("pieces") == Effect::Pieces && effect_named("nope") == Effect::None);
+	CHECK(effect_named("") == Effect::None);
+	for (Effect e : {Effect::None, Effect::Splat, Effect::Feathers, Effect::Pieces})
+		CHECK(effect_named(effect_name(e)) == e);
+	ReactView view;
+	auto splat = []() {
+		Throw t;
+		t.picture = 0;
+		t.side = 1;
+		t.stick = 3; // broken as it hits: never stuck
+		t.look.effect = Effect::Splat;
+		t.look.mark = 5;
+		t.look.drip = 6;
+		t.look.bits = {7};
+		t.look.seconds = 2;
+		return t;
+	};
+	auto step_to_hit = [&](React &r) {
+		ReactOut o;
+		for (int i = 0; i < 200 && !o.hits; i++)
+			o = r.step(FRAME, view);
+		return o;
+	};
+	{
+		// The splat: left where it hit, juice thrown off, the tomato gone.
+		React r(3);
+		CHECK(r.throw_at(splat()) > 0);
+		ReactOut o = step_to_hit(r);
+		CHECK(o.hits == 1);
+		CHECK(o.marks.size() == 1 && o.marks[0].picture == 5 && !o.marks[0].from_top);
+		const float mx = o.marks[0].x, my = o.marks[0].y;
+		CHECK(std::fabs(mx) < 0.4f && std::fabs(my) < 0.4f);
+		CHECK(o.bits.size() >= 8 && o.bits.size() <= 11);
+		for (const Bit &b : o.bits)
+			CHECK(b.picture == 7);
+		CHECK(r.stuck() == 0);
+		// It spreads out from a little under its size, a touch past it,
+		// and settles.
+		float first = o.marks[0].size, most = 0, settled = 0;
+		bool tomato_gone = false, drips_grow = true;
+		float drip_seen = 0;
+		std::vector<float> last_len(8, 0);
+		// The juice's middle, a tenth and three tenths of a second on.
+		std::vector<float> juice_y;
+		bool fine = finite_out(o);
+		run(r, 1.0f, view, [&](const ReactOut &q) {
+			fine = fine && finite_out(q);
+			for (const Mark &m : q.marks)
+				if (!m.from_top) {
+					most = std::max(most, m.size);
+					settled = m.size;
+				}
+			if (q.flying.empty())
+				tomato_gone = true;
+			int d = 0;
+			for (const Mark &m : q.marks)
+				if (m.from_top) {
+					CHECK(m.picture == 6);
+					drips_grow = drips_grow && m.length + 1e-5f >= last_len[d];
+					last_len[d++] = m.length;
+					drip_seen = std::max(drip_seen, m.length);
+				}
+			if (!q.bits.empty()) {
+				float y = 0;
+				for (const Bit &b : q.bits)
+					y += b.y / q.bits.size();
+				juice_y.push_back(y);
+			}
+		});
+		CHECK(fine);
+		CHECK(first < most && most > settled && settled > first);
+		CHECK(std::fabs(most / settled - 1.08f) < 0.03f);
+		CHECK(tomato_gone && r.flying() == 0);
+		CHECK(drips_grow && drip_seen > 0.1f);
+		// Thrown out and up, then falling.
+		CHECK(juice_y.size() > 20 && juice_y[20] > juice_y[6]);
+		// The juice falls off and is gone well before the splat.
+		ReactOut now = r.step(FRAME, view);
+		CHECK(now.bits.empty());
+		CHECK(!now.marks.empty());
+		// It stays its seconds (2 here), slides down a little as it fades,
+		// then it's gone and all is still.
+		float y_before = 0;
+		for (const Mark &m : now.marks)
+			if (!m.from_top)
+				y_before = m.y;
+		run(r, 1.2f, view, [](const ReactOut &) {});
+		now = r.step(FRAME, view);
+		float y_after = y_before;
+		for (const Mark &m : now.marks)
+			if (!m.from_top)
+				y_after = m.y;
+		CHECK(!now.marks.empty() && y_after > y_before + 0.02f);
+		run(r, 1.0f, view, [](const ReactOut &) {});
+		now = r.step(FRAME, view);
+		CHECK(now.marks.empty() && !now.busy);
+	}
+	{
+		// What's left on its face tilts with its face (a camera's), and
+		// moves with its head.
+		React r(4);
+		r.throw_at(splat());
+		ReactOut o = step_to_hit(r);
+		run(r, 0.8f, view, [](const ReactOut &) {});
+		o = r.step(FRAME, view);
+		Mark before;
+		for (const Mark &m : o.marks)
+			if (!m.from_top)
+				before = m;
+		ReactView tipped = view;
+		tipped.roll = 0.4f;
+		o = r.step(FRAME, tipped);
+		Mark after;
+		for (const Mark &m : o.marks)
+			if (!m.from_top)
+				after = m;
+		const float c = std::cos(0.4f), s = std::sin(0.4f);
+		CHECK(std::fabs(after.x - (before.x * c - before.y * s)) < 0.02f);
+		CHECK(std::fabs(after.y - (before.x * s + before.y * c)) < 0.02f);
+		CHECK(std::fabs(after.angle - before.angle - 0.4f) < 0.02f);
+	}
+	{
+		// Feathers: the pillow bounces off as before, feathers float down
+		// slowly, swaying, and are gone in a few seconds.
+		React r(5);
+		Throw t;
+		t.picture = 0;
+		t.above = true;
+		t.look.effect = Effect::Feathers;
+		t.look.bits = {8, 9};
+		r.throw_at(t);
+		ReactOut o = step_to_hit(r);
+		CHECK(o.bits.size() >= 12 && o.bits.size() <= 16);
+		CHECK(o.marks.empty());
+		bool both = false;
+		for (const Bit &b : o.bits)
+			both = both || b.picture == 9;
+		CHECK(both);
+		run(r, 0.3f, view, [](const ReactOut &) {});
+		o = r.step(FRAME, view);
+		CHECK(!o.flying.empty() && o.flying[0].opacity > 0.3f); // the pillow, bouncing off
+		// Drifting down slowly once the air has them, swaying side to side.
+		run(r, 0.9f, view, [](const ReactOut &) {});
+		std::vector<Bit> a = r.step(FRAME, view).bits;
+		run(r, 0.5f, view, [](const ReactOut &) {});
+		std::vector<Bit> b = r.step(FRAME, view).bits;
+		CHECK(a.size() == b.size() && !a.empty());
+		float fall = 0;
+		for (size_t i = 0; i < a.size() && i < b.size(); i++)
+			fall += (b[i].y - a[i].y) / a.size();
+		CHECK(fall > 0.05f && fall < 0.3f);
+		run(r, 3.0f, view, [](const ReactOut &) {});
+		CHECK(r.step(FRAME, view).bits.empty() && r.bits() == 0);
+	}
+	{
+		// Pieces: crushed, then chunks and a puff burst off it, some snow
+		// left a moment.
+		React r(6);
+		Throw t;
+		t.picture = 0;
+		t.look.effect = Effect::Pieces;
+		t.look.mark = 3;
+		t.look.bits = {10, 11, 12};
+		t.look.puff = 13;
+		t.look.seconds = 1;
+		r.throw_at(t);
+		ReactOut o = step_to_hit(r);
+		int chunks = 0, puffs = 0;
+		float puff_size = 0;
+		for (const Bit &b : o.bits) {
+			chunks += b.picture >= 10 && b.picture <= 12;
+			if (b.picture == 13) {
+				puffs++;
+				puff_size = b.size;
+			}
+		}
+		CHECK(chunks >= 9 && chunks <= 12 && puffs == 2);
+		CHECK(o.marks.size() == 1 && o.marks[0].picture == 3);
+		run(r, 0.25f, view, [](const ReactOut &) {});
+		o = r.step(FRAME, view);
+		CHECK(o.flying.empty());
+		for (const Bit &b : o.bits)
+			if (b.picture == 13)
+				CHECK(b.size > puff_size * 1.3f);
+		run(r, 1.0f, view, [](const ReactOut &) {});
+		CHECK(r.step(FRAME, view).bits.empty());
+		run(r, 1.0f, view, [](const ReactOut &) {});
+		CHECK(!r.step(FRAME, view).busy);
+	}
+	{
+		// A squishy one: squashed flat as it hits, wobbling back (taller
+		// than it is a moment), settling.
+		React r(7);
+		Throw t;
+		t.picture = 0;
+		t.look.squishy = true;
+		r.throw_at(t);
+		step_to_hit(r);
+		float widest = 0, tallest = 0, last = 0;
+		run(r, 0.6f, view, [&](const ReactOut &q) {
+			if (q.flying.empty())
+				return;
+			widest = std::max(widest, q.flying[0].squash_x);
+			tallest = std::max(tallest, q.flying[0].squash_y);
+			last = q.flying[0].squash_x;
+		});
+		CHECK(widest > 1.45f && tallest > 1.05f && std::fabs(last - 1) < 0.02f);
+		// Not squishy: as before.
+		React plain(7);
+		plain.throw_at(Throw());
+		step_to_hit(plain);
+		float plain_widest = 0;
+		run(plain, 0.3f, view, [&](const ReactOut &q) {
+			for (const Flying &f : q.flying)
+				plain_widest = std::max(plain_widest, f.squash_x);
+		});
+		CHECK(plain_widest < 1.36f);
+	}
+	{
+		// Never too much: the oldest splats fade as more come; bits capped;
+		// stop clears it all quickly; odd numbers are safe.
+		React r(8);
+		int showing_most = 0;
+		size_t bits_most = 0;
+		bool fine = true;
+		for (int round = 0; round < 4; round++) {
+			for (int i = 0; i < 12; i++) {
+				Throw t = splat();
+				t.look.seconds = std::numeric_limits<float>::quiet_NaN();
+				r.throw_at(t);
+			}
+			run(r, 1.6f, view, [&](const ReactOut &q) {
+				fine = fine && finite_out(q);
+				bits_most = std::max(bits_most, q.bits.size());
+			});
+			showing_most = std::max(showing_most, r.marks());
+		}
+		CHECK(fine);
+		CHECK(bits_most <= (size_t)MOST_BITS);
+		int splats = 0;
+		for (const Mark &m : r.step(FRAME, view).marks)
+			splats += !m.from_top && m.opacity > 0.99f;
+		CHECK(splats <= MOST_MARKS && splats > 0);
+		r.stop();
+		run(r, 0.45f, view, [](const ReactOut &) {});
+		ReactOut o = r.step(FRAME, view);
+		CHECK(o.marks.empty() && o.bits.empty());
+	}
+}
+
 int main()
 {
 	test_names();
@@ -1201,6 +1464,7 @@ int main()
 	test_pats();
 	test_sticks_and_bonks();
 	test_all_at_once();
+	test_effects();
 	std::printf("unit_react: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;
 }

@@ -151,6 +151,7 @@ private:
 		size_t points = 0;
 		bool bumped = false;
 		float distance = 1;
+		V3 middle; // its points' middle, as made (a glowing part's depth)
 	};
 	std::shared_ptr<const Model> model_;
 	std::vector<gs_texture_t *> textures_;
@@ -241,6 +242,9 @@ private:
 	bool upload(const Rig *rig);
 	void make_head();
 	void set_camera();
+	// 0.9.0: every point of the next part drawn at this point's depth (a
+	// glowing part's middle, in the world), or (null) as they are.
+	void set_flat(const V3 *at);
 	void set_lights(const View3D &v);
 	// front_only: a part drawn only from its front (its edges' facings are
 	// laid side-on, not turned round: see the effect's towards_camera).
@@ -260,7 +264,8 @@ private:
 		    *p_outline_width = nullptr, *p_outline_colour = nullptr, *p_texel = nullptr,
 		    *p_normal_map = nullptr, *p_occlusion_map = nullptr, *p_detail = nullptr, *p_key_dir = nullptr,
 		    *p_key_colour = nullptr, *p_fill_dir = nullptr, *p_fill_colour = nullptr, *p_room_up = nullptr,
-		    *p_room_down = nullptr, *p_rim_light = nullptr, *p_key_tint = nullptr, *p_room_tint = nullptr;
+		    *p_room_down = nullptr, *p_rim_light = nullptr, *p_key_tint = nullptr, *p_room_tint = nullptr,
+		    *p_glow = nullptr, *p_flat_at = nullptr;
 	EffectCheck check_;
 	M4 cam_;
 	gs_texture_t *white_ = nullptr, *black_ = nullptr, *flat_ = nullptr;

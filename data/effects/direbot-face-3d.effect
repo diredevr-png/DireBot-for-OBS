@@ -41,6 +41,15 @@ uniform float3 matcap_colour;
 uniform float4 look;
 // where the pictures land: move xy, size zw
 uniform float4 uv_place;
+// 0.9.0, a glowing part (fire, sparks, smoke): 1 (else 0), how fast it
+// thins out seen edge on (a power), how ragged its outline (0: a smooth
+// fade) - see shade_point.
+uniform float4 gas;
+// 0.9.0: w 1: every point of the part drawn at the depth of this point
+// in the world (xyz; its middle), so a soft glowing puff never cuts into
+// itself or the puffs drawn before it (OBS can't draw without writing
+// depth); w 0: as they are.
+uniform float4 flat_at;
 // Outline: how far out (world units), its colour, how much it's lit.
 uniform float outline_width;
 uniform float4 outline_colour;
@@ -110,10 +119,25 @@ struct BumpOut {
 	float4 vtan : TEXCOORD3;
 };
 
+// Every point of a part at the depth of `flat_at`: all of them with its
+// w, so z / w comes out the very same number everywhere (no rounding
+// between them: the part never fails the depth test against itself),
+// and x and y scaled to stay put on the picture. A point reaching past the
+// camera is left out (beyond the far end).
+float4 flattened(float4 p)
+{
+	if (flat_at.w < 0.5)
+		return p;
+	float4 c = mul(float4(flat_at.xyz, 1.0), ViewProj);
+	if (c.w > 0.0 && p.w > 0.05 * c.w)
+		return float4(p.xy * (c.w / p.w), c.z, c.w);
+	return float4(0.0, 0.0, 2.0, 1.0);
+}
+
 VertOut VSDraw(VertIn v)
 {
 	VertOut o;
-	o.pos = mul(float4(v.pos.xyz, 1.0), ViewProj);
+	o.pos = flattened(mul(float4(v.pos.xyz, 1.0), ViewProj));
 	o.col = v.col;
 	o.uv = v.uv * uv_place.zw + uv_place.xy;
 	o.vpos = mul(float4(v.pos.xyz, 1.0), cam).xyz;
@@ -124,7 +148,7 @@ VertOut VSDraw(VertIn v)
 BumpOut VSBumped(BumpIn v)
 {
 	BumpOut o;
-	o.pos = mul(float4(v.pos.xyz, 1.0), ViewProj);
+	o.pos = flattened(mul(float4(v.pos.xyz, 1.0), ViewProj));
 	o.col = v.col;
 	o.uv = v.uv * uv_place.zw + uv_place.xy;
 	o.vpos = mul(float4(v.pos.xyz, 1.0), cam).xyz;
@@ -185,6 +209,27 @@ float4 shade_point(float2 uv, float4 vcol, float3 V, float3 N, float3 Ng)
 	float4 occ = occlusion_map.Sample(wrapSampler, uv);
 	float2 cap_uv = float2(N.x * 0.5 + 0.5, 0.5 - N.y * 0.5);
 	float4 cap = matcap_map.Sample(clampSampler, cap_uv);
+
+	// A glowing part (0.9.0: fire, sparks, smoke): a soft see-through gas.
+	// Its light (its emissive colour x its picture x its points' colour) is
+	// added to what's behind it, however see-through it is; what's behind
+	// it is hidden only as much as its base colour's alpha says (soot a lot,
+	// a white-hot flame hardly at all). Seen edge on it thins out (gas.y,
+	// a power) - with gas.z, eating into its picture's thin places first,
+	// so its outline breaks up into wisps along its swirls. Premultiplied,
+	// as everything here is.
+	if (gas.x > 0.5) {
+		float e = pow(saturate(abs(dot(Ng, V))), max(gas.y, 0.001));
+		float shape = gas.z > 0.0 ? saturate((tex.a - (1.0 - e)) / gas.z) : saturate(tex.a) * e;
+		float there = shape * saturate(vcol.a) * look.w;
+		if (there < 0.004)
+			discard;
+		float a = saturate(base_colour.a) * there;
+		float3 vc = lin(vcol.rgb);
+		float3 body = base_colour.rgb * lin(tex.rgb) * vc;
+		float3 light = emissive * lin(glow_tex.rgb) * vc;
+		return float4(srgb(body) * a + srgb(light) * there, a);
+	}
 
 	float4 base = base_colour * float4(lin(tex.rgb), tex.a) * float4(lin(vcol.rgb), vcol.a);
 	float alpha = base.a * look.w;

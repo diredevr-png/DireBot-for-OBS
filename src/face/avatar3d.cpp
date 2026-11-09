@@ -361,6 +361,8 @@ Avatar3D::Avatar3D()
 		p_rim_light = param("rim_light");
 		p_key_tint = param("key_tint");
 		p_room_tint = param("room_tint");
+		p_glow = param("gas");
+		p_flat_at = param("flat_at");
 		check_.load(effect_, "3D", face_3d_needs());
 	}
 	// Plain pictures for a part without its own: white, black, and a
@@ -517,6 +519,12 @@ void Avatar3D::set_camera()
 	matrix4 cam = obs_matrix(cam_);
 	matrix4_transpose(&cam, &cam);
 	gs_effect_set_matrix4(p_cam, &cam);
+	set_flat(nullptr);
+}
+
+void Avatar3D::set_flat(const V3 *at)
+{
+	set_vec4(p_flat_at, at ? at->x : 0.0f, at ? at->y : 0.0f, at ? at->z : 0.0f, at ? 1.0f : 0.0f);
 }
 
 // The lights (lights.hpp), as the effect has them.
@@ -581,6 +589,7 @@ void Avatar3D::set_material(const Material &m, const View3D &v, bool outline, bo
 	set_vec3(p_emissive, m.emissive);
 	set_vec4(p_surface, m.metallic, m.roughness, m.alpha == AlphaMode::Mask ? std::max(0.001f, m.cutoff) : 0.0f,
 		 m.alpha == AlphaMode::Blend ? 1.0f : 0.0f);
+	set_vec4(p_glow, m.glow ? 1.0f : 0.0f, m.glow_soft, m.glow_ragged, 0.0f);
 	if (own_toon) {
 		set_vec4(p_toon, m.shade_shift, m.shade_toony, m.rim_power, m.rim_lift);
 		set_vec3(p_shade, m.shade);
@@ -653,11 +662,21 @@ void Avatar3D::draw_prop(Prop3D &prop, const View3D &v, bool see_through)
 		part_distance_ = part.distance;
 		set_material(mat, v, false, skin, sides_shown(mat, prop.handed_) == Sides::Front, &prop.textures_);
 		gs_set_cull_mode(cull_of(mat, prop.handed_));
+		// A glowing part (0.9.0): all of it at its middle's depth.
+		const V3 middle = point(prop.place_, part.middle);
+		if (mat.glow) {
+			set_flat(&middle);
+			gs_depth_function(GS_LEQUAL);
+		}
 		gs_load_vertexbuffer(part.vb);
 		gs_load_indexbuffer(part.ib);
 		check_(technique);
 		while (gs_effect_loop(effect_, technique))
 			gs_draw(GS_TRIS, 0, 0);
+		if (mat.glow) {
+			set_flat(nullptr);
+			gs_depth_function(GS_LESS);
+		}
 		gs_set_cull_mode(GS_NEITHER);
 	}
 	opacity_ = was;
@@ -731,6 +750,7 @@ Prop3D::Prop3D(std::shared_ptr<const Model> model, const std::vector<ModelPictur
 				}
 				low_ = {std::min(low_.x, q.x), std::min(low_.y, q.y), std::min(low_.z, q.z)};
 				high_ = {std::max(high_.x, q.x), std::max(high_.y, q.y), std::max(high_.z, q.z)};
+				part.middle = part.middle + q * (1.0f / (float)part.points);
 			}
 			for (const MorphTarget &t : p.morphs) {
 				std::vector<V3> dp(part.points), dn;
@@ -896,15 +916,16 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 		Avatar3D *a;
 		const std::vector<Rig::Part> *posed;
 		std::vector<float> distance;
+		std::vector<V3> middle; // each part's middle, in the world (a glowing part's depth)
 		bool own_outlines = false;
 		bool main = false;
 	};
 	std::vector<Drawn> all;
 	static const std::vector<Rig::Part> nothing;
-	all.push_back({this, character ? &rig->parts() : &nothing, {}, false, true});
+	all.push_back({this, character ? &rig->parts() : &nothing, {}, {}, false, true});
 	for (const Other &o : others)
 		if (o.avatar && o.avatar != this && o.avatar->effect_ && o.avatar->upload(o.rig))
-			all.push_back({o.avatar, &o.rig->parts(), {}, false, false});
+			all.push_back({o.avatar, &o.rig->parts(), {}, {}, false, false});
 	if (!effect_ || !v.w || !v.h || (!character && props.empty() && all.size() < 2))
 		return nullptr;
 
@@ -924,14 +945,17 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 		// see-through parts' order and screen-sized outlines.
 		const std::vector<Rig::Part> &posed = *dr.posed;
 		dr.distance.assign(posed.size(), 1);
+		dr.middle.assign(posed.size(), V3{});
 		for (size_t i = 0; i < posed.size(); i++) {
 			const std::vector<V3> &pos = posed[i].pos;
 			V3 sum;
 			size_t n = 0;
 			for (size_t j = 0; j < pos.size(); j += 17, n++)
 				sum = sum + pos[j];
-			if (n)
-				dr.distance[i] = std::max(1e-4f, -point(v.view, sum * (1.0f / n)).z);
+			if (n) {
+				dr.middle[i] = sum * (1.0f / n);
+				dr.distance[i] = std::max(1e-4f, -point(v.view, dr.middle[i]).z);
+			}
 		}
 		// A character with outlines of its own keeps the outline setting
 		// off the parts it has none on (a face, its eyes).
@@ -1010,7 +1034,7 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 	for (Drawn &dr : all)
 		for (size_t i = 0; i < dr.posed->size(); i++) {
 			const Material &mat = material_of(dr, i);
-			if (!shows(dr, i) || (mat.outline == Outline::None && (v.outline <= 0 || dr.own_outlines)))
+			if (!shows(dr, i) || mat.glow || (mat.outline == Outline::None && (v.outline <= 0 || dr.own_outlines)))
 				continue;
 			dr.a->part_distance_ = dr.distance[i];
 			dr.a->set_material(mat, v, true, false, false);
@@ -1061,7 +1085,18 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 		dr.a->part_distance_ = dr.distance[i];
 		dr.a->set_material(mat, v, false, is_skin(dr, i), sides_shown(mat, p.handed) == Sides::Front);
 		gs_set_cull_mode(cull_of(mat, p.handed));
+		// A glowing part (0.9.0: a puff of fire or smoke): all of it at its
+		// middle's depth, so it never cuts into itself or the puffs before
+		// it (drawn far to near, each nearer one passes).
+		if (mat.glow) {
+			dr.a->set_flat(&dr.middle[i]);
+			gs_depth_function(GS_LEQUAL);
+		}
 		dr.a->draw_part(i, p, technique_of(dr, i));
+		if (mat.glow) {
+			dr.a->set_flat(nullptr);
+			gs_depth_function(GS_LESS);
+		}
 		gs_set_cull_mode(GS_NEITHER);
 	}
 

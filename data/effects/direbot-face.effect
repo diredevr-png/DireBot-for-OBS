@@ -1,5 +1,7 @@
 // DireBot Face Avatar (src/face/face-avatar.cpp, sums in src/face/avatar2d.cpp):
 //   Picture  the character's pictures (straight colour), cut to `clip`
+//   Stain    a picture premultiplied (something left on its face: the
+//            blend keeps it to where the character is drawn)
 //   Cutout   one of your eyes or your mouth, from the camera: along its
 //            soft outline (`mask_map`), its skin taking the character's
 //            colour
@@ -91,6 +93,15 @@ float4 PSPicture(VertData v_in) : TARGET
 	if (v_in.uv.x < clip.x || v_in.uv.y < clip.y || v_in.uv.x >= clip.z || v_in.uv.y >= clip.w)
 		kept = 0.0;
 	return float4(c.rgb, c.a * opacity * kept);
+}
+
+// ---- Stain ----
+
+float4 PSStain(VertData v_in) : TARGET
+{
+	float4 c = image.Sample(textureSampler, v_in.uv);
+	float a = c.a * opacity;
+	return float4(c.rgb * a, a);
 }
 
 // ---- Colour (avatar2d.cpp's lab_of and rgb_of) ----
@@ -327,6 +338,15 @@ technique Picture
 	{
 		vertex_shader = VSDefault(v_in);
 		pixel_shader  = PSPicture(v_in);
+	}
+}
+
+technique Stain
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSStain(v_in);
 	}
 }
 

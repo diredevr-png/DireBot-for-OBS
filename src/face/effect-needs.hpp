@@ -44,16 +44,16 @@ inline const std::vector<EffectNeeds> &face_3d_needs()
 		 {"cam", "uv_place", "base_map", "shade_map", "emissive_map", "metal_map", "matcap_map", "base_colour",
 		  "look", "surface", "emissive", "toon", "shade_colour", "rim_colour", "matcap_colour", "occlusion_map",
 		  "detail", "key_dir", "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light",
-		  "key_tint", "room_tint"}},
+		  "key_tint", "room_tint", "gas", "flat_at"}},
 		{"DrawBumped",
 		 {"cam", "uv_place", "base_map", "shade_map", "emissive_map", "metal_map", "matcap_map", "base_colour",
 		  "look", "surface", "emissive", "toon", "shade_colour", "rim_colour", "matcap_colour", "occlusion_map",
 		  "detail", "key_dir", "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light",
-		  "key_tint", "room_tint", "normal_map"}},
+		  "key_tint", "room_tint", "normal_map", "gas", "flat_at"}},
 		{"Outline",
 		 {"cam", "uv_place", "outline_width", "base_map", "surface", "base_colour", "outline_colour", "look",
 		  "key_tint"}},
-		{"Hidden", {"cam", "uv_place"}},
+		{"Hidden", {"cam", "uv_place", "flat_at"}},
 		{"Down", {"image", "texel"}},
 	};
 	return needs;
@@ -63,6 +63,7 @@ inline const std::vector<EffectNeeds> &face_2d_needs()
 {
 	static const std::vector<EffectNeeds> needs = {
 		{"Picture", {"image", "opacity", "clip"}},
+		{"Stain", {"image", "opacity"}},
 		{"Cutout",
 		 {"image", "mask_map", "body_map", "opacity", "origin", "across", "down", "mask_place", "body_place",
 		  "inside", "skin_lab", "target_lab", "mask_rows", "skin_amount"}},
