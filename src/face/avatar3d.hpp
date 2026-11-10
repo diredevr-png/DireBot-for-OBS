@@ -235,6 +235,7 @@ private:
 		gs_indexbuffer_t *ib = nullptr;
 		size_t points = 0;
 		bool bumped = false; // its points carry tangents (its normal map's)
+		bool strands = false; // hair strands (model.hpp's Primitive::strands)
 	};
 	void clear();
 	// The posed points onto the graphics card (0.9.0: parts it hides left
@@ -252,6 +253,8 @@ private:
 	void set_material(const Material &m, const View3D &v, bool outline, bool skin, bool front_only,
 			  const std::vector<gs_texture_t *> *textures = nullptr);
 	void draw_part(size_t i, const Rig::Part &p, const char *technique);
+	// Hair strands: the camera, and how big a pixel is (set_material first).
+	void set_strand(const View3D &v, uint32_t drawn_w, uint32_t drawn_h);
 	// A thing's parts: its solid ones, or its see-through ones (or all of
 	// it, while it fades).
 	void draw_prop(Prop3D &prop, const View3D &v, bool see_through);
@@ -265,7 +268,7 @@ private:
 		    *p_normal_map = nullptr, *p_occlusion_map = nullptr, *p_detail = nullptr, *p_key_dir = nullptr,
 		    *p_key_colour = nullptr, *p_fill_dir = nullptr, *p_fill_colour = nullptr, *p_room_up = nullptr,
 		    *p_room_down = nullptr, *p_rim_light = nullptr, *p_key_tint = nullptr, *p_room_tint = nullptr,
-		    *p_glow = nullptr, *p_flat_at = nullptr;
+		    *p_glow = nullptr, *p_flat_at = nullptr, *p_eye = nullptr, *p_strand = nullptr;
 	EffectCheck check_;
 	M4 cam_;
 	gs_texture_t *white_ = nullptr, *black_ = nullptr, *flat_ = nullptr;

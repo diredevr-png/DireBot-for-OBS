@@ -155,6 +155,16 @@ struct Primitive {
 	// out from its UVs (tangents_of).
 	std::vector<float> tangent;
 	bool own_tangents = false; // its tangents are the file's (not worked out)
+	// Hair strands (a glTF LINES or LINE_STRIP part): each point of the
+	// file's strands is here twice, its two sides (uv x 0 and 1, uv y how
+	// far along its strand, 0 root to 1 tip), and each piece between two
+	// points two triangles - drawn by the effect's Strand technique, which
+	// spreads the two sides apart facing the camera. `normal` is the way
+	// its strand runs there (bones turn it as they turn a facing).
+	bool strands = false;
+	// 2 a point with strands: its width (the file's _WIDTH, its units;
+	// 0.0001 if none) and a number 0 to 1 for its own strand.
+	std::vector<float> strand;
 };
 // A part's tangents worked out from its points, facings and UVs with
 // MikkTSpace, as glTF asks (its UVs' v going down the picture, a normal

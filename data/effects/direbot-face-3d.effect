@@ -10,6 +10,12 @@
 //            its far side drawn, so it shows round the edge
 //   Hidden   the hidden head shape: only depth, so what's behind your
 //            head is hidden
+//   Strand   hair strands (a file's lines: model.hpp's Primitive::strands),
+//            each piece a thin ribbon turned to face the camera, at least
+//            `strand.y` pixels wide (thinner hairs cover as much of their
+//            pixels as they would: some of the pixels drawn, at random),
+//            lit as hair is: across its length, with a white shine and a
+//            coloured one from inside it
 //   Down     the picture drawn twice the size, halved: smooth edges
 // Points come already moved by the bones and expressions, in the world;
 // `cam` takes them to the camera's view (x right, y up, looking along -z)
@@ -50,6 +56,11 @@ uniform float4 gas;
 // itself or the puffs drawn before it (OBS can't draw without writing
 // depth); w 0: as they are.
 uniform float4 flat_at;
+// Strand: where the camera is (the world), and how wide one pixel is
+// a unit away (x), the thinnest a hair is drawn (y, pixels), the picture's
+// size in pixels (zw).
+uniform float3 eye_pos;
+uniform float4 strand;
 // Outline: how far out (world units), its colour, how much it's lit.
 uniform float outline_width;
 uniform float4 outline_colour;
@@ -376,6 +387,125 @@ float4 PSHidden(VertOut v) : TARGET
 	return float4(0.0, 0.0, 0.0, 0.0);
 }
 
+// Hair strands: see Strand at the top. Its points come twice, its two
+// sides (uv.x 0 and 1); uv.y how far along its strand (0 root, 1 tip);
+// `ws` its width (world units) and its strand's own number (0 to 1). The
+// facing (NORMAL) is the way the strand runs.
+struct StrandIn {
+	float4 pos  : POSITION;
+	float4 norm : NORMAL;
+	float4 col  : COLOR;
+	float2 uv   : TEXCOORD0;
+	float2 ws   : TEXCOORD1;
+};
+
+struct StrandOut {
+	float4 pos  : POSITION;
+	float4 col  : COLOR;
+	float2 uv   : TEXCOORD0;
+	float3 vpos : TEXCOORD1;
+	float3 vtan : TEXCOORD2;
+	float4 clip : TEXCOORD3;
+	float2 cs   : TEXCOORD4;
+};
+
+StrandOut VSStrand(StrandIn v)
+{
+	StrandOut o;
+	float3 P = v.pos.xyz;
+	float3 T = normalize(v.norm.xyz);
+	float3 E = eye_pos - P;
+	float d = max(length(E), 0.0001);
+	float3 S = cross(T, E / d);
+	float sl = length(S);
+	S = sl > 0.00001 ? S / sl : normalize(cross(T, float3(0.0, 1.0, 0.001)));
+	// As wide as it is, but never thinner than strand.y pixels: then it
+	// covers only its share of them (cs.x).
+	float w = max(v.ws.x, 0.0);
+	float wd = max(w, d * strand.x * strand.y);
+	float side = v.uv.x * 2.0 - 1.0;
+	P = P + S * (side * wd * 0.5);
+	o.pos = mul(float4(P, 1.0), ViewProj);
+	o.clip = o.pos;
+	o.col = v.col;
+	o.uv = v.uv;
+	o.vpos = mul(float4(P, 1.0), cam).xyz;
+	o.vtan = mul(float4(T, 0.0), cam).xyz;
+	o.cs = float2(wd > 0.0 ? w / wd : 0.0, v.ws.y);
+	return o;
+}
+
+float4 PSStrand(StrandOut v) : TARGET
+{
+	float t = saturate(v.uv.y);
+	float seed = v.cs.y;
+	// How much of this pixel the hair covers (thinner than drawn, its tip
+	// fading, its material's and points' see-through, the whole avatar's):
+	// that share of its pixels drawn, picked at random for each hair, so
+	// many thin hairs over one another add up as they would (and the
+	// picture drawn twice the size, halved, smooths it).
+	float a = v.cs.x * saturate(base_colour.a * v.col.a) * saturate((1.0 - t) * 10.0) * look.w;
+	float2 px = floor((v.clip.xy / v.clip.w * 0.5 + 0.5) * strand.zw);
+	float h = frac(sin(dot(px + float2(seed * 131.0, seed * 71.0), float2(12.9898, 78.233))) * 43758.5453);
+	if (a <= h)
+		discard;
+
+	float3 V = normalize(-v.vpos);
+	float3 T = normalize(v.vtan);
+	// Round: its facing goes from one side of the hair, through towards
+	// the camera, to the other.
+	float side = v.uv.x * 2.0 - 1.0;
+	float3 B = cross(T, V);
+	float bl = length(B);
+	B = bl > 0.00001 ? B / bl : float3(0.0, 0.0, 0.0);
+	float3 F = V - T * dot(T, V);
+	float fl = length(F);
+	F = fl > 0.00001 ? F / fl : V;
+	float3 N = normalize(B * side + F * sqrt(saturate(1.0 - side * side)));
+
+	float4 tex = base_map.Sample(wrapSampler, float2(seed, t));
+	float3 albedo = base_colour.rgb * lin(tex.rgb) * lin(v.col.rgb) * (0.88 + 0.24 * frac(seed * 13.7));
+	float3 glow = emissive * lin(emissive_map.Sample(wrapSampler, float2(seed, t)).rgb);
+	if (look.x > 1.5)
+		return float4(srgb(albedo + glow), 1.0);
+
+	float3 L = key_dir;
+	float3 L2 = fill_dir;
+	// Lit across its length (Kajiya-Kay), softened round its back.
+	float tl = dot(T, L), tl2 = dot(T, L2);
+	float across = sqrt(saturate(1.0 - tl * tl)), across2 = sqrt(saturate(1.0 - tl2 * tl2));
+	float wrap = saturate(dot(N, L) * 0.6 + 0.4), wrap2 = saturate(dot(N, L2) * 0.6 + 0.4);
+	float3 ambient = lerp(room_down, room_up, N.y * 0.5 + 0.5);
+	float3 col;
+	if (look.x > 0.5) {
+		float lit = saturate((across * wrap - 0.4) * 6.0);
+		col = albedo * lerp(0.55, 1.0, lit) * key_tint + albedo * 0.12 * room_tint;
+	} else {
+		col = albedo * (ambient + key_colour * (across * wrap) + fill_colour * (across2 * wrap2));
+		// Two shines (Marschner's, as games draw them): white off its
+		// surface, tilted towards the tip; and its own colour from inside
+		// it, broader and tilted towards the root. Each hair's a little
+		// different.
+		float rough = saturate(surface.y);
+		float e1 = lerp(320.0, 24.0, rough), e2 = e1 * 0.35;
+		float jitter = (frac(seed * 7.31) - 0.5) * 0.12;
+		float3 H = normalize(L + V);
+		float3 T1 = normalize(T + N * (-0.10 + jitter));
+		float3 T2 = normalize(T + N * (0.12 + jitter));
+		float th1 = dot(T1, H), th2 = dot(T2, H);
+		float s1 = pow(sqrt(saturate(1.0 - th1 * th1)), e1);
+		float s2 = pow(sqrt(saturate(1.0 - th2 * th2)), e2);
+		// (a hair pointing at the camera shows no shine along it)
+		float strength = (1.0 - rough * 0.8) * saturate(bl * 3.0);
+		col = col + key_colour * key_tint * (s1 * 0.06 * strength * wrap);
+		col = col + albedo * key_tint * (s2 * 0.8 * strength * wrap);
+	}
+	float nv = saturate(dot(N, V));
+	col = col + rim_light.rgb * pow(1.0 - nv, max(rim_light.w, 0.001));
+	col = col + glow;
+	return float4(srgb(col), 1.0);
+}
+
 struct DownData {
 	float4 pos : POSITION;
 	float2 uv  : TEXCOORD0;
@@ -434,6 +564,15 @@ technique Hidden
 	{
 		vertex_shader = VSDraw(v);
 		pixel_shader  = PSHidden(v);
+	}
+}
+
+technique Strand
+{
+	pass
+	{
+		vertex_shader = VSStrand(v);
+		pixel_shader  = PSStrand(v);
 	}
 }
 

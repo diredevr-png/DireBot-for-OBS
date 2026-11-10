@@ -363,6 +363,8 @@ Avatar3D::Avatar3D()
 		p_room_tint = param("room_tint");
 		p_glow = param("gas");
 		p_flat_at = param("flat_at");
+		p_eye = param("eye_pos");
+		p_strand = param("strand");
 		check_.load(effect_, "3D", face_3d_needs());
 	}
 	// Plain pictures for a part without its own: white, black, and a
@@ -406,7 +408,8 @@ namespace {
 // A buffer of `n` points (with tangents: `tangents`); a still one (not
 // `dynamic`) is filled from `points` now, as OBS keeps no copy of it to
 // change later.
-gs_vertbuffer_t *make_vb(size_t n, bool dynamic, const V3 *points = nullptr, bool tangents = false)
+gs_vertbuffer_t *make_vb(size_t n, bool dynamic, const V3 *points = nullptr, bool tangents = false,
+			 bool strands = false)
 {
 	gs_vb_data *vb = gs_vbdata_create();
 	vb->num = n;
@@ -419,10 +422,13 @@ gs_vertbuffer_t *make_vb(size_t n, bool dynamic, const V3 *points = nullptr, boo
 		vec3_set(&vb->normals[i], 0, 0, 1);
 	}
 	vb->colors = static_cast<uint32_t *>(bzalloc(sizeof(uint32_t) * n));
-	vb->num_tex = 1;
-	vb->tvarray = static_cast<gs_tvertarray *>(bzalloc(sizeof(gs_tvertarray)));
-	vb->tvarray[0].width = 2;
-	vb->tvarray[0].array = bzalloc(sizeof(float) * 2 * n);
+	// Hair strands: their widths and own numbers too (a second set).
+	vb->num_tex = strands ? 2 : 1;
+	vb->tvarray = static_cast<gs_tvertarray *>(bzalloc(sizeof(gs_tvertarray) * vb->num_tex));
+	for (size_t t = 0; t < vb->num_tex; t++) {
+		vb->tvarray[t].width = 2;
+		vb->tvarray[t].array = bzalloc(sizeof(float) * 2 * n);
+	}
 	return gs_vertexbuffer_create(vb, dynamic ? GS_DYNAMIC : 0);
 }
 
@@ -487,8 +493,9 @@ void Avatar3D::set(std::shared_ptr<const Model> model, std::vector<ModelPicture>
 			Part part;
 			part.points = p.pos.size();
 			part.bumped = p.tangent.size() == part.points * 4;
+			part.strands = p.strands && p.strand.size() == part.points * 2;
 			if (part.points && !p.index.empty()) {
-				part.vb = make_vb(part.points, true, nullptr, part.bumped);
+				part.vb = make_vb(part.points, true, nullptr, part.bumped, part.strands);
 				part.ib = make_ib(p.index);
 			}
 			if (part.vb) {
@@ -504,6 +511,8 @@ void Avatar3D::set(std::shared_ptr<const Model> model, std::vector<ModelPicture>
 						srgb_bytes(&p.colour[i * 4], c);
 					std::memcpy(&d->colors[i], c, 4);
 				}
+				if (part.strands)
+					std::memcpy(d->tvarray[1].array, p.strand.data(), sizeof(float) * 2 * part.points);
 				// Its colours and UVs sent now, once (drawing sends only
 				// what moves).
 				gs_vertexbuffer_flush(part.vb);
@@ -630,6 +639,17 @@ void Avatar3D::draw_part(size_t i, const Rig::Part &p, const char *technique)
 	while (gs_effect_loop(effect_, technique))
 		gs_draw(GS_TRIS, 0, 0);
 	(void)p;
+}
+
+void Avatar3D::set_strand(const View3D &v, uint32_t drawn_w, uint32_t drawn_h)
+{
+	const M4 to_world = inverse(cam_);
+	const V3 eye = move_of(to_world);
+	set_vec3(p_eye, &eye.x);
+	// One pixel's width a unit from the camera; hairs at least 1 pixel of
+	// the picture as drawn (twice the size: half a pixel of the one shown).
+	const float pixel = 2 * std::tan(v.fov / 2) / std::max(1u, drawn_h);
+	set_vec4(p_strand, pixel, 1.0f, (float)drawn_w, (float)drawn_h);
 }
 
 void Avatar3D::draw_prop(Prop3D &prop, const View3D &v, bool see_through)
@@ -1017,6 +1037,8 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 	auto technique_of = [&](const Drawn &dr, size_t i) {
 		const Material &mat = material_of(dr, i);
 		const bool flat_look = v.look == 3 || (v.look == 0 && mat.shading == Shading::Unlit);
+		if (dr.a->parts_[i].strands)
+			return "Strand";
 		return dr.a->parts_[i].bumped && v.detail && !flat_look && mat.normal_map.used() ? "DrawBumped"
 												 : "Draw";
 	};
@@ -1034,7 +1056,8 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 	for (Drawn &dr : all)
 		for (size_t i = 0; i < dr.posed->size(); i++) {
 			const Material &mat = material_of(dr, i);
-			if (!shows(dr, i) || mat.glow || (mat.outline == Outline::None && (v.outline <= 0 || dr.own_outlines)))
+			if (!shows(dr, i) || mat.glow || dr.a->parts_[i].strands ||
+			    (mat.outline == Outline::None && (v.outline <= 0 || dr.own_outlines)))
 				continue;
 			dr.a->part_distance_ = dr.distance[i];
 			dr.a->set_material(mat, v, true, false, false);
@@ -1047,13 +1070,18 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 				continue;
 			const Material &mat = material_of(dr, i);
 			const Rig::Part &p = (*dr.posed)[i];
-			if (mat.alpha == AlphaMode::Blend || v.opacity < 0.999f) {
+			// Hair strands are drawn with the solid parts, however
+			// see-through: their see-through is a share of their pixels.
+			const bool strands = dr.a->parts_[i].strands;
+			if (!strands && (mat.alpha == AlphaMode::Blend || v.opacity < 0.999f)) {
 				blended.push_back({w, i});
 				continue;
 			}
 			dr.a->part_distance_ = dr.distance[i];
 			dr.a->set_material(mat, v, false, is_skin(dr, i), sides_shown(mat, p.handed) == Sides::Front);
-			gs_set_cull_mode(cull_of(mat, p.handed));
+			if (strands)
+				dr.a->set_strand(v, v.w * k, v.h * k);
+			gs_set_cull_mode(strands ? GS_NEITHER : cull_of(mat, p.handed));
 			dr.a->draw_part(i, p, technique_of(dr, i));
 			gs_set_cull_mode(GS_NEITHER);
 		}

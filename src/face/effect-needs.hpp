@@ -54,6 +54,10 @@ inline const std::vector<EffectNeeds> &face_3d_needs()
 		 {"cam", "uv_place", "outline_width", "base_map", "surface", "base_colour", "outline_colour", "look",
 		  "key_tint"}},
 		{"Hidden", {"cam", "uv_place", "flat_at"}},
+		{"Strand",
+		 {"cam", "base_map", "emissive_map", "base_colour", "look", "surface", "emissive", "key_dir",
+		  "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light", "key_tint", "room_tint",
+		  "eye_pos", "strand"}},
 		{"Down", {"image", "texel"}},
 	};
 	return needs;

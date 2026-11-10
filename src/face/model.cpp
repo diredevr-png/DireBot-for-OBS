@@ -72,6 +72,18 @@ float num(const json &j, const char *key, float def)
 	const double d = v.get<double>();
 	return std::isfinite(d) ? (float)d : def;
 }
+// A size or place in a file, in bytes (or a count): exactly, as a float
+// can't hold one past 16 million (a part of a big file read from the
+// wrong place: "a buffer view past its end").
+double whole(const json &j, const char *key, double def)
+{
+	const json &v = field(j, key);
+	if (!v.is_number())
+		return def;
+	const double d = v.get<double>();
+	return std::isfinite(d) ? d : def;
+}
+
 int index_of(const json &j, const char *key, int def = -1)
 {
 	const json &v = field(j, key);
@@ -221,7 +233,7 @@ struct Reader {
 		const int b = index_of(v, "buffer");
 		if (b < 0 || b >= (int)buffers.size())
 			fail("the file is damaged (a missing buffer)");
-		const double off = num(v, "byteOffset", 0), len = num(v, "byteLength", -1);
+		const double off = whole(v, "byteOffset", 0), len = whole(v, "byteLength", -1);
 		if (off < 0 || len < 0 || off + len > (double)buffers[b].size())
 			fail("the file is damaged (a buffer view past its end)");
 		View out;
@@ -309,7 +321,7 @@ struct Reader {
 		const int csize = size_of(type);
 		if (!csize || !comps || (want_comps && comps != want_comps))
 			fail("the file has numbers DireBot can't read");
-		const long long count = (long long)num(acc, "count", -1);
+		const long long count = (long long)whole(acc, "count", -1);
 		if (count < 0 || (size_t)count > MOST_INDEX)
 			fail("the file is too big or damaged");
 		const bool normalized = flag(acc, "normalized", false);
@@ -317,7 +329,7 @@ struct Reader {
 		const int view_i = index_of(acc, "bufferView");
 		if (view_i >= 0 && count > 0) {
 			const View v = view(view_i);
-			const double off = num(acc, "byteOffset", 0);
+			const double off = whole(acc, "byteOffset", 0);
 			const size_t elem = (size_t)comps * csize;
 			// (Small matrices of bytes pad their columns; nothing here reads them.)
 			if ((comps == 4 && text(acc, "type") == "MAT2" && csize < 4) || (comps == 9 && csize < 4))
@@ -333,7 +345,7 @@ struct Reader {
 		}
 		const json &sparse = field(acc, "sparse");
 		if (sparse.is_object()) {
-			const long long n = (long long)num(sparse, "count", 0);
+			const long long n = (long long)whole(sparse, "count", 0);
 			const json &ix = field(sparse, "indices"), &vals = field(sparse, "values");
 			const int itype = index_of(ix, "componentType");
 			const int isize = size_of(itype);
@@ -342,7 +354,7 @@ struct Reader {
 			if (n > 0) {
 				const View iv = view(index_of(ix, "bufferView"));
 				const View vv = view(index_of(vals, "bufferView"));
-				const double ioff = num(ix, "byteOffset", 0), voff = num(vals, "byteOffset", 0);
+				const double ioff = whole(ix, "byteOffset", 0), voff = whole(vals, "byteOffset", 0);
 				if (ioff < 0 || voff < 0 || ioff + (double)n * isize > (double)iv.size ||
 				    voff + (double)n * comps * csize > (double)vv.size)
 					fail("the file is damaged (sparse numbers past their end)");
@@ -381,6 +393,100 @@ struct Reader {
 		return out;
 	}
 };
+
+// A part of hair strands (glTF LINES, mode 1, or one LINE_STRIP, mode 3)
+// made ready to draw: see Primitive::strands. Each strand's points are
+// found by following its pieces from its root (the point no piece comes
+// into); its width is the file's _WIDTH (one number a point).
+void make_strands(Primitive &p, const std::vector<uint32_t> &ix, int mode, Reader &rd, const json &attr)
+{
+	const size_t n = p.pos.size();
+	std::vector<std::pair<uint32_t, uint32_t>> pieces;
+	if (mode == 1)
+		for (size_t i = 0; i + 1 < ix.size(); i += 2)
+			pieces.push_back({ix[i], ix[i + 1]});
+	else
+		for (size_t i = 0; i + 1 < ix.size(); i++)
+			pieces.push_back({ix[i], ix[i + 1]});
+	constexpr uint32_t NONE = 0xFFFFFFFFu;
+	std::vector<uint32_t> next(n, NONE), prev(n, NONE);
+	for (const auto &pc : pieces)
+		if (pc.first != pc.second && next[pc.first] == NONE && prev[pc.second] == NONE) {
+			next[pc.first] = pc.second;
+			prev[pc.second] = pc.first;
+		}
+	std::vector<float> along(n, 0), seed(n, 0);
+	std::vector<char> seen(n, 0);
+	for (uint32_t root = 0; root < n; root++) {
+		if (prev[root] != NONE || next[root] == NONE)
+			continue;
+		// Its length, then how far along it each point is.
+		float total = 0;
+		size_t steps = 0;
+		for (uint32_t a = root; next[a] != NONE && steps < n; a = next[a], steps++)
+			total += length(p.pos[next[a]] - p.pos[a]);
+		uint32_t h = root * 2654435761u;
+		h ^= h >> 15;
+		const float own = (float)(h & 0xFFFFFF) / (float)0x1000000;
+		float run = 0;
+		steps = 0;
+		for (uint32_t a = root; a != NONE && !seen[a] && steps <= n; steps++) {
+			seen[a] = 1;
+			along[a] = total > 0 ? run / total : 0;
+			seed[a] = own;
+			if (next[a] != NONE)
+				run += length(p.pos[next[a]] - p.pos[a]);
+			a = next[a];
+		}
+	}
+	std::vector<float> width(n, 0.0001f);
+	if (index_of(attr, "_WIDTH") >= 0) {
+		const std::vector<float> w = rd.floats(index_of(attr, "_WIDTH"), 1);
+		if (w.size() == n)
+			for (size_t i = 0; i < n; i++)
+				width[i] = std::max(0.0f, w[i]);
+	}
+	Primitive s;
+	s.strands = true;
+	s.material = p.material;
+	s.pos.resize(n * 2);
+	s.normal.resize(n * 2);
+	s.uv.resize(n * 4);
+	s.strand.resize(n * 4);
+	if (!p.colour.empty())
+		s.colour.resize(n * 8);
+	if (!p.joints.empty()) {
+		s.joints.resize(n * 8);
+		s.weights.resize(n * 8);
+	}
+	for (size_t i = 0; i < n; i++) {
+		const V3 a = prev[i] != NONE ? p.pos[prev[i]] : p.pos[i];
+		const V3 b = next[i] != NONE ? p.pos[next[i]] : p.pos[i];
+		const V3 run = normalized(b - a, {0, 1, 0});
+		for (size_t side = 0; side < 2; side++) {
+			const size_t k = i * 2 + side;
+			s.pos[k] = p.pos[i];
+			s.normal[k] = run;
+			s.uv[k * 2] = (float)side;
+			s.uv[k * 2 + 1] = along[i];
+			s.strand[k * 2] = width[i];
+			s.strand[k * 2 + 1] = seed[i];
+			if (!p.colour.empty())
+				std::memcpy(&s.colour[k * 4], &p.colour[i * 4], sizeof(float) * 4);
+			if (!p.joints.empty()) {
+				std::memcpy(&s.joints[k * 4], &p.joints[i * 4], sizeof(uint16_t) * 4);
+				std::memcpy(&s.weights[k * 4], &p.weights[i * 4], sizeof(float) * 4);
+			}
+		}
+	}
+	for (const auto &pc : pieces) {
+		if (pc.first == pc.second)
+			continue;
+		const uint32_t a0 = pc.first * 2, a1 = a0 + 1, b0 = pc.second * 2, b1 = b0 + 1;
+		s.index.insert(s.index.end(), {a0, b0, a1, a1, b0, b1});
+	}
+	p = std::move(s);
+}
 
 // The triangles of a strip or fan, as a list.
 std::vector<uint32_t> triangles_of(const std::vector<uint32_t> &ix, int mode)
@@ -1105,8 +1211,10 @@ void read_meshes(Reader &rd, const json &doc, Model &m)
 		const json &names = field(field(mj, "extras"), "targetNames");
 		for (const json &pj : list(mj, "primitives")) {
 			const int mode = index_of(pj, "mode", 4);
-			if (mode < 4 || mode > 6)
-				continue; // points and lines
+			// Lines and line strips: hair strands (Primitive::strands).
+			const bool strands = mode == 1 || mode == 3;
+			if (!strands && (mode < 4 || mode > 6))
+				continue; // points, line loops
 			const json &attr = field(pj, "attributes");
 			const int pos_a = index_of(attr, "POSITION");
 			if (pos_a < 0)
@@ -1184,8 +1292,15 @@ void read_meshes(Reader &rd, const json &doc, Model &m)
 				for (size_t i = 0; i < n; i++)
 					ix[i] = (uint32_t)i;
 			}
-			p.index = triangles_of(ix, mode);
-			p.index.resize(p.index.size() / 3 * 3);
+			if (strands) {
+				make_strands(p, ix, mode, rd, attr);
+				points += p.pos.size() / 2;
+				if (points > MOST_POINTS)
+					fail("the file is too big (over 4 million points)");
+			} else {
+				p.index = triangles_of(ix, mode);
+				p.index.resize(p.index.size() / 3 * 3);
+			}
 			indices += p.index.size();
 			if (indices > MOST_INDEX)
 				fail("the file is too big (over 8 million triangles)");
@@ -1202,6 +1317,19 @@ void read_meshes(Reader &rd, const json &doc, Model &m)
 				if ((!mt.pos.empty() && mt.pos.size() != n) ||
 				    (!mt.normal.empty() && mt.normal.size() != n))
 					fail("the file is damaged (an expression doesn't fit its part)");
+				// Hair strands: each point's move for both its sides (a
+				// strand's facing is the way it runs: its normals' moves
+				// left out).
+				if (strands) {
+					auto twice = [](std::vector<V3> &v) {
+						std::vector<V3> out(v.size() * 2);
+						for (size_t i = 0; i < v.size(); i++)
+							out[i * 2] = out[i * 2 + 1] = v[i];
+						v.swap(out);
+					};
+					twice(mt.pos);
+					mt.normal.clear();
+				}
 				points += (mt.pos.size() + mt.normal.size()) / 4;
 			}
 			if (points > MOST_POINTS * 2)
@@ -1433,7 +1561,7 @@ void load_json(Reader &rd, const json &doc, Model &m)
 	for (Mesh &mesh : m.meshes)
 		for (Primitive &p : mesh.parts) {
 			const bool bumpy = p.material >= 0 && p.material < (int)m.materials.size() &&
-					   m.materials[p.material].normal_map.used() && !p.uv.empty();
+					   m.materials[p.material].normal_map.used() && !p.uv.empty() && !p.strands;
 			if (!bumpy) {
 				std::vector<float>().swap(p.tangent);
 				continue;
