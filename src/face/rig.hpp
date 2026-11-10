@@ -375,10 +375,6 @@ private:
 		std::vector<Joint> joints;
 		std::vector<int> colliders;
 	};
-	struct Sparse {
-		std::vector<uint32_t> at;
-		std::vector<V3> pos, normal;
-	};
 	struct Driver {
 		int mesh = -1, morph = -1;
 		int move = -1; // an ARKit move, or -1
@@ -509,7 +505,6 @@ private:
 	// Its shapes by name (lower case): mesh and morph.
 	std::map<std::string, std::vector<std::pair<int, int>>> morph_by_name_;
 	V3 last_root_;
-	std::vector<std::vector<std::vector<Sparse>>> sparse_; // mesh, part, morph
 	std::vector<std::vector<float>> weights_;
 	std::vector<Driver> drivers_;
 	bool perfect_sync_ = false;

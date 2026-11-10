@@ -852,12 +852,14 @@ Prop3D::Prop3D(std::shared_ptr<const Model> model, const std::vector<ModelPictur
 			}
 			for (const MorphTarget &t : p.morphs) {
 				std::vector<V3> dp(part.points), dn;
-				for (size_t k = 0; k < part.points && k < t.pos.size(); k++)
-					dp[k] = direction(at(k), t.pos[k]);
-				if (t.normal.size() == part.points) {
+				for (size_t i = 0; i < t.at.size(); i++)
+					if (t.at[i] < part.points)
+						dp[t.at[i]] = direction(at(t.at[i]), t.pos[i]);
+				if (!t.normal.empty()) {
 					dn.resize(part.points);
-					for (size_t k = 0; k < part.points; k++)
-						dn[k] = direction(at(k), t.normal[k]);
+					for (size_t i = 0; i < t.normal.size(); i++)
+						if (t.at[i] < part.points)
+							dn[t.at[i]] = direction(at(t.at[i]), t.normal[i]);
 				}
 				part.morph_pos.push_back(std::move(dp));
 				part.morph_normal.push_back(std::move(dn));

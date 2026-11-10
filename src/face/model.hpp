@@ -134,10 +134,16 @@ inline Sides sides_shown(const Material &m, float handed)
 	return m.inside_only == (handed < 0) ? Sides::Front : Sides::Back;
 }
 
-// An expression's change to a part: each point moved by this much (and
-// its facing changed) at full strength.
+// An expression's change to a part, kept only for the points it moves:
+// point at[i] moved by pos[i] (and its facing changed by normal[i]) at
+// full strength. A file's expression usually moves a small part of a
+// big character (a blink, its eyelids), and a part with nothing moved
+// keeps nothing. normal is empty if the file has none.
 struct MorphTarget {
-	std::vector<V3> pos, normal; // normal is empty if the file has none
+	std::vector<uint32_t> at; // in order, each once
+	std::vector<V3> pos, normal;
+	// Its move of point v (none if it doesn't move it).
+	V3 pos_of(uint32_t v) const;
 };
 
 struct Primitive {

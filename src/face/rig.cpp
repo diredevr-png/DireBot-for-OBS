@@ -521,31 +521,11 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 	measure_head();
 	find_arms();
 
-	// Expressions: the morphs, each only where it moves something.
-	sparse_.resize(m.meshes.size());
+	// Expressions: each mesh's own strengths (the morphs themselves are
+	// kept only where they move something, as the file is read).
 	weights_.resize(m.meshes.size());
-	for (size_t mi = 0; mi < m.meshes.size(); mi++) {
-		const Mesh &mesh = m.meshes[mi];
-		weights_[mi] = mesh.weights;
-		sparse_[mi].resize(mesh.parts.size());
-		for (size_t pi = 0; pi < mesh.parts.size(); pi++) {
-			const Primitive &p = mesh.parts[pi];
-			sparse_[mi][pi].resize(p.morphs.size());
-			for (size_t k = 0; k < p.morphs.size(); k++) {
-				const MorphTarget &mt = p.morphs[k];
-				Sparse &sp = sparse_[mi][pi][k];
-				for (size_t v = 0; v < p.pos.size(); v++) {
-					const V3 dp = mt.pos.empty() ? V3{} : mt.pos[v];
-					const V3 dn = mt.normal.empty() ? V3{} : mt.normal[v];
-					if (dot(dp, dp) > 1e-14f || dot(dn, dn) > 1e-10f) {
-						sp.at.push_back((uint32_t)v);
-						sp.pos.push_back(dp);
-						sp.normal.push_back(dn);
-					}
-				}
-			}
-		}
-	}
+	for (size_t mi = 0; mi < m.meshes.size(); mi++)
+		weights_[mi] = m.meshes[mi].weights;
 	// Every shape by its name (any case), for a face on cue by a shape's
 	// own name.
 	for (size_t mi = 0; mi < m.meshes.size(); mi++)
@@ -613,10 +593,10 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 		if ((!blink || blinks_) && (!mouth || talks_))
 			continue;
 		float most = 0;
-		if (d.mesh >= 0 && d.mesh < (int)sparse_.size())
-			for (const std::vector<Sparse> &part : sparse_[d.mesh])
-				if (d.morph >= 0 && d.morph < (int)part.size())
-					for (const V3 &dp : part[d.morph].pos)
+		if (d.mesh >= 0 && d.mesh < (int)m.meshes.size())
+			for (const Primitive &part : m.meshes[d.mesh].parts)
+				if (d.morph >= 0 && d.morph < (int)part.morphs.size())
+					for (const V3 &dp : part.morphs[d.morph].pos)
 						most = std::max(most, length(dp));
 		if (most * d.weight < FACE_SHOWS * height_)
 			continue;
@@ -2571,11 +2551,11 @@ void Rig::skin()
 					mn.assign(p.normal.begin(), p.normal.end());
 					morphed = true;
 				}
-				const Sparse &sp = sparse_[node.mesh][pi][k];
-				for (size_t i = 0; i < sp.at.size(); i++) {
+				const MorphTarget &sp = p.morphs[k];
+				for (size_t i = 0; i < sp.at.size(); i++)
 					mp[sp.at[i]] = mp[sp.at[i]] + sp.pos[i] * w[k];
+				for (size_t i = 0; i < sp.normal.size(); i++)
 					mn[sp.at[i]] = mn[sp.at[i]] + sp.normal[i] * w[k];
-				}
 			}
 			if (morphed) {
 				src_p = mp.data();
@@ -3099,11 +3079,11 @@ FaceSpots face_spots(const std::shared_ptr<const Model> &mp, Quat facing, const 
 			const int kind = kind_of(mi, k, mesh);
 			if (kind == 0)
 				continue;
-			const std::vector<V3> &moved = prim.morphs[k].pos;
-			for (size_t v = 0; v < moved.size() && v < points[pi].size(); v++) {
-				const float w = length(moved[v]);
-				if (w >= 1e-7f)
-					hits.push_back({parts[pi].node, kind, points[pi][v], w});
+			const MorphTarget &mt = prim.morphs[k];
+			for (size_t i = 0; i < mt.at.size(); i++) {
+				const float w = length(mt.pos[i]);
+				if (w >= 1e-7f && mt.at[i] < points[pi].size())
+					hits.push_back({parts[pi].node, kind, points[pi][mt.at[i]], w});
 			}
 		}
 	}

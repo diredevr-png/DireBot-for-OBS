@@ -44,6 +44,9 @@ constexpr size_t MOST_POINTS = 4'000'000;
 constexpr size_t MOST_INDEX = 24'000'000;
 constexpr size_t MOST_NODES = 100'000;
 constexpr size_t MOST_MORPHS = 512;
+// An expression's move of a point too small to see (squared lengths:
+// 1e-7 of a move, 1e-5 of a turn of its facing): not kept.
+constexpr float MOVES_NOTHING = 1e-14f, TURNS_NOTHING = 1e-10f;
 constexpr size_t MOST_IMAGES = 256;
 constexpr size_t MOST_ANIMATIONS = 256;
 constexpr size_t MOST_KEY_NUMBERS = 8'000'000; // all its animations' keys' numbers
@@ -1195,6 +1198,33 @@ void read_constraints(const json &doc, Model &m)
 	m.constraints_left_out = left_out;
 }
 
+// An expression's moves kept only where it moves a point (by more than
+// 1e-7, or turns its facing by more than 1e-5: less is nothing to see),
+// from the file's moves of all n points (dp or dn empty: none). For
+// hair strands (two points a file's point, its two sides) each moved
+// point is kept for both sides.
+MorphTarget only_moved(const std::vector<V3> &dp, const std::vector<V3> &dn, size_t n, bool strands)
+{
+	MorphTarget mt;
+	const size_t sides = strands ? 2 : 1;
+	for (size_t v = 0; v < n; v++) {
+		const V3 p = dp.empty() ? V3{} : dp[v];
+		const V3 f = dn.empty() ? V3{} : dn[v];
+		if (dot(p, p) <= MOVES_NOTHING && dot(f, f) <= TURNS_NOTHING)
+			continue;
+		for (size_t side = 0; side < sides; side++) {
+			mt.at.push_back((uint32_t)(v * sides + side));
+			mt.pos.push_back(p);
+			if (!dn.empty())
+				mt.normal.push_back(f);
+		}
+	}
+	mt.at.shrink_to_fit();
+	mt.pos.shrink_to_fit();
+	mt.normal.shrink_to_fit();
+	return mt;
+}
+
 void read_meshes(Reader &rd, const json &doc, Model &m)
 {
 	size_t points = 0, indices = 0;
@@ -1309,28 +1339,19 @@ void read_meshes(Reader &rd, const json &doc, Model &m)
 			const json &targets = list(pj, "targets");
 			p.morphs.resize(morphs);
 			for (size_t t = 0; t < targets.size() && t < morphs; t++) {
-				MorphTarget &mt = p.morphs[t];
+				std::vector<V3> dp, dn;
 				if (index_of(targets[t], "POSITION") >= 0)
-					mt.pos = rd.vec3s(index_of(targets[t], "POSITION"));
-				if (index_of(targets[t], "NORMAL") >= 0)
-					mt.normal = rd.vec3s(index_of(targets[t], "NORMAL"));
-				if ((!mt.pos.empty() && mt.pos.size() != n) ||
-				    (!mt.normal.empty() && mt.normal.size() != n))
+					dp = rd.vec3s(index_of(targets[t], "POSITION"));
+				// A strand's facing is the way it runs: its normals'
+				// moves left out.
+				if (index_of(targets[t], "NORMAL") >= 0 && !strands)
+					dn = rd.vec3s(index_of(targets[t], "NORMAL"));
+				if ((!dp.empty() && dp.size() != n) || (!dn.empty() && dn.size() != n))
 					fail("the file is damaged (an expression doesn't fit its part)");
-				// Hair strands: each point's move for both its sides (a
-				// strand's facing is the way it runs: its normals' moves
-				// left out).
-				if (strands) {
-					auto twice = [](std::vector<V3> &v) {
-						std::vector<V3> out(v.size() * 2);
-						for (size_t i = 0; i < v.size(); i++)
-							out[i * 2] = out[i * 2 + 1] = v[i];
-						v.swap(out);
-					};
-					twice(mt.pos);
-					mt.normal.clear();
-				}
-				points += (mt.pos.size() + mt.normal.size()) / 4;
+				p.morphs[t] = only_moved(dp, dn, n, strands);
+				// Counted by what's kept: the points it moves (each
+				// strand point twice, its two sides), not every point.
+				points += (p.morphs[t].pos.size() + p.morphs[t].normal.size()) / 4;
 			}
 			if (points > MOST_POINTS * 2)
 				fail("the file is too big");
@@ -1981,6 +2002,12 @@ struct Mikk {
 };
 
 } // namespace
+
+V3 MorphTarget::pos_of(uint32_t v) const
+{
+	const auto it = std::lower_bound(at.begin(), at.end(), v);
+	return it != at.end() && *it == v ? pos[(size_t)(it - at.begin())] : V3{};
+}
 
 std::vector<float> tangents_of(const Primitive &p)
 {

@@ -207,7 +207,7 @@ static void test_write_and_read()
 		out = out && dot(p.normal[i], p.pos[i] - V3{0, 1, 0}) > 0;
 	CHECK(out);
 	CHECK(m.meshes[0].morph_names.size() == 2 && m.meshes[0].morph_names[0] == "jawOpen");
-	CHECK(p.morphs.size() == 2 && near3(p.morphs[1].pos[3], {0.2f, 0, 0}, 1e-6f));
+	CHECK(p.morphs.size() == 2 && near3(p.morphs[1].pos_of(3), {0.2f, 0, 0}, 1e-6f));
 	CHECK(near(m.materials[0].base[0], 0.5, 1e-6) && near(m.materials[0].metallic, 0.25, 1e-6) &&
 	      near(m.materials[0].roughness, 0.75, 1e-6));
 	CHECK(m.materials[0].base_map.image == 0 && m.images[0].bytes.size() == 7 && m.images[0].mime == "image/png");
@@ -264,8 +264,8 @@ static void test_storage()
 	CHECK(p.uv.size() == 8 && near(p.uv[2], 1, 1e-6) && near(p.uv[5], 1, 1e-6) && near(p.uv[6], 1, 1e-6));
 	CHECK(p.colour.size() == 16 && near(p.colour[0], 1, 1e-6) && near(p.colour[7], 128 / 255.0, 1e-6));
 	CHECK((p.index == std::vector<uint32_t>{0, 1, 2, 2, 1, 3}));
-	CHECK(p.morphs.size() == 1 && near3(p.morphs[0].pos[3], {0, 0, 0.5f}, 1e-6f) &&
-	      near3(p.morphs[0].pos[0], {}, 1e-9f));
+	CHECK(p.morphs.size() == 1 && near3(p.morphs[0].pos_of(3), {0, 0, 0.5f}, 1e-6f) &&
+	      near3(p.morphs[0].pos_of(0), {}, 1e-9f) && (p.morphs[0].at == std::vector<uint32_t>{3}));
 	CHECK((m.meshes[1].parts[0].index == std::vector<uint32_t>{0, 1, 2, 0, 2, 3}));
 	const Node &n = m.nodes[0];
 	CHECK(near3(n.t, {0, 2, 0}, 1e-6f) && near3(n.s, {1, 1, 1}, 1e-5f));
@@ -4591,6 +4591,122 @@ static void test_posed_on_the_card()
 	CHECK(Rig::GPU_MOST_BONES * 4 == 1020);
 }
 
+// Expressions are kept, and counted against the size limit, only where
+// they move a point. A big part carrying many shapes that move none of
+// it (as Blender gives a braid that shares the face's shapes) used to
+// count each shape as a quarter of its points and was refused.
+static void test_expressions_kept_where_they_move()
+{
+	Builder b;
+	// A million points with 40 shapes that move nothing and one that
+	// moves three points: counted the old way 11.25 million, over the
+	// limit of 8.
+	const size_t n = 1000000;
+	std::vector<V3> pos(n);
+	for (size_t i = 0; i < n; i++)
+		pos[i] = {(float)(i % 1000) * 0.001f, (float)(i / 1000) * 0.001f, (float)(i % 3) * 0.0005f};
+	const int big = b.vec3s(pos);
+	json targets = json::array();
+	for (int t = 0; t < 40; t++) {
+		b.doc["accessors"].push_back({{"componentType", 5126}, {"count", n}, {"type", "VEC3"}});
+		targets.push_back({{"POSITION", (int)b.doc["accessors"].size() - 1}});
+	}
+	std::vector<uint32_t> sp_at = {5, 77, 999999};
+	std::vector<float> sp_val = {0, 0.01f, 0, 0.02f, 0, 0, 0, 0, -0.03f};
+	b.doc["accessors"].push_back(
+		{{"componentType", 5126},
+		 {"count", n},
+		 {"type", "VEC3"},
+		 {"sparse",
+		  {{"count", 3},
+		   {"indices", {{"bufferView", b.view(sp_at.data(), 12)}, {"componentType", 5125}}},
+		   {"values", {{"bufferView", b.view(sp_val.data(), 36)}}}}}});
+	targets.push_back({{"POSITION", (int)b.doc["accessors"].size() - 1}});
+	b.doc["meshes"].push_back({{"primitives", {{{"attributes", {{"POSITION", big}}}, {"targets", targets}}}}});
+
+	// A small part whose shapes carry facings: one moves point 1 and
+	// turns it, one only turns point 2, one moves nothing.
+	const std::vector<V3> tri = {{0, 0, 0}, {0.1f, 0, 0}, {0, 0.1f, 0}};
+	const std::vector<V3> d1 = {{}, {0, 0, 0.01f}, {}}, n1 = {{}, {0.1f, 0, 0}, {}};
+	const std::vector<V3> d2 = {{}, {}, {}}, n2 = {{}, {}, {0, 0.2f, 0}};
+	const json small_targets = {{{"POSITION", b.vec3s(d1)}, {"NORMAL", b.vec3s(n1)}},
+				    {{"POSITION", b.vec3s(d2)}, {"NORMAL", b.vec3s(n2)}},
+				    {{"POSITION", b.vec3s(d2)}, {"NORMAL", b.vec3s(d2)}}};
+	const json small = {{"attributes", {{"POSITION", b.vec3s(tri)}, {"NORMAL", b.vec3s({{0, 0, 1}, {0, 0, 1}, {0, 0, 1}})}}},
+			    {"indices", b.indices({0, 1, 2})},
+			    {"targets", small_targets}};
+	// A hair strand of 4 points whose shape lifts point 2 (and would turn
+	// it: a strand's facing is the way it runs, left out).
+	const std::vector<V3> hair = {{0, 0, 0}, {0, 0.01f, 0}, {0, 0.02f, 0}, {0, 0.03f, 0}};
+	const std::vector<V3> lift = {{}, {}, {0.005f, 0, 0}, {}}, turn = {{}, {}, {0, 0, 1}, {}};
+	const json strand = {{"attributes", {{"POSITION", b.vec3s(hair)}}},
+			     {"mode", 3},
+			     {"targets", {{{"POSITION", b.vec3s(lift)}, {"NORMAL", b.vec3s(turn)}},
+			       {{"POSITION", b.vec3s(lift)}},
+			       {{"POSITION", b.vec3s(std::vector<V3>(4))}}}}};
+	b.doc["meshes"].push_back({{"primitives", json::array({small, strand})}});
+	b.node({{"mesh", 0}});
+	b.node({{"mesh", 1}});
+	Model m;
+	std::string why;
+	CHECK(load(b.glb(), m, &why));
+	if (!why.empty())
+		std::printf("  refused: %s\n", why.c_str());
+	if (m.meshes.size() != 2 || m.meshes[0].parts.size() != 1 || m.meshes[1].parts.size() != 2)
+		return;
+	const Primitive &p = m.meshes[0].parts[0];
+	CHECK(p.pos.size() == n && p.morphs.size() == 41);
+	size_t kept = 0;
+	for (size_t t = 0; t < 40 && t < p.morphs.size(); t++)
+		kept += p.morphs[t].at.size() + p.morphs[t].pos.size() + p.morphs[t].normal.size();
+	CHECK(kept == 0);
+	if (p.morphs.size() == 41) {
+		const MorphTarget &mt = p.morphs[40];
+		CHECK((mt.at == std::vector<uint32_t>{5, 77, 999999}) && mt.pos.size() == 3 && mt.normal.empty());
+		CHECK(near3(mt.pos_of(77), {0.02f, 0, 0}, 1e-9f) && near3(mt.pos_of(999999), {0, 0, -0.03f}, 1e-9f));
+		CHECK(near3(mt.pos_of(76), {}, 0) && near3(mt.pos_of(78), {}, 0) && near3(mt.pos_of(0), {}, 0));
+	}
+
+	const Primitive &q = m.meshes[1].parts[0];
+	CHECK(q.morphs.size() == 3);
+	if (q.morphs.size() == 3) {
+		CHECK((q.morphs[0].at == std::vector<uint32_t>{1}) && q.morphs[0].normal.size() == 1 &&
+		      near3(q.morphs[0].normal[0], {0.1f, 0, 0}, 1e-7f));
+		// Only turned: kept (its facing changes the shading).
+		CHECK((q.morphs[1].at == std::vector<uint32_t>{2}) && near3(q.morphs[1].pos[0], {}, 0) &&
+		      near3(q.morphs[1].normal[0], {0, 0.2f, 0}, 1e-7f));
+		CHECK(q.morphs[2].at.empty() && q.morphs[2].pos.empty() && q.morphs[2].normal.empty());
+	}
+	const Primitive &h = m.meshes[1].parts[1];
+	CHECK(h.strands && h.pos.size() == 8 && h.morphs.size() == 3);
+	if (h.morphs.size() == 3) {
+		// Point 2's two sides, 4 and 5.
+		CHECK((h.morphs[0].at == std::vector<uint32_t>{4, 5}) && h.morphs[0].normal.empty() &&
+		      near3(h.morphs[0].pos[0], {0.005f, 0, 0}, 1e-9f) && near3(h.morphs[0].pos[1], {0.005f, 0, 0}, 1e-9f));
+		CHECK(h.morphs[1].at == h.morphs[0].at && h.morphs[2].at.empty());
+	}
+
+	// Posed with the small part's shapes on: moved and turned there, the
+	// rest as it was.
+	auto posed = std::make_shared<Model>(std::move(m));
+	posed->meshes[1].weights = {1, 1, 0};
+	Rig rig(posed, RigOptions());
+	rig.pose(still());
+	const Rig::Part *sp = nullptr;
+	for (const Rig::Part &part : rig.parts())
+		if (part.prim == &posed->meshes[1].parts[0])
+			sp = &part;
+	CHECK(sp && sp->pos.size() == 3 && sp->normal.size() == 3);
+	if (sp && sp->pos.size() == 3 && sp->normal.size() == 3) {
+		const M4 &w = rig.world()[sp->node];
+		CHECK(near3(sp->pos[0], point(w, {0, 0, 0}), 1e-6f) && near3(sp->pos[1], point(w, {0.1f, 0, 0.01f}), 1e-6f) &&
+		      near3(sp->pos[2], point(w, {0, 0.1f, 0}), 1e-6f));
+		CHECK(near3(sp->normal[0], normalized(direction(w, {0, 0, 1}), {}), 1e-5f) &&
+		      near3(sp->normal[1], normalized(direction(w, {0.1f, 0, 1}), {}), 1e-5f) &&
+		      near3(sp->normal[2], normalized(direction(w, {0, 0.2f, 1}), {}), 1e-5f));
+	}
+}
+
 int main()
 {
 	test_write_and_read();
@@ -4636,6 +4752,7 @@ int main()
 	test_knocked_and_head();
 	test_bones_that_follow();
 	test_posed_on_the_card();
+	test_expressions_kept_where_they_move();
 	std::printf("unit_model: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;
 }
