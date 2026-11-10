@@ -145,39 +145,56 @@ float4 flattened(float4 p)
 	return float4(0.0, 0.0, 2.0, 1.0);
 }
 
-VertOut VSDraw(VertIn v)
+// (Each technique's points as plain numbers, so the Sk techniques share
+// them: OpenGL takes an entry's input struct for its own.)
+VertOut draw_out(float3 pos, float3 norm, float4 col, float2 uv)
 {
 	VertOut o;
-	o.pos = flattened(mul(float4(v.pos.xyz, 1.0), ViewProj));
-	o.col = v.col;
-	o.uv = v.uv * uv_place.zw + uv_place.xy;
-	o.vpos = mul(float4(v.pos.xyz, 1.0), cam).xyz;
-	o.vnrm = mul(float4(v.norm.xyz, 0.0), cam).xyz;
+	o.pos = flattened(mul(float4(pos, 1.0), ViewProj));
+	o.col = col;
+	o.uv = uv * uv_place.zw + uv_place.xy;
+	o.vpos = mul(float4(pos, 1.0), cam).xyz;
+	o.vnrm = mul(float4(norm, 0.0), cam).xyz;
+	return o;
+}
+
+VertOut VSDraw(VertIn v)
+{
+	return draw_out(v.pos.xyz, v.norm.xyz, v.col, v.uv);
+}
+
+BumpOut bumped_out(float3 pos, float3 norm, float4 tang, float4 col, float2 uv)
+{
+	BumpOut o;
+	o.pos = flattened(mul(float4(pos, 1.0), ViewProj));
+	o.col = col;
+	o.uv = uv * uv_place.zw + uv_place.xy;
+	o.vpos = mul(float4(pos, 1.0), cam).xyz;
+	o.vnrm = mul(float4(norm, 0.0), cam).xyz;
+	o.vtan = float4(mul(float4(tang.xyz, 0.0), cam).xyz, tang.w);
 	return o;
 }
 
 BumpOut VSBumped(BumpIn v)
 {
-	BumpOut o;
-	o.pos = flattened(mul(float4(v.pos.xyz, 1.0), ViewProj));
-	o.col = v.col;
-	o.uv = v.uv * uv_place.zw + uv_place.xy;
-	o.vpos = mul(float4(v.pos.xyz, 1.0), cam).xyz;
-	o.vnrm = mul(float4(v.norm.xyz, 0.0), cam).xyz;
-	o.vtan = float4(mul(float4(v.tang.xyz, 0.0), cam).xyz, v.tang.w);
+	return bumped_out(v.pos.xyz, v.norm.xyz, v.tang, v.col, v.uv);
+}
+
+VertOut outline_out(float3 pos, float3 norm, float4 col, float2 uv)
+{
+	VertOut o;
+	float3 p = pos + norm * outline_width;
+	o.pos = mul(float4(p, 1.0), ViewProj);
+	o.col = col;
+	o.uv = uv * uv_place.zw + uv_place.xy;
+	o.vpos = mul(float4(p, 1.0), cam).xyz;
+	o.vnrm = mul(float4(norm, 0.0), cam).xyz;
 	return o;
 }
 
 VertOut VSOutline(VertIn v)
 {
-	VertOut o;
-	float3 p = v.pos.xyz + v.norm.xyz * outline_width;
-	o.pos = mul(float4(p, 1.0), ViewProj);
-	o.col = v.col;
-	o.uv = v.uv * uv_place.zw + uv_place.xy;
-	o.vpos = mul(float4(p, 1.0), cam).xyz;
-	o.vnrm = mul(float4(v.norm.xyz, 0.0), cam).xyz;
-	return o;
+	return outline_out(v.pos.xyz, v.norm.xyz, v.col, v.uv);
 }
 
 float3 lin(float3 c)
@@ -409,11 +426,11 @@ struct StrandOut {
 	float2 cs   : TEXCOORD4;
 };
 
-StrandOut VSStrand(StrandIn v)
+StrandOut strand_out(float3 pos, float3 norm, float4 col, float2 uv, float2 ws)
 {
 	StrandOut o;
-	float3 P = v.pos.xyz;
-	float3 T = normalize(v.norm.xyz);
+	float3 P = pos;
+	float3 T = normalize(norm);
 	float3 E = eye_pos - P;
 	float d = max(length(E), 0.0001);
 	float3 S = cross(T, E / d);
@@ -421,18 +438,23 @@ StrandOut VSStrand(StrandIn v)
 	S = sl > 0.00001 ? S / sl : normalize(cross(T, float3(0.0, 1.0, 0.001)));
 	// As wide as it is, but never thinner than strand.y pixels: then it
 	// covers only its share of them (cs.x).
-	float w = max(v.ws.x, 0.0);
+	float w = max(ws.x, 0.0);
 	float wd = max(w, d * strand.x * strand.y);
-	float side = v.uv.x * 2.0 - 1.0;
+	float side = uv.x * 2.0 - 1.0;
 	P = P + S * (side * wd * 0.5);
 	o.pos = mul(float4(P, 1.0), ViewProj);
 	o.clip = o.pos;
-	o.col = v.col;
-	o.uv = v.uv;
+	o.col = col;
+	o.uv = uv;
 	o.vpos = mul(float4(P, 1.0), cam).xyz;
 	o.vtan = mul(float4(T, 0.0), cam).xyz;
-	o.cs = float2(wd > 0.0 ? w / wd : 0.0, v.ws.y);
+	o.cs = float2(wd > 0.0 ? w / wd : 0.0, ws.y);
 	return o;
+}
+
+StrandOut VSStrand(StrandIn v)
+{
+	return strand_out(v.pos.xyz, v.norm.xyz, v.col, v.uv, v.ws);
 }
 
 float4 PSStrand(StrandOut v) : TARGET

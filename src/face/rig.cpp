@@ -1384,10 +1384,23 @@ Bounds Rig::rest_bounds()
 	Drive d; // in model space, nothing moving it
 	d.look = false;
 	d.expressions = false;
+	// Posed on the graphics card: worked out here (every point), the
+	// parts as posed for the card kept as they were.
+	std::vector<Part> posed;
+	if (gpu_skin_)
+		posed = parts_;
+	measuring_ = true;
 	pose(d);
+	measuring_ = false;
+	std::vector<Part> measured;
+	if (gpu_skin_ && posed.size() == parts_.size()) {
+		measured.swap(parts_);
+		parts_.swap(posed);
+	}
+	const std::vector<Part> &each = measured.empty() ? parts_ : measured;
 	Bounds b;
 	V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
-	for (const Part &p : parts_)
+	for (const Part &p : each)
 		for (const V3 &v : p.pos)
 			if (std::isfinite(v.x + v.y + v.z)) {
 				lo = {std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
@@ -2511,6 +2524,14 @@ void Rig::skin()
 			for (size_t j = 0; j < skin->joints.size(); j++)
 				joint[j] = world_[skin->joints[j]] * skin->inverse_bind[j];
 		}
+		const bool gpu = gpu_skin_ && !measuring_ && (!skin || skin->joints.size() <= GPU_MOST_BONES);
+		if (gpu) {
+			bone_sets_.resize(m.nodes.size());
+			if (skin)
+				bone_sets_[ni] = joint;
+			else
+				bone_sets_[ni].assign(1, world_[ni]);
+		}
 		const std::vector<float> &w = weights_[node.mesh];
 		for (size_t pi = 0; pi < mesh.parts.size(); pi++) {
 			const Primitive &p = mesh.parts[pi];
@@ -2560,16 +2581,57 @@ void Rig::skin()
 				src_p = mp.data();
 				src_n = mn.data();
 			}
+			auto handed = [](const M4 &a) {
+				const V3 x{a.m[0], a.m[1], a.m[2]}, y{a.m[4], a.m[5], a.m[6]}, z{a.m[8], a.m[9], a.m[10]};
+				return dot(x, cross(y, z)) < 0 ? -1.0f : 1.0f;
+			};
+			out.gpu = gpu;
+			if (gpu) {
+				// Only its middle worked out here (and which way its
+				// bones turn it); the card does every point.
+				out.pos.clear();
+				out.normal.clear();
+				out.tangent.clear();
+				out.bones = (int)ni;
+				out.morphed = morphed;
+				if (morphed) {
+					out.rest_pos.assign(mp.begin(), mp.end());
+					out.rest_normal.assign(mn.begin(), mn.end());
+				} else {
+					std::vector<V3>().swap(out.rest_pos);
+					std::vector<V3>().swap(out.rest_normal);
+				}
+				const bool skinned = skin && !p.joints.empty();
+				out.handed = skinned ? (p.joints[0] < joint.size() ? handed(joint[p.joints[0]]) : 1.0f)
+						     : handed(world_[ni]);
+				V3 sum;
+				size_t count = 0;
+				for (size_t i = 0; i < n; i += 17, count++) {
+					V3 v;
+					if (skinned) {
+						for (int k = 0; k < 4; k++) {
+							const float wk = p.weights[i * 4 + k];
+							const uint16_t j = p.joints[i * 4 + k];
+							if (wk > 0 && j < joint.size())
+								v = v + point(joint[j], src_p[i]) * wk;
+						}
+					} else {
+						v = point(world_[ni], src_p[i]);
+					}
+					sum = sum + v;
+				}
+				out.middle = count ? sum * (1.0f / count) : V3{};
+				out.collapsed = hide_face_ && own_face_[ni] && n;
+				continue;
+			}
+			out.gpu = false;
+			out.collapsed = false;
 			out.pos.resize(n);
 			out.normal.resize(n);
 			// Its tangents turned as its facings are (the drawing squares
 			// them up with the facing).
 			const bool tangents = p.tangent.size() == n * 4;
 			out.tangent.resize(tangents ? n : 0);
-			auto handed = [](const M4 &a) {
-				const V3 x{a.m[0], a.m[1], a.m[2]}, y{a.m[4], a.m[5], a.m[6]}, z{a.m[8], a.m[9], a.m[10]};
-				return dot(x, cross(y, z)) < 0 ? -1.0f : 1.0f;
-			};
 			out.handed = skin && !p.joints.empty() ? (p.joints[0] < joint.size() ? handed(joint[p.joints[0]]) : 1.0f)
 							       : handed(world_[ni]);
 			auto tangent_of = [&p](size_t i) {

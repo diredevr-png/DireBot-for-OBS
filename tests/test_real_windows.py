@@ -318,6 +318,55 @@ def test_moves_from_a_tracker_app(obs):
         c.disconnect()
 
 
+
+def test_posed_on_the_graphics_card(obs):
+    """Hair and fur work: on Windows (Direct3D) a 3D character is posed on
+    the graphics card (the -skin effect), and looks the same as posed by
+    the CPU (the card_posing setting off) - its arms brought down from its
+    T, its parts where they were."""
+    figure = os.path.join(obs.home, "posed.vrm")
+    arms_character(figure)
+    c = obs.client()
+
+    def st():
+        return vendor(c, "FaceGetState", {"source": "Posed"})["model"]
+    try:
+        c.send("CreateScene", {"sceneName": "Posed scene"}, raw=True)
+        c.send("CreateInput", {"sceneName": "Posed scene", "inputName": "Posed",
+                               "inputKind": "direbot_face_avatar",
+                               "inputSettings": {"model": figure, "width": 200, "height": 200,
+                                                 "size": 100, "framing": "whole", "style": "drawn",
+                                                 "mirror": False, "smoothing": 0, "breathing": 0,
+                                                 "sway": 0, "eye_moves": False}}, raw=True)
+        c.send("SetCurrentProgramScene", {"sceneName": "Posed scene"}, raw=True)
+        assert wait_for(lambda: st()["shown"], 60, 0.2), obs.log()
+        assert wait_for(lambda: st()["on_card"], 10, 0.1), (st(), obs.log())
+        log = obs.log()
+        assert "3D effect" not in log and "Windows won't draw" not in log, log
+        time.sleep(0.8)
+        card = shot(c, "Posed")
+        c.send("SetInputSettings", {"inputName": "Posed", "inputSettings": {"card_posing": False}}, raw=True)
+        assert wait_for(lambda: not st()["on_card"], 10, 0.1), st()
+        time.sleep(0.8)
+        cpu = shot(c, "Posed")
+        assert len(card) == len(cpu) and len(card[0]) == len(cpu[0])
+        drawn = sum(1 for row in cpu for px in row if max(px) > 40)
+        assert drawn > 200, drawn
+        off = sum(1 for a_row, b_row in zip(card, cpu) for a, b in zip(a_row, b_row)
+                  if max(abs(int(x) - int(y)) for x, y in zip(a, b)) > 24)
+        print("\nPosed on the card vs by the CPU: %d of %d pixels differ" % (off, len(cpu) * len(cpu[0])))
+        assert off <= max(20, drawn // 100), off
+        # Back on the card.
+        c.send("SetInputSettings", {"inputName": "Posed", "inputSettings": {"card_posing": True}}, raw=True)
+        assert wait_for(lambda: st()["on_card"], 10, 0.1), st()
+    finally:
+        try:
+            c.send("RemoveInput", {"inputName": "Posed"}, raw=True)
+        except Exception:
+            pass
+        c.disconnect()
+
+
 class Typist:
     """Windows' own SendInput, as a person at this PC: presses of keys no
     keyboard most people have (F13 to F16, so nothing in OBS answers

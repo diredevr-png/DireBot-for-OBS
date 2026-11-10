@@ -254,8 +254,32 @@ public:
 		// mount kept hidden in its rider's file until a move brings it
 		// out): not worked out, and not drawn (`pos` empty).
 		bool hidden = false;
+		// Posed on the graphics card (set_gpu_skin): `pos`, `normal` and
+		// `tangent` stay empty; the card moves the part's points by
+		// bones(`bones`) - each its joint's world x inverse bind, or (no
+		// bones) its node's world as joint 0 - from its points as made
+		// (rest_pos / rest_normal: with its expressions on them while any
+		// shows - `morphed` - else the file's own).
+		bool gpu = false;
+		int bones = -1;
+		bool morphed = false;
+		std::vector<V3> rest_pos, rest_normal;
+		// Its middle in the world (every 17th point, posed here), and,
+		// its own face hidden under your real one, not drawn at all.
+		V3 middle;
+		bool collapsed = false;
 	};
 	const std::vector<Part> &parts() const { return parts_; }
+	// The most bones a part posed on the graphics card hangs from (the
+	// effect's list holds 4 numbers a bone); more: posed here.
+	static constexpr size_t GPU_MOST_BONES = 255;
+	// The bones a part posed on the graphics card hangs from (Part::bones).
+	const std::vector<M4> &bones(int set) const { return bone_sets_[set]; }
+	// Each frame's points worked out on the graphics card instead of
+	// here (Avatar3D, when it can). Measuring (rest_bounds) still works
+	// every point out here.
+	void set_gpu_skin(bool on) { gpu_skin_ = on; }
+	bool gpu_skin() const { return gpu_skin_; }
 	const std::vector<M4> &world() const { return world_; }
 	const Model &model() const { return *model_; }
 	// Whether it turns whole (no head bone) and round where (model space).
@@ -430,6 +454,8 @@ private:
 	std::vector<char> held_;     // a node standing upright this frame
 	std::vector<char> own_face_; // a node of its own drawn face
 	bool hide_face_ = false;
+	bool gpu_skin_ = false, measuring_ = false;
+	std::vector<std::vector<M4>> bone_sets_; // by node (Part::bones)
 	bool auto_chain_ = false;
 	bool settled_ = true;
 	float spring_time_ = 0;

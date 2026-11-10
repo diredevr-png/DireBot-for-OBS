@@ -25,7 +25,7 @@ namespace direbot::face {
 
 // The values each technique of the face avatar's effects reads (OBS's
 // own ViewProj aside): data/effects/direbot-face-3d.effect (the 3D
-// characters) and direbot-face.effect (pictures, cutouts, cards). OBS
+// characters; -skin: posing them on the card too) and direbot-face.effect (pictures, cutouts, cards). OBS
 // empties every value an effect holds each time one of its techniques
 // finishes, and on Windows (Direct3D) it won't draw at all if a value a
 // shader reads is empty, where OpenGL quietly reads zeros. So the drawing
@@ -60,6 +60,37 @@ inline const std::vector<EffectNeeds> &face_3d_needs()
 		  "eye_pos", "strand"}},
 		{"Down", {"image", "texel"}},
 	};
+	return needs;
+}
+
+// direbot-face-3d-skin.effect (Windows: posing on the graphics card): all
+// of the above, and the same drawn from the points as made, with bones.
+inline const std::vector<EffectNeeds> &face_3d_skin_needs()
+{
+	static const std::vector<EffectNeeds> needs = [] {
+		std::vector<EffectNeeds> all = face_3d_needs();
+		const std::vector<EffectNeeds> skin = {
+			{"DrawSk",
+			 {"cam", "uv_place", "base_map", "shade_map", "emissive_map", "metal_map", "matcap_map", "base_colour",
+			  "look", "surface", "emissive", "toon", "shade_colour", "rim_colour", "matcap_colour", "occlusion_map",
+			  "detail", "key_dir", "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light",
+			  "key_tint", "room_tint", "gas", "flat_at", "bone_cols"}},
+			{"DrawBumpedSk",
+			 {"cam", "uv_place", "base_map", "shade_map", "emissive_map", "metal_map", "matcap_map", "base_colour",
+			  "look", "surface", "emissive", "toon", "shade_colour", "rim_colour", "matcap_colour", "occlusion_map",
+			  "detail", "key_dir", "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light",
+			  "key_tint", "room_tint", "normal_map", "gas", "flat_at", "bone_cols", "skin_info"}},
+			{"OutlineSk",
+			 {"cam", "uv_place", "outline_width", "base_map", "surface", "base_colour", "outline_colour", "look",
+			  "key_tint", "bone_cols"}},
+			{"StrandSk",
+			 {"cam", "base_map", "emissive_map", "base_colour", "look", "surface", "emissive", "key_dir",
+			  "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light", "key_tint", "room_tint",
+			  "eye_pos", "strand", "bone_cols"}},
+		};
+		all.insert(all.end(), skin.begin(), skin.end());
+		return all;
+	}();
 	return needs;
 }
 

@@ -1078,6 +1078,9 @@ struct FaceAvatar {
 	float bend = 0.85f;      // turning and nodding with you
 	bool turn_pictures = true;
 	std::atomic<bool> easy{false};
+	// Characters posed on the graphics card (Windows; else, or off, by
+	// the CPU) - the "card_posing" setting, on unless turned off.
+	std::atomic<bool> card_posing{true};
 	// Your real eyes and mouth, or its own drawn face, moved by yours.
 	std::atomic<bool> drawn_style{false};
 	// Worn on your head: the source is the camera, with the character on
@@ -1463,6 +1466,8 @@ struct FaceAvatar {
 		// and follows your head.
 		int fingers = 0;
 		bool body = false;
+		// Posed on the graphics card (else by the CPU).
+		bool on_card = false;
 		// Its bones that follow others (VRM's node constraints: twist
 		// bones...), and how many its file has that can't be.
 		int following = 0, following_left_out = 0;
@@ -3125,6 +3130,15 @@ struct FaceAvatar {
 			const V3 toward = normalized(cross(f.right, f.up), {0, 0, 1});
 			d.knock = (right * k.x + f.up * k.y + toward * k.z) * head_world;
 		}
+		// Posed on the graphics card or by the CPU, as set (and as it can).
+		if (avatar3d) {
+			avatar3d->set_gpu_skin(card_posing);
+			rig->set_gpu_skin(avatar3d->gpu_skin());
+		}
+		if (state3d.on_card != rig->gpu_skin()) {
+			std::lock_guard<std::mutex> l(state_lock);
+			state3d.on_card = rig->gpu_skin();
+		}
 		rig->pose(d);
 		// 0.9.0: its companion beside it, on its floor, posed as it comes,
 		// sits, is patted and goes - drawn with it (only in its own spot).
@@ -3143,6 +3157,8 @@ struct FaceAvatar {
 			cd.upright = cd.place;
 			cd.has_upright = true;
 			cd.body = companion_now.moves;
+			companion3d->set_gpu_skin(card_posing);
+			companion_rig->set_gpu_skin(companion3d->gpu_skin());
 			companion_rig->pose(cd);
 			others.push_back({companion3d.get(), companion_rig.get()});
 			companion_drawn = true;
@@ -5324,6 +5340,7 @@ struct FaceAvatar {
 		loader.want(model_file ? model_file : "");
 		mirror = obs_data_get_bool(settings, "mirror");
 		easy = obs_data_get_bool(settings, "easy");
+		card_posing = obs_data_get_bool(settings, "card_posing");
 		const char *style = obs_data_get_string(settings, "style");
 		drawn_style = style && std::strcmp(style, "drawn") == 0;
 		// Your face from a phone app (VTube Studio's, MeowFace, or
@@ -6567,6 +6584,7 @@ struct FaceAvatar {
 				      {"points", st.points},
 				      {"triangles", st.triangles},
 				      {"springs", st.springs},
+				      {"on_card", st.on_card},
 				      {"animations", animations},
 				      {"animation", st.animation},
 				      {"swinging_chain", st.chain},
@@ -7019,6 +7037,7 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "breath_time", 5);
 	obs_data_set_default_int(settings, "sway", 50);
 	obs_data_set_default_bool(settings, "eye_moves", true);
+	obs_data_set_default_bool(settings, "card_posing", true);
 	obs_data_set_default_bool(settings, "auto_blink", false);
 	obs_data_set_default_string(settings, "model_place", "");
 	obs_data_set_default_string(settings, "model_setup", "");
@@ -7170,6 +7189,7 @@ obs_properties_t *get_properties(void *data)
 	p = obs_properties_add_int_slider(props, "smoothing", text("FaceAvatar.Smoothing"), 0, 100, 1);
 	obs_property_int_set_suffix(p, "%");
 	obs_properties_add_bool(props, "easy", text("FaceAvatar.Easy"));
+	obs_properties_add_bool(props, "card_posing", text("FaceAvatar.CardPosing"));
 	obs_properties_add_bool(props, "worn", text("FaceAvatar.Worn"));
 	obs_properties_add_bool(props, "show_camera", text("FaceAvatar.ShowCamera"));
 	p = obs_properties_add_int_slider(props, "worn_size", text("FaceAvatar.WornSize"), 50, 300, 5);

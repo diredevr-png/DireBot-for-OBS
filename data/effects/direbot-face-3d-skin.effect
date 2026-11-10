@@ -1,0 +1,163 @@
+// DireBot Face Avatar, 3D characters posed on the graphics card
+// (src/face/avatar3d.cpp; Windows - Direct3D 11 - only: OBS's OpenGL sends
+// only the first of a list of numbers, so there the CPU poses them):
+// everything in direbot-face-3d.effect, and
+//   DrawSk, DrawBumpedSk, OutlineSk, StrandSk  Draw, DrawBumped, Outline,
+//            Strand with the points as made, moved here by up to 4 bones
+//            each
+// A file of its own so OpenGL never builds the long list below.
+
+#include "direbot-face-3d.effect"
+
+// Each bone's matrix (world x its inverse bind; a part with no bones: its
+// node's world as bone 0) as its 4 columns, up to 255 bones (rig.hpp's
+// GPU_MOST_BONES); x of skin_info: -1 for a part its bones turn inside
+// out (its tangents' w).
+uniform float4 bone_cols[1020];
+uniform float4 skin_info;
+
+// ---- Posed on the graphics card (the Sk techniques) ----
+// The same sums as the CPU's (rig.cpp's skin): each bone's share of the
+// point moved by it, facings and tangents turned by it, then made length 1.
+struct Skinned {
+	float3 pos;
+	float3 norm;
+	float3 tang;
+};
+
+float3 bone_point(int at, float3 p)
+{
+	return bone_cols[at].xyz * p.x + bone_cols[at + 1].xyz * p.y + bone_cols[at + 2].xyz * p.z +
+	       bone_cols[at + 3].xyz;
+}
+
+float3 bone_turn(int at, float3 d)
+{
+	return bone_cols[at].xyz * d.x + bone_cols[at + 1].xyz * d.y + bone_cols[at + 2].xyz * d.z;
+}
+
+Skinned skinned(float3 p, float3 n, float3 t, float4 j, float4 w)
+{
+	Skinned o;
+	o.pos = float3(0.0, 0.0, 0.0);
+	o.norm = float3(0.0, 0.0, 0.0);
+	o.tang = float3(0.0, 0.0, 0.0);
+	int b0 = int(min(floor(j.x + 0.5), 254.0) * 4.0);
+	int b1 = int(min(floor(j.y + 0.5), 254.0) * 4.0);
+	int b2 = int(min(floor(j.z + 0.5), 254.0) * 4.0);
+	int b3 = int(min(floor(j.w + 0.5), 254.0) * 4.0);
+	if (w.x > 0.0) {
+		o.pos = o.pos + bone_point(b0, p) * w.x;
+		o.norm = o.norm + bone_turn(b0, n) * w.x;
+		o.tang = o.tang + bone_turn(b0, t) * w.x;
+	}
+	if (w.y > 0.0) {
+		o.pos = o.pos + bone_point(b1, p) * w.y;
+		o.norm = o.norm + bone_turn(b1, n) * w.y;
+		o.tang = o.tang + bone_turn(b1, t) * w.y;
+	}
+	if (w.z > 0.0) {
+		o.pos = o.pos + bone_point(b2, p) * w.z;
+		o.norm = o.norm + bone_turn(b2, n) * w.z;
+		o.tang = o.tang + bone_turn(b2, t) * w.z;
+	}
+	if (w.w > 0.0) {
+		o.pos = o.pos + bone_point(b3, p) * w.w;
+		o.norm = o.norm + bone_turn(b3, n) * w.w;
+		o.tang = o.tang + bone_turn(b3, t) * w.w;
+	}
+	float nl = length(o.norm);
+	o.norm = nl > 0.0 ? o.norm / nl : float3(0.0, 0.0, 1.0);
+	float tl = length(o.tang);
+	o.tang = tl > 0.0 ? o.tang / tl : float3(1.0, 0.0, 0.0);
+	return o;
+}
+
+struct SkinIn {
+	float4 pos  : POSITION;
+	float4 norm : NORMAL;
+	float4 col  : COLOR;
+	float2 uv   : TEXCOORD0;
+	float4 jnt  : TEXCOORD1;
+	float4 wgt  : TEXCOORD2;
+};
+
+struct SkinBumpIn {
+	float4 pos  : POSITION;
+	float4 norm : NORMAL;
+	float4 col  : COLOR;
+	float4 tang : TANGENT;
+	float2 uv   : TEXCOORD0;
+	float4 jnt  : TEXCOORD1;
+	float4 wgt  : TEXCOORD2;
+};
+
+struct SkinStrandIn {
+	float4 pos  : POSITION;
+	float4 norm : NORMAL;
+	float4 col  : COLOR;
+	float2 uv   : TEXCOORD0;
+	float2 ws   : TEXCOORD1;
+	float4 jnt  : TEXCOORD2;
+	float4 wgt  : TEXCOORD3;
+};
+
+VertOut VSDrawSk(SkinIn v)
+{
+	Skinned s = skinned(v.pos.xyz, v.norm.xyz, float3(1.0, 0.0, 0.0), v.jnt, v.wgt);
+	return draw_out(s.pos, s.norm, v.col, v.uv);
+}
+
+BumpOut VSBumpedSk(SkinBumpIn v)
+{
+	Skinned s = skinned(v.pos.xyz, v.norm.xyz, v.tang.xyz, v.jnt, v.wgt);
+	return bumped_out(s.pos, s.norm, float4(s.tang, v.tang.w * skin_info.x), v.col, v.uv);
+}
+
+VertOut VSOutlineSk(SkinIn v)
+{
+	Skinned s = skinned(v.pos.xyz, v.norm.xyz, float3(1.0, 0.0, 0.0), v.jnt, v.wgt);
+	return outline_out(s.pos, s.norm, v.col, v.uv);
+}
+
+StrandOut VSStrandSk(SkinStrandIn v)
+{
+	Skinned s = skinned(v.pos.xyz, v.norm.xyz, float3(1.0, 0.0, 0.0), v.jnt, v.wgt);
+	return strand_out(s.pos, s.norm, v.col, v.uv, v.ws);
+}
+
+technique DrawSk
+{
+	pass
+	{
+		vertex_shader = VSDrawSk(v);
+		pixel_shader  = PSDraw(v);
+	}
+}
+
+technique DrawBumpedSk
+{
+	pass
+	{
+		vertex_shader = VSBumpedSk(v);
+		pixel_shader  = PSDrawBumped(v);
+	}
+}
+
+technique OutlineSk
+{
+	pass
+	{
+		vertex_shader = VSOutlineSk(v);
+		pixel_shader  = PSOutline(v);
+	}
+}
+
+technique StrandSk
+{
+	pass
+	{
+		vertex_shader = VSStrandSk(v);
+		pixel_shader  = PSStrand(v);
+	}
+}

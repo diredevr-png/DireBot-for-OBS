@@ -210,6 +210,15 @@ public:
 	Avatar3D &operator=(const Avatar3D &) = delete;
 
 	bool ready() const { return effect_ != nullptr; }
+	// Whether it poses characters on the graphics card: a Rig drawn by it
+	// should then be told so (Rig::set_gpu_skin) - before set(), as the
+	// parts are made for it.
+	bool gpu_skin() const { return gpu_skin_; }
+	bool can_gpu_skin() const { return can_gpu_skin_; }
+	// Posing on the card on or off (where it can): its parts made again
+	// for it; its Rig should be told (Rig::set_gpu_skin) before it's
+	// drawn again.
+	void set_gpu_skin(bool on);
 	// A new character (or none) onto the graphics card.
 	void set(std::shared_ptr<const Model> model, std::vector<ModelPicture> pictures);
 	const Model *model() const { return model_.get(); }
@@ -236,8 +245,21 @@ private:
 		size_t points = 0;
 		bool bumped = false; // its points carry tangents (its normal map's)
 		bool strands = false; // hair strands (model.hpp's Primitive::strands)
+		bool skin = false;    // its points as made, with their bones (posed on the card)
+		bool was_morphed = false;
+		bool posed_here = false; // a card part's points last sent posed here
 	};
+	// Each bone set's matrices (their columns, 16 numbers a bone), for
+	// the card to pose with; worked out once a frame.
+	struct BoneCols {
+		uint64_t stamp = 0;
+		std::vector<float> cols;
+	};
+	std::map<int, BoneCols> bone_cols_;
+	uint64_t bone_stamp_ = 0;
+	bool gpu_skin_ = false, can_gpu_skin_ = false;
 	void clear();
+	void make_parts();
 	// The posed points onto the graphics card (0.9.0: parts it hides left
 	// as they were); whether `rig` is this one's character.
 	bool upload(const Rig *rig);
@@ -268,7 +290,7 @@ private:
 		    *p_normal_map = nullptr, *p_occlusion_map = nullptr, *p_detail = nullptr, *p_key_dir = nullptr,
 		    *p_key_colour = nullptr, *p_fill_dir = nullptr, *p_fill_colour = nullptr, *p_room_up = nullptr,
 		    *p_room_down = nullptr, *p_rim_light = nullptr, *p_key_tint = nullptr, *p_room_tint = nullptr,
-		    *p_glow = nullptr, *p_flat_at = nullptr, *p_eye = nullptr, *p_strand = nullptr;
+		    *p_glow = nullptr, *p_flat_at = nullptr, *p_eye = nullptr, *p_strand = nullptr, *p_bones = nullptr, *p_skin = nullptr;
 	EffectCheck check_;
 	M4 cam_;
 	gs_texture_t *white_ = nullptr, *black_ = nullptr, *flat_ = nullptr;

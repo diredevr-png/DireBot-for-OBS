@@ -1921,14 +1921,24 @@ static void test_set_up()
 // like a value, which OBS would take as reading the value.
 static void check_effect_needs(const std::string &file, const std::vector<direbot::face::EffectNeeds> &needs)
 {
-	std::ifstream in(std::string(DIREBOT_SOURCE_DIR) + "/data/effects/" + file);
-	CHECK(in.good());
-	std::stringstream ss;
-	ss << in.rdbuf();
-	const std::string text = std::regex_replace(ss.str(), std::regex("//[^\n]*"), "");
+	// The file with what it #includes put in, as OBS reads it.
+	std::function<std::string(const std::string &)> read = [&](const std::string &name) {
+		std::ifstream in(std::string(DIREBOT_SOURCE_DIR) + "/data/effects/" + name);
+		CHECK(in.good());
+		std::stringstream ss;
+		ss << in.rdbuf();
+		std::string t = std::regex_replace(ss.str(), std::regex("//[^\n]*"), "");
+		std::smatch inc;
+		while (std::regex_search(t, inc, std::regex("#include\\s+\"([^\"]+)\""))) {
+			const std::string inner = read(inc[1]);
+			t = inc.prefix().str() + inner + inc.suffix().str();
+		}
+		return t;
+	};
+	const std::string text = read(file);
 
 	std::set<std::string> uniforms;
-	const std::regex uniform_re("uniform\\s+\\w+\\s+(\\w+)\\s*[;=]");
+	const std::regex uniform_re("uniform\\s+\\w+\\s+(\\w+)\\s*(\\[\\s*\\d+\\s*\\])?\\s*[;=]");
 	for (std::sregex_iterator it(text.begin(), text.end(), uniform_re), end; it != end; ++it)
 		uniforms.insert((*it)[1]);
 	CHECK(uniforms.count("image"));
@@ -2001,6 +2011,7 @@ static void check_effect_needs(const std::string &file, const std::vector<direbo
 static void test_effect_needs()
 {
 	check_effect_needs("direbot-face-3d.effect", direbot::face::face_3d_needs());
+	check_effect_needs("direbot-face-3d-skin.effect", direbot::face::face_3d_skin_needs());
 	check_effect_needs("direbot-face.effect", direbot::face::face_2d_needs());
 }
 
@@ -4455,6 +4466,131 @@ static void test_bones_that_follow()
 	CHECK(dot(x_in(srig, tip), aim_now) < 0.996f); // its tip more than 5 degrees behind
 }
 
+// Posed on the graphics card (Windows): the rig hands over each part's
+// bones and its points as made; the card's sums (the -skin effect's
+// skinned(), done here the same way) land every point where the CPU puts
+// it - a chain swinging, a hair strand (a file's line, made 2 points a
+// point) on it, a part with no bones. Measuring still works every point
+// out, and leaves the parts as posed for the card.
+static void test_posed_on_the_card()
+{
+	Builder b;
+	const int armature = b.node({{"name", "Armature"}});
+	const int b0 = b.node({{"name", "Bone"}, {"translation", {0, 1, 0}}, {"rotation", {1, 0, 0, 0}}});
+	const int b1 = b.node({{"name", "Bone.001"}, {"translation", {0, 0.3f, 0}}});
+	const int b2 = b.node({{"name", "Bone.002"}, {"translation", {0, 0.3f, 0}}});
+	b.doc["nodes"][armature]["children"] = {b0};
+	b.doc["nodes"][b0]["children"] = {b1};
+	b.doc["nodes"][b1]["children"] = {b2};
+	std::vector<V3> pos, hair;
+	std::vector<uint8_t> joints, hair_joints;
+	std::vector<float> weights, hair_weights, width;
+	std::vector<uint16_t> ix;
+	for (int i = 0; i <= 9; i++) {
+		const float y = 1 - i / 10.0f;
+		const float along = (1 - y) / 0.3f;
+		const int bone = std::min(1, (int)along);
+		const float share = std::min(1.0f, along - bone);
+		for (float x : {-0.05f, 0.05f}) {
+			pos.push_back({x, y, 0.01f * i});
+			joints.insert(joints.end(), {(uint8_t)bone, (uint8_t)(bone + 1), 0, 0});
+			weights.insert(weights.end(), {1 - share, share, 0, 0});
+		}
+		if (i)
+			ix.insert(ix.end(), {(uint16_t)(2 * i - 2), (uint16_t)(2 * i - 1), (uint16_t)(2 * i),
+					     (uint16_t)(2 * i - 1), (uint16_t)(2 * i + 1), (uint16_t)(2 * i)});
+		hair.push_back({0.08f, y, 0.02f});
+		hair_joints.insert(hair_joints.end(), {(uint8_t)bone, (uint8_t)(bone + 1), 0, 0});
+		hair_weights.insert(hair_weights.end(), {1 - share, share, 0, 0});
+		width.push_back(0.002f);
+	}
+	const json skinned_tri = {
+		{"attributes",
+		 {{"POSITION", b.vec3s(pos)},
+		  {"JOINTS_0", b.accessor(b.view(joints.data(), joints.size()), 5121, pos.size(), "VEC4")},
+		  {"WEIGHTS_0", b.floats(weights, 4, "VEC4")}}},
+		{"indices", b.indices(ix)}};
+	const json strand = {
+		{"attributes",
+		 {{"POSITION", b.vec3s(hair)},
+		  {"JOINTS_0", b.accessor(b.view(hair_joints.data(), hair_joints.size()), 5121, hair.size(), "VEC4")},
+		  {"WEIGHTS_0", b.floats(hair_weights, 4, "VEC4")},
+		  {"_WIDTH", b.floats(width, 1, "SCALAR")}}},
+		{"mode", 3}};
+	b.doc["meshes"].push_back({{"primitives", json::array({skinned_tri, strand})}});
+	// A part with no bones, on a node of its own.
+	const std::vector<V3> square = {{0, 0, 0}, {0.1f, 0, 0}, {0, 0.1f, 0}};
+	const json plain = {{"attributes", {{"POSITION", b.vec3s(square)}}}, {"indices", b.indices({0, 1, 2})}};
+	b.doc["meshes"].push_back({{"primitives", json::array({plain})}});
+	std::vector<float> ibm;
+	for (int i = 0; i < 3; i++) {
+		const M4 inv = inverse(moved({0, 1 - 0.3f * i, 0}) * matrix_of(Quat{1, 0, 0, 0}));
+		ibm.insert(ibm.end(), inv.m, inv.m + 16);
+	}
+	b.doc["skins"].push_back({{"joints", {b0, b1, b2}}, {"inverseBindMatrices", b.floats(ibm, 16, "MAT4")}});
+	const int body = b.node({{"name", "Links"}, {"mesh", 0}, {"skin", 0}});
+	const int badge = b.node({{"name", "Badge"}, {"mesh", 1}, {"translation", {0.2f, 0.5f, 0}}});
+	b.doc["nodes"][b1]["children"] = {b2, badge};
+	b.doc["scenes"] = json::array({{{"nodes", {armature, body}}}});
+	auto m = std::make_shared<Model>();
+	std::string why;
+	CHECK(load(b.glb(), *m, &why));
+	CHECK(m->meshes.size() == 2 && m->meshes[0].parts.size() == 2);
+	if (m->meshes.size() != 2 || m->meshes[0].parts.size() != 2)
+		return;
+	const Primitive &h = m->meshes[0].parts[1];
+	CHECK(h.strands && h.pos.size() == 20 && h.strand.size() == 40 && h.index.size() == 9 * 6);
+	CHECK(h.joints.size() == 80 && h.weights.size() == 80);
+
+	Rig cpu(m, RigOptions()), card(m, RigOptions());
+	card.set_gpu_skin(true);
+	const Bounds a = cpu.rest_bounds(), c = card.rest_bounds();
+	CHECK(a.found && c.found && near3(a.low, c.low, 1e-6f) && near3(a.high, c.high, 1e-6f));
+	auto card_point = [&](const Rig::Part &p, size_t i) {
+		const std::vector<M4> &set = card.bones(p.bones);
+		const Primitive &prim = *p.prim;
+		const V3 at = p.morphed ? p.rest_pos[i] : prim.pos[i];
+		V3 sum{};
+		for (int k = 0; k < 4; k++) {
+			const bool boned = !prim.joints.empty();
+			const float w = boned ? prim.weights[i * 4 + k] : (k == 0 ? 1.0f : 0.0f);
+			const int j = boned ? prim.joints[i * 4 + k] : 0;
+			if (w > 0 && j < (int)set.size())
+				sum = sum + point(set[j], at) * w;
+		}
+		return sum;
+	};
+	Drive t = still();
+	t.place = matrix_of(axis_angle({0, 0, 1}, 0.5f));
+	for (int f = 0; f < 90; f++) {
+		cpu.pose(t);
+		card.pose(t);
+		if (f == 30) {
+			// Measuring between frames (it settles the springs: both).
+			cpu.rest_bounds();
+			card.rest_bounds();
+			CHECK(card.parts()[0].gpu && card.parts()[0].pos.empty());
+		}
+	}
+	CHECK(cpu.parts().size() == 3 && card.parts().size() == 3);
+	float worst = 0;
+	size_t checked = 0;
+	for (size_t pi = 0; pi < card.parts().size(); pi++) {
+		const Rig::Part &g = card.parts()[pi], &r = cpu.parts()[pi];
+		CHECK(g.gpu && !r.gpu && g.pos.empty() && g.bones >= 0);
+		for (size_t i = 0; i < r.pos.size(); i++, checked++) {
+			const float d = length(card_point(g, i) - r.pos[i]);
+			if (d > 1e-4f)
+				std::printf("  part %zu point %zu off %.5f\n", pi, i, d);
+			worst = std::max(worst, d);
+		}
+	}
+	CHECK(checked == 20 + 20 + 3);
+	CHECK(worst < 1e-4f);
+	// More bones than the card's list holds: posed here.
+	CHECK(Rig::GPU_MOST_BONES * 4 == 1020);
+}
+
 int main()
 {
 	test_write_and_read();
@@ -4499,6 +4635,7 @@ int main()
 	test_faces_on_cue();
 	test_knocked_and_head();
 	test_bones_that_follow();
+	test_posed_on_the_card();
 	std::printf("unit_model: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;
 }

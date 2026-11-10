@@ -22,6 +22,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -316,12 +317,21 @@ void PropLoader::run()
 
 Avatar3D::Avatar3D()
 {
-	char *path = obs_module_file("effects/direbot-face-3d.effect");
-	if (path) {
+	// On Windows (Direct3D 11) the effect that also poses characters on
+	// the graphics card; OpenGL can't be sent its bones (only the first of
+	// a list of numbers goes), so there - or if it won't load - the plain
+	// one, the CPU posing them.
+	const bool d3d = gs_get_device_type() == GS_DEVICE_DIRECT3D_11;
+	for (const char *file : {"effects/direbot-face-3d-skin.effect", "effects/direbot-face-3d.effect"}) {
+		if (effect_ || (!d3d && std::strstr(file, "-skin")))
+			continue;
+		char *path = obs_module_file(file);
+		if (!path)
+			continue;
 		char *errors = nullptr;
 		effect_ = gs_effect_create_from_file(path, &errors);
 		if (!effect_)
-			obs_log(LOG_WARNING, "DireBot Face Avatar: the 3D effect didn't load: %s",
+			obs_log(LOG_WARNING, "DireBot Face Avatar: the 3D effect (%s) didn't load: %s", file,
 				errors ? errors : "(no reason given)");
 		bfree(errors);
 		bfree(path);
@@ -365,7 +375,17 @@ Avatar3D::Avatar3D()
 		p_flat_at = param("flat_at");
 		p_eye = param("eye_pos");
 		p_strand = param("strand");
-		check_.load(effect_, "3D", face_3d_needs());
+		p_bones = param("bone_cols");
+		p_skin = param("skin_info");
+		// Posing on the graphics card, where the effect has it (an older
+		// effect file beside a newer add-on: as before).
+		// (DIREBOT_FACE_CPU_POSE=1: posed by the CPU anyway - the tests
+		// compare the two.)
+		const char *cpu = std::getenv("DIREBOT_FACE_CPU_POSE");
+		can_gpu_skin_ = gs_effect_get_technique(effect_, "DrawSk") != nullptr && p_bones && p_skin &&
+				!(cpu && *cpu && *cpu != '0');
+		gpu_skin_ = can_gpu_skin_;
+		check_.load(effect_, "3D", can_gpu_skin_ ? face_3d_skin_needs() : face_3d_needs());
 	}
 	// Plain pictures for a part without its own: white, black, and a
 	// normal map with no bumps (straight out: 128, 128, 255).
@@ -400,6 +420,7 @@ void Avatar3D::clear()
 		gs_indexbuffer_destroy(p.ib);
 	}
 	parts_.clear();
+	bone_cols_.clear();
 	model_.reset();
 }
 
@@ -409,7 +430,7 @@ namespace {
 // `dynamic`) is filled from `points` now, as OBS keeps no copy of it to
 // change later.
 gs_vertbuffer_t *make_vb(size_t n, bool dynamic, const V3 *points = nullptr, bool tangents = false,
-			 bool strands = false)
+			 bool strands = false, bool skin = false)
 {
 	gs_vb_data *vb = gs_vbdata_create();
 	vb->num = n;
@@ -423,11 +444,13 @@ gs_vertbuffer_t *make_vb(size_t n, bool dynamic, const V3 *points = nullptr, boo
 	}
 	vb->colors = static_cast<uint32_t *>(bzalloc(sizeof(uint32_t) * n));
 	// Hair strands: their widths and own numbers too (a second set).
-	vb->num_tex = strands ? 2 : 1;
+	// Posed on the graphics card: each point's 4 bones and how much each
+	// moves it (after those).
+	vb->num_tex = (strands ? 2 : 1) + (skin ? 2 : 0);
 	vb->tvarray = static_cast<gs_tvertarray *>(bzalloc(sizeof(gs_tvertarray) * vb->num_tex));
 	for (size_t t = 0; t < vb->num_tex; t++) {
-		vb->tvarray[t].width = 2;
-		vb->tvarray[t].array = bzalloc(sizeof(float) * 2 * n);
+		vb->tvarray[t].width = t < (strands ? 2u : 1u) ? 2 : 4;
+		vb->tvarray[t].array = bzalloc(sizeof(float) * vb->tvarray[t].width * n);
 	}
 	return gs_vertexbuffer_create(vb, dynamic ? GS_DYNAMIC : 0);
 }
@@ -485,6 +508,28 @@ void Avatar3D::set(std::shared_ptr<const Model> model, std::vector<ModelPicture>
 		}
 		textures_.push_back(tex);
 	}
+	make_parts();
+}
+
+void Avatar3D::set_gpu_skin(bool on)
+{
+	const bool now = can_gpu_skin_ && on;
+	if (now == gpu_skin_)
+		return;
+	gpu_skin_ = now;
+	// Its parts made again for the new way (its pictures kept).
+	for (Part &p : parts_) {
+		gs_vertexbuffer_destroy(p.vb);
+		gs_indexbuffer_destroy(p.ib);
+	}
+	parts_.clear();
+	bone_cols_.clear();
+	if (model_)
+		make_parts();
+}
+
+void Avatar3D::make_parts()
+{
 	const Model &m = *model_;
 	for (const Node &node : m.nodes) {
 		if (node.mesh < 0)
@@ -495,7 +540,9 @@ void Avatar3D::set(std::shared_ptr<const Model> model, std::vector<ModelPicture>
 			part.bumped = p.tangent.size() == part.points * 4;
 			part.strands = p.strands && p.strand.size() == part.points * 2;
 			if (part.points && !p.index.empty()) {
-				part.vb = make_vb(part.points, true, nullptr, part.bumped, part.strands);
+				part.skin = gpu_skin_ && (node.skin < 0 || m.skins[node.skin].joints.size() <=
+										   Rig::GPU_MOST_BONES);
+				part.vb = make_vb(part.points, true, nullptr, part.bumped, part.strands, part.skin);
 				part.ib = make_ib(p.index);
 			}
 			if (part.vb) {
@@ -513,6 +560,29 @@ void Avatar3D::set(std::shared_ptr<const Model> model, std::vector<ModelPicture>
 				}
 				if (part.strands)
 					std::memcpy(d->tvarray[1].array, p.strand.data(), sizeof(float) * 2 * part.points);
+				if (part.skin) {
+					// Its points as made, and its bones (none: its node's
+					// world as bone 0, all of it).
+					const size_t first = part.strands ? 2 : 1;
+					float *jt = static_cast<float *>(d->tvarray[first].array);
+					float *wt = static_cast<float *>(d->tvarray[first + 1].array);
+					const bool boned = node.skin >= 0 && p.joints.size() == part.points * 4 &&
+							   p.weights.size() == part.points * 4;
+					for (size_t i = 0; i < part.points; i++) {
+						vec3_set(&d->points[i], p.pos[i].x, p.pos[i].y, p.pos[i].z);
+						const V3 n = i < p.normal.size() ? p.normal[i] : V3{0, 0, 1};
+						vec3_set(&d->normals[i], n.x, n.y, n.z);
+						if (part.bumped && d->tangents) {
+							vec3_set(&d->tangents[i], p.tangent[i * 4], p.tangent[i * 4 + 1],
+								 p.tangent[i * 4 + 2]);
+							d->tangents[i].w = p.tangent[i * 4 + 3];
+						}
+						for (int k = 0; k < 4; k++) {
+							jt[i * 4 + k] = boned ? (float)p.joints[i * 4 + k] : 0.0f;
+							wt[i * 4 + k] = boned ? p.weights[i * 4 + k] : (k == 0 ? 1.0f : 0.0f);
+						}
+					}
+				}
 				// Its colours and UVs sent now, once (drawing sends only
 				// what moves).
 				gs_vertexbuffer_flush(part.vb);
@@ -633,12 +703,20 @@ void Avatar3D::draw_part(size_t i, const Rig::Part &p, const char *technique)
 	const Part &part = parts_[i];
 	if (!part.vb || !part.ib)
 		return;
+	if (p.gpu) {
+		if (!part.skin || p.collapsed)
+			return;
+		auto b = bone_cols_.find(p.bones);
+		if (b == bone_cols_.end() || b->second.cols.empty())
+			return;
+		gs_effect_set_val(p_bones, b->second.cols.data(), b->second.cols.size() * sizeof(float));
+		set_vec4(p_skin, p.handed, 0, 0, 0);
+	}
 	gs_load_vertexbuffer(part.vb);
 	gs_load_indexbuffer(part.ib);
 	check_(technique);
 	while (gs_effect_loop(effect_, technique))
 		gs_draw(GS_TRIS, 0, 0);
-	(void)p;
 }
 
 void Avatar3D::set_strand(const View3D &v, uint32_t drawn_w, uint32_t drawn_h)
@@ -899,11 +977,54 @@ bool Avatar3D::upload(const Rig *rig)
 	if (!character)
 		return false;
 	const std::vector<Rig::Part> &posed = rig->parts();
+	bone_stamp_++;
 	for (size_t i = 0; i < posed.size(); i++) {
 		Part &part = parts_[i];
 		const Rig::Part &p = posed[i];
+		if (p.gpu) {
+			if (!part.vb || !part.skin || p.hidden)
+				continue;
+			// Its points as made, with its expressions while any shows
+			// (and once more as made when they stop).
+			if (p.morphed || part.was_morphed || part.posed_here) {
+				const Primitive &prim = *p.prim;
+				const bool now = p.morphed && p.rest_pos.size() == part.points &&
+						 p.rest_normal.size() == part.points;
+				const V3 *rp = now ? p.rest_pos.data() : prim.pos.data();
+				const V3 *rn = now ? p.rest_normal.data() : prim.normal.data();
+				gs_vb_data *d = gs_vertexbuffer_get_data(part.vb);
+				for (size_t k = 0; k < part.points; k++) {
+					vec3_set(&d->points[k], rp[k].x, rp[k].y, rp[k].z);
+					vec3_set(&d->normals[k], rn[k].x, rn[k].y, rn[k].z);
+				}
+				gs_vb_data moved = {};
+				moved.num = d->num;
+				moved.points = d->points;
+				moved.normals = d->normals;
+				gs_vertexbuffer_flush_direct(part.vb, &moved);
+				part.was_morphed = now;
+				part.posed_here = false;
+			}
+			// Its bones, once a frame for each set.
+			if (p.bones >= 0) {
+				const std::vector<M4> &set = rig->bones(p.bones);
+				BoneCols &b = bone_cols_[p.bones];
+				if (b.stamp != bone_stamp_ && !set.empty() && set.size() <= Rig::GPU_MOST_BONES) {
+					// Always the whole list (Direct3D wants every number
+					// of it), the bones not there left as nothing.
+					b.cols.assign(Rig::GPU_MOST_BONES * 16, 0.0f);
+					for (size_t j = 0; j < set.size(); j++)
+						std::memcpy(&b.cols[j * 16], set[j].m, sizeof(float) * 16);
+					b.stamp = bone_stamp_;
+				}
+			}
+			continue;
+		}
 		if (!part.vb || p.hidden || p.pos.size() != part.points)
 			continue;
+		// (A part made for the card, posed here this once - measuring:
+		// its points as made go back before the card poses it again.)
+		part.posed_here = part.skin;
 		gs_vb_data *d = gs_vertexbuffer_get_data(part.vb);
 		for (size_t k = 0; k < part.points; k++) {
 			vec3_set(&d->points[k], p.pos[k].x, p.pos[k].y, p.pos[k].z);
@@ -967,6 +1088,11 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 		dr.distance.assign(posed.size(), 1);
 		dr.middle.assign(posed.size(), V3{});
 		for (size_t i = 0; i < posed.size(); i++) {
+			if (posed[i].gpu) {
+				dr.middle[i] = posed[i].middle;
+				dr.distance[i] = std::max(1e-4f, -point(v.view, dr.middle[i]).z);
+				continue;
+			}
 			const std::vector<V3> &pos = posed[i].pos;
 			V3 sum;
 			size_t n = 0;
@@ -1037,13 +1163,15 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 	auto technique_of = [&](const Drawn &dr, size_t i) {
 		const Material &mat = material_of(dr, i);
 		const bool flat_look = v.look == 3 || (v.look == 0 && mat.shading == Shading::Unlit);
+		const bool sk = (*dr.posed)[i].gpu;
 		if (dr.a->parts_[i].strands)
-			return "Strand";
-		return dr.a->parts_[i].bumped && v.detail && !flat_look && mat.normal_map.used() ? "DrawBumped"
-												 : "Draw";
+			return sk ? "StrandSk" : "Strand";
+		if (dr.a->parts_[i].bumped && v.detail && !flat_look && mat.normal_map.used())
+			return sk ? "DrawBumpedSk" : "DrawBumped";
+		return sk ? "DrawSk" : "Draw";
 	};
 	auto shows = [&](const Drawn &dr, size_t i) {
-		return !(*dr.posed)[i].hidden;
+		return !(*dr.posed)[i].hidden && !(*dr.posed)[i].collapsed;
 	};
 	// Outlines (only their far side, so they show round the edges), then
 	// the solid parts over them, then the see-through ones far to near.
@@ -1061,7 +1189,7 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 				continue;
 			dr.a->part_distance_ = dr.distance[i];
 			dr.a->set_material(mat, v, true, false, false);
-			dr.a->draw_part(i, (*dr.posed)[i], "Outline");
+			dr.a->draw_part(i, (*dr.posed)[i], (*dr.posed)[i].gpu ? "OutlineSk" : "Outline");
 		}
 	for (size_t w = 0; w < all.size(); w++) {
 		Drawn &dr = all[w];
