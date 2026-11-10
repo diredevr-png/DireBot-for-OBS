@@ -17,9 +17,11 @@ settings folder and C:\\ProgramData\\obs-studio\\plugins):
 
 import base64
 import json
+import math
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -319,13 +321,108 @@ def test_moves_from_a_tracker_app(obs):
 
 
 
+def skinned_sleeves(path):
+    """arms_character (a VRM), with a sleeve over each arm that its bones
+    bend (a skin: each point hung on the upper and lower arm, shared round
+    the elbow) - as real characters are made."""
+    arms_character(path)
+    with open(path, "rb") as f:
+        data = f.read()
+    jlen, = struct.unpack_from("<I", data, 12)
+    doc = json.loads(data[20:20 + jlen])
+    blob = bytearray(data[20 + jlen + 8:])
+    nodes = doc["nodes"]
+    parent = {c: i for i, n in enumerate(nodes) for c in n.get("children", [])}
+
+    def world(i):
+        t = [0.0, 0.0, 0.0]
+        while i is not None:
+            for k in range(3):
+                t[k] += nodes[i].get("translation", [0, 0, 0])[k]
+            i = parent.get(i)
+        return t
+
+    def add(raw, target=None):
+        while len(blob) % 4:
+            blob.append(0)
+        view = {"buffer": 0, "byteOffset": len(blob), "byteLength": len(raw)}
+        if target:
+            view["target"] = target
+        doc["bufferViews"].append(view)
+        blob.extend(raw)
+        return len(doc["bufferViews"]) - 1
+
+    def accessor(view, kind, count, ctype, more=None):
+        doc["accessors"].append(dict({"bufferView": view, "componentType": ctype, "count": count,
+                                      "type": kind}, **(more or {})))
+        return len(doc["accessors"]) - 1
+
+    names = {n.get("name"): i for i, n in enumerate(nodes)}
+    joints = [names["leftUpperArm"], names["leftLowerArm"], names["rightUpperArm"], names["rightLowerArm"]]
+    pos, nrm, jnt, wgt, ix = [], [], [], [], []
+    for side, sx in ((0, 1), (1, -1)):
+        start = world(joints[side * 2])
+        rings, around = 25, 12
+        for r in range(rings):
+            d = 0.48 * r / (rings - 1)
+            upper = min(1.0, max(0.0, (0.30 - d) / 0.12))
+            for a in range(around):
+                ang = 2 * math.pi * a / around
+                cy, cz = math.cos(ang), math.sin(ang)
+                pos.append((start[0] + sx * d, start[1] + 0.045 * cy, start[2] + 0.045 * cz))
+                nrm.append((0.0, cy, cz))
+                jnt.append((side * 2, side * 2 + 1, 0, 0))
+                wgt.append((upper, 1.0 - upper, 0.0, 0.0))
+        base = side * rings * around
+        for r in range(rings - 1):
+            for a in range(around):
+                p0 = base + r * around + a
+                p1 = base + r * around + (a + 1) % around
+                q0, q1 = p0 + around, p1 + around
+                ix += [p0, q0, p1, p1, q0, q1] if sx > 0 else [p0, p1, q0, p1, q1, q0]
+    lo = [min(v[k] for v in pos) for k in range(3)]
+    hi = [max(v[k] for v in pos) for k in range(3)]
+    a_pos = accessor(add(struct.pack("<%df" % (len(pos) * 3), *[c for v in pos for c in v]), 34962),
+                     "VEC3", len(pos), 5126, {"min": lo, "max": hi})
+    a_nrm = accessor(add(struct.pack("<%df" % (len(nrm) * 3), *[c for v in nrm for c in v]), 34962),
+                     "VEC3", len(nrm), 5126)
+    a_jnt = accessor(add(struct.pack("<%dH" % (len(jnt) * 4), *[c for v in jnt for c in v]), 34962),
+                     "VEC4", len(jnt), 5123)
+    a_wgt = accessor(add(struct.pack("<%df" % (len(wgt) * 4), *[c for v in wgt for c in v]), 34962),
+                     "VEC4", len(wgt), 5126)
+    a_ix = accessor(add(struct.pack("<%dI" % len(ix), *ix), 34963), "SCALAR", len(ix), 5125)
+    ibm = []
+    for jn in joints:
+        w = world(jn)
+        ibm += [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -w[0], -w[1], -w[2], 1]
+    a_ibm = accessor(add(struct.pack("<%df" % len(ibm), *ibm)), "MAT4", len(joints), 5126)
+    doc["materials"].append({"pbrMetallicRoughness": {"baseColorFactor": [0.55, 0.1, 0.7, 1],
+                                                      "metallicFactor": 0, "roughnessFactor": 0.6}})
+    doc["meshes"].append({"primitives": [{"attributes": {"POSITION": a_pos, "NORMAL": a_nrm, "JOINTS_0": a_jnt,
+                                                         "WEIGHTS_0": a_wgt},
+                                          "indices": a_ix, "material": len(doc["materials"]) - 1}]})
+    doc["skins"] = [{"joints": joints, "inverseBindMatrices": a_ibm}]
+    nodes.append({"name": "sleeves", "mesh": len(doc["meshes"]) - 1, "skin": 0})
+    nodes[0].setdefault("children", []).append(len(nodes) - 1)
+    doc["buffers"][0]["byteLength"] = len(blob)
+    text = json.dumps(doc).encode()
+    text += b" " * (-len(text) % 4)
+    while len(blob) % 4:
+        blob.append(0)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(text) + 8 + len(blob)))
+        f.write(struct.pack("<II", len(text), 0x4E4F534A) + text)
+        f.write(struct.pack("<II", len(blob), 0x004E4942) + bytes(blob))
+
+
 def test_posed_on_the_graphics_card(obs):
     """Hair and fur work: on Windows (Direct3D) a 3D character is posed on
     the graphics card (the -skin effect), and looks the same as posed by
     the CPU (the card_posing setting off) - its arms brought down from its
-    T, its parts where they were."""
+    T, its parts where they were, the sleeves its arm bones bend (a skin)
+    bent the same."""
     figure = os.path.join(obs.home, "posed.vrm")
-    arms_character(figure)
+    skinned_sleeves(figure)
     c = obs.client()
 
     def st():
@@ -351,6 +448,9 @@ def test_posed_on_the_graphics_card(obs):
         cpu = shot(c, "Posed")
         assert len(card) == len(cpu) and len(card[0]) == len(cpu[0])
         drawn = sum(1 for row in cpu for px in row if max(px) > 40)
+        purple = sum(1 for row in cpu for px in row
+                     if px[0] > 110 and px[2] > 130 and px[1] < px[0] - 40 and px[1] < px[2] - 60)
+        assert purple > 30, purple
         assert drawn > 200, drawn
         off = sum(1 for a_row, b_row in zip(card, cpu) for a, b in zip(a_row, b_row)
                   if max(abs(int(x) - int(y)) for x, y in zip(a, b)) > 24)
