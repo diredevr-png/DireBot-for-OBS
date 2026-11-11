@@ -884,7 +884,150 @@ def test_hidden_hair_is_left_out_on_the_card(obs):
         log = obs.log()
         assert "3D effect" not in log and "Windows won't draw" not in log, log
     finally:
-        for name in ("Hidden", "Hidden thin"):
+        for name in ("Hidden", "Hidden thin", "Hidden among"):
+            try:
+                c.send("RemoveInput", {"inputName": name}, raw=True)
+            except Exception:
+                pass
+        c.disconnect()
+
+
+def test_hair_laid_out_as_drawn_on_the_card(obs):
+    """Hair posed on the graphics card can lie in its memory in the order
+    it's drawn in ("hair_layout" 1, a number the settings window doesn't
+    show; FaceGetState's "laid": the pieces drawn from memory laid out that
+    way, and "laid_mb": how much of it there is). It's the same hair: the
+    picture is the same to the pixel as with a point's numbers once, where
+    its strand is ("hair_layout" 0) - as ribbons, as lines, with its thin
+    hairs alone as lines, with only some of its strands drawn (small in the
+    picture), and with the hidden hair left out (and only the left-out hair
+    drawn). Posed by the CPU nothing is laid out."""
+    figure = os.path.join(obs.home, "laid.vrm")
+    strands = hair_character(figure, crown=600, locks=20, tuft=200, behind=200)
+    thin = os.path.join(obs.home, "laid-thin.vrm")
+    assert hair_character(thin, crown=600, locks=20, tuft=200, behind=200, width=0.0006) == strands
+    among = os.path.join(obs.home, "laid-among.vrm")
+    assert hair_character(among, crown=600, locks=20, tuft=200, behind=200, width=0.0006, wide_every=5) == strands
+    names = ("Laid", "Laid thin", "Laid among")
+    c = obs.client()
+
+    def st(name):
+        return vendor(c, "FaceGetState", {"source": name})["model"]
+
+    def hair(name):
+        return st(name)["hair"]
+
+    def change(name, **settings):
+        c.send("SetInputSettings", {"inputName": name, "inputSettings": settings}, raw=True)
+
+    def differ(a, b):
+        assert len(a) == len(b) and len(a[0]) == len(b[0])
+        return sum(1 for a_row, b_row in zip(a, b) for x, y in zip(a_row, b_row) if tuple(x) != tuple(y))
+
+    def drawn_px(rows):
+        return sum(1 for row in rows for px in row if any(px))
+
+    def settled(name, layout):
+        """Its hair drawn from the layout asked for, the same count twice."""
+        def right():
+            h = hair(name)
+            return h["pieces"] > 0 and h["laid"] == (h["pieces"] if layout else 0)
+        assert wait_for(right, 15, 0.1), (name, layout, hair(name), obs.log())
+        time.sleep(0.8)
+        assert right(), (name, layout, hair(name))
+        return hair(name)
+    try:
+        c.send("CreateScene", {"sceneName": "Laid scene"}, raw=True)
+        for name, model, lines in zip(names, (figure, thin, among), (-1, 2, -1)):
+            c.send("CreateInput", {"sceneName": "Laid scene", "inputName": name,
+                                   "inputKind": "direbot_face_avatar",
+                                   "inputSettings": {"model": model, "width": 300, "height": 300,
+                                                     "size": 100, "framing": "whole", "style": "drawn",
+                                                     "mirror": False, "smoothing": 0, "breathing": 0,
+                                                     "sway": 0, "eye_moves": False,
+                                                     "hair_budget_ms": 0, "hair_lines": lines,
+                                                     "hair_layout": 0}}, raw=True)
+        c.send("SetCurrentProgramScene", {"sceneName": "Laid scene"}, raw=True)
+        for name in names:
+            assert wait_for(lambda: st(name)["shown"], 60, 0.2), obs.log()
+            assert wait_for(lambda: st(name)["on_card"], 10, 0.1), (st(name), obs.log())
+            assert wait_for(lambda: hair(name)["drawn"] == strands, 10, 0.1), (hair(name), obs.log())
+
+        def both(name, what, least=2000, **settings):
+            """The picture by point and laid out as drawn, with `settings`:
+            the same to the pixel (at least `least` of them drawn); what was
+            drawn each way."""
+            change(name, hair_layout=0, **settings)
+            before = settled(name, 0)
+            by_point = shot(c, name)
+            change(name, hair_layout=1)
+            after = settled(name, 1)
+            laid = shot(c, name)
+            off = differ(by_point, laid)
+            print("%s, %s: %d of %d drawn pixels differ laid out as drawn; by point %s; laid out %s"
+                  % (name, what, off, drawn_px(by_point), before, after))
+            assert drawn_px(by_point) > least and off == 0, (name, what, off, drawn_px(by_point))
+            for key in ("drawn", "pieces", "lines", "skips_hidden"):
+                assert before[key] == after[key], (name, what, key, before, after)
+            assert before["laid_mb"] >= 0 and after["laid_mb"] > 0, (before, after)
+            return before, after
+
+        print()
+        # Ribbons: every hair, with the hidden ones left out.
+        before, after = both("Laid", "ribbons")
+        assert after["lines"] == 0 and after["drawn"] == strands and after["skips_hidden"], after
+        # (One draw a run, as by point.)
+        assert after["draws"] == before["draws"], (before, after)
+        # Every hair sent, and only the hair that would be left out.
+        both("Laid", "every hair sent", hair_skip_hidden=0)
+        both("Laid", "only what's left out", hair_skip_hidden=2)
+        change("Laid", hair_skip_hidden=-1)
+        # Lines.
+        before, after = both("Laid thin", "lines")
+        assert after["lines"] == after["pieces"], after
+        # Small in the picture (and every hair drawn left solid): only some
+        # of its strands, the first of them.
+        for size in (30, 12, 6):
+            before, after = both("Laid thin", "small (size %d), some of its strands" % size, least=40, size=size,
+                                 hair_lines=-1, hair_solid=1.0)
+            if after["drawn"] < strands:
+                break
+        assert 0 < after["drawn"] < strands, after
+        before, after = both("Laid thin", "small, as ribbons", least=40, hair_lines=0)
+        assert after["lines"] == 0 and 0 < after["drawn"] < strands, after
+        # Thin hairs among wide ones: the thin ones lines, the rest ribbons
+        # - two sorts, each laid out apart.
+        before, after = both("Laid among", "thin hairs as lines among wide ones")
+        assert 0.6 * after["pieces"] < after["lines"] < 0.85 * after["pieces"], after
+        both("Laid among", "all ribbons", hair_lines=0)
+        both("Laid among", "all lines", hair_lines=2)
+        # (By then all four of its layouts are made: more of the card's
+        # memory than one.)
+        assert hair("Laid among")["laid_mb"] > after["laid_mb"], (hair("Laid among"), after)
+
+        # Posed by the CPU: nothing's laid out, and the picture's as it was.
+        change("Laid", hair_layout=1)
+        on_card = shot(c, "Laid")
+        change("Laid", card_posing=False)
+        assert wait_for(lambda: not st("Laid")["on_card"], 10, 0.1), st("Laid")
+        time.sleep(0.5)
+        assert wait_for(lambda: not st("Laid")["loading"] and st("Laid")["shown"], 60, 0.1), (st("Laid"), obs.log())
+        assert wait_for(lambda: hair("Laid")["drawn"] == strands, 10, 0.1), hair("Laid")
+        time.sleep(0.8)
+        h = hair("Laid")
+        assert h["laid"] == 0 and h["laid_mb"] == 0 and h["pieces"] > 0, h
+        cpu = shot(c, "Laid")
+        off = sum(1 for a_row, b_row in zip(cpu, on_card) for x, y in zip(a_row, b_row)
+                  if max(abs(int(p) - int(q)) for p, q in zip(x, y)) > 24)
+        print("Laid out on the card vs posed by the CPU: %d pixels differ" % off)
+        assert off <= 60, off
+        change("Laid", card_posing=True)
+        assert wait_for(lambda: st("Laid")["on_card"], 10, 0.1), st("Laid")
+        settled("Laid", 1)
+        log = obs.log()
+        assert "3D effect" not in log and "Windows won't draw" not in log, log
+    finally:
+        for name in names:
             try:
                 c.send("RemoveInput", {"inputName": name}, raw=True)
             except Exception:

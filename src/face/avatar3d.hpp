@@ -239,6 +239,10 @@ public:
 	// whether hidden hair was left out before the card drew it (HairPlan).
 	struct HairDrawn {
 		size_t in_file = 0, loaded = 0, drawn = 0, pieces = 0, draws = 0, lines = 0;
+		// Of `pieces`: those drawn from memory laid out as drawn
+		// (HairPlan::layout 1), and how much of the card's memory all the
+		// hair laid out that way takes (bytes; what's been made of it).
+		size_t laid = 0, laid_bytes = 0;
 		float share = 1, ms = -1;
 		bool skips = false;
 	};
@@ -276,6 +280,21 @@ private:
 		gs_indexbuffer_t *ib_lines = nullptr;
 		bool as_lines = false, thin_lines = false; // (all of them; its thin ones only)
 		bool skin = false;    // its points as made, with their bones (posed on the card)
+		bool boned = false;   // a strand part: its points have bones of their own
+		// A strand part posed on the card, laid out as it's drawn
+		// (HairPlan::layout 1; lay_strands): its pieces' corners again, in
+		// the order the pieces are drawn in - by sort (0: a run's wide
+		// pieces, or all of them with one sort; 1: its thin ones) and form
+		// (0 ribbons, 1 lines), each made the first time it's drawn so.
+		// `from`: a run's first piece's place among its sort's.
+		struct Laid {
+			gs_vertbuffer_t *vb = nullptr;
+			gs_indexbuffer_t *ib = nullptr;
+			bool tried = false, none = false; // (none: it has no pieces of that sort)
+			size_t bytes = 0;                 // of the card's memory
+		};
+		Laid laid[2][2];
+		std::vector<uint32_t> laid_from[2];
 		bool was_morphed = false;
 		bool posed_here = false; // a card part's points last sent posed here
 	};
@@ -323,7 +342,13 @@ private:
 			  const char *technique, bool lines, int sort, HairDrawn &drawn);
 	// A hair-strand part's bones and spots' moves for the card, its points
 	// and pieces (as ribbons or as lines) loaded: whether it can be drawn.
-	bool load_strands(size_t i, const Rig::Part &p, bool lines = false);
+	// `laid`: laid out as drawn - only its bones and moves (draw_strands
+	// loads each sort's own points and pieces).
+	bool load_strands(size_t i, const Rig::Part &p, bool lines = false, bool laid = false);
+	// A strand part's pieces of one sort laid out as they're drawn, as
+	// ribbons or as lines (Part::laid), made if they aren't yet: whether
+	// they can be drawn that way.
+	bool lay_strands(Part &part, const Primitive &p, int sort, bool lines);
 	// A part's buffers freed.
 	static void free_part(Part &part);
 	// A hair-strand part's hull into the picture of the solid parts'

@@ -469,6 +469,14 @@ void Avatar3D::free_part(Part &part)
 	gs_indexbuffer_destroy(part.ib_lines);
 	part.vb = nullptr;
 	part.ib = part.ib_lines = nullptr;
+	for (auto &sort : part.laid)
+		for (Part::Laid &l : sort) {
+			gs_vertexbuffer_destroy(l.vb);
+			gs_indexbuffer_destroy(l.ib);
+			l = Part::Laid();
+		}
+	for (auto &from : part.laid_from)
+		from.clear();
 }
 
 namespace {
@@ -557,57 +565,140 @@ static float strand_order(const Strands &h, size_t s)
 	return steps + 131072.0f * (float)Strands::rate_step(rate);
 }
 
+namespace {
+
+// A strand part's points as the card is given them (make_strand_part's
+// list): corner `k` of a buffer filled with point `i`'s numbers, its
+// first side or its second.
+struct StrandFill {
+	const Primitive &p;
+	const Strands &h;
+	gs_vb_data *vb;
+	float *jw; // (posed on the card: its bones; else null)
+	bool boned, spots, coloured;
+	std::vector<float> order; // a point: its strand's number (1 + strand_order)
+
+	StrandFill(const Primitive &prim, bool bones)
+		: p(prim), h(prim.hair), vb(nullptr), jw(nullptr),
+		  boned(bones && prim.joints.size() == prim.pos.size() * 4 &&
+			prim.weights.size() == prim.pos.size() * 4),
+		  spots(prim.hair.anchor.size() == prim.pos.size()),
+		  coloured(prim.hair.colour.size() == prim.pos.size() * 4), order(prim.pos.size(), 1.0f)
+	{
+		for (size_t s = 0; s < h.strands(); s++) {
+			const float o = 1.0f + strand_order(h, s);
+			for (uint32_t i = h.first[s]; i < h.first[s + 1] && i < order.size(); i++)
+				order[i] = o;
+		}
+	}
+	// A buffer of `count` corners to fill (with their bones: `skin`).
+	void make(size_t count, bool skin)
+	{
+		vb = gs_vbdata_create();
+		vb->num = count;
+		vb->points = static_cast<vec3 *>(bzalloc(sizeof(vec3) * count));
+		vb->normals = static_cast<vec3 *>(bzalloc(sizeof(vec3) * count));
+		vb->colors = static_cast<uint32_t *>(bzalloc(sizeof(uint32_t) * count));
+		jw = nullptr;
+		if (skin) {
+			vb->num_tex = 1;
+			vb->tvarray = static_cast<gs_tvertarray *>(bzalloc(sizeof(gs_tvertarray)));
+			vb->tvarray[0].width = 4;
+			vb->tvarray[0].array = bzalloc(sizeof(float) * 4 * count);
+			jw = static_cast<float *>(vb->tvarray[0].array);
+		}
+	}
+	void corner(size_t k, uint32_t i, bool second) const
+	{
+		static const uint8_t white[4] = {255, 255, 255, 255};
+		float e[2];
+		folded(p.normal[i], e);
+		const float along =
+			std::min(1.0f, std::max(0.0f, h.along[i])) * 0.9995f + (spots ? (float)h.anchor[i] : 0.0f);
+		vec3_set(&vb->points[k], p.pos[i].x, p.pos[i].y, p.pos[i].z);
+		vb->points[k].w = second ? order[i] : -order[i];
+		vec3_set(&vb->normals[k], e[0], e[1], h.width[i]);
+		vb->normals[k].w = along;
+		std::memcpy(&vb->colors[k], coloured ? &h.colour[(size_t)i * 4] : white, 4);
+		// Its bones (none: its node's world as bone 0, all of it).
+		for (int j = 0; jw && j < 4; j++)
+			jw[k * 4 + j] = boned ? (float)std::min<uint16_t>(254, p.joints[(size_t)i * 4 + j]) +
+							std::min(1.0f, p.weights[(size_t)i * 4 + j]) * 0.999f
+					      : (j == 0 ? 0.999f : 0.0f);
+	}
+};
+
+} // namespace
+
 void Avatar3D::make_strand_part(Part &part, const Primitive &p, bool boned)
 {
 	const Strands &h = p.hair;
 	const size_t n = p.pos.size(), count = n * 2;
 	if (!n || h.pieces.empty() || h.width.size() != n || h.along.size() != n || p.normal.size() != n)
 		return;
-	gs_vb_data *vb = gs_vbdata_create();
-	vb->num = count;
-	vb->points = static_cast<vec3 *>(bzalloc(sizeof(vec3) * count));
-	vb->normals = static_cast<vec3 *>(bzalloc(sizeof(vec3) * count));
-	vb->colors = static_cast<uint32_t *>(bzalloc(sizeof(uint32_t) * count));
-	float *jw = nullptr;
-	if (part.skin) {
-		vb->num_tex = 1;
-		vb->tvarray = static_cast<gs_tvertarray *>(bzalloc(sizeof(gs_tvertarray)));
-		vb->tvarray[0].width = 4;
-		vb->tvarray[0].array = bzalloc(sizeof(float) * 4 * count);
-		jw = static_cast<float *>(vb->tvarray[0].array);
+	StrandFill fill(p, boned);
+	part.boned = fill.boned;
+	fill.make(count, part.skin);
+	for (uint32_t i = 0; i < n; i++) {
+		fill.corner((size_t)i * 2, i, false);
+		fill.corner((size_t)i * 2 + 1, i, true);
 	}
-	boned = boned && p.joints.size() == n * 4 && p.weights.size() == n * 4;
-	const bool spots = h.anchor.size() == n;
-	const bool coloured = h.colour.size() == n * 4;
-	const uint8_t white[4] = {255, 255, 255, 255};
-	for (size_t s = 0; s < h.strands(); s++) {
-		const float order = 1.0f + strand_order(h, s);
-		for (uint32_t i = h.first[s]; i < h.first[s + 1]; i++) {
-			float e[2];
-			folded(p.normal[i], e);
-			const float along = std::min(1.0f, std::max(0.0f, h.along[i])) * 0.9995f +
-					    (spots ? (float)h.anchor[i] : 0.0f);
-			for (size_t side = 0; side < 2; side++) {
-				const size_t k = (size_t)i * 2 + side;
-				vec3_set(&vb->points[k], p.pos[i].x, p.pos[i].y, p.pos[i].z);
-				vb->points[k].w = side ? order : -order;
-				vec3_set(&vb->normals[k], e[0], e[1], h.width[i]);
-				vb->normals[k].w = along;
-				std::memcpy(&vb->colors[k], coloured ? &h.colour[(size_t)i * 4] : white, 4);
-				// Its bones (none: its node's world as bone 0, all of it).
-				for (int j = 0; jw && j < 4; j++)
-					jw[k * 4 + j] =
-						boned ? (float)std::min<uint16_t>(254, p.joints[(size_t)i * 4 + j]) +
-								std::min(1.0f, p.weights[(size_t)i * 4 + j]) * 0.999f
-						      : (j == 0 ? 0.999f : 0.0f);
-			}
-		}
-	}
-	part.vb = gs_vertexbuffer_create(vb, part.skin ? 0 : GS_DYNAMIC);
+	part.vb = gs_vertexbuffer_create(fill.vb, part.skin ? 0 : GS_DYNAMIC);
 	part.points = count;
 	uint32_t *ix = static_cast<uint32_t *>(bmalloc(sizeof(uint32_t) * h.pieces.size() * 6));
 	strand_corners(h.pieces.data(), nullptr, h.pieces.size(), false, ix);
 	part.ib = gs_indexbuffer_create(GS_UNSIGNED_LONG, ix, h.pieces.size() * 6, 0);
+}
+
+// A strand part's pieces of one sort, laid out as they're drawn (posed on
+// the card; HairPlan::layout 1). The card reads a piece's corners where
+// they lie in its memory: by point (make_strand_part) a run's pieces -
+// one layer of a group, a few points of each strand - are far apart, and
+// each is fetched on its own (measured on a Radeon RX 9070 XT, 11-11: a
+// coat's time went with how much memory its corners were spread over, not
+// with how many pieces showed). Here a run's corners follow each other in
+// the order its pieces are drawn in (Strands::pieces), each sort's apart:
+// a point two pieces running on from each other share is there once, and
+// a point of two runs once in each. As ribbons both its sides; as lines
+// only its first (a line's corners are all first sides). The first so
+// many strands' pieces are still the start of each run's stretch.
+bool Avatar3D::lay_strands(Part &part, const Primitive &p, int sort, bool lines)
+{
+	Part::Laid &l = part.laid[sort ? 1 : 0][lines ? 1 : 0];
+	if (l.tried)
+		return l.none || (l.vb && l.ib);
+	l.tried = true;
+	const Strands &h = p.hair;
+	const size_t n = p.pos.size();
+	if (!part.skin || !n || h.pieces.empty() || h.runs.size() < 2 || h.width.size() != n || h.along.size() != n ||
+	    p.normal.size() != n)
+		return false;
+	StrandLayout lay = strand_layout(h, sort ? 1 : 0, lines);
+	part.laid_from[sort ? 1 : 0] = std::move(lay.from);
+	if (lay.corners.empty()) {
+		l.none = true;
+		return true;
+	}
+	const size_t sides = lines ? 1 : 2, points = lay.points.size();
+	if (points * sides > 0xFFFFFFF0u)
+		return false;
+	StrandFill fill(p, part.boned);
+	fill.make(points * sides, true);
+	for (size_t k = 0; k < points; k++)
+		for (size_t side = 0; side < sides; side++)
+			fill.corner(k * sides + side, lay.points[k], side == 1);
+	l.vb = gs_vertexbuffer_create(fill.vb, 0);
+	l.ib = make_ib(lay.corners);
+	if (!l.vb || !l.ib) {
+		gs_vertexbuffer_destroy(l.vb);
+		gs_indexbuffer_destroy(l.ib);
+		l.vb = nullptr;
+		l.ib = nullptr;
+		return false;
+	}
+	// (52 bytes a corner, 4 a corner of a piece.)
+	l.bytes = points * sides * 52 + lay.corners.size() * 4;
+	return true;
 }
 
 // The hidden head shape: a ball the shape of a head, in the face's own
@@ -903,12 +994,12 @@ void Avatar3D::set_depth_material(const Material &m, const std::vector<gs_textur
 	set_vec4(p_uv, m.base_map.offset[0], m.base_map.offset[1], m.base_map.scale[0], m.base_map.scale[1]);
 }
 
-bool Avatar3D::load_strands(size_t i, const Rig::Part &p, bool lines)
+bool Avatar3D::load_strands(size_t i, const Rig::Part &p, bool lines, bool laid)
 {
 	Part &part = parts_[i];
 	if (!part.vb || !part.ib || !p.prim)
 		return false;
-	if (lines && !part.ib_lines) {
+	if (lines && !laid && !part.ib_lines) {
 		// (Its pieces as lines: made the first time it's drawn that way.)
 		const Strands &h = p.prim->hair;
 		uint32_t *ix = static_cast<uint32_t *>(bmalloc(sizeof(uint32_t) * h.pieces.size() * 2));
@@ -932,6 +1023,8 @@ bool Avatar3D::load_strands(size_t i, const Rig::Part &p, bool lines)
 		}
 		gs_effect_set_val(p_spots, spots_.data(), spots_.size() * sizeof(float));
 	}
+	if (laid)
+		return true;
 	gs_load_vertexbuffer(part.vb);
 	gs_load_indexbuffer(lines ? part.ib_lines : part.ib);
 	return true;
@@ -940,7 +1033,15 @@ bool Avatar3D::load_strands(size_t i, const Rig::Part &p, bool lines)
 void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int> &groups, size_t layer, size_t count,
 			    const char *technique, bool lines, int sort, HairDrawn &drawn)
 {
-	if (!load_strands(i, p, lines))
+	// Laid out as drawn (posed on the card): each sort's own points and
+	// pieces, made before the first time they're drawn; one that can't be
+	// made (no memory for it): by point, as before.
+	Part &part = parts_[i];
+	bool laid = hair_plan_.layout == 1 && p.gpu && part.skin && p.prim;
+	for (int k = 0; laid && k < 2; k++)
+		if (sort != 1 - k)
+			laid = lay_strands(part, *p.prim, k, lines);
+	if (!load_strands(i, p, lines, laid))
 		return;
 	// (A piece: two triangles' six corners, or a line's two.)
 	const uint32_t corners = lines ? 2 : 6;
@@ -950,6 +1051,34 @@ void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int>
 	const size_t layers = (size_t)std::max(1, h.layers);
 	if (layer >= layers)
 		return;
+	if (laid) {
+		const Part::Laid *loaded = nullptr;
+		while (gs_effect_loop(effect_, technique)) {
+			loaded = nullptr;
+			for (int g : groups) {
+				const size_t run = (size_t)g * layers + layer;
+				Strands::Stretch some[2];
+				h.pieces_of(run, count, some);
+				for (int k = 0; k < 2; k++) {
+					if (!some[k].count || sort == 1 - k || run >= part.laid_from[k].size())
+						continue;
+					const Part::Laid &l = part.laid[k][lines ? 1 : 0];
+					if (loaded != &l) {
+						gs_load_vertexbuffer(l.vb);
+						gs_load_indexbuffer(l.ib);
+						loaded = &l;
+					}
+					gs_draw(shape, part.laid_from[k][run] * corners, some[k].count * corners);
+					drawn.pieces += some[k].count;
+					drawn.laid += some[k].count;
+					if (lines)
+						drawn.lines += some[k].count;
+					drawn.draws++;
+				}
+			}
+		}
+		return;
+	}
 	while (gs_effect_loop(effect_, technique))
 		for (int g : groups) {
 			Strands::Stretch some[2];
@@ -1597,6 +1726,9 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 				hair_drawn_.loaded += (*dr.posed)[i].gpu ? h.strands()
 									 : h.strands_in((*dr.posed)[i].pos.size());
 				hair_drawn_.drawn += s.count;
+				for (const auto &sort : dr.a->parts_[i].laid)
+					for (const Part::Laid &l : sort)
+						hair_drawn_.laid_bytes += l.bytes;
 			}
 	}
 	hair_drawn_.share = budget;

@@ -86,6 +86,13 @@ struct HairPlan {
 	// Hairs well under a pixel wide sent as lines (hair_form): 0 never, 1
 	// where they're that thin, 2 always (tests).
 	int lines = 1;
+	// How hair posed on the card lies in its memory: 0 a point's numbers
+	// once, in its strand's place, whichever pieces use it (the pieces'
+	// corners point into them: a run's are far apart); 1 as it's drawn -
+	// each run's corners one after another in the order its pieces go to
+	// the card (Avatar3D's lay_strands), so the card reads them straight
+	// through.
+	int layout = 0;
 };
 
 inline HairPlan hair_plan(HairDetail d)
@@ -256,6 +263,70 @@ inline void strand_corners(const uint32_t *starts, const uint32_t *ends, size_t 
 			std::copy(six, six + 6, out + k * 6);
 		}
 	}
+}
+
+// A strand part's pieces of one sort (0: each run's wide pieces, or all of
+// them with one sort; 1: its thin ones - Strands::thin) laid out as
+// they're drawn (HairPlan::layout 1): the points the card is given, in the
+// order its pieces are drawn in (Strands::pieces), each run's after the
+// one before's. A piece that starts where the piece before it (in the
+// same run and sort) ends shares that point; a point of two runs, or of
+// both sorts, is there once for each.
+//   points   each point laid out: which of the part's points it is
+//   corners  its pieces' corners, as strand_corners has them - 6 a piece
+//            as ribbons (a point laid out is two corners, its sides: 2 x
+//            its place and 2 x its place + 1), 2 a piece as lines (one
+//            corner a point: its place)
+//   from     a run: how many pieces of this sort come before its own (one
+//            more entry than runs: all of them)
+// The first so many strands' pieces of a run (Strands::pieces_of) are
+// still the start of its stretch: pieces from[run] on.
+struct StrandLayout {
+	std::vector<uint32_t> points, corners, from;
+};
+
+inline StrandLayout strand_layout(const Strands &h, int sort, bool lines)
+{
+	StrandLayout out;
+	if (h.runs.size() < 2)
+		return out;
+	const size_t runs = h.runs.size() - 1;
+	const bool two = h.thin.size() >= runs;
+	out.from.assign(runs + 1, 0);
+	size_t pieces = 0;
+	for (size_t r = 0; r < runs; r++) {
+		const uint32_t middle = two ? h.thin[r] : h.runs[r + 1];
+		out.from[r] = (uint32_t)pieces;
+		pieces += sort ? h.runs[r + 1] - middle : middle - h.runs[r];
+	}
+	out.from[runs] = (uint32_t)pieces;
+	const size_t sides = lines ? 1 : 2;
+	out.corners.reserve(pieces * (lines ? 2 : 6));
+	out.points.reserve(pieces + pieces / 2);
+	for (size_t r = 0; r < runs; r++) {
+		const uint32_t middle = two ? h.thin[r] : h.runs[r + 1];
+		const uint32_t a = sort ? middle : h.runs[r], b = sort ? h.runs[r + 1] : middle;
+		uint32_t end = 0; // (the piece before's end's first corner)
+		for (uint32_t q = a; q < b; q++) {
+			const uint32_t i = h.pieces[q];
+			uint32_t a0 = end;
+			if (q == a || i != h.pieces[q - 1] + 1) {
+				a0 = (uint32_t)(out.points.size() * sides);
+				out.points.push_back(i);
+			}
+			const uint32_t b0 = (uint32_t)(out.points.size() * sides);
+			out.points.push_back(i + 1);
+			end = b0;
+			if (lines) {
+				out.corners.push_back(a0);
+				out.corners.push_back(b0);
+			} else {
+				const uint32_t six[6] = {a0, b0, a0 + 1, a0 + 1, b0, b0 + 1};
+				out.corners.insert(out.corners.end(), six, six + 6);
+			}
+		}
+	}
+	return out;
 }
 
 // The hair budget. Each frame the drawing says how long hair took on the

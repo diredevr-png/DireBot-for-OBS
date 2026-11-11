@@ -885,6 +885,36 @@ def test_thin_hairs_among_wide_ones_are_lines(run):
         s.close()
 
 
+def test_hair_is_laid_out_as_drawn_only_on_the_card(run):
+    """Hair posed on the graphics card can lie in its memory in the order
+    it's drawn in ("hair_layout" 1, a number the settings window doesn't
+    show: test_real_windows.py). Posed here, by the CPU - as on Linux and
+    the Mac - there's nothing to lay out: FaceGetState's "laid" stays 0,
+    and the picture is the same."""
+    figure = os.path.join(run.home, "laid-here.vrm")
+    strands = hair_character(figure, width=0.0006, wide_every=5)
+    s = Stage(run, "Laid here")
+    try:
+        s.add("By point", figure, hair_layout=0)
+        s.add("Laid out", figure, hair_layout=1)
+        s.shown()
+        assert wait_for(lambda: all(s.hair(name)["drawn"] > 0 for name in s.names), 10, 0.1)
+        time.sleep(0.5)
+        h = {name: s.hair(name) for name in s.names}
+        for name in s.names:
+            print(f"{name}: {h[name]}")
+            assert not s.model(name)["on_card"] and "problem" not in s.model(name), s.model(name)
+            assert h[name]["laid"] == 0 and h[name]["laid_mb"] == 0 and h[name]["pieces"] > strands, h[name]
+        for key in ("drawn", "pieces", "lines", "draws"):
+            assert h["By point"][key] == h["Laid out"][key], (key, h)
+        a, b = s.shot("By point"), s.shot("Laid out")
+        off = sum(1 for ra, rb in zip(a, b) for x, y in zip(ra, rb) if tuple(x) != tuple(y))
+        print(f"posed here, by point and told laid out: {off} pixels differ")
+        assert off == 0 and count(a, magenta) > 1500, (off, count(a, magenta))
+    finally:
+        s.close()
+
+
 def test_fewer_hairs_are_drawn_the_smaller_it_is(run):
     """The same character drawn smaller has fewer of its strands drawn
     (each wider, to cover as much): FaceGetState's count falls with its

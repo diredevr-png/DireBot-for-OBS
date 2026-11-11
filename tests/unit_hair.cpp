@@ -3568,6 +3568,168 @@ static bool stretches_right(const Primitive &h, size_t count)
 	return total == h.hair.first[strands] - strands;
 }
 
+// A strand part laid out as it's drawn (strand_layout), as ribbons and as
+// lines: each sort's pieces in the order they're drawn in, a piece's
+// corners the same points and sides as its corners by point
+// (strand_corners); the points in the order the pieces use them, one
+// shared only by a piece and the piece before it; `from` each run's
+// first piece's place; nothing left over. `points`: how many points each
+// sort's layout holds (as ribbons).
+static bool layout_right(const Primitive &p, size_t points[2] = nullptr)
+{
+	const Strands &h = p.hair;
+	const size_t runs = h.runs.empty() ? 0 : h.runs.size() - 1;
+	size_t pieces = 0;
+	for (int lines = 0; lines < 2; lines++) {
+		const size_t corners = lines ? 2 : 6, sides = lines ? 1 : 2;
+		std::vector<uint32_t> by_point(h.pieces.size() * corners);
+		strand_corners(h.pieces.data(), nullptr, h.pieces.size(), lines != 0, by_point.data());
+		pieces = 0;
+		for (int sort = 0; sort < 2; sort++) {
+			const StrandLayout l = strand_layout(h, sort, lines != 0);
+			if (l.from.size() != runs + 1)
+				return false;
+			size_t at = 0, next = 0; // (pieces, and points, so far)
+			for (size_t r = 0; r < runs; r++) {
+				Strands::Stretch both[2];
+				h.pieces_of(r, h.strands(), both);
+				const Strands::Stretch &some = both[sort];
+				if (l.from[r] != at || (at + some.count) * corners > l.corners.size())
+					return false;
+				for (uint32_t k = 0; k < some.count; k++, at++) {
+					const uint32_t *want = by_point.data() + (size_t)(some.from + k) * corners;
+					const uint32_t *got = l.corners.data() + at * corners;
+					for (size_t c = 0; c < corners; c++) {
+						const size_t place = got[c] / sides, side = got[c] % sides;
+						if (place >= l.points.size() || l.points[place] != want[c] / 2 || side != want[c] % 2)
+							return false;
+					}
+					// Its start: the point before's (the piece before in
+					// this stretch ended there), or the next new one; its
+					// end: always the next new one.
+					const size_t start = got[0] / sides, end = got[1] / sides;
+					const bool runs_on = k > 0 && h.pieces[some.from + k] == h.pieces[some.from + k - 1] + 1;
+					if (start != (runs_on ? next - 1 : next))
+						return false;
+					next += runs_on ? 0 : 1;
+					if (end != next++)
+						return false;
+				}
+			}
+			if (l.from[runs] != at || l.corners.size() != at * corners || l.points.size() != next)
+				return false;
+			if (sort == 1 && h.thin.empty() && (at || !l.points.empty() || !l.corners.empty()))
+				return false;
+			pieces += at;
+			if (points && !lines)
+				points[sort] = l.points.size();
+		}
+		if (pieces != h.pieces.size())
+			return false;
+	}
+	// (The first so many strands' pieces of a run: from the same place.)
+	for (size_t count : {(size_t)0, (size_t)1, h.strands() / 3, h.strands()})
+		for (size_t r = 0; r < runs; r++) {
+			Strands::Stretch some[2], all[2];
+			h.pieces_of(r, count, some);
+			h.pieces_of(r, h.strands(), all);
+			if (some[0].from != all[0].from || some[1].from != all[1].from || some[0].count > all[0].count ||
+			    some[1].count > all[1].count)
+				return false;
+		}
+	return true;
+}
+
+// Hair posed on the card, laid out in its memory as it's drawn.
+static void test_layout()
+{
+	// The long coat of 400 hairs on two bones, in 5 layers and one sort:
+	// every piece once, a hair's pieces of one layer sharing their points.
+	const Groom g = long_coat(400);
+	Builder b = file_of({g}, {{5, 0, 0}, {15, 0, 0}});
+	const Model m = loaded(b, options_with(0));
+	const Primitive &h = part_of(m);
+	const size_t pieces = g.pos.size() - 400;
+	size_t points[2] = {0, 0};
+	CHECK(h.hair.pieces.size() == pieces && h.hair.thin.empty() && layout_right(h, points));
+	// (More than its own points - a point where a hair crosses from one
+	// layer to the next is in both - and fewer than two a piece.)
+	CHECK(points[0] > g.pos.size() && points[0] < 2 * pieces && points[1] == 0);
+	const StrandLayout ribbons = strand_layout(h.hair, 0, false), lines = strand_layout(h.hair, 0, true);
+	CHECK(ribbons.corners.size() == pieces * 6 && lines.corners.size() == pieces * 2 && ribbons.points == lines.points);
+	CHECK(strand_layout(h.hair, 1, false).corners.empty() && strand_layout(h.hair, 1, true).points.empty());
+	// (Its corners rise as they're drawn, a point or two a piece: the
+	// card reads straight through.)
+	bool rising = true;
+	for (size_t k = 1; k < pieces; k++) {
+		const uint32_t by = lines.corners[k * 2 + 1] - lines.corners[(k - 1) * 2 + 1];
+		rising = rising && (by == 1 || by == 2) &&
+			 ribbons.corners[k * 6 + 1] - ribbons.corners[(k - 1) * 6 + 1] == 2 * by;
+	}
+	CHECK(rising);
+	// In one layer a hair's pieces all run on: exactly its own points, in
+	// the order its groups' strands are drawn.
+	for (int layers : {1, 2, 16}) {
+		LoadOptions o = options_with(0);
+		o.strand_layers = layers;
+		const Model n = loaded(b, o);
+		size_t count[2] = {0, 0};
+		CHECK(layout_right(part_of(n), count));
+		CHECK(layers > 1 ? count[0] > g.pos.size() : count[0] == g.pos.size());
+	}
+
+	// Two sorts (every fifth hair wide): each sort's pieces laid out apart,
+	// all of them between the two.
+	{
+		Groom two = long_coat(400);
+		for (size_t s = 0; s < 400; s++)
+			two.width.insert(two.width.end(), two.first[s + 1] - two.first[s], s % 5 == 0 ? 0.0005f : 0.0001f);
+		Builder file = file_of({two}, {{5, 0, 0}, {15, 0, 0}});
+		const Model n = loaded(file, options_with(0));
+		const Primitive &q = part_of(n);
+		size_t count[2] = {0, 0};
+		CHECK(!q.hair.thin.empty() && layout_right(q, count));
+		const StrandLayout wide = strand_layout(q.hair, 0, false), thin = strand_layout(q.hair, 1, true);
+		CHECK(wide.corners.size() / 6 + thin.corners.size() / 2 == pieces);
+		CHECK(near((double)thin.corners.size() / 2 / (double)pieces, q.hair.thin_share, 1e-6));
+		CHECK(count[0] == wide.points.size() && count[1] == thin.points.size() && count[0] < count[1]);
+		for (int layers : {1, 3}) {
+			LoadOptions o = options_with(0);
+			o.strand_layers = layers;
+			const Model again = loaded(file, o);
+			CHECK(!part_of(again).hair.thin.empty() && layout_right(part_of(again)));
+		}
+	}
+	// Hairs that narrow from root to tip (their first two pieces wide, the
+	// other seven thin): a hair is in both sorts, and the point where it
+	// turns thin in each.
+	{
+		Groom taper;
+		for (int k = 0; k < 200; k++) {
+			taper.straight({(float)(k % 20), 0, (float)(k / 20)}, {(float)(k % 20), 0.9f, (float)(k / 20)}, 10);
+			for (int i = 0; i < 10; i++)
+				taper.width.push_back(0.001f - 0.0001f * (float)i);
+		}
+		LoadOptions o = options_with(0);
+		o.strand_layers = 1;
+		const Model n = loaded(taper, o);
+		const Primitive &q = part_of(n);
+		size_t count[2] = {0, 0};
+		CHECK(q.hair.pieces.size() == 1800 && !q.hair.thin.empty() && layout_right(q, count));
+		CHECK(count[0] == 200 * 3 && count[1] == 200 * 8);
+		const Model layered = loaded(taper, options_with(0));
+		CHECK(layout_right(part_of(layered)));
+	}
+	// A coat short of points (its deep hairs kept wider apart): right too.
+	{
+		const Model n = loaded(b, rated(g.pos.size() / 2));
+		CHECK(part_of(n).hair.strands() < 400 && layout_right(part_of(n)));
+	}
+	// No hair: nothing.
+	const StrandLayout none = strand_layout(Strands(), 0, false);
+	CHECK(none.points.empty() && none.corners.empty() && none.from.empty());
+}
+
 static void test_two_sorts()
 {
 	// The long coat of 400 hairs on two bones, every fifth hair 0.0005
@@ -5152,6 +5314,7 @@ int main()
 	test_groups();
 	test_layers_and_pieces();
 	test_two_sorts();
+	test_layout();
 	test_expressions();
 	test_expressions_by_strand();
 	test_stand_in_hair();
