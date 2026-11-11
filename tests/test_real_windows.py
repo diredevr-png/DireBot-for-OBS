@@ -34,7 +34,8 @@ obsws = pytest.importorskip("obsws_python")
 
 from test_real_face import (PretendPhone, PretendVmcApp, arms_character, camera_picture,  # noqa: E402
                             character_picture, middle_of, read_bmp, unity_turn, write_gif)
-from test_real_hair import LIFT, hair_character, magenta, per_metre, settles, top_of, white, yellow  # noqa: E402
+from test_real_hair import (LIFT, hair_character, hair_over_body, magenta, per_metre, settles, top_of,  # noqa: E402
+                            white, yellow)
 from test_real_obs import VERSION, free_port, vendor, wait_for  # noqa: E402
 
 ROOT = os.environ.get("DIREBOT_OBS_ROOT", "")
@@ -551,14 +552,15 @@ def test_hair_strands_on_the_graphics_card(obs):
     (Direct3D). Its strands are posed on the graphics card (the -skin
     effect: by its bones, and by its expression's spots) and look the same
     as posed by the CPU - at rest, with its expression showing (the hair
-    on its head lifted) and with its neck tipped over (its own animation,
-    holding still). FaceGetState says how many are kept and drawn; the
+    on its head lifted), with its neck tipped over (its own animation,
+    holding still) and with an animation of its own holding the
+    expression's shape on (its hair lifted as far as its expression's). FaceGetState says how many are kept and drawn; the
     hair budget, far too small, brings the share drawn down to its least
     by the graphics card's own clock, and none lets them all back; the
     hair detail setting keeps its strands for Light and wears its stand-in
     hair for Today."""
     figure = os.path.join(obs.home, "hair.vrm")
-    strands = hair_character(figure, standin=True)
+    strands = hair_character(figure, standin=True, played=True)
     c = obs.client()
 
     def st():
@@ -580,8 +582,10 @@ def test_hair_strands_on_the_graphics_card(obs):
         return vendor(c, "FaceReact", {"source": "Hair", **data})
 
     def poses():
-        """Its picture at rest, with its expression showing, and with its
-        neck tipped over."""
+        """Its picture at rest, with its expression showing, with its
+        neck tipped over, and with its own animation holding the
+        expression's shape on (a "weights" track its file asks to be
+        played)."""
         out = {}
         time.sleep(0.8)
         out["rest"] = shot(c, "Hair")
@@ -596,6 +600,11 @@ def test_hair_strands_on_the_graphics_card(obs):
         assert wait_for(lambda: st()["animation"] == "Tilt", 10, 0.1), st()
         time.sleep(0.8)
         out["tilted"] = shot(c, "Hair")
+        change(animation="Lift")
+        assert wait_for(lambda: st()["animation"] == "Lift", 10, 0.1), st()
+        time.sleep(1.0)
+        assert st()["expressions"].get("happy", 0) == 0, st()["expressions"]
+        out["played"] = shot(c, "Hair")
         change(animation="")
         assert wait_for(lambda: st()["animation"] == "", 10, 0.1), st()
         return out
@@ -641,8 +650,17 @@ def test_hair_strands_on_the_graphics_card(obs):
               % (up, up / metre, LIFT))
         assert abs(up / metre - LIFT) < 0.03, (up, metre)
         assert unlike(card["tilted"], card["rest"]) > 300, unlike(card["tilted"], card["rest"])
+        # (Its animation's shape: its hair as far over its body as its
+        # expression put it - fitted to its spot as it stands in its
+        # animation, so measured by its body.)
+        over = [hair_over_body(card[name]) for name in ("rest", "lifted", "played")]
+        print("Its animation's shape on the card: its hair %.3f m over its body at rest, %.3f with its "
+              "expression, %.3f with its animation (the file lifts it %s)" % (*over, LIFT))
+        assert abs(over[1] - over[0] - LIFT) < 0.03 and abs(over[2] - over[0] - LIFT) < 0.03, over
+        # (Standing in its "Lift" animation it's drawn a little smaller.)
         for name, rows in card.items():
-            assert pixels(rows, magenta) > 600 and pixels(rows, yellow) == 0, (name, pixels(rows, magenta))
+            assert pixels(rows, magenta) > (400 if name == "played" else 600) and pixels(rows, yellow) == 0, \
+                (name, pixels(rows, magenta))
 
         # The hair budget, by the graphics card's own clock: far too
         # small, the share drawn falls to its least and no further (still
@@ -691,12 +709,12 @@ def test_hair_strands_on_the_graphics_card(obs):
         reloaded()
         assert wait_for(lambda: hair()["drawn"] == strands, 10, 0.1), hair()
         cpu = poses()
-        for name in ("rest", "lifted", "tilted"):
+        for name in ("rest", "lifted", "tilted", "played"):
             drawn = sum(1 for row in cpu[name] for px in row if max(px) > 40)
             off = unlike(card[name], cpu[name])
             print("Hair posed on the card vs by the CPU, %s: %d of %d pixels differ (%d drawn, %d of hair)"
                   % (name, off, len(cpu[name]) * len(cpu[name][0]), drawn, pixels(cpu[name], magenta)))
-            assert drawn > 1500 and pixels(cpu[name], magenta) > 600, (name, drawn)
+            assert drawn > 1500 and pixels(cpu[name], magenta) > (400 if name == "played" else 600), (name, drawn)
             assert off <= max(20, drawn // 100), (name, off)
         log = obs.log()
         assert "3D effect" not in log and "Windows won't draw" not in log, log

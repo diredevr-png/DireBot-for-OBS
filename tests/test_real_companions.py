@@ -341,6 +341,133 @@ def test_a_companions_own_move(run):
         c.disconnect()
 
 
+def with_shape_move(src, dst, marked):
+    """A copy of a .glb whose one mesh has a shape - everything above 0.9
+    of it lifted 0.35 - and a move "swell" whose track (glTF's "weights",
+    jumping) puts the shape on from 0.3 s to 1.6 s of its 2 s; `marked`:
+    the mesh's node asks for its shapes to be played."""
+    with open(src, "rb") as f:
+        data = f.read()
+    n = struct.unpack("<I", data[12:16])[0]
+    doc = json.loads(data[20:20 + n])
+    rest = data[20 + n:]
+    m = struct.unpack("<I", rest[:4])[0]
+    blob = bytearray(rest[8:8 + m])
+
+    def add(raw, count, kind, **more):
+        while len(blob) % 4:
+            blob.append(0)
+        doc["bufferViews"].append({"buffer": 0, "byteOffset": len(blob), "byteLength": len(raw)})
+        blob.extend(raw)
+        doc["accessors"].append({"bufferView": len(doc["bufferViews"]) - 1, "componentType": 5126,
+                                 "count": count, "type": kind, **more})
+        return len(doc["accessors"]) - 1
+    prim = doc["meshes"][0]["primitives"][0]
+    acc = doc["accessors"][prim["attributes"]["POSITION"]]
+    view = doc["bufferViews"][acc["bufferView"]]
+    at = view.get("byteOffset", 0) + acc.get("byteOffset", 0)
+    step = view.get("byteStride", 12)
+    lift = []
+    for i in range(acc["count"]):
+        y = struct.unpack_from("<3f", blob, at + i * step)[1]
+        lift += [0.0, 0.35 if y > 0.9 else 0.0, 0.0]
+    assert 0 < sum(1 for v in lift if v) < acc["count"]
+    prim["targets"] = [{"POSITION": add(struct.pack("<%df" % len(lift), *lift), acc["count"], "VEC3",
+                                        min=[0, 0, 0], max=[0, 0.35, 0])}]
+    doc["meshes"][0]["weights"] = [0]
+    node = [i for i, nd in enumerate(doc["nodes"]) if nd.get("mesh") == 0][0]
+    if marked:
+        doc["nodes"][node]["extras"] = {"direbot": {"shapes": True}}
+    tail = [i for i, nd in enumerate(doc["nodes"]) if nd.get("name") == "tail"][0]
+    stays = list(doc["nodes"][tail].get("translation", [0, 0, 0]))
+    times = add(struct.pack("<4f", 0, 0.3, 1.6, 2.0), 4, "SCALAR", min=[0], max=[2.0])
+    doc["animations"].append({
+        "name": "swell",
+        "samplers": [{"input": times, "output": add(struct.pack("<4f", 0, 1, 0, 0), 4, "SCALAR"),
+                      "interpolation": "STEP"},
+                     {"input": times, "output": add(struct.pack("<12f", *(stays * 4)), 4, "VEC3")}],
+        "channels": [{"sampler": 0, "target": {"node": node, "path": "weights"}},
+                     {"sampler": 1, "target": {"node": tail, "path": "translation"}}]})
+    while len(blob) % 4:
+        blob.append(0)
+    doc["buffers"][0]["byteLength"] = len(blob)
+    text = json.dumps(doc).encode()
+    text += b" " * (-len(text) % 4)
+    out = struct.pack("<4sII", b"glTF", 2, 12 + 8 + len(text) + 8 + len(blob))
+    out += struct.pack("<I4s", len(text), b"JSON") + text + struct.pack("<I4s", len(blob), b"BIN\0") + bytes(blob)
+    with open(dst, "wb") as f:
+        f.write(out)
+
+
+def test_a_companions_move_plays_its_shapes(run):
+    """A companion whose file asks for its mesh's shapes to be played
+    ("extras": {"direbot": {"shapes": true}} on the mesh's node): a move of
+    its own with a "weights" track changes its shape while it plays - its
+    top up - and back after. The same file not marked: the move plays, its
+    shape stays as it is (as before)."""
+    camera = os.path.join(run.home, "camera.png")
+    if not os.path.exists(camera):
+        camera_picture(camera)
+    marked = os.path.join(run.home, "wolf-swell.glb")
+    plain = os.path.join(run.home, "wolf-swell-plain.glb")
+    with_shape_move(WOLF, marked, True)
+    with_shape_move(WOLF, plain, False)
+    settings = {"source": "Swell camera", "width": W, "height": H, "size": 60, "framing": "whole",
+                "model": RIDER, "animation": "idle", "mirror": False, "smoothing": 100, "follow_move": 0,
+                "follow_grow": 0, "follow_tilt": 0, "bend": 0, "body_follow": 0, "style": "drawn", **STILL}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+
+    def comp():
+        return vendor(c, "FaceGetState", {"source": "Swell"})["companion"]
+
+    def cue(**data):
+        return vendor(c, "FaceReact", {"source": "Swell", **data})
+
+    def its_top():
+        rows = screenshot(c, "Swell")
+        xs = columns(rows, 0, int(W * 0.42))
+        return min(y for y in range(H) if any(drawn(rows[y][x]) for x in xs)) if xs else None
+
+    def swell(file):
+        """Its top sitting, 0.9 s into the move, and after it."""
+        assert cue(do="companion", action="come", file=file, instant=True,
+                   place={"size": 0.7, "side": -1, "distance": 0.45})["came"]
+        assert wait_for(lambda: comp()["loaded"] and comp()["phase"] == "out", 20, 0.05), comp()
+        assert [a["name"] for a in comp()["animations"]][-1] == "swell", comp()
+        time.sleep(0.5)
+        sitting = its_top()
+        answer = cue(do="companion", action="move", move="swell")
+        assert answer["ok"] and answer["moves"] and abs(answer["length"] - 2.0) < 0.01, answer
+        assert wait_for(lambda: comp()["moving"] == "swell", 1, 0.02), comp()
+        time.sleep(0.9)
+        playing = its_top()
+        assert wait_for(lambda: comp()["moving"] == "", 3, 0.05), comp()
+        time.sleep(0.3)
+        after = its_top()
+        assert cue(do="companion", action="go", instant=True)["went"]
+        assert wait_for(lambda: comp()["phase"] == "away", 6, 0.05), comp()
+        return sitting, playing, after
+    try:
+        send(c, "CreateScene", {"sceneName": "Swells"})
+        send(c, "CreateInput", {"sceneName": "Swells", "inputName": "Swell camera",
+                                "inputKind": "image_source", "inputSettings": {"file": camera}})
+        send(c, "CreateInput", {"sceneName": "Swells", "inputName": "Swell",
+                                "inputKind": "direbot_face_avatar", "inputSettings": settings})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Swells"})
+        assert wait_for(lambda: vendor(c, "FaceGetState", {"source": "Swell"})["model"]["shown"], 30, 0.2)
+        sitting, playing, after = swell(marked)
+        print(f"marked: its top sitting {sitting}, while the move plays {playing}, after {after}")
+        assert None not in (sitting, playing, after) and playing < sitting - 8, (sitting, playing, after)
+        assert abs(after - sitting) <= 3, (sitting, after)
+        sitting, playing, after = swell(plain)
+        print(f"not marked: its top sitting {sitting}, while the move plays {playing}, after {after}")
+        assert None not in (sitting, playing, after), (sitting, playing, after)
+        assert abs(playing - sitting) <= 3 and abs(after - sitting) <= 3, (sitting, playing, after)
+        send(c, "RemoveInput", {"inputName": "Swell"})
+    finally:
+        c.disconnect()
+
+
 def test_a_move_that_stays_and_its_companion_bolting(run):
     camera = os.path.join(run.home, "camera.png")
     if not os.path.exists(camera):

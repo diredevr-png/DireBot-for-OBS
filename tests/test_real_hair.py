@@ -190,15 +190,15 @@ def add_part(doc, blob, shape, colour, parent, at, name, more=None, picture=None
 
 
 def add_animation(doc, blob, name, channels):
-    """One more animation of its own: [(node, "rotation" or "translation",
-    times, values flat)]."""
+    """One more animation of its own: [(node, "rotation", "translation" or
+    "weights" (its mesh's shapes' strengths), times, values flat)]."""
     samplers, chans = [], []
     for node, path, times, values in channels:
-        width = 4 if path == "rotation" else 3
+        width = {"rotation": 4, "weights": 1}.get(path, 3)
         t = add_numbers(doc, blob, struct.pack("<%df" % len(times), *times), "SCALAR", len(times), 5126,
                         more={"min": [min(times)], "max": [max(times)]})
-        v = add_numbers(doc, blob, struct.pack("<%df" % len(values), *values), "VEC%d" % width,
-                        len(values) // width, 5126)
+        v = add_numbers(doc, blob, struct.pack("<%df" % len(values), *values),
+                        "SCALAR" if width == 1 else "VEC%d" % width, len(values) // width, 5126)
         samplers.append({"input": t, "output": v, "interpolation": "LINEAR"})
         chans.append({"sampler": len(samplers) - 1, "target": {"node": node, "path": path}})
     doc.setdefault("animations", []).append({"name": name, "samplers": samplers, "channels": chans})
@@ -217,7 +217,7 @@ WIDE_HAIR = 0.006
 
 
 def hair_character(path, vrm=True, standin=False, behind=0, fan=0, width=0.006, crown=2400, locks=300, tuft=200,
-                   wide_every=0):
+                   wide_every=0, played=False):
     """arms_character with real hair, magenta:
       - on top of its head `crown` strands standing out all round, drooping
         a little, hung on its head; its one expression ("lift": a VRM's
@@ -238,7 +238,10 @@ def hair_character(path, vrm=True, standin=False, behind=0, fan=0, width=0.006, 
     `wide_every`, every so-manyth hair of its crown, its locks and its tuft
     WIDE_HAIR wide: a coat of thin hairs with a few wide ones among them.
     An animation of its own, "Tilt", holds its neck tipped TILT degrees
-    over. Returns how many strands the file has."""
+    over. `played`: its hair's node asks for its shapes to be played
+    ({"direbot": {"shapes": true}} in its extras), and another animation,
+    "Lift", holds its expression's shape full on (a "weights" track).
+    Returns how many strands the file has."""
     arms_character(path, vrm=vrm)
 
     def wide(i):
@@ -307,6 +310,9 @@ def hair_character(path, vrm=True, standin=False, behind=0, fan=0, width=0.006, 
     half = math.radians(TILT) / 2
     add_animation(doc, blob, "Tilt", [(names["neck"], "rotation", [0, 1],
                                        [0, 0, math.sin(half), math.cos(half)] * 2)])
+    if played:
+        doc["nodes"][node]["extras"] = {"direbot": {"shapes": True}}
+        add_animation(doc, blob, "Lift", [(node, "weights", [0, 1], [1, 1])])
     save_glb(path, doc, blob)
     return hair.count
 
@@ -357,6 +363,12 @@ def per_metre(rows):
     """How many pixels a metre of the character is in the picture: by its
     blue body, 0.4 tall."""
     return sum(1 for row in rows if sum(1 for px in row if blue(px)) >= 3) / 0.4
+
+
+def hair_over_body(rows):
+    """How far the top of its hair is over the top of its blue body, in
+    metres - whatever size the picture has it."""
+    return (top_of(rows, blue) - top_of(rows, magenta)) / per_metre(rows)
 
 
 def top_of(rows, test, least=3):
@@ -1056,7 +1068,7 @@ def test_hair_moves_with_its_expression_and_its_bones(run):
     the locks down its sides bend (their tips, on its chest, stay), and
     the tuft on its hand is at its hand wherever its arm is."""
     figure = os.path.join(run.home, "moves.vrm")
-    hair_character(figure)
+    hair_character(figure, played=True)
     plain = os.path.join(run.home, "moves-plain.glb")
     hair_character(plain, vrm=False)
     s = Stage(run, "Moves")
@@ -1118,6 +1130,28 @@ def test_hair_moves_with_its_expression_and_its_bones(run):
         assert abs(count(tilted, magenta, tips) - count(rest, magenta, tips)) < 0.25 * count(rest, magenta, tips)
         s.set("Moves", animation="")
         assert wait_for(lambda: s.model("Moves")["animation"] == "", 5, 0.1)
+
+        # Its own animation holding the same shape on (a "weights" track,
+        # its file asking for its shapes to be played), none of its
+        # expressions on: its hair as far over its body as its expression
+        # put it. (It's fitted to its spot as it stands in its animation,
+        # lifted hair and all - so a little smaller: measured by its body.)
+        s.set("Moves", animation="Lift")
+        assert wait_for(lambda: s.model("Moves")["animation"] == "Lift", 5, 0.1), s.model("Moves")
+        time.sleep(1.0)
+        played = s.shot("Moves", "moves played")
+        over = [hair_over_body(rows) for rows in (rest, lifted, played)]
+        print("its animation's shape: its hair %.3f m over its body at rest, %.3f with its expression, %.3f "
+              "with its animation (the file lifts it %s)" % (*over, LIFT))
+        assert s.model("Moves")["expressions"].get("happy", 0) == 0, s.model("Moves")["expressions"]
+        assert abs(over[1] - over[0] - LIFT) < 0.02 and abs(over[2] - over[0] - LIFT) < 0.02, over
+        assert abs(count(played, magenta, (0, 0, SIZE, top_of(played, blue))) * (metre / per_metre(played)) ** 2
+                   - count(lifted, magenta, (0, 0, SIZE, top_of(lifted, blue)))) \
+            < 0.15 * count(lifted, magenta, (0, 0, SIZE, top_of(lifted, blue)))
+        s.set("Moves", animation="")
+        assert wait_for(lambda: s.model("Moves")["animation"] == "", 5, 0.1)
+        time.sleep(1.0)
+        assert differing(s.shot("Moves"), rest) <= 20
 
         # The tuft on its hand: by its hand with its arm down (a VRM's
         # arms hang) and with it straight out (the plain file's T).

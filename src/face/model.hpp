@@ -29,8 +29,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // eyes, the expressions (blink, "aa", happy...) and the swinging parts
 // (spring bones) with what they bump into; its bones that follow others
 // (VRM's node constraints: twist bones, sleeves). And its own animations
-// (moves, turns and sizes; not its expressions' strengths), and VRM
-// animation files (.vrma) for any VRM.
+// (moves, turns and sizes; its shapes' strengths only where the file
+// asks for them - Node::plays_shapes), and VRM animation files (.vrma)
+// for any VRM.
 //
 // Plain code over plain numbers (tests/unit_model.cpp). Every number in a
 // file is checked before it's used, so a broken or hostile file only
@@ -327,6 +328,13 @@ struct Node {
 	// jumps (STEP) is never played part-way - not while a move eases in
 	// or out over how it stood (rig.cpp's play_own).
 	bool size_switch = false;
+	// Its mesh's shapes are played by the file's own animations (the file
+	// says so: "extras": {"direbot": {"shapes": true}}): their "weights"
+	// tracks - one that jumps (STEP) all of it as soon as a move plays at
+	// all, the others eased with the move as its bones are. Without it
+	// such tracks aren't read (as before 0.9.0's hair work: a file's
+	// shapes are its face's, moved by yours).
+	bool plays_shapes = false;
 	M4 local() const { return matrix_of(t, r, s); }
 };
 
@@ -403,16 +411,19 @@ struct LookRange {
 // idle, a tail's wag... (played over and over by the rig, if chosen).
 // Each channel moves one node: where it is, its turn or its size, key
 // by key - jumping to each key, straight between them (turns the
-// shortest way round), or curved by each key's slopes.
+// shortest way round), or curved by each key's slopes. Or (Shapes, glTF's
+// "weights") the strengths of its mesh's shapes - only of a node whose
+// file asks for them to be played (Node::plays_shapes).
 struct AnimChannel {
-	enum Path { Move, Turn, Size };
+	enum Path { Move, Turn, Size, Shapes };
 	enum Ease { Step, Straight, Curved };
 	int node = -1;
 	Path path = Turn;
 	Ease ease = Straight;
+	int shapes = 0;            // Shapes: how many its mesh has (numbers a key)
 	std::vector<float> times;  // seconds, rising
 	std::vector<float> values; // 3 a key (4 for a turn); Curved: its slope in, value and slope out
-	int size() const { return path == Turn ? 4 : 3; }
+	int size() const { return path == Turn ? 4 : path == Shapes ? shapes : 3; }
 };
 struct Animation {
 	std::string name; // as the file has it, or "Animation 1", "Animation 2"...

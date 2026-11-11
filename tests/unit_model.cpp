@@ -3616,6 +3616,208 @@ static void test_a_size_switch()
 	CHECK(whole && away_frames >= 10 && part_frames >= 5);
 }
 
+// A mesh's shapes played by the file's own animation (glTF's "weights"
+// track), only where the file asks for it ("extras": {"direbot":
+// {"shapes": true}} on the mesh's node): a track that jumps (STEP) is
+// played whole as soon as the move plays at all, a straight one eased
+// with the move; hair strands in the mesh follow; a companion's drive
+// (no expressions) plays them too. Not marked: not read, as ever.
+static void test_shapes_a_move_plays()
+{
+	Builder b;
+	const std::vector<V3> square = {{0, 0, 0}, {0.1f, 0, 0}, {0, 0.1f, 0}, {0.1f, 0.1f, 0}};
+	const std::vector<V3> lift = {{}, {}, {0, 0, 0.02f}, {0, 0, 0.02f}}, slide = {{0.01f, 0, 0}, {}, {}, {}};
+	std::vector<V3> hair, bend, none;
+	std::vector<float> width;
+	for (int i = 0; i < 6; i++) {
+		hair.push_back({0.05f + 0.002f * (i % 2), 0.1f + 0.01f * i, 0});
+		bend.push_back(i >= 2 ? V3{0.003f * i, 0, 0} : V3{});
+		none.push_back({});
+		width.push_back(0.002f);
+	}
+	const json skin = {{"attributes", {{"POSITION", b.vec3s(square)}}},
+			   {"indices", b.indices({0, 1, 2, 1, 3, 2})},
+			   {"targets", {{{"POSITION", b.vec3s(lift)}}, {{"POSITION", b.vec3s(slide)}}}}};
+	const json strand = {{"attributes", {{"POSITION", b.vec3s(hair)}, {"_WIDTH", b.floats(width, 1, "SCALAR")}}},
+			     {"mode", 3},
+			     {"targets", {{{"POSITION", b.vec3s(bend)}}, {{"POSITION", b.vec3s(none)}}}}};
+	b.doc["meshes"].push_back({{"primitives", json::array({skin, strand})}, {"weights", {0.2f, 0}}});
+	for (float rest : {0.0f, 0.4f}) {
+		const json one = {{"attributes", {{"POSITION", b.vec3s(square)}}},
+				  {"indices", b.indices({0, 1, 2, 1, 3, 2})},
+				  {"targets", {{{"POSITION", b.vec3s(lift)}}}}};
+		b.doc["meshes"].push_back({{"primitives", json::array({one})}, {"weights", {rest}}});
+	}
+	const int throat = b.node({{"name", "Throat"}, {"mesh", 0}, {"extras", {{"direbot", {{"shapes", true}}}}}});
+	const int face = b.node({{"name", "Face"}, {"mesh", 1}, {"translation", {0.3f, 0, 0}}});
+	const int eased = b.node(
+		{{"name", "Eased"}, {"mesh", 2}, {"translation", {0.6f, 0, 0}}, {"extras", {{"direbot", {{"shapes", 1}}}}}});
+	const int turner = b.node({{"name", "Turner"}});
+	// "Howl": the throat's two shapes jump at half a second and again at
+	// one; the face's would (not marked); the eased one's runs straight.
+	const int t3 = b.floats({0, 0.5f, 1}, 1, "SCALAR"), t2 = b.floats({0, 1}, 1, "SCALAR");
+	const int turn = b.floats({0, 0, 0, 1, 0, 0, 0, 1}, 4, "VEC4");
+	b.doc["animations"] = json::array(
+		{{{"name", "Howl"},
+		  {"samplers",
+		   {{{"input", t3}, {"output", b.floats({0, 0, 1, 0.5f, 0.25f, 1}, 1, "SCALAR")}, {"interpolation", "STEP"}},
+		    {{"input", t3}, {"output", b.floats({0, 1, 1}, 1, "SCALAR")}, {"interpolation", "STEP"}},
+		    {{"input", t2}, {"output", b.floats({0, 1}, 1, "SCALAR")}},
+		    {{"input", t2}, {"output", turn}},
+		    // (One whose numbers don't fit its mesh's two shapes: left out.)
+		    {{"input", t3}, {"output", b.floats({0, 1, 1}, 1, "SCALAR")}}}},
+		  {"channels",
+		   {{{"sampler", 0}, {"target", {{"node", throat}, {"path", "weights"}}}},
+		    {{"sampler", 1}, {"target", {{"node", face}, {"path", "weights"}}}},
+		    {{"sampler", 2}, {"target", {{"node", eased}, {"path", "weights"}}}},
+		    {{"sampler", 3}, {"target", {{"node", turner}, {"path", "rotation"}}}},
+		    {{"sampler", 4}, {"target", {{"node", throat}, {"path", "weights"}}}},
+		    // (And one on a node with no mesh.)
+		    {{"sampler", 2}, {"target", {{"node", turner}, {"path", "weights"}}}}}}},
+		 {{"name", "Nod"},
+		  {"samplers", {{{"input", t2}, {"output", turn}}}},
+		  {"channels", {{{"sampler", 0}, {"target", {{"node", turner}, {"path", "rotation"}}}}}}}});
+	auto m = std::make_shared<Model>();
+	std::string why;
+	CHECK(load(b.glb(), *m, &why));
+	CHECK(m->animations.size() == 2 && m->meshes.size() == 3 && m->meshes[0].parts.size() == 2);
+	if (m->animations.size() != 2 || m->meshes.size() != 3 || m->meshes[0].parts.size() != 2)
+		return;
+	CHECK(m->nodes[throat].plays_shapes && !m->nodes[face].plays_shapes && m->nodes[eased].plays_shapes &&
+	      !m->nodes[turner].plays_shapes);
+	// The marked ones' tracks are read (as many numbers a key as the mesh
+	// has shapes); the face's, the misfit and the mesh-less one aren't.
+	const std::vector<AnimChannel> &cs = m->animations[0].channels;
+	CHECK(cs.size() == 3);
+	if (cs.size() != 3)
+		return;
+	CHECK(cs[0].path == AnimChannel::Shapes && cs[0].node == throat && cs[0].shapes == 2 && cs[0].size() == 2 &&
+	      cs[0].ease == AnimChannel::Step && cs[0].times.size() == 3 && cs[0].values.size() == 6);
+	CHECK(cs[1].path == AnimChannel::Shapes && cs[1].node == eased && cs[1].shapes == 1 &&
+	      cs[1].ease == AnimChannel::Straight);
+	CHECK(cs[2].path == AnimChannel::Turn && cs[2].size() == 4);
+	const Primitive &h = m->meshes[0].parts[1];
+	CHECK(h.strands && h.hair.moves.size() == 2 && h.hair.anchors() > 1);
+	const size_t tip = h.pos.size() - 1;
+
+	RigOptions o;
+	o.springs = false;
+	Rig rig(m, o), card(m, o);
+	card.set_gpu_skin(true);
+	auto strengths = [](const Rig &r, float a, float bb, float f, float e) {
+		const std::vector<std::vector<float>> &w = r.weights();
+		return w.size() == 3 && w[0].size() == 2 && near(w[0][0], a, 1e-6) && near(w[0][1], bb, 1e-6) &&
+		       near(w[1][0], f, 1e-6) && near(w[2][0], e, 1e-6);
+	};
+	// As a companion is driven: no expressions of yours.
+	Drive d = still();
+	d.expressions = false;
+	d.look = false;
+	// Nothing playing: as the file has them.
+	rig.pose(d);
+	CHECK(strengths(rig, 0.2f, 0, 0, 0.4f));
+	const V3 skin_rest = rig.parts()[0].pos[2], tip_rest = rig.parts()[1].pos[tip];
+	CHECK(near3(skin_rest, {0, 0.1f, 0.004f}, 1e-6f));
+	MoveNow mv;
+	mv.animation = 0;
+	mv.time = 0.75f;
+	mv.amount = 1;
+	d.body = {mv};
+	// All of the move, then half, a quarter, a hundredth of it (easing in
+	// or out): the track that jumps whole each time, the straight one from
+	// how the mesh rests as far as the move is on; the face's never.
+	for (float amount : {1.0f, 0.5f, 0.25f, 0.01f}) {
+		d.body[0].amount = amount;
+		rig.pose(d);
+		card.pose(d);
+		CHECK(strengths(rig, 1, 0.5f, 0, 0.4f + (0.75f - 0.4f) * amount));
+		CHECK(strengths(card, 1, 0.5f, 0, 0.4f + (0.75f - 0.4f) * amount));
+		// The skin where its shapes put it, the hair's tip with it (from
+		// a fifth of its bend to all of it).
+		CHECK(near3(rig.parts()[0].pos[2], {0, 0.1f, 0.02f}, 1e-6f) &&
+		      near3(rig.parts()[0].pos[0], {0.005f, 0, 0}, 1e-6f));
+		CHECK(near3(rig.parts()[1].pos[tip] - tip_rest, bend[5] * 0.8f, 1e-5f));
+		// On the card: the skin's points handed over as shaped, the
+		// hair's spots each with its move.
+		const Rig::Part &cskin = card.parts()[0], &chair = card.parts()[1];
+		CHECK(cskin.gpu && cskin.morphed && cskin.rest_pos.size() == 4 && chair.gpu && !chair.morphed);
+		if (cskin.rest_pos.size() == 4)
+			CHECK(near3(cskin.rest_pos[2], {0, 0.1f, 0.02f}, 1e-6f) && near3(cskin.rest_pos[0], {0.005f, 0, 0}, 1e-6f));
+		CHECK(chair.spot_moves.size() == h.hair.anchors() && h.hair.anchor[tip] != 0);
+		if (chair.spot_moves.size() == h.hair.anchors())
+			CHECK(near3(chair.spot_moves[h.hair.anchor[tip]], bend[5], 1e-6f));
+	}
+	// Before it jumps: the track's own first key (none of either), whole,
+	// whatever the amount - not how the mesh rests.
+	d.body[0].time = 0.25f;
+	rig.pose(d);
+	CHECK(strengths(rig, 0, 0, 0, 0.4f + (0.25f - 0.4f) * 0.01f));
+	CHECK(near3(rig.parts()[0].pos[2], {0, 0.1f, 0}, 1e-6f));
+	// At its end and past it: its last key.
+	d.body[0].time = 5;
+	d.body[0].amount = 1;
+	rig.pose(d);
+	CHECK(strengths(rig, 0.25f, 1, 0, 1));
+	// Not playing: as the file has them again.
+	d.body[0].amount = 0;
+	rig.pose(d);
+	CHECK(strengths(rig, 0.2f, 0, 0, 0.4f));
+	CHECK(near3(rig.parts()[0].pos[2], skin_rest, 1e-7f) && near3(rig.parts()[1].pos[tip], tip_rest, 1e-7f));
+	// A move with no such track over it: nothing of theirs changes.
+	d.body[0].animation = 1;
+	d.body[0].amount = 1;
+	rig.pose(d);
+	CHECK(strengths(rig, 0.2f, 0, 0, 0.4f));
+	// Two moves at once (one easing out as the next eases in): the later
+	// one over the earlier, the jumping track's whole.
+	MoveNow first = mv, second = mv;
+	first.time = 5;
+	first.amount = 0.5f;
+	second.time = 0.75f;
+	second.amount = 0.25f;
+	d.body = {first, second};
+	rig.pose(d);
+	const float e1 = 0.4f + (1 - 0.4f) * 0.5f;
+	CHECK(strengths(rig, 1, 0.5f, 0, e1 + (0.75f - e1) * 0.25f));
+
+	// Its own animation played over and over (an idle chosen for it): the
+	// same tracks, as far as it has got.
+	Rig idle(m, o);
+	idle.set_animation(0);
+	Drive on = still();
+	on.expressions = false;
+	for (int i = 0; i < 40; i++)
+		idle.pose(on);
+	CHECK(near(idle.animation_time(), 40 / 60.0, 1e-3));
+	CHECK(strengths(idle, 1, 0.5f, 0, idle.animation_time()));
+	// Fading in over another: the jumping track whole from the first
+	// frame, the straight one part-way from how the mesh rests.
+	Rig fading(m, o);
+	fading.set_animation(1);
+	for (int i = 0; i < 5; i++)
+		fading.pose(on);
+	fading.set_animation(0, 0.4f, 0.6f);
+	fading.pose(on);
+	CHECK(fading.animation_fading());
+	const std::vector<std::vector<float>> &w = fading.weights();
+	CHECK(near(w[0][0], 1, 1e-6) && near(w[0][1], 0.5, 1e-6) && w[2][0] > 0.4f && w[2][0] < 0.45f);
+	for (int i = 0; i < 30; i++)
+		fading.pose(on);
+	CHECK(!fading.animation_fading() && near(fading.weights()[2][0], fading.animation_time(), 1e-5));
+
+	// The same file not marked: its tracks aren't read, nothing plays.
+	Builder plain = b;
+	plain.doc["nodes"][throat].erase("extras");
+	plain.doc["nodes"][eased]["extras"] = {{"direbot", {{"shapes", false}}}};
+	auto pm = std::make_shared<Model>();
+	CHECK(load(plain.glb(), *pm, &why));
+	CHECK(pm->animations.size() == 2 && pm->animations[0].channels.size() == 1);
+	Rig prig(pm, o);
+	d.body = {mv};
+	prig.pose(d);
+	CHECK(strengths(prig, 0.2f, 0, 0, 0.4f));
+}
+
 static void test_faces_on_cue()
 {
 	Person p = make_person(false);
@@ -4952,6 +5154,7 @@ int main()
 	test_springs();
 	test_own_animation();
 	test_a_size_switch();
+	test_shapes_a_move_plays();
 	test_link_chain();
 	test_spots_on_a_vrm();
 	test_spots_on_two_characters();

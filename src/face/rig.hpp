@@ -419,6 +419,7 @@ private:
 	void play_builtin(BuiltIn b, float t, float amount);
 	void play_own(int animation, float t, float amount);
 	bool size_switched(const AnimChannel &c) const;
+	void play_shapes(const AnimChannel &c, float t, float amount);
 	void measure_head();
 	void squish_head(const Drive &d);
 	void stand_upright(const Drive &d);
@@ -520,6 +521,14 @@ private:
 	std::map<std::string, std::vector<std::pair<int, int>>> morph_by_name_;
 	V3 last_root_;
 	std::vector<std::vector<float>> weights_;
+	// The shapes its own animations play this frame (AnimChannel::Shapes;
+	// `plays_shapes_`: it has such a track), a mesh each: how much of the
+	// strengths it had is kept (1: none played) and what's put on top -
+	// a strength is what it was x `shape_keep_` + `shape_play_`.
+	bool plays_shapes_ = false;
+	std::vector<float> shape_keep_;
+	std::vector<std::vector<float>> shape_play_;
+	std::vector<float> shape_now_; // (a track's strengths at one time)
 	std::vector<Driver> drivers_;
 	bool perfect_sync_ = false;
 	int arkit_count_ = 0;

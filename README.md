@@ -577,6 +577,17 @@ eases in or out over how the character stood. A bone its file marks
 jumps (glTF's `STEP`) plays whole as soon as the move plays at all.
 Bones not marked, and size tracks that don't jump, ease as before.
 
+**Shapes a move plays (after 0.9.0).** A character's or a companion's
+own animation can change its mesh's shapes (its morph targets: glTF's
+`weights` track) - a throat that hugs an opening jaw, a chest that
+swells - when the node holding the mesh is marked `"extras": {"direbot":
+{"shapes": true}}`. A track that jumps (`STEP`) plays whole as soon as
+the move plays at all; any other eases with the move as its bones do;
+with nothing playing it the shapes are as the file has them. Hair
+strands in the mesh follow (their own targets, as with expressions).
+Not marked, such tracks aren't read, as before: a face's shapes are
+moved by your face.
+
 **Glowing parts: fire, sparks and smoke (0.9.0).** A see-through part
 (glTF's `BLEND`) whose material has `"extras": {"direbot": {"glow":
 {"soft": 1.5, "ragged": 0}}}` is drawn as a soft glowing gas - a

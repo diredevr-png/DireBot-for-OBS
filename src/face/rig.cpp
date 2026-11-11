@@ -551,6 +551,16 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 	weights_.resize(m.meshes.size());
 	for (size_t mi = 0; mi < m.meshes.size(); mi++)
 		weights_[mi] = m.meshes[mi].weights;
+	// (And those its own animations play, of a file that asks for it.)
+	for (const Animation &a : m.animations)
+		for (const AnimChannel &c : a.channels)
+			plays_shapes_ = plays_shapes_ || c.path == AnimChannel::Shapes;
+	if (plays_shapes_) {
+		shape_keep_.assign(m.meshes.size(), 1.0f);
+		shape_play_.resize(m.meshes.size());
+		for (size_t mi = 0; mi < m.meshes.size(); mi++)
+			shape_play_[mi].assign(m.meshes[mi].weights.size(), 0.0f);
+	}
 	// Every shape by its name (any case), for a face on cue by a shape's
 	// own name.
 	for (size_t mi = 0; mi < m.meshes.size(); mi++)
@@ -1711,6 +1721,26 @@ bool Rig::size_switched(const AnimChannel &c) const
 	       model_->nodes[c.node].size_switch;
 }
 
+// A track of its mesh's shapes' strengths (AnimChannel::Shapes) at `t`
+// seconds, over what's played of them so far this frame: one that jumps
+// (STEP) all of it as soon as it plays at all - a switch, as a marked
+// part's size is - any other as much as `amount`, eased with the move as
+// its bones are.
+void Rig::play_shapes(const AnimChannel &c, float t, float amount)
+{
+	const int mesh = model_->nodes[c.node].mesh;
+	const float k = clamp01(amount);
+	if (mesh < 0 || mesh >= (int)shape_play_.size() || c.shapes <= 0 || c.times.empty() || !(k > 0))
+		return;
+	shape_now_.assign((size_t)c.shapes, 0.0f);
+	sample(c, t, shape_now_.data());
+	const float a = c.ease == AnimChannel::Step ? 1.0f : k;
+	std::vector<float> &play = shape_play_[mesh];
+	shape_keep_[mesh] *= 1 - a;
+	for (size_t i = 0; i < play.size() && i < shape_now_.size(); i++)
+		play[i] = play[i] * (1 - a) + shape_now_[i] * a;
+}
+
 // One of its own animations, once, at `t` seconds.
 void Rig::play_own(int animation, float t, float amount)
 {
@@ -1721,6 +1751,10 @@ void Rig::play_own(int animation, float t, float amount)
 	for (const AnimChannel &c : a.channels) {
 		if (c.node < 0 || c.node >= (int)r_.size())
 			continue;
+		if (c.path == AnimChannel::Shapes) {
+			play_shapes(c, t, k);
+			continue;
+		}
 		sample(c, t, v);
 		if (c.path == AnimChannel::Move) {
 			t_[c.node] = t_[c.node] + (V3{v[0], v[1], v[2]} - t_[c.node]) * k;
@@ -1875,6 +1909,10 @@ void Rig::apply_animation(int which, float t, float amount)
 	for (const AnimChannel &c : a.channels) {
 		if (c.node < 0 || c.node >= (int)r_.size())
 			continue;
+		if (c.path == AnimChannel::Shapes) {
+			play_shapes(c, t, k);
+			continue;
+		}
 		sample(c, t, v);
 		if (c.path == AnimChannel::Move) {
 			const V3 to{v[0], v[1], v[2]};
@@ -2121,6 +2159,16 @@ void Rig::drive_expressions(const Drive &d)
 		if (dr.mesh >= 0 && dr.mesh < (int)weights_.size() && dr.morph >= 0 &&
 		    dr.morph < (int)weights_[dr.mesh].size())
 			weights_[dr.mesh][dr.morph] = 0;
+	// The shapes its own animations play (play_shapes), over those - and
+	// under your face's, which add to them.
+	if (plays_shapes_)
+		for (size_t mi = 0; mi < weights_.size() && mi < shape_play_.size(); mi++) {
+			if (shape_keep_[mi] >= 1)
+				continue;
+			std::vector<float> &w = weights_[mi];
+			for (size_t i = 0; i < w.size() && i < shape_play_[mi].size(); i++)
+				w[i] = w[i] * shape_keep_[mi] + shape_play_[mi][i];
+		}
 	values_.clear();
 	if (!d.expressions)
 		return;
@@ -2367,6 +2415,11 @@ void Rig::pose(const Drive &d)
 		t_[i] = m.nodes[i].t;
 		r_[i] = m.nodes[i].r;
 		s_[i] = m.nodes[i].s;
+	}
+	if (plays_shapes_) {
+		std::fill(shape_keep_.begin(), shape_keep_.end(), 1.0f);
+		for (std::vector<float> &play : shape_play_)
+			std::fill(play.begin(), play.end(), 0.0f);
 	}
 	animate(d.dt);
 	play_moves(d);

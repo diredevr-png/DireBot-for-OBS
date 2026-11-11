@@ -2119,6 +2119,8 @@ void read_nodes(const json &doc, Model &m)
 		// ticked box either way.)
 		const json &sw = field(field(field(n, "extras"), "direbot"), "switch");
 		node.size_switch = sw.is_boolean() ? sw.get<bool>() : sw.is_number() && sw.get<double>() != 0;
+		const json &sh = field(field(field(n, "extras"), "direbot"), "shapes");
+		node.plays_shapes = sh.is_boolean() ? sh.get<bool>() : sh.is_number() && sh.get<double>() != 0;
 		node.mesh = index_of(n, "mesh");
 		node.skin = index_of(n, "skin");
 		if (node.mesh >= (int)list(doc, "meshes").size())
@@ -2597,38 +2599,48 @@ void read_skins(Reader &rd, const json &doc, Model &m)
 	}
 }
 
-// Its own animations. A channel DireBot can't play (an expression's
-// strengths, a missing part, numbers that don't add up) is left out; the
-// model loads all the same.
-// An animation's channel (`cj`, of animation `aj`) on one of `nodes`
-// nodes, into `c`: false if it's broken, isn't a move, turn or size
-// ("weights", its expressions' strengths, aren't played), or there's too
-// much of it (`numbers`: all the keys' numbers so far).
-bool read_channel(Reader &rd, const json &aj, const json &cj, size_t nodes, AnimChannel &c, size_t &numbers)
+// Its own animations. A channel DireBot can't play (the strengths of a
+// face's shapes, a missing part, numbers that don't add up) is left out;
+// the model loads all the same.
+// An animation's channel (`cj`, of animation `aj`) on one of the model's
+// nodes, into `c`: false if it's broken, isn't a move, turn or size - or
+// the strengths of its mesh's shapes ("weights"), on a node whose file
+// asks for them to be played (Node::plays_shapes; any other's are its
+// face's, moved by yours, and aren't read) - or there's too much of it
+// (`numbers`: all the keys' numbers so far).
+bool read_channel(Reader &rd, const json &aj, const json &cj, const Model &m, AnimChannel &c, size_t &numbers)
 {
 	const json &samplers = list(aj, "samplers");
 	const json &target = field(cj, "target");
 	const std::string path = text(target, "path");
 	const int node = index_of(target, "node");
 	const int si = index_of(cj, "sampler");
-	if (node < 0 || node >= (int)nodes || si < 0 || si >= (int)samplers.size())
+	if (node < 0 || node >= (int)m.nodes.size() || si < 0 || si >= (int)samplers.size())
 		return false;
 	c = AnimChannel();
 	c.node = node;
-	if (path == "translation")
+	if (path == "translation") {
 		c.path = AnimChannel::Move;
-	else if (path == "rotation")
+	} else if (path == "rotation") {
 		c.path = AnimChannel::Turn;
-	else if (path == "scale")
+	} else if (path == "scale") {
 		c.path = AnimChannel::Size;
-	else
+	} else if (path == "weights") {
+		const Node &n = m.nodes[node];
+		if (!n.plays_shapes || n.mesh < 0 || n.mesh >= (int)m.meshes.size() || m.meshes[n.mesh].weights.empty())
+			return false;
+		c.path = AnimChannel::Shapes;
+		c.shapes = (int)m.meshes[n.mesh].weights.size();
+	} else {
 		return false;
+	}
 	const json &sj = samplers[si];
 	const std::string ease = text(sj, "interpolation");
 	c.ease = ease == "STEP" ? AnimChannel::Step : ease == "CUBICSPLINE" ? AnimChannel::Curved : AnimChannel::Straight;
 	try {
 		c.times = rd.floats(index_of(sj, "input"), 1);
-		c.values = rd.floats(index_of(sj, "output"), c.size());
+		// (Shapes' strengths: one list of plain numbers, a key's after another's.)
+		c.values = rd.floats(index_of(sj, "output"), c.path == AnimChannel::Shapes ? 1 : c.size());
 	} catch (const Fail &) {
 		return false;
 	}
@@ -2660,7 +2672,7 @@ void read_animations(Reader &rd, const json &doc, Model &m)
 			anim.name = "Animation " + std::to_string(ai + 1);
 		for (const json &cj : list(aj, "channels")) {
 			AnimChannel c;
-			if (!read_channel(rd, aj, cj, m.nodes.size(), c, numbers))
+			if (!read_channel(rd, aj, cj, m, c, numbers))
 				continue;
 			anim.length = std::max(anim.length, c.times.back());
 			anim.channels.push_back(std::move(c));
@@ -2988,7 +3000,7 @@ void load_motion_json(Reader &rd, const json &doc, Motion &out)
 		out.name = text(aj, "name");
 		for (const json &cj : list(aj, "channels")) {
 			AnimChannel c;
-			if (!read_channel(rd, aj, cj, m.nodes.size(), c, numbers))
+			if (!read_channel(rd, aj, cj, m, c, numbers))
 				continue;
 			const int node = c.node;
 			c.node = -1;
