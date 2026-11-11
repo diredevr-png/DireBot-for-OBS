@@ -1061,6 +1061,8 @@ def test_the_hair_budget(run):
             print(f"a budget far too small: its least share {least}: {h}")
             assert least is not None and 0 < least < 0.25, h
             assert h["share"] == least and h["ms"] > h["budget_ms"], h
+            # (Full's rule: the one that keeps the share it was over at.)
+            assert h["over"] == least, h
             assert h["loaded"] == strands and h["shown_strands"] == strands, h
             # That share of its strands, each as much wider.
             assert 16 <= h["drawn"] < 0.25 * strands, h
@@ -1094,7 +1096,9 @@ def test_the_budgets_share_held_and_its_lines(run):
     ribbons under that, at half the budget's share: "hair_line_loss" (up to
     0.4 instead of a twentieth) keeps them lines with fewer hairs, and
     "hair_line_cost" says what share they have as ribbons. Left alone,
-    all as ever. FaceGetState also counts the budget's changes of share
+    as the hair detail setting has them: Full keeps a budget's lines (they
+    may lose 0.4), with the budget's other rule. FaceGetState also counts
+    the budget's changes of share
     ("share_changes") and a part's changes between lines and ribbons
     ("form_changes"), and gives the share the budget's other rule
     ("hair_budget_rule" 1) was over its limit at ("over")."""
@@ -1115,8 +1119,11 @@ def test_the_budgets_share_held_and_its_lines(run):
             everything
         shares = (0.9, 0.75, 0.6, 0.5, 0.4, 0.3, 0.2)
         found = {}
+        # (0.05: a budget's lines as the first way had them. Under 0: the
+        # setting's own - Full's, kept: as told 0.4.)
+        first = 0.05
         for share in shares:
-            for loss in (-1, 0.2, 0.4):
+            for loss in (first, 0.2, 0.4, -1):
                 s.set("Held", hair_share=share, hair_line_loss=loss, hair_line_cost=-1)
                 assert wait_for(lambda: abs(s.hair("Held")["share"] - share) < 1e-3, 5, 0.05), s.hair("Held")
                 time.sleep(0.3)
@@ -1132,22 +1139,25 @@ def test_the_budgets_share_held_and_its_lines(run):
                 assert abs(h["drawn"] - want * strands) <= 0.01 * strands + 1, (share, loss, h)
         for share in shares:
             # (Told it may lose more: lines wherever it was lines told less.)
-            assert bool(found[(share, 0.2)]["lines"]) >= bool(found[(share, -1)]["lines"]), share
+            assert bool(found[(share, 0.2)]["lines"]) >= bool(found[(share, first)]["lines"]), share
             assert bool(found[(share, 0.4)]["lines"]) >= bool(found[(share, 0.2)]["lines"]), share
+            # (Left to the setting - Full: as told 0.4.)
+            for key in ("drawn", "pieces", "lines"):
+                assert found[(share, -1)][key] == found[(share, 0.4)][key], (share, key, found)
         # With most of its hairs, lines as ever; with a fifth of them,
         # ribbons whatever it's told; and between, somewhere it's ribbons
-        # as ever and lines - twice the hairs - told it may lose more.
-        assert found[(0.9, -1)]["lines"] and not found[(0.2, 0.4)]["lines"], found
-        lower = [share for share in shares if not found[(share, -1)]["lines"] and found[(share, 0.4)]["lines"]]
+        # the first way and lines - twice the hairs - told it may lose more.
+        assert found[(0.9, first)]["lines"] and not found[(0.2, 0.4)]["lines"], found
+        lower = [share for share in shares if not found[(share, first)]["lines"] and found[(share, 0.4)]["lines"]]
         assert lower, found
-        assert found[(lower[0], 0.4)]["drawn"] > 1.9 * found[(lower[0], -1)]["drawn"], found
+        assert found[(lower[0], 0.4)]["drawn"] > 1.9 * found[(lower[0], first)]["drawn"], found
         # Their pictures: held at a share with lines kept, each hair still
         # a hair - no more of the picture covered than with all of them,
         # and not much less; as ribbons, fewer and wider.
         s.set("Held", hair_share=lower[0], hair_line_loss=0.4)
         time.sleep(0.5)
         rows = {"all": s.shot("All"), "lines": s.shot("Held")}
-        s.set("Held", hair_line_loss=-1)
+        s.set("Held", hair_line_loss=first)
         time.sleep(0.5)
         rows["ribbons"] = s.shot("Held")
         cover = {name: count(r, faint_magenta) for name, r in rows.items()}
@@ -1159,23 +1169,25 @@ def test_the_budgets_share_held_and_its_lines(run):
         # What a ribbon costs against a line: as ribbons, that much of the
         # share held (as ever: half).
         for cost, part in ((1.0, 1.0), (0.8, 0.8), (-1, 0.5)):
-            s.set("Held", hair_share=0.3, hair_line_loss=-1, hair_line_cost=cost)
+            s.set("Held", hair_share=0.3, hair_line_loss=first, hair_line_cost=cost)
             assert wait_for(lambda: abs(s.hair("Held")["drawn"] - 0.3 * part * strands) <= 0.01 * strands + 1,
                             5, 0.05), (cost, s.hair("Held"))
             assert s.hair("Held")["lines"] == 0, s.hair("Held")
         # Not held any more: all of them.
-        s.set("Held", hair_share=-1)
+        s.set("Held", hair_share=-1, hair_line_loss=-1)
         assert wait_for(lambda: s.hair("Held")["share"] == 1 and s.hair("Held")["drawn"] == strands, 5, 0.05), \
             s.hair("Held")
         assert s.hair("Held")["lines"] == s.hair("Held")["pieces"], s.hair("Held")
 
-        # The budget's other rule, where the card's clock answers: with room
-        # for every hair it goes up to all of them in a few changes and
-        # keeps no share it was over at; with a budget far too small it
-        # comes down to its least share, as the first rule does, and that's
-        # the share it keeps as over the limit.
+        # The budget's other rule - Full's own, so left to the setting -
+        # where the card's clock answers: with room for every hair it goes
+        # up to all of them in a few changes and keeps no share it was over
+        # at; with a budget far too small it comes down to its least share,
+        # as the first rule does, and that's the share it keeps as over the
+        # limit. The first rule, asked for by its number: down to its least
+        # share too, and no share kept.
         clock = wait_for(lambda: s.hair("All")["ms"] > 0, 8, 0.1)
-        s.set("Held", hair_budget_rule=1, hair_budget_ms=100000)
+        s.set("Held", hair_budget_rule=-1, hair_budget_ms=100000)
         assert wait_for(lambda: s.hair("Held")["budget_ms"] == 100000, 5, 0.05), s.hair("Held")
         if clock:
             assert wait_for(lambda: s.hair("Held")["share"] == 1 and s.hair("Held")["share_changes"] > 0, 30, 0.05), \
@@ -1190,6 +1202,14 @@ def test_the_budgets_share_held_and_its_lines(run):
             print(f"the other rule, a budget far too small: {h}")
             assert least is not None and 0 < least < 0.25 and h["over"] == least, (least, h)
             assert 1 <= h["share_changes"] <= 6 and h["ms"] > h["budget_ms"], h
+            s.set("Held", hair_budget_rule=0)
+            assert wait_for(lambda: s.hair("Held")["over"] == 0 and s.hair("Held")["share"] < 0.5, 10, 0.02), \
+                s.hair("Held")
+            least = settles(lambda: s.hair("Held")["share"])
+            h = s.hair("Held")
+            print(f"the first rule, a budget far too small: {h}")
+            assert least is not None and 0 < least < 0.25 and h["over"] == 0, (least, h)
+            s.set("Held", hair_budget_rule=-1)
         else:
             time.sleep(2)
             h = s.hair("Held")

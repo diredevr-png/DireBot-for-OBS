@@ -675,6 +675,8 @@ def test_hair_strands_on_the_graphics_card(obs):
         print("A hair budget far too small: its least share %s: %s" % (least, h))
         assert least is not None and 0 < least < 0.25, (h, obs.log())
         assert h["share"] == least and h["ms"] > h["budget_ms"], h
+        # (Full's rule: the one that keeps the share it was over at.)
+        assert h["over"] == least, h
         assert h["loaded"] == strands and 16 <= h["drawn"] < 0.25 * strands, h
         assert abs(h["drawn"] - least * strands) <= 0.02 * strands, (h, least)
         change(hair_budget_ms=0)
@@ -1039,8 +1041,9 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
         # of every run, and of its hull's - by point and laid out the same
         # to the pixel, as ribbons and with its thin hairs as lines. And a
         # budget's lines kept with fewer hairs ("hair_line_loss": how much
-        # of what they cover they may lose, up to 0.4 instead of a
-        # twentieth): never fewer lines, never fewer hairs, than as ever.
+        # of what they cover they may lose, up to 0.4 - Full's own -
+        # instead of the first way's twentieth): never fewer lines, never
+        # fewer hairs, than the first way.
         for share in (0.6, 0.3):
             before, after = both("Laid", "its share held at %s, ribbons" % share, least=1000, hair_share=share)
             assert abs(after["share"] - share) < 1e-6 and after["lines"] == 0, after
@@ -1048,7 +1051,7 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
             assert 0 < after["hull_pieces"] < after["pieces"], after
         change("Laid", hair_share=-1)
         kept = {}
-        for loss in (-1, 0.4):
+        for loss in (0.05, 0.4):
             for share in (0.7, 0.4):
                 before, after = both("Laid among", "its share held at %s, a budget's lines losing %s" % (share, loss),
                                      least=1000, hair_lines=-1, hair_share=share, hair_line_loss=loss)
@@ -1056,8 +1059,8 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
                     (share, after)
                 kept[(loss, share)] = after
         for share in (0.7, 0.4):
-            assert kept[(0.4, share)]["lines"] >= kept[(-1, share)]["lines"], (share, kept)
-            assert kept[(0.4, share)]["drawn"] >= kept[(-1, share)]["drawn"], (share, kept)
+            assert kept[(0.4, share)]["lines"] >= kept[(0.05, share)]["lines"], (share, kept)
+            assert kept[(0.4, share)]["drawn"] >= kept[(0.05, share)]["drawn"], (share, kept)
         change("Laid among", hair_share=-1, hair_line_loss=-1)
         assert wait_for(lambda: hair("Laid among")["share"] == 1 and hair("Laid among")["drawn"] == strands, 10, 0.1), \
             hair("Laid among")

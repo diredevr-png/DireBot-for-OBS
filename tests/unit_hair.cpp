@@ -417,12 +417,17 @@ static void test_plans()
 	// As made: nothing limited.
 	const HairPlan made;
 	CHECK(made.budget_ms == 0 && made.pieces == 0);
-	// Whatever the choice: the budget's first rule, a budget's lines as
-	// ever, and its share never held.
+	// Full: the budget's other rule, and with it a budget's thin hairs
+	// kept lines with fewer hairs (the two together). The rest: its first
+	// rule, a budget's lines as ever. Whatever the choice: what a ribbon
+	// costs against a line as ever, and the budget's share never held.
+	CHECK(full.budget_rule == 1 && full.line_loss == HAIR_LINE_LOSS_KEPT);
+	for (const HairPlan &plan : {light, today, made})
+		CHECK(plan.budget_rule == 0 && plan.line_loss == HAIR_LINE_LOSS);
 	for (const HairPlan &plan : {full, light, today, made})
-		CHECK(plan.budget_rule == 0 && plan.line_loss == HAIR_LINE_LOSS && plan.line_cost == HAIR_LINE_COST &&
-		      plan.share == 0);
-	CHECK(HAIR_LINE_LOSS == 0.05f && HAIR_LINE_COST == 0.5f);
+		CHECK(plan.line_cost == HAIR_LINE_COST && plan.share == 0);
+	CHECK(HAIR_LINE_LOSS == 0.05f && HAIR_LINE_COST == 0.5f && HAIR_LINE_LOSS_KEPT == 0.4f);
+	CHECK(HAIR_LINE_LOSS_KEPT == Strands::LINE_LOSS[Strands::LINE_LOSSES - 1]);
 
 	// How a file is loaded for each: the points kept (on the card, here),
 	// and how straight a run is left out.

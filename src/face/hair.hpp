@@ -121,6 +121,11 @@ struct HairPlan {
 	float share = 0;
 };
 
+// How much of what its hairs cover a part's lines may lose under a budget
+// where they're kept lines with fewer hairs (HairPlan::line_loss; the most
+// Strands::LINE_LOSS goes to).
+constexpr float HAIR_LINE_LOSS_KEPT = 0.4f;
+
 inline HairPlan hair_plan(HairDetail d)
 {
 	HairPlan p;
@@ -130,6 +135,15 @@ inline HairPlan hair_plan(HairDetail d)
 		p.solid = 0.4f;
 		p.budget_ms = 1.0f;
 		p.pieces = 1'500'000;
+		// Its budget's rule that uses the whole limit, and with it a
+		// budget's thin hairs kept lines with fewer hairs: the two go
+		// together. (Measured on a Radeon RX 9070 XT, a coat of 436,000
+		// hairs filling the picture: the first rule stops at 159,000 of
+		// them, as ribbons, with a fifth of the limit unused; this rule
+		// with lines as ever goes back and forth where the lines begin,
+		// right at the limit; with the lines kept it holds 257,000.)
+		p.budget_rule = 1;
+		p.line_loss = HAIR_LINE_LOSS_KEPT;
 	} else {
 		p.points_card = 800'000;
 		p.points_cpu = 60'000;
@@ -233,7 +247,8 @@ inline float hair_px(const Strands &h, float width, const HairShare &s, float sc
 //     coat a little thinner with its hairs still hair-thin, or as thick
 //     as ever with fewer, wider hairs). With the budget's other rule
 //     (HairPlan::budget_rule) a part that's lines under a budget stays
-//     lines until a pixel is a tenth smaller, as above.
+//     lines until a pixel is a tenth smaller, as above. (Full's plan: that
+//     rule, and lines that may lose HAIR_LINE_LOSS_KEPT - hair_plan.)
 constexpr float HAIR_LINE_STAYS = 1.1f, HAIR_LINE_COST = 0.5f, HAIR_LINE_LOSS = 0.05f, HAIR_SHARE_LEAST = 0.1f;
 
 // How wide a pixel has to be (in the part's file's units, its hairs as

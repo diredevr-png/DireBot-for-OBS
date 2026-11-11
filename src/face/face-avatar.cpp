@@ -1113,8 +1113,10 @@ struct FaceAvatar {
 	// one that uses the whole limit; how much of what they cover a budget's
 	// lines may lose - "hair_line_loss", 0.05 to 0.4; what a ribbon costs
 	// against a line - "hair_line_cost", 0.1 to 1; and, for measuring
-	// only, the budget's share held - "hair_share", up to 1. Under 0, or 0:
-	// the setting's. HairPlan::budget_rule, line_loss, line_cost, share.)
+	// only, the budget's share held - "hair_share", up to 1. Under 0 (and
+	// for the last three, 0): the setting's - Full's is the other rule
+	// with lines that may lose 0.4, hair_plan. HairPlan::budget_rule,
+	// line_loss, line_cost, share.)
 	std::atomic<int> hair_budget_rule{-1};
 	std::atomic<float> hair_line_loss{-1.0f}, hair_line_cost{-1.0f}, hair_share{-1.0f};
 	// Whether characters can be posed on the card here (known for sure
