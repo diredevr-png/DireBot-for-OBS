@@ -154,7 +154,8 @@ inline HairPlan hair_plan(HairDetail d)
 		// hairs filling the picture: the first rule stops at 159,000 of
 		// them, as ribbons, with a fifth of the limit unused; this rule
 		// with lines as ever goes back and forth where the lines begin,
-		// right at the limit; with the lines kept it holds 257,000.)
+		// right at the limit; with the lines kept it holds 253,000 at
+		// 0.93 ms (257,000 with lines that may lose 0.2).)
 		p.budget_rule = 1;
 		p.line_loss = HAIR_LINE_LOSS_KEPT;
 	} else {

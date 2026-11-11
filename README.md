@@ -618,24 +618,43 @@ inner layers of a share of the hairs standing in as a solid core, so
 hair behind hair behind skin sorts itself out without the card sorting
 every hair every frame.
 
-It's made cheap in four ways. As it loads, points that hardly bend their
-hair are left out (a point stays where leaving it out would move the
-hair more than 0.03% of the coat's size, turn it more than 20 degrees,
-change its width or colour enough to see, or let its bones swing it
-wrong), and a character keeps at most 2 million points (800,000 on
-Lighter; where the CPU poses it, 150,000 and 60,000): a file with more
-has hairs left out evenly all over, more of them where the coat is many
-hairs deep and fewer where it's thin, and the ones kept are drawn that
-much wider so the coat covers as much. As it's drawn, a coat that's
-small on screen draws fewer, wider hairs (a hair thinner than a pixel is
-drawn a pixel wide and as see-through as it's thinner, and only as many
-are drawn as leaves each at least 40% solid; 65% on Lighter), and no
-more than 1.5 million pieces of hair in a frame (750,000 on Lighter).
+It's made cheap as it loads and as it's drawn. As it loads, points that
+hardly bend their hair are left out (a point stays where leaving it out
+would move the hair more than 0.03% of the coat's size, turn it more
+than 20 degrees, change its width or colour enough to see, let its bones
+swing it wrong, or let an expression move it unlike the points beside
+it), and a character keeps at most 2 million points (800,000 on Lighter;
+where the CPU poses it, 150,000 and 60,000): a file with more has hairs
+left out evenly all over, more of them where the coat is many hairs deep
+and fewer where it's thin, and the ones kept are drawn that much wider
+so the coat covers as much.
+
+As it's drawn, a coat that's small on screen draws fewer, wider hairs (a
+hair thinner than a pixel is drawn a pixel wide and as see-through as
+it's thinner, and only as many are drawn as leaves each at least 40%
+solid; 65% on Lighter), and no more than 1.5 million pieces of hair in a
+frame (750,000 on Lighter). Hairs well under a pixel wide go to the card
+as lines, which is the same picture from half the corners; a coat of
+thin hairs with a few wide ones among them sends only its thin ones so.
+Posed on the graphics card (Windows), hair that can't show behind a
+solid part or deep under other hair is left out before the card cuts it
+into pixels, and each form a part is drawn in lies in the card's memory
+in the order it's drawn, so the card reads straight through it - made
+off the drawing thread, and freed again when it hasn't been drawn from
+for a while.
+
 And the hair budget: the add-on times hair on the graphics card every
 frame (the card's own clock), and when it takes more than 1 ms (0.5 ms on
 Lighter) it draws fewer, wider hairs until it doesn't, down to a tenth
 of them - so hair gives way before your game does. A new character
-starts at a quarter and works up.
+starts at a quarter and works up. On Full the budget aims just under its
+limit and remembers where it went over, and thin hairs stay lines under
+it. A companion's hair is drawn by its character's settings, and the two
+share the one limit. (Measured on a Radeon RX 9070 XT, a wolf's coat of
+436,000 hairs filling a 1080p picture: 1.3 ms with every hair, and
+253,000 of them at the 1 ms limit.) How all of it works, what was
+measured, what was tried and dropped, and how to measure it again:
+[docs/hair.md](docs/hair.md).
 
 `hair_detail` (in the source's settings, "Hair detail") picks `full`,
 `light` ("Lighter": fewer, wider hairs, half the budget) or `today`
@@ -648,10 +667,10 @@ character without any keeps its strands there, as on Lighter.
 What it can't do yet: hair casts no shadows on itself or the body (so a
 white coat is flatter than in Blender, and a braid's crossing locks show
 through each other a little); where the CPU poses a character (OpenGL:
-Linux and Mac) it keeps far fewer hairs than on Windows; hairs are
-simplified as the file has them, not as an expression moves them; and
-expressions move each strand part by 2,047 spots at most (hairs close
-together that move alike share one).
+Linux and Mac) it keeps far fewer hairs than on Windows; the first time
+a character's hair is drawn the picture waits a moment for it to be laid
+out; and expressions move each strand part by 2,047 spots at most (hairs
+close together that move alike share one).
 
 The link never hands out your stream key: `GetStreamServiceSettings`
 through it shows the key (and a custom server's password or token) as
