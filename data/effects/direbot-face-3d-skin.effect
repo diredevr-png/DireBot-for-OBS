@@ -124,15 +124,74 @@ VertOut VSOutlineSk(SkinIn v)
 	return outline_out(s.pos, s.norm, v.col, v.uv);
 }
 
-StrandOut VSStrandSk(SkinStrandIn v)
+// Hidden hair left out before it's drawn (strand_view.w; Direct3D only -
+// avatar3d.cpp gives the picture of the solid parts' distances to this
+// stage itself, as OBS gives pictures to the pixel stage alone). Most of a
+// coat is behind the body or under other hair, and every piece of it would
+// still be cut into pixels only for PSStrand to throw each one away. So
+// each point says whether it could show: not if everything is nearer than
+// it - by more than a margin (strand_view.z), and what PSStrand allows a
+// root - at its own pixel and the 8 round it, 4 and 8 pixels off (a piece
+// is wider than its middle, and the hull's edge isn't sharp). The card
+// drops a piece all of whose corners say no (SV_CullDistance) and draws
+// the rest as before, PSStrand still judging every pixel. A point off the
+// picture, or by its edge, always says yes.
+struct StrandSkOut {
+	float4 pos   : POSITION;
+	float4 lit   : TEXCOORD0;
+	float3 shine : TEXCOORD1;
+	float4 uv    : TEXCOORD2;
+	float  depth : TEXCOORD3;
+	float  shown : SV_CullDistance0;
+};
+
+float strand_shown(float3 pos, float along)
+{
+	if (strand_view.w < 0.5)
+		return 1.0;
+	float shown = 1.0;
+	float4 c = mul(float4(pos, 1.0), ViewProj);
+	if (c.w > 0.0) {
+		float2 at = float2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5) * strand_view.xy;
+		if (at.x >= 9.0 && at.y >= 9.0 && at.x < strand_view.x - 9.0 && at.y < strand_view.y - 9.0) {
+			int3 p = int3(int(at.x), int(at.y), 0);
+			float far = depth_map.Load(p).r;
+			far = max(far, depth_map.Load(p + int3(4, 0, 0)).r);
+			far = max(far, depth_map.Load(p + int3(-4, 0, 0)).r);
+			far = max(far, depth_map.Load(p + int3(0, 4, 0)).r);
+			far = max(far, depth_map.Load(p + int3(0, -4, 0)).r);
+			far = max(far, depth_map.Load(p + int3(8, 8, 0)).r);
+			far = max(far, depth_map.Load(p + int3(-8, 8, 0)).r);
+			far = max(far, depth_map.Load(p + int3(8, -8, 0)).r);
+			far = max(far, depth_map.Load(p + int3(-8, -8, 0)).r);
+			float depth = -mul(float4(pos, 1.0), cam).z;
+			float t = saturate(along);
+			if (depth > far + strand.w * (1.0 - t) * (1.0 - t) + strand_view.z)
+				shown = -1.0;
+		}
+	}
+	// (2, a test's view: only what would be left out.)
+	return strand_view.w > 1.5 ? -shown : shown;
+}
+
+StrandSkOut VSStrandSk(SkinStrandIn v)
 {
 	float spot = floor(v.norm.w);
 	int at = int(min(spot, 2047.0));
 	float3 made = v.pos.xyz + spot_moves[at].xyz;
 	float4 j = floor(v.jw);
 	Skinned s = skinned(made, oct_dir(v.norm.xy), float3(1.0, 0.0, 0.0), j, (v.jw - j) / 0.999);
-	return strand_out(s.pos, s.norm, v.col, v.norm.z, (v.norm.w - spot) / 0.9995, abs(v.pos.w) - 1.0,
-			  v.pos.w < 0.0 ? -1.0 : 1.0);
+	float along = (v.norm.w - spot) / 0.9995;
+	StrandOut o = strand_out(s.pos, s.norm, v.col, v.norm.z, along, abs(v.pos.w) - 1.0,
+				 v.pos.w < 0.0 ? -1.0 : 1.0);
+	StrandSkOut k;
+	k.pos = o.pos;
+	k.lit = o.lit;
+	k.shine = o.shine;
+	k.uv = o.uv;
+	k.depth = o.depth;
+	k.shown = strand_shown(s.pos, along);
+	return k;
 }
 
 HullOut VSHullSk(SkinStrandIn v)

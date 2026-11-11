@@ -1296,16 +1296,49 @@ Primitive finish_strands(const RawStrands &raw, int layers, std::vector<uint32_t
 	h.full = kept < in_file ? key_of(kept) : 1 / lowest;
 	// Its hairs' mean width along their lengths (whichever of their points
 	// are kept), as drawn at `full`.
+	// (And as lines: how wide a pixel has to be for its hairs to lose a
+	// hundredth, and a twentieth, of what they cover - of every so-manyth
+	// piece, so a big coat's aren't all gone through forty times.)
 	double width_sum = 0, length_sum = 0;
+	const size_t pieces = p.pos.size() > kept ? p.pos.size() - kept : 0,
+		     every = std::max<size_t>(1, pieces / 200000);
+	std::vector<std::pair<float, float>> some; // (how wide, how long)
+	some.reserve(pieces / every + 1);
+	size_t at = 0;
+	double widest = 0;
 	for (size_t k = 0; k < kept; k++) {
 		const double wider = 1 / std::min(1.0, (double)h.full * (double)h.rate[k]);
-		for (uint32_t i = h.first[k]; i + 1 < h.first[k + 1]; i++) {
+		for (uint32_t i = h.first[k]; i + 1 < h.first[k + 1]; i++, at++) {
 			const double piece = length(p.pos[i + 1] - p.pos[i]);
-			width_sum += 0.5 * ((double)h.width[i] + (double)h.width[i + 1]) * piece * wider;
+			const double wide = 0.5 * ((double)h.width[i] + (double)h.width[i + 1]) * wider;
+			width_sum += wide * piece;
 			length_sum += piece;
+			if (at % every == 0) {
+				some.push_back({(float)wide, (float)piece});
+				widest = std::max(widest, wide);
+			}
 		}
 	}
 	h.mean_width = length_sum > 0 ? (float)(width_sum / length_sum) : 0.0f;
+	auto lost_at = [&some](double pixel) {
+		double lost = 0, all = 0;
+		for (const std::pair<float, float> &one : some) {
+			all += (double)one.first * (double)one.second;
+			lost += std::max(0.0, (double)one.first - (double)Strands::LINE_COVERS * pixel) *
+				(double)one.second;
+		}
+		return all > 0 ? lost / all : 0.0;
+	};
+	auto pixel_losing = [&](double share) {
+		double under = 0, over = widest / (double)Strands::LINE_COVERS; // (at `over`, nothing's lost)
+		for (int step = 0; step < 40; step++) {
+			const double middle = 0.5 * (under + over);
+			(lost_at(middle) > share ? under : over) = middle;
+		}
+		return (float)over;
+	};
+	h.line_pixel = pixel_losing(0.01);
+	h.line_pixel_most = pixel_losing(0.05);
 	p.joints.shrink_to_fit();
 	p.weights.shrink_to_fit();
 	p.pos.shrink_to_fit();

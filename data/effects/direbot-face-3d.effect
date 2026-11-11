@@ -19,7 +19,9 @@
 //            as makes up for the rest. Lit as hair is - across its length,
 //            with a white shine and a coloured one from inside it - at
 //            its points, and hidden where a solid part is in front by the
-//            picture of their depths (`depth_map`: hairs write no depth)
+//            picture of their depths (`depth_map`: hairs write no depth).
+//            Hairs under a pixel wide are sent as lines instead (the same
+//            picture for half the work: `strand_lod.z`)
 //   Depth    a solid part's distance from the camera, for that picture
 //   Hull     the inner layers of the hairs into that picture too
 //   Down     the picture drawn twice the size, halved: smooth edges
@@ -67,11 +69,19 @@ uniform float4 flat_at;
 // (y), how much bigger its bones make it (z: its widths are the file's)
 // and how far behind a solid part its root still shows (w: it sits on the
 // skin); `strand_lod`: the threshold its strands are drawn up to (x: the
-// ones whose keys are under it), and (Hull) how much further off than it
-// is a hair of the hull is written (y).
+// ones whose keys are under it), (Hull) how much further off than it is a
+// hair of the hull is written (y), and 1 when its pieces are sent as lines
+// (z: hairs thinner than a pixel - a line is a pixel wide, so it's the
+// same picture for half the triangles; avatar3d.cpp says when);
+// `strand_view`: the picture's size in pixels (x y), and for leaving
+// hidden hair out before it's drawn (the -skin effect's strand_shown):
+// how much further off than what's in front of it a point has to be (z)
+// and whether it's done (w: 0 no, 1 yes, 2 only the hair left out is drawn
+// - a test's view of it).
 uniform float3 eye_pos;
 uniform float4 strand;
 uniform float4 strand_lod;
+uniform float4 strand_view;
 uniform texture2d depth_map;
 // Outline: how far out (world units), its colour, how much it's lit.
 uniform float outline_width;
@@ -509,7 +519,10 @@ StrandOut strand_out(float3 pos, float3 run, float4 col, float width, float alon
 	// covers only its share of them.
 	float px = d * strand.x;
 	float wd = max(w, px * strand.y);
-	P = P + S * (side * wd * 0.5);
+	// (Sent as lines - strand_lod.z: its middle, the card draws it a pixel
+	// wide.)
+	float as_lines = strand_lod.z;
+	P = P + S * (side * wd * 0.5 * (1.0 - as_lines));
 	o.pos = mul(float4(P, 1.0), ViewProj);
 	float3 vpos = mul(float4(P, 1.0), cam).xyz;
 	o.depth = -vpos.z;
@@ -518,7 +531,20 @@ StrandOut strand_out(float3 pos, float3 run, float4 col, float width, float alon
 	float seed = frac(sin(drawn.x * 12345.678 + 0.5) * 43758.5453);
 	// How much of its pixels it covers: thinner than drawn, its tip
 	// fading, its material's and points' see-through, the whole avatar's.
-	float cover = (wd > 0.0 ? w / wd : 0.0) * saturate(base_colour.a * col.a) * saturate((1.0 - t) * 10.0) * look.w;
+	float thin = wd > 0.0 ? w / wd : 0.0;
+	if (as_lines > 0.5) {
+		// A line is a pixel wide along the picture's rows or its columns,
+		// whichever it crosses: one running corner to corner covers fewer
+		// pixels than a ribbon a pixel wide would - as much more solid.
+		float4 on = mul(float4(pos + T * px, 1.0), ViewProj);
+		if (o.pos.w > 0.0 && on.w > 0.0) {
+			float2 ran = abs((on.xy / on.w - o.pos.xy / o.pos.w) * strand_view.xy);
+			float longest = max(ran.x, ran.y);
+			if (longest > 0.000001)
+				thin = min(1.0, thin * min(1.4143, length(ran) / longest));
+		}
+	}
+	float cover = thin * saturate(base_colour.a * col.a) * saturate((1.0 - t) * 10.0) * look.w;
 	float wide = saturate(wd / max(px, 0.0000001) - 1.5);
 
 	float3 V = normalize(-vpos);
@@ -571,7 +597,8 @@ StrandOut strand_out(float3 pos, float3 run, float4 col, float width, float alon
 	}
 	o.lit = float4(lit, cover);
 	o.shine = shine;
-	o.uv = float4(seed, t, side, wide);
+	// (A line has no sides to be darker towards.)
+	o.uv = float4(seed, t, side * (1.0 - as_lines), wide);
 	return o;
 }
 
@@ -633,9 +660,11 @@ float4 PSStrand(StrandOut v) : TARGET
 	// (Its root sits on the skin, so there it still shows a little behind
 	// one, strand.w - less and less further along it, and at its tip not
 	// at all: a hair's end never shows through an eye or a nose.)
+	// (strand_view.w 2, a test's view: the hair that's left out before
+	// it's drawn, all of it shown.)
 	float solid = depth_map.Load(int3(v.pos.xy, 0)).r;
 	float behind = strand.w * (1.0 - v.uv.y) * (1.0 - v.uv.y);
-	if (v.depth > solid + behind)
+	if (strand_view.w < 1.5 && v.depth > solid + behind)
 		discard;
 	float a = v.lit.a;
 	if (a < 0.004)

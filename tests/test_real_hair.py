@@ -744,6 +744,89 @@ def test_thin_hairs_are_smooth_not_grainy(run):
         s.close()
 
 
+def ink(rows):
+    """How much hair a picture has in all: its hair pixels' red, added up
+    (see-through hair counts for as much as shows)."""
+    return sum(px[0] for row in rows for px in row if faint_magenta(px))
+
+
+def test_thin_hairs_are_sent_as_lines(run):
+    """Hair well under a pixel wide is drawn a pixel wide and see-through -
+    which is what a line is, for half the work: so a part whose hairs are
+    that thin goes to the graphics card as lines, and FaceGetState says how
+    many of its pieces did. The picture has as much hair in it either way
+    (the same hairs told never to be lines: "hair_lines" 0, a number the
+    settings window doesn't show), each hair still an unbroken line. Wide
+    hairs stay ribbons - the same picture as told never - and only told
+    always (2) are they lines: thin ones, with less hair to see."""
+    thin = os.path.join(run.home, "lines-thin.vrm")
+    strands = hair_character(thin, width=0.0006)
+    wide = os.path.join(run.home, "lines-wide.vrm")
+    assert hair_character(wide) == strands
+    rays = os.path.join(run.home, "lines-rays.vrm")
+    ray_character(rays, 0.0006)
+    s = Stage(run, "Lines")
+    try:
+        s.add("Thin", thin)
+        s.add("Thin never", thin, hair_lines=0)
+        s.add("Thin always", thin, hair_lines=2)
+        s.add("Wide", wide)
+        s.add("Wide never", wide, hair_lines=0)
+        s.add("Wide always", wide, hair_lines=2)
+        s.add("Rays", rays)
+        s.add("Rays never", rays, hair_lines=0)
+        s.shown()
+        assert wait_for(lambda: all(s.hair(name)["drawn"] > 0 for name in s.names), 10, 0.1)
+        time.sleep(0.5)
+        h = {name: s.hair(name) for name in s.names}
+        for name in s.names:
+            print(f"{name}: {h[name]}")
+        rows = {name: s.shot(name) for name in s.names}
+        # Thin hairs: lines unless told never - every piece drawn, the same
+        # hairs either way.
+        assert h["Thin"]["pieces"] > strands and h["Thin"]["lines"] == h["Thin"]["pieces"], h["Thin"]
+        assert h["Thin never"]["lines"] == 0 and h["Thin never"]["pieces"] == h["Thin"]["pieces"], h["Thin never"]
+        assert h["Thin always"]["lines"] == h["Thin"]["pieces"], h["Thin always"]
+        assert h["Thin"]["drawn"] == h["Thin never"]["drawn"] == h["Thin always"]["drawn"], h
+        # As much hair in the picture, over as much of it.
+        lines, ribbons = ink(rows["Thin"]), ink(rows["Thin never"])
+        over, over_ribbons = count(rows["Thin"], faint_magenta), count(rows["Thin never"], faint_magenta)
+        print(f"thin hair as lines: {lines} of red over {over} pixels; as ribbons {ribbons} over {over_ribbons}")
+        assert ribbons > 20000 and over_ribbons > 2000, (ribbons, over_ribbons)
+        assert 0.9 * ribbons < lines < 1.1 * ribbons, (lines, ribbons)
+        assert 0.85 * over_ribbons < over < 1.15 * over_ribbons, (over, over_ribbons)
+        assert differing(rows["Thin always"], rows["Thin"]) == 0
+        # A few thin hairs standing apart: each an unbroken line as lines
+        # too, leaving as much in a row.
+        assert h["Rays"]["lines"] == h["Rays"]["pieces"] > 0 and h["Rays never"]["lines"] == 0, (h["Rays"],
+                                                                                              h["Rays never"])
+        ys = [y for y, row in enumerate(rows["Rays never"]) if any(faint_magenta(px) for px in row)]
+        first, last = ys[0] + (ys[-1] - ys[0]) // 5, ys[-1] - (ys[-1] - ys[0]) // 10
+        left = {}
+        for name in ("Rays", "Rays never"):
+            found = [runs_of(rows[name][y], trace) for y in range(first, last)]
+            broken = [(first + i, len(f)) for i, f in enumerate(found) if len(f) != RAYS]
+            assert not broken, (name, broken[:10])
+            left[name] = sum(total for f in found for total, _ in f)
+        print(f"thin hairs standing apart: as lines {left['Rays']} of red in rows {first}-{last}, "
+              f"as ribbons {left['Rays never']}")
+        assert 0.9 * left["Rays never"] < left["Rays"] < 1.1 * left["Rays never"], left
+        # Wide hairs: ribbons, the same picture as told never; told always,
+        # lines - thin ones.
+        assert h["Wide"]["lines"] == 0 and h["Wide never"]["lines"] == 0, (h["Wide"], h["Wide never"])
+        assert h["Wide always"]["lines"] == h["Wide"]["pieces"] > strands, h["Wide always"]
+        assert differing(rows["Wide"], rows["Wide never"]) == 0
+        wide_ribbons, wide_lines = count(rows["Wide"], magenta), count(rows["Wide always"], magenta)
+        print(f"wide hair: {wide_ribbons} magenta pixels as ribbons, {wide_lines} told to be lines")
+        unlike = differing(rows["Wide always"], rows["Wide"])
+        assert wide_ribbons > 3000 and wide_lines < 0.95 * wide_ribbons and unlike > 1000, (wide_ribbons, wide_lines,
+                                                                                         unlike)
+        for name in s.names:
+            assert "problem" not in s.model(name), s.model(name)
+    finally:
+        s.close()
+
+
 def test_fewer_hairs_are_drawn_the_smaller_it_is(run):
     """The same character drawn smaller has fewer of its strands drawn
     (each wider, to cover as much): FaceGetState's count falls with its

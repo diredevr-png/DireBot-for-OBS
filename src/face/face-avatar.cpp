@@ -1087,6 +1087,14 @@ struct FaceAvatar {
 	// ("hair_budget_ms", for measuring; under 0: the setting's).
 	std::atomic<int> hair_detail{(int)HairDetail::Full};
 	std::atomic<float> hair_budget{-1.0f};
+	// (And, for measuring and for tests: hidden hair left out before it's
+	// drawn - "hair_skip_hidden", and thin hair sent as lines -
+	// "hair_lines"; under 0: as the setting has them. hair.hpp's HairPlan.)
+	std::atomic<int> hair_skip_hidden{-1}, hair_lines{-1};
+	// (And how straight a run of a strand's points is left out when its
+	// file is loaded - "hair_bend", in its file's units, and "hair_turn",
+	// degrees; under 0: the setting's. model.hpp's LoadOptions.)
+	std::atomic<float> hair_bend{-1.0f}, hair_turn{-1.0f};
 	// Whether characters can be posed on the card here (known for sure
 	// once the drawing's made): their hair is kept for how it's posed.
 #ifdef _WIN32
@@ -1096,7 +1104,12 @@ struct FaceAvatar {
 #endif
 	LoadOptions hair_options() const
 	{
-		return hair_load_options((HairDetail)hair_detail.load(), card_posing && card_able);
+		LoadOptions lo = hair_load_options((HairDetail)hair_detail.load(), card_posing && card_able);
+		if (const float own = hair_bend; own >= 0)
+			lo.strand_bend = own;
+		if (const float own = hair_turn; own >= 0)
+			lo.strand_turn = own;
+		return lo;
 	}
 	// The character's file as last asked for (model_lock), and how its
 	// and its companion's were (graphics thread): asked again when the
@@ -3192,6 +3205,10 @@ struct FaceAvatar {
 		HairPlan hair = hair_plan((HairDetail)hair_detail.load());
 		if (const float own = hair_budget; own >= 0)
 			hair.budget_ms = own;
+		if (const int own = hair_skip_hidden; own >= 0)
+			hair.skip_hidden = own;
+		if (const int own = hair_lines; own >= 0)
+			hair.lines = own;
 		if (avatar3d) {
 			avatar3d->set_gpu_skin(card_posing);
 			rig->set_gpu_skin(avatar3d->gpu_skin());
@@ -5408,6 +5425,10 @@ struct FaceAvatar {
 		const char *hair = obs_data_get_string(settings, "hair_detail");
 		hair_detail = (int)hair_detail_of(hair ? hair : "");
 		hair_budget = (float)obs_data_get_double(settings, "hair_budget_ms");
+		hair_skip_hidden = (int)obs_data_get_int(settings, "hair_skip_hidden");
+		hair_lines = (int)obs_data_get_int(settings, "hair_lines");
+		hair_bend = (float)obs_data_get_double(settings, "hair_bend");
+		hair_turn = (float)obs_data_get_double(settings, "hair_turn");
 		const char *model_file = obs_data_get_string(settings, "model");
 		{
 			std::lock_guard<std::mutex> l(model_lock);
@@ -6667,6 +6688,8 @@ struct FaceAvatar {
 					{"shown_loaded", st.hair.loaded},
 					{"drawn", st.hair.drawn},
 					{"pieces", st.hair.pieces},
+					{"lines", st.hair.lines},
+					{"skips_hidden", st.hair.skips},
 					{"draws", st.hair.draws},
 					{"share", r(st.hair.share, 1000)},
 					{"ms", r(st.hair.ms, 1000)},
@@ -7126,6 +7149,10 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "card_posing", true);
 	obs_data_set_default_string(settings, "hair_detail", "full");
 	obs_data_set_default_double(settings, "hair_budget_ms", -1);
+	obs_data_set_default_int(settings, "hair_skip_hidden", -1);
+	obs_data_set_default_int(settings, "hair_lines", -1);
+	obs_data_set_default_double(settings, "hair_bend", -1.0);
+	obs_data_set_default_double(settings, "hair_turn", -1.0);
 	obs_data_set_default_bool(settings, "auto_blink", false);
 	obs_data_set_default_string(settings, "model_place", "");
 	obs_data_set_default_string(settings, "model_setup", "");

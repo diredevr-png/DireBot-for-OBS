@@ -2,6 +2,7 @@
 // part of src/face/model.cpp and src/face/rig.cpp), on coats made here:
 // the hair detail setting and what each choice allows, how many of a
 // part's strands are drawn for its size on screen, and the hair budget; a
+// part's hairs thin enough to be sent as lines; a
 // file's lines and line strips read into strands, the order they're drawn
 // in, the points allowed, how thickly hair covers its skin and which
 // strands are kept and drawn first for it (their rates and keys), the
@@ -594,6 +595,142 @@ static void test_share_on_screen()
 		CHECK(s.count >= 16 && s.count <= 4000);
 		odd.full = part.full;
 	}
+}
+
+// --- Thin hair sent as lines --------------------------------------------------
+
+static void test_lines()
+{
+	// The corners a part's pieces go to the card with. A point's two sides
+	// are corners 2 x point and 2 x point + 1. As ribbons: two triangles
+	// over a piece's start's and end's sides. As lines: its start's and
+	// its end's first sides.
+	{
+		const uint32_t starts[] = {0, 1, 5};
+		uint32_t six[18], two[6];
+		strand_corners(starts, nullptr, 3, false, six);
+		const uint32_t ribbons[18] = {0, 2, 1, 1, 2, 3, 2, 4, 3, 3, 4, 5, 10, 12, 11, 11, 12, 13};
+		CHECK(std::equal(six, six + 18, ribbons));
+		strand_corners(starts, nullptr, 3, true, two);
+		const uint32_t lines[6] = {0, 2, 2, 4, 10, 12};
+		CHECK(std::equal(two, two + 6, lines));
+		// (Pieces that end further on than the next point.)
+		const uint32_t ends[] = {3, 4, 9};
+		strand_corners(starts, ends, 3, false, six);
+		const uint32_t long_ribbons[18] = {0, 6, 1, 1, 6, 7, 2, 8, 3, 3, 8, 9, 10, 18, 11, 11, 18, 19};
+		CHECK(std::equal(six, six + 18, long_ribbons));
+		strand_corners(starts, ends, 3, true, two);
+		const uint32_t long_lines[6] = {0, 6, 2, 8, 10, 18};
+		CHECK(std::equal(two, two + 6, long_lines));
+		// (None: nothing written.)
+		uint32_t untouched = 77;
+		strand_corners(starts, nullptr, 0, true, &untouched);
+		CHECK(untouched == 77);
+	}
+
+	// A coat of 10000 hairs all 0.0005 wide, where a pixel is 0.001 wide a
+	// unit from the camera: half a pixel wide from 1 away. As lines its
+	// hairs lose a hundredth of what they cover once a pixel is 1.2375
+	// hair widths, a twentieth at 1.1875 (the loader's numbers for hairs
+	// all one width: test_what_a_point_keeps).
+	const float pixel = 0.001f, width = 0.0005f;
+	Strands coat = alike(10000, 10000, width);
+	coat.line_pixel = 1.2375f * width;
+	coat.line_pixel_most = 1.1875f * width;
+	const HairShare whole = hair_share(coat, 10000, 1, 1, pixel, 1, 0.4f, 1);
+	CHECK(near(hair_px(coat, width, whole, 1, 1, pixel), 0.5, 1e-6));
+	CHECK(near(hair_px(coat, width, whole, 2, 4, pixel), 0.25, 1e-6));
+	CHECK(near(hair_px(coat, coat.line_pixel, whole, 1, 1, pixel), 0.61875, 1e-6));
+	// Never, when the plan says never; always, when it says always (near
+	// as well) - the same hairs drawn either way.
+	for (float away : {0.2f, 1.0f, 5.0f}) {
+		const HairShare s = hair_share(coat, 10000, 1, away, pixel, 1, 0.4f, 1);
+		HairForm f = hair_form(coat, 10000, 1, away, pixel, 1, 0.4f, 1, 0, true);
+		CHECK(!f.lines && f.share.count == s.count && f.share.upto == s.upto);
+		f = hair_form(coat, 10000, 1, away, pixel, 1, 0.4f, 1, 2, false);
+		CHECK(f.lines && f.share.count == s.count && f.share.upto == s.upto);
+	}
+	// Where they're thin enough: from 1 away, lines (0.62 of the pixel
+	// that would lose a hundredth). Nearer than 0.62 away, ribbons - but
+	// lines already stay lines until a pixel is a tenth smaller than that
+	// (from 0.5625 away).
+	HairForm f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 1, 1, false);
+	CHECK(f.lines && f.share.count == 10000 && f.share.upto == 1);
+	CHECK(hair_form(coat, 10000, 1, 0.63f, pixel, 1, 0.4f, 1, 1, false).lines);
+	CHECK(!hair_form(coat, 10000, 1, 0.61f, pixel, 1, 0.4f, 1, 1, false).lines);
+	CHECK(hair_form(coat, 10000, 1, 0.61f, pixel, 1, 0.4f, 1, 1, true).lines);
+	CHECK(hair_form(coat, 10000, 1, 0.57f, pixel, 1, 0.4f, 1, 1, true).lines);
+	CHECK(!hair_form(coat, 10000, 1, 0.55f, pixel, 1, 0.4f, 1, 1, true).lines);
+	f = hair_form(coat, 10000, 1, 0.3f, pixel, 1, 0.4f, 1, 1, false);
+	CHECK(!f.lines && f.share.count == 10000);
+	// (Bones that make it twice the size: as from half as far.)
+	CHECK(!hair_form(coat, 10000, 2, 1.0f, pixel, 1, 0.4f, 1, 1, false).lines);
+	CHECK(hair_form(coat, 10000, 2, 2.0f, pixel, 1, 0.4f, 1, 1, false).lines);
+	// Far off fewer are drawn, each as much wider - 0.38 of a pixel
+	// however far: lines all the way out.
+	for (float away : {2.0f, 5.0f, 20.0f, 100.0f}) {
+		const HairShare s = hair_share(coat, 10000, 1, away, pixel, 1, 0.4f, 1);
+		f = hair_form(coat, 10000, 1, away, pixel, 1, 0.4f, 1, 1, false);
+		CHECK(f.lines && f.share.count == s.count && f.share.upto == s.upto);
+	}
+
+	// The budget draws fewer hairs, each wider. While lines lose them
+	// under a twentieth (to 0.59 of the hairs: each 0.84 of a pixel),
+	// lines, the budget's share of them.
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.8f, 1, false);
+	CHECK(f.lines && f.share.count == 8000 && near(f.share.upto, 0.8, 1e-6));
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.6f, 1, true);
+	CHECK(f.lines && f.share.count == 6000);
+	// Fewer than that: ribbons - half the budget's share of them, a ribbon
+	// costing the card two lines.
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.5f, 1, true);
+	CHECK(!f.lines && f.share.count == 2500 && near(f.share.upto, 0.25, 1e-6));
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.3f, 1, false);
+	CHECK(!f.lines && f.share.count == 1500);
+	// (Never fewer than the budget's least share of them, a tenth: as
+	// ribbons alone had it.)
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.15f, 1, false);
+	CHECK(!f.lines && f.share.count == 1000);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.1f, 1, false);
+	CHECK(!f.lines && f.share.count == 1000);
+	CHECK(HairBudget::LEAST == HAIR_SHARE_LEAST);
+	// (Told always or never: the budget's share as it is.)
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.5f, 2, false);
+	CHECK(f.lines && f.share.count == 5000);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.5f, 0, false);
+	CHECK(!f.lines && f.share.count == 5000);
+	// A coat too wide for lines with all its hairs drawn is ribbons under
+	// a budget as ever: the budget's share, not half of it.
+	f = hair_form(coat, 10000, 1, 0.3f, pixel, 1, 0.4f, 0.5f, 1, false);
+	CHECK(!f.lines && f.share.count == 5000);
+	// With all its hairs (no budget's say, or more than all): never the
+	// half.
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 1, 1, false);
+	CHECK(f.lines && f.share.count == 10000);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 3, 1, false);
+	CHECK(f.lines && f.share.count == 10000);
+
+	// A coat whose widths were never measured (no hairs with any length):
+	// ribbons. None ready to draw: none, and not lines.
+	Strands unmeasured = coat;
+	unmeasured.line_pixel = unmeasured.line_pixel_most = 0;
+	CHECK(!hair_form(unmeasured, 10000, 1, 1, pixel, 1, 0.4f, 1, 1, true).lines);
+	CHECK(hair_form(unmeasured, 10000, 1, 1, pixel, 1, 0.4f, 1, 2, false).lines);
+	f = hair_form(coat, 0, 1, 1, pixel, 1, 0.4f, 1, 2, true);
+	CHECK(!f.lines && f.share.count == 0);
+	// Numbers that aren't numbers: ribbons or lines, some of its strands.
+	const float inf = std::numeric_limits<float>::infinity(), nan = std::numeric_limits<float>::quiet_NaN();
+	for (float v : {nan, inf, -inf, 0.0f, -1.0f, 1e30f, 1e-30f})
+		for (int which = 0; which < 6; which++) {
+			float a[6] = {1, 1, pixel, 1, 0.4f, 0.7f};
+			a[which] = v;
+			f = hair_form(coat, 10000, a[0], a[1], a[2], a[3], a[4], a[5], 1, which % 2 == 0);
+			CHECK(f.share.count >= 16 && f.share.count <= 10000 && std::isfinite(f.share.upto));
+			Strands odd = coat;
+			(which % 2 ? odd.line_pixel : odd.line_pixel_most) = v;
+			f = hair_form(odd, 10000, 1, 1, pixel, 1, 0.4f, 0.7f, 1, which > 2);
+			CHECK(f.share.count >= 16 && f.share.count <= 10000 && std::isfinite(f.share.upto));
+		}
 }
 
 // --- The hair budget --------------------------------------------------------
@@ -1239,6 +1376,21 @@ static void test_what_a_point_keeps()
 		two.straight({1, 0, 0}, {1, 3, 0});
 		two.width = {0.001f, 0.001f, 0.001f, 0.005f, 0.005f, 0.005f};
 		CHECK(near(part_of(loaded(two)).hair.mean_width, 0.004, 1e-8));
+		// As lines (a line can stand for a hair up to Strands::LINE_COVERS
+		// of a pixel wide): how wide a pixel has to be for the two to lose
+		// a hundredth of what they cover (0.001 x 1 + 0.005 x 3) - all of
+		// it the wide one's - and a twentieth.
+		const Strands &h = part_of(loaded(two)).hair;
+		CHECK(near(h.line_pixel, (0.005 - 0.00016 / 3) / 0.8, 1e-8));
+		CHECK(near(h.line_pixel_most, (0.005 - 0.0008 / 3) / 0.8, 1e-8));
+		// (Hairs all one width: 0.99 and 0.95 of it, over what a line
+		// covers.)
+		Groom same;
+		same.straight({0, 0, 0}, {0, 1, 0});
+		same.straight({1, 0, 0}, {1, 3, 0});
+		same.width = std::vector<float>(6, 0.002f);
+		const Strands &one = part_of(loaded(same)).hair;
+		CHECK(near(one.line_pixel, 0.002 * 0.99 / 0.8, 1e-8) && near(one.line_pixel_most, 0.002 * 0.95 / 0.8, 1e-8));
 	}
 }
 
@@ -4677,6 +4829,7 @@ int main()
 	test_detail_names();
 	test_plans();
 	test_share_on_screen();
+	test_lines();
 	test_budget();
 	test_budget_settles();
 	test_lines_and_strips();

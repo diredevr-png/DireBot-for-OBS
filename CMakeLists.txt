@@ -113,6 +113,7 @@ target_sources(
     src/face/setup.cpp
     src/face/pictures.cpp
     src/face/avatar3d.cpp
+    src/face/card-picture.cpp
     src/face/face-avatar.cpp
     src/face/body.cpp
     src/face/arms.cpp

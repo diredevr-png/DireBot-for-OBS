@@ -27,6 +27,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,14 @@ struct HairPlan {
 	// the hair on screen together, whatever the card's clock says (0: no
 	// limit).
 	size_t pieces = 0;
+	// Hair that can't show - behind a solid part, or deep under other hair
+	// - left out before the card cuts it into pixels (posed on the card,
+	// Direct3D: the effect's strand_shown): 0 never, 1 where it can, 2
+	// only the hair that would be left out is drawn (a test's view of it).
+	int skip_hidden = 1;
+	// Hairs well under a pixel wide sent as lines (hair_form): 0 never, 1
+	// where they're that thin, 2 always (tests).
+	int lines = 1;
 };
 
 inline HairPlan hair_plan(HairDetail d)
@@ -147,6 +156,91 @@ inline HairShare hair_share(const Strands &h, size_t loaded, float scale, float 
 	return out;
 }
 
+// How many pixels a width of a part's (its file's units, of its hairs as
+// drawn with all of them: Strands::mean_width, line_pixel) comes to on
+// screen with the share of its hairs `s` - fewer hairs, each as much
+// wider.
+inline float hair_px(const Strands &h, float width, const HairShare &s, float scale, float distance, float pixel)
+{
+	return width * scale / std::max(1e-12f, distance * pixel) * (h.full / std::max(1e-6f, s.upto));
+}
+
+// Lines. A hair thinner than a pixel is drawn a pixel wide and as
+// see-through as it's thinner - which is what a line is: a pixel wide. So
+// where a part's hairs are that thin anyway, its pieces go to the card as
+// lines: the same picture from half the corners and half the shapes of a
+// ribbon's two triangles. A line covers one pixel in each row or column
+// it crosses, so it can't stand for a hair wider than 0.7 of a pixel (one
+// running corner to corner) to 1 (straight across): the effect makes it
+// as solid as its hair is wide, up to that, and what's wider is lost.
+//   - A part is lines when, with every hair its size on screen asks for,
+//     that loses its hairs under a hundredth of what they cover
+//     (Strands::line_pixel is no bigger than a pixel) - and once it is,
+//     until a pixel is a tenth smaller than that, so it doesn't flicker
+//     between the two at the edge. Nearer, it's ribbons as ever: nothing
+//     changes in a close-up.
+//   - The budget draws fewer hairs, each wider - and a line can only be
+//     more solid. So under a budget it stays lines while that loses under
+//     a twentieth (Strands::line_pixel_most); with too few hairs for that
+//     it's ribbons again - at HAIR_LINE_COST of the budget's share, as a
+//     ribbon costs the card about twice a line: the same cost either side
+//     of the change, so the budget finds one answer and stays there. (But
+//     never under the budget's least share, HAIR_SHARE_LEAST: a coat is
+//     never thinned further than it was as ribbons alone.)
+constexpr float HAIR_LINE_STAYS = 1.1f, HAIR_LINE_COST = 0.5f, HAIR_SHARE_LEAST = 0.1f;
+
+struct HairForm {
+	HairShare share;
+	bool lines = false;
+};
+
+// hair_share's answer and whether the part is sent as lines: `lines` the
+// plan's say (HairPlan::lines), `was_lines` whether it was last frame.
+inline HairForm hair_form(const Strands &h, size_t loaded, float scale, float distance, float pixel, float thinnest,
+			  float solid, float budget, int lines, bool was_lines)
+{
+	HairForm f;
+	f.share = hair_share(h, loaded, scale, distance, pixel, thinnest, solid, budget);
+	if (!f.share.count || lines <= 0)
+		return f;
+	if (lines >= 2) {
+		f.lines = true;
+		return f;
+	}
+	if (!(h.line_pixel > 0))
+		return f;
+	const HairShare all = budget < 1 ? hair_share(h, loaded, scale, distance, pixel, thinnest, solid, 1.0f)
+					 : f.share;
+	if (hair_px(h, h.line_pixel, all, scale, distance, pixel) > (was_lines ? HAIR_LINE_STAYS : 1.0f))
+		return f;
+	if (!(budget < 1) || hair_px(h, h.line_pixel_most, f.share, scale, distance, pixel) <= 1.0f)
+		f.lines = true;
+	else
+		f.share = hair_share(h, loaded, scale, distance, pixel, thinnest, solid,
+				     std::max(budget * HAIR_LINE_COST, std::min(budget, HAIR_SHARE_LEAST)));
+	return f;
+}
+
+// The corners a strand part's pieces go to the graphics card with (its
+// index buffer; a point's two sides are corners 2 x point and 2 x point +
+// 1). As ribbons, 6 a piece: two triangles over its start's and its end's
+// sides. As lines, 2 a piece: its start's and its end's first sides (the
+// effect puts both sides at the hair's middle then). A piece runs from
+// starts[k] to ends[k] - or, with no `ends`, to the point after its start.
+inline void strand_corners(const uint32_t *starts, const uint32_t *ends, size_t pieces, bool lines, uint32_t *out)
+{
+	for (size_t k = 0; k < pieces; k++) {
+		const uint32_t a0 = starts[k] * 2, b0 = (ends ? ends[k] : starts[k] + 1) * 2;
+		if (lines) {
+			out[k * 2] = a0;
+			out[k * 2 + 1] = b0;
+		} else {
+			const uint32_t six[6] = {a0, b0, a0 + 1, a0 + 1, b0, b0 + 1};
+			std::copy(six, six + 6, out + k * 6);
+		}
+	}
+}
+
 // The hair budget. Each frame the drawing says how long hair took on the
 // graphics card (milliseconds; the card's own clock, read a few frames
 // late), and the budget answers with the share of the hairs to draw next
@@ -163,7 +257,7 @@ inline HairShare hair_share(const Strands &h, size_t loaded, float scale, float 
 // limit, until it answers again - never held at a share nothing measures.
 class HairBudget {
 public:
-	static constexpr float START = 0.25f, LEAST = 0.1f;
+	static constexpr float START = 0.25f, LEAST = HAIR_SHARE_LEAST;
 	static constexpr size_t READINGS = 6; // how many it waits for after a change
 	static constexpr size_t SILENT = 120; // frames with no reading before the clock counts as gone
 

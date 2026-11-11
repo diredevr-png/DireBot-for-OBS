@@ -34,7 +34,7 @@ obsws = pytest.importorskip("obsws_python")
 
 from test_real_face import (PretendPhone, PretendVmcApp, arms_character, camera_picture,  # noqa: E402
                             character_picture, middle_of, read_bmp, unity_turn, write_gif)
-from test_real_hair import LIFT, hair_character, magenta, per_metre, settles, top_of, yellow  # noqa: E402
+from test_real_hair import LIFT, hair_character, magenta, per_metre, settles, top_of, white, yellow  # noqa: E402
 from test_real_obs import VERSION, free_port, vendor, wait_for  # noqa: E402
 
 ROOT = os.environ.get("DIREBOT_OBS_ROOT", "")
@@ -708,6 +708,151 @@ def test_hair_strands_on_the_graphics_card(obs):
             c.send("RemoveInput", {"inputName": "Hair"}, raw=True)
         except Exception:
             pass
+        c.disconnect()
+
+
+def test_hidden_hair_is_left_out_on_the_card(obs):
+    """Hair that can't show - behind a solid part - is left out on the
+    graphics card before it's cut into pixels (the -skin effect's
+    strand_shown; FaceGetState's "skips_hidden"), and the picture is the
+    same as with every hair sent ("hair_skip_hidden" 0, a number the
+    settings window doesn't show). The test's own view (2: only the hair
+    that's left out, drawn over everything) shows which it is: the white
+    hairs hanging behind its body, never seen from the front - and none of
+    the hair in plain sight, the tuft on its hand (but for a hair's first
+    piece, where its root is inside the hand). Sent as lines ("hair_lines"
+    2) the same hairs are left out. Posed by the CPU nothing is left
+    out."""
+    figure = os.path.join(obs.home, "hidden.vrm")
+    strands = hair_character(figure, crown=0, locks=0, tuft=200, behind=400)
+    assert strands == 600
+    # (The same with its tuft's hairs thin: a tenth of a pixel wide.)
+    thin = os.path.join(obs.home, "hidden-thin.vrm")
+    assert hair_character(thin, crown=0, locks=0, tuft=200, behind=400, width=0.0006) == strands
+    c = obs.client()
+
+    def st(name="Hidden"):
+        return vendor(c, "FaceGetState", {"source": name})["model"]
+
+    def hair(name="Hidden"):
+        return st(name)["hair"]
+
+    def change(name="Hidden", **settings):
+        c.send("SetInputSettings", {"inputName": name, "inputSettings": settings}, raw=True)
+
+    def pixels(rows, test):
+        return sum(1 for row in rows for px in row if test(px))
+
+    def unlike(a, b):
+        assert len(a) == len(b) and len(a[0]) == len(b[0])
+        return sum(1 for a_row, b_row in zip(a, b) for x, y in zip(a_row, b_row)
+                   if max(abs(int(p) - int(q)) for p, q in zip(x, y)) > 24)
+
+    def faint(px):
+        return px[0] > 6 and px[2] > 6 and px[1] * 2 < min(px[0], px[2])
+    try:
+        c.send("CreateScene", {"sceneName": "Hidden scene"}, raw=True)
+        for name, model, lines in (("Hidden", figure, -1), ("Hidden thin", thin, 2)):
+            c.send("CreateInput", {"sceneName": "Hidden scene", "inputName": name,
+                                   "inputKind": "direbot_face_avatar",
+                                   "inputSettings": {"model": model, "width": 300, "height": 300,
+                                                     "size": 100, "framing": "whole", "style": "drawn",
+                                                     "mirror": False, "smoothing": 0, "breathing": 0,
+                                                     "sway": 0, "eye_moves": False,
+                                                     "hair_budget_ms": 0, "hair_lines": lines}}, raw=True)
+        c.send("SetCurrentProgramScene", {"sceneName": "Hidden scene"}, raw=True)
+        for name in ("Hidden", "Hidden thin"):
+            assert wait_for(lambda: st(name)["shown"], 60, 0.2), obs.log()
+            assert wait_for(lambda: st(name)["on_card"], 10, 0.1), (st(name), obs.log())
+            assert wait_for(lambda: hair(name)["drawn"] == strands, 10, 0.1), (hair(name), obs.log())
+        time.sleep(0.8)
+
+        # Left out on the card: the picture has none of the hair behind its
+        # body, and all of the tuft on its hand.
+        h = hair()
+        print("\nHidden hair left out on the card: %s" % h)
+        assert h["skips_hidden"] and h["lines"] == 0 and h["pieces"] >= strands, h
+        skipped = shot(c, "Hidden")
+        tuft = pixels(skipped, magenta)
+        assert tuft > 300 and pixels(skipped, white) == 0, (tuft, pixels(skipped, white))
+        # Every hair sent: the same picture.
+        change(hair_skip_hidden=0)
+        assert wait_for(lambda: not hair()["skips_hidden"], 10, 0.1), hair()
+        time.sleep(0.8)
+        sent = shot(c, "Hidden")
+        off = unlike(skipped, sent)
+        print("Hidden hair left out vs every hair sent: %d of %d pixels differ (%d of hair)"
+              % (off, len(sent) * len(sent[0]), pixels(sent, magenta)))
+        assert off <= 8 and pixels(sent, white) == 0, (off, pixels(sent, white))
+        assert hair()["pieces"] == h["pieces"] and hair()["drawn"] == strands, hair()
+        # Only what's left out, drawn over everything: the hair behind its
+        # body, and none of the tuft.
+        change(hair_skip_hidden=2)
+        assert wait_for(lambda: hair()["skips_hidden"], 10, 0.1), hair()
+        time.sleep(0.8)
+        only = shot(c, "Hidden")
+        print("Only the hair that's left out: %d white pixels (behind its body), %d magenta (its tuft: %d in plain sight)"
+              % (pixels(only, white), pixels(only, magenta), tuft))
+        assert pixels(only, white) > 300, pixels(only, white)
+        assert pixels(only, magenta) <= 0.6 * tuft, (pixels(only, magenta), tuft)
+        change(hair_skip_hidden=-1)
+        assert wait_for(lambda: hair()["skips_hidden"], 10, 0.1), hair()
+        time.sleep(0.8)
+        assert unlike(shot(c, "Hidden"), skipped) <= 8
+
+        # Sent as lines on the card: the same ones left out - the same
+        # picture as with every hair sent; only what's left out, the hair
+        # behind its body (lines, a pixel wide); and its thin tuft has as
+        # much hair in the picture as ribbons.
+        h = hair("Hidden thin")
+        print("Sent as lines on the card: %s" % h)
+        assert h["skips_hidden"] and h["lines"] == h["pieces"] >= strands, h
+        lines = shot(c, "Hidden thin")
+        assert pixels(lines, faint) > 40 and pixels(lines, white) == 0, (pixels(lines, faint), pixels(lines, white))
+        change("Hidden thin", hair_skip_hidden=0)
+        assert wait_for(lambda: not hair("Hidden thin")["skips_hidden"], 10, 0.1), hair("Hidden thin")
+        time.sleep(0.8)
+        assert unlike(shot(c, "Hidden thin"), lines) <= 8
+        change("Hidden thin", hair_skip_hidden=2)
+        assert wait_for(lambda: hair("Hidden thin")["skips_hidden"], 10, 0.1), hair("Hidden thin")
+        time.sleep(0.8)
+        only = shot(c, "Hidden thin")
+        print("As lines, only what's left out: %d white pixels (behind its body), %d of its tuft (%d in plain sight)"
+              % (pixels(only, white), pixels(only, faint), pixels(lines, faint)))
+        assert pixels(only, white) > 100, pixels(only, white)
+        assert pixels(only, faint) <= 0.6 * pixels(lines, faint), (pixels(only, faint), pixels(lines, faint))
+        change("Hidden thin", hair_skip_hidden=-1, hair_lines=0)
+        assert wait_for(lambda: hair("Hidden thin")["lines"] == 0 and hair("Hidden thin")["skips_hidden"], 10, 0.1), \
+            hair("Hidden thin")
+        time.sleep(0.8)
+        ribbons = shot(c, "Hidden thin")
+        ink_lines = sum(px[0] for row in lines for px in row if faint(px))
+        ink_ribbons = sum(px[0] for row in ribbons for px in row if faint(px))
+        print("Thin hair on the card: %d of red as lines, %d as ribbons" % (ink_lines, ink_ribbons))
+        assert ink_ribbons > 1000 and 0.85 * ink_ribbons < ink_lines < 1.15 * ink_ribbons, (ink_lines, ink_ribbons)
+
+        # Posed by the CPU: nothing's left out, the same picture.
+        change(card_posing=False)
+        assert wait_for(lambda: not st()["on_card"], 10, 0.1), st()
+        time.sleep(0.5)
+        assert wait_for(lambda: not st()["loading"] and st()["shown"], 60, 0.1), (st(), obs.log())
+        assert wait_for(lambda: hair()["drawn"] == strands, 10, 0.1), hair()
+        time.sleep(0.8)
+        assert not hair()["skips_hidden"], hair()
+        cpu = shot(c, "Hidden")
+        off = unlike(cpu, skipped)
+        print("Hidden hair left out on the card vs posed by the CPU: %d pixels differ" % off)
+        assert off <= max(20, tuft // 20) and pixels(cpu, white) == 0, (off, pixels(cpu, white))
+        change(card_posing=True)
+        assert wait_for(lambda: st()["on_card"], 10, 0.1), st()
+        log = obs.log()
+        assert "3D effect" not in log and "Windows won't draw" not in log, log
+    finally:
+        for name in ("Hidden", "Hidden thin"):
+            try:
+                c.send("RemoveInput", {"inputName": name}, raw=True)
+            except Exception:
+                pass
         c.disconnect()
 
 

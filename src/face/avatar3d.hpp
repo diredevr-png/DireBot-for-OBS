@@ -234,10 +234,13 @@ public:
 	// strands their files have, those kept, those drawn and their pieces
 	// and draw calls; the hair budget's share (0 to 1 of what their size
 	// on screen asks for) and what hair took on the graphics card as the
-	// budget last read it (milliseconds; -1: not known).
+	// budget last read it (milliseconds; -1: not known). `lines`: how many
+	// of the pieces went as lines (hairs thinner than a pixel); `skips`:
+	// whether hidden hair was left out before the card drew it (HairPlan).
 	struct HairDrawn {
-		size_t in_file = 0, loaded = 0, drawn = 0, pieces = 0, draws = 0;
+		size_t in_file = 0, loaded = 0, drawn = 0, pieces = 0, draws = 0, lines = 0;
 		float share = 1, ms = -1;
+		bool skips = false;
 	};
 	const HairDrawn &hair_drawn() const { return hair_drawn_; }
 	// The solid parts' distances from the camera, as last drawn (hairs
@@ -268,6 +271,10 @@ private:
 		// Hair strands (model.hpp's Strands): two points here a point of
 		// its strands, its two sides.
 		bool strands = false;
+		// Its pieces as lines (hair.hpp's strand_corners), made the first
+		// time it's drawn that way; and whether it was last frame.
+		gs_indexbuffer_t *ib_lines = nullptr;
+		bool as_lines = false;
 		bool skin = false;    // its points as made, with their bones (posed on the card)
 		bool was_morphed = false;
 		bool posed_here = false; // a card part's points last sent posed here
@@ -303,16 +310,20 @@ private:
 	// Hair strands: the camera, how big a pixel is (the picture drawn
 	// `drawn_h` high), the share of its strands drawn, how much bigger
 	// its bones make it and the solid parts' distances (set_material
-	// first).
-	void set_strand(const View3D &v, uint32_t drawn_h, float upto, float scale, gs_texture_t *depth);
+	// first). `lines`: its pieces go as lines; `skip`: hidden hair left
+	// out before it's drawn (HairPlan::skip_hidden; 0: not).
+	void set_strand(const View3D &v, uint32_t drawn_h, float upto, float scale, gs_texture_t *depth,
+			bool lines = false, int skip = 0);
 	// A layer of a hair-strand part: the groups given (Strands::groups),
 	// in that order, each one's pieces in that layer of its first `count`
-	// strands; what it drew added to `drawn`.
+	// strands - as ribbons or as lines; what it drew added to `drawn`.
 	void draw_strands(size_t i, const Rig::Part &p, const std::vector<int> &groups, size_t layer, size_t count,
-			  const char *technique, HairDrawn &drawn);
+			  const char *technique, bool lines, HairDrawn &drawn);
 	// A hair-strand part's bones and spots' moves for the card, its points
-	// and pieces loaded: whether it can be drawn.
-	bool load_strands(size_t i, const Rig::Part &p);
+	// and pieces (as ribbons or as lines) loaded: whether it can be drawn.
+	bool load_strands(size_t i, const Rig::Part &p, bool lines = false);
+	// A part's buffers freed.
+	static void free_part(Part &part);
 	// A hair-strand part's hull into the picture of the solid parts'
 	// distances: the inner layers of some of the `count` strands drawn
 	// (as much wider), each written further off than it is by how far its
@@ -334,8 +345,8 @@ private:
 		    *p_key_colour = nullptr, *p_fill_dir = nullptr, *p_fill_colour = nullptr, *p_room_up = nullptr,
 		    *p_room_down = nullptr, *p_rim_light = nullptr, *p_key_tint = nullptr, *p_room_tint = nullptr,
 		    *p_glow = nullptr, *p_flat_at = nullptr, *p_eye = nullptr, *p_strand = nullptr,
-		    *p_strand_lod = nullptr, *p_depth_map = nullptr, *p_spots = nullptr, *p_bones = nullptr,
-		    *p_skin = nullptr;
+		    *p_strand_lod = nullptr, *p_strand_view = nullptr, *p_depth_map = nullptr, *p_spots = nullptr,
+		    *p_bones = nullptr, *p_skin = nullptr;
 	EffectCheck check_;
 	M4 cam_;
 	gs_texture_t *white_ = nullptr, *black_ = nullptr, *flat_ = nullptr;

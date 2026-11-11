@@ -186,6 +186,15 @@ struct Strands {
 	// Its hairs' width along their lengths, as drawn at `full` (a strand
 	// of whose neighbours only a share are kept: that much wider).
 	float mean_width = 0;
+	// Sent to the card as lines (hair.hpp's hair_form: a line is a pixel
+	// wide, and can't stand for a hair wider than about LINE_COVERS of
+	// one), its wider hairs lose some of what they cover. How wide a pixel
+	// has to be - in its file's units, its hairs as drawn at `full` - for
+	// all of them together to lose a hundredth of it (`line_pixel`), and a
+	// twentieth (`line_pixel_most`). Hairs all one width: 1.24 and 1.19
+	// times that width.
+	static constexpr float LINE_COVERS = 0.8f;
+	float line_pixel = 0, line_pixel_most = 0;
 	size_t strands() const { return first.empty() ? 0 : first.size() - 1; }
 	// How many of its strands (the first of them) lie wholly in its first
 	// `points` points.
