@@ -3627,20 +3627,34 @@ static void test_shapes_a_move_plays()
 	Builder b;
 	const std::vector<V3> square = {{0, 0, 0}, {0.1f, 0, 0}, {0, 0.1f, 0}, {0.1f, 0.1f, 0}};
 	const std::vector<V3> lift = {{}, {}, {0, 0, 0.02f}, {0, 0, 0.02f}}, slide = {{0.01f, 0, 0}, {}, {}, {}};
-	std::vector<V3> hair, bend, none;
+	std::vector<V3> hair, bend;
 	std::vector<float> width;
 	for (int i = 0; i < 6; i++) {
 		hair.push_back({0.05f + 0.002f * (i % 2), 0.1f + 0.01f * i, 0});
 		bend.push_back(i >= 2 ? V3{0.003f * i, 0, 0} : V3{});
-		none.push_back({});
 		width.push_back(0.002f);
 	}
+	// (As a file may write them: the second shape, which moves one point
+	// of the skin, a sparse list over nothing; the hair's share of it,
+	// which moves none, numbers with no bytes behind them at all.)
+	const uint16_t first_point = 0;
+	const int sparse_at = b.view(&first_point, 2), sparse_move = b.view(&slide[0].x, 12);
+	b.doc["accessors"].push_back({{"componentType", 5126},
+				      {"count", 4},
+				      {"type", "VEC3"},
+				      {"sparse",
+				       {{"count", 1},
+					{"indices", {{"bufferView", sparse_at}, {"componentType", 5123}}},
+					{"values", {{"bufferView", sparse_move}}}}}});
+	const int slide_sparse = (int)b.doc["accessors"].size() - 1;
+	b.doc["accessors"].push_back({{"componentType", 5126}, {"count", 6}, {"type", "VEC3"}});
+	const int none_at_all = (int)b.doc["accessors"].size() - 1;
 	const json skin = {{"attributes", {{"POSITION", b.vec3s(square)}}},
 			   {"indices", b.indices({0, 1, 2, 1, 3, 2})},
-			   {"targets", {{{"POSITION", b.vec3s(lift)}}, {{"POSITION", b.vec3s(slide)}}}}};
+			   {"targets", {{{"POSITION", b.vec3s(lift)}}, {{"POSITION", slide_sparse}}}}};
 	const json strand = {{"attributes", {{"POSITION", b.vec3s(hair)}, {"_WIDTH", b.floats(width, 1, "SCALAR")}}},
 			     {"mode", 3},
-			     {"targets", {{{"POSITION", b.vec3s(bend)}}, {{"POSITION", b.vec3s(none)}}}}};
+			     {"targets", {{{"POSITION", b.vec3s(bend)}}, {{"POSITION", none_at_all}}}}};
 	b.doc["meshes"].push_back({{"primitives", json::array({skin, strand})}, {"weights", {0.2f, 0}}});
 	for (float rest : {0.0f, 0.4f}) {
 		const json one = {{"attributes", {{"POSITION", b.vec3s(square)}}},
@@ -3660,7 +3674,7 @@ static void test_shapes_a_move_plays()
 	b.doc["animations"] = json::array(
 		{{{"name", "Howl"},
 		  {"samplers",
-		   {{{"input", t3}, {"output", b.floats({0, 0, 1, 0.5f, 0.25f, 1}, 1, "SCALAR")}, {"interpolation", "STEP"}},
+		   {{{"input", t3}, {"output", b.floats({0, 0, 1, 0.5f, -0.5f, 1}, 1, "SCALAR")}, {"interpolation", "STEP"}},
 		    {{"input", t3}, {"output", b.floats({0, 1, 1}, 1, "SCALAR")}, {"interpolation", "STEP"}},
 		    {{"input", t2}, {"output", b.floats({0, 1}, 1, "SCALAR")}},
 		    {{"input", t2}, {"output", turn}},
@@ -3697,7 +3711,8 @@ static void test_shapes_a_move_plays()
 	      cs[1].ease == AnimChannel::Straight);
 	CHECK(cs[2].path == AnimChannel::Turn && cs[2].size() == 4);
 	const Primitive &h = m->meshes[0].parts[1];
-	CHECK(h.strands && h.hair.moves.size() == 2 && h.hair.anchors() > 1);
+	CHECK(h.strands && h.hair.moves.size() == 2 && h.hair.anchors() > 1 && near(h.hair.spots_off, 0, 1e-7));
+	CHECK(m->meshes[0].parts[0].morphs.size() == 2 && m->meshes[0].parts[0].morphs[1].at.size() == 1);
 	const size_t tip = h.pos.size() - 1;
 
 	RigOptions o;
@@ -3753,11 +3768,13 @@ static void test_shapes_a_move_plays()
 	rig.pose(d);
 	CHECK(strengths(rig, 0, 0, 0, 0.4f + (0.25f - 0.4f) * 0.01f));
 	CHECK(near3(rig.parts()[0].pos[2], {0, 0.1f, 0}, 1e-6f));
-	// At its end and past it: its last key.
+	// At its end and past it: its last key - a strength under nothing as
+	// the file has it (the skin pushed the other way).
 	d.body[0].time = 5;
 	d.body[0].amount = 1;
 	rig.pose(d);
-	CHECK(strengths(rig, 0.25f, 1, 0, 1));
+	CHECK(strengths(rig, -0.5f, 1, 0, 1));
+	CHECK(near3(rig.parts()[0].pos[2], {0, 0.1f, -0.01f}, 1e-6f) && near3(rig.parts()[0].pos[0], {0.01f, 0, 0}, 1e-6f));
 	// Not playing: as the file has them again.
 	d.body[0].amount = 0;
 	rig.pose(d);

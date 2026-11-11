@@ -2568,7 +2568,7 @@ void read_meshes(Reader &rd, const json &doc, Model &m, const LoadOptions &optio
 	for (Pending &pd : pending) {
 		std::vector<uint32_t> which;
 		Primitive p = finish_strands(pd.raw, options.strand_layers, which);
-		anchor_strands(rd, pd.raw, which, p);
+		p.hair.spots_off = anchor_strands(rd, pd.raw, which, p);
 		m.strands_in_file += p.hair.in_file;
 		m.strands += p.hair.strands();
 		m.strand_points += p.pos.size();

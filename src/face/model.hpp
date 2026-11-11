@@ -277,6 +277,10 @@ struct Strands {
 	std::vector<uint16_t> anchor;       // a point (empty: none move)
 	std::vector<std::vector<V3>> moves; // an expression: each spot's move (spot 0: none)
 	size_t anchors() const { return moves.empty() ? 0 : moves[0].size(); }
+	// How far the worst of its points is left from where the file would
+	// move it, following its spot instead (the file's units; 0: every
+	// moved point just where the file puts it).
+	float spots_off = 0;
 };
 
 struct Primitive {
