@@ -1043,7 +1043,7 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
         # twentieth): never fewer lines, never fewer hairs, than as ever.
         for share in (0.6, 0.3):
             before, after = both("Laid", "its share held at %s, ribbons" % share, least=1000, hair_share=share)
-            assert after["share"] == share and after["lines"] == 0, after
+            assert abs(after["share"] - share) < 1e-6 and after["lines"] == 0, after
             assert abs(after["drawn"] - share * strands) <= 0.03 * strands, (share, after)
             assert 0 < after["hull_pieces"] < after["pieces"], after
         change("Laid", hair_share=-1)
@@ -1052,7 +1052,8 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
             for share in (0.7, 0.4):
                 before, after = both("Laid among", "its share held at %s, a budget's lines losing %s" % (share, loss),
                                      least=1000, hair_lines=-1, hair_share=share, hair_line_loss=loss)
-                assert after["share"] == share and 16 <= after["drawn"] <= share * strands * 1.03, (share, after)
+                assert abs(after["share"] - share) < 1e-6 and 16 <= after["drawn"] <= share * strands * 1.03, \
+                    (share, after)
                 kept[(loss, share)] = after
         for share in (0.7, 0.4):
             assert kept[(0.4, share)]["lines"] >= kept[(-1, share)]["lines"], (share, kept)
