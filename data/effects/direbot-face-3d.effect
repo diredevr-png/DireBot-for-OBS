@@ -77,7 +77,8 @@ uniform float4 flat_at;
 // hidden hair out before it's drawn (the -skin effect's strand_shown):
 // how much further off than what's in front of it a point has to be (z)
 // and whether it's done (w: 0 no, 1 yes, 2 only the hair left out is drawn
-// - a test's view of it).
+// - a test's view of it; 3 and 4 measure: every piece left out, and the
+// test made with nothing left out).
 uniform float3 eye_pos;
 uniform float4 strand;
 uniform float4 strand_lod;
@@ -664,7 +665,7 @@ float4 PSStrand(StrandOut v) : TARGET
 	// it's drawn, all of it shown.)
 	float solid = depth_map.Load(int3(v.pos.xy, 0)).r;
 	float behind = strand.w * (1.0 - v.uv.y) * (1.0 - v.uv.y);
-	if (strand_view.w < 1.5 && v.depth > solid + behind)
+	if ((strand_view.w < 1.5 || strand_view.w > 3.5) && v.depth > solid + behind)
 		discard;
 	float a = v.lit.a;
 	if (a < 0.004)

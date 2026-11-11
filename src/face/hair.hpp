@@ -81,7 +81,8 @@ struct HairPlan {
 	// Direct3D: the effect's strand_shown): 0 never, 1 where it can, 2
 	// only the hair that would be left out is drawn (a test's view of it),
 	// 3 every piece is left out (a measure: the card's work on hair before
-	// any of it is cut into pixels).
+	// any of it is cut into pixels), 4 the test is made and nothing is
+	// left out (a measure: what the test itself costs).
 	int skip_hidden = 1;
 	// Hairs well under a pixel wide sent as lines (hair_form): 0 never, 1
 	// where they're that thin, 2 always (tests).
@@ -93,6 +94,11 @@ struct HairPlan {
 	// the card (Avatar3D's lay_strands), so the card reads them straight
 	// through.
 	int layout = 0;
+	// For measuring only ("hair_measure"): 1 hair is drawn into a single
+	// pixel of the picture's corner (a scissor) - the card poses every
+	// piece and puts its triangles together as ever, and fills next to
+	// none of their pixels: what hair costs but for its pixels.
+	int measure = 0;
 };
 
 inline HairPlan hair_plan(HairDetail d)

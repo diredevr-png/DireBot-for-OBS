@@ -22,6 +22,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -673,6 +674,7 @@ bool Avatar3D::lay_strands(Part &part, const Primitive &p, int sort, bool lines)
 	if (!part.skin || !n || h.pieces.empty() || h.runs.size() < 2 || h.width.size() != n || h.along.size() != n ||
 	    p.normal.size() != n)
 		return false;
+	const auto began = std::chrono::steady_clock::now();
 	StrandLayout lay = strand_layout(h, sort ? 1 : 0, lines);
 	part.laid_from[sort ? 1 : 0] = std::move(lay.from);
 	if (lay.corners.empty()) {
@@ -698,6 +700,7 @@ bool Avatar3D::lay_strands(Part &part, const Primitive &p, int sort, bool lines)
 	}
 	// (52 bytes a corner, 4 a corner of a piece.)
 	l.bytes = points * sides * 52 + lay.corners.size() * 4;
+	l.ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - began).count();
 	return true;
 }
 
@@ -1727,8 +1730,10 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 									 : h.strands_in((*dr.posed)[i].pos.size());
 				hair_drawn_.drawn += s.count;
 				for (const auto &sort : dr.a->parts_[i].laid)
-					for (const Part::Laid &l : sort)
+					for (const Part::Laid &l : sort) {
 						hair_drawn_.laid_bytes += l.bytes;
+						hair_drawn_.laid_ms += l.ms;
+					}
 			}
 	}
 	hair_drawn_.share = budget;
@@ -2086,6 +2091,13 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 			}
 			gs_set_cull_mode(GS_NEITHER);
 			gs_enable_depth_test(false);
+			// (A measure - HairPlan::measure 1: all of it into one pixel
+			// of the picture's corner.)
+			const bool one_pixel = hair_plan_.measure == 1;
+			if (one_pixel) {
+				const gs_rect corner = {0, 0, 1, 1};
+				gs_set_scissor_rect(&corner);
+			}
 			for (size_t layer = 0; layer < layers; layer++)
 				for (const HairPart &part : parts) {
 					const Rig::Part &p = (*dr.posed)[part.i];
@@ -2106,6 +2118,8 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 								   hair_drawn_);
 					}
 				}
+			if (one_pixel)
+				gs_set_scissor_rect(nullptr);
 			gs_enable_depth_test(true);
 			if (clock && hair_timer == 1 && at >= last_hair) {
 				gs_timer_end(clock->hair);

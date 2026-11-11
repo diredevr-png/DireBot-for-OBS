@@ -1105,6 +1105,9 @@ struct FaceAvatar {
 	// 0 by point, 1 as it's drawn; under 0: the setting's.
 	// HairPlan::layout.)
 	std::atomic<int> hair_layout{-1};
+	// (And, for measuring only, its pixels all but left out -
+	// "hair_measure": HairPlan::measure; under 0: not.)
+	std::atomic<int> hair_measure{-1};
 	// Whether characters can be posed on the card here (known for sure
 	// once the drawing's made): their hair is kept for how it's posed.
 #ifdef _WIN32
@@ -3225,6 +3228,8 @@ struct FaceAvatar {
 			hair.solid = std::min(1.0f, std::max(0.05f, own));
 		if (const int own = hair_layout; own >= 0)
 			hair.layout = own;
+		if (const int own = hair_measure; own >= 0)
+			hair.measure = own;
 		if (avatar3d) {
 			avatar3d->set_gpu_skin(card_posing);
 			rig->set_gpu_skin(avatar3d->gpu_skin());
@@ -5448,6 +5453,7 @@ struct FaceAvatar {
 		hair_layers = (int)obs_data_get_int(settings, "hair_layers");
 		hair_solid = (float)obs_data_get_double(settings, "hair_solid");
 		hair_layout = (int)obs_data_get_int(settings, "hair_layout");
+		hair_measure = (int)obs_data_get_int(settings, "hair_measure");
 		const char *model_file = obs_data_get_string(settings, "model");
 		{
 			std::lock_guard<std::mutex> l(model_lock);
@@ -6710,6 +6716,7 @@ struct FaceAvatar {
 					{"lines", st.hair.lines},
 					{"laid", st.hair.laid},
 					{"laid_mb", r((float)((double)st.hair.laid_bytes / 1048576.0), 10)},
+					{"laid_ms", r(st.hair.laid_ms, 10)},
 					{"skips_hidden", st.hair.skips},
 					{"draws", st.hair.draws},
 					{"share", r(st.hair.share, 1000)},
@@ -7177,6 +7184,7 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "hair_layers", -1);
 	obs_data_set_default_double(settings, "hair_solid", -1.0);
 	obs_data_set_default_int(settings, "hair_layout", -1);
+	obs_data_set_default_int(settings, "hair_measure", -1);
 	obs_data_set_default_bool(settings, "auto_blink", false);
 	obs_data_set_default_string(settings, "model_place", "");
 	obs_data_set_default_string(settings, "model_setup", "");

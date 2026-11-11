@@ -896,7 +896,8 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
     """Hair posed on the graphics card can lie in its memory in the order
     it's drawn in ("hair_layout" 1, a number the settings window doesn't
     show; FaceGetState's "laid": the pieces drawn from memory laid out that
-    way, and "laid_mb": how much of it there is). It's the same hair: the
+    way, "laid_mb": how much of it there is, and "laid_ms": how long making
+    it took). It's the same hair: the
     picture is the same to the pixel as with a point's numbers once, where
     its strand is ("hair_layout" 0) - as ribbons, as lines, with its thin
     hairs alone as lines, with only some of its strands drawn (small in the
@@ -1005,8 +1006,42 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
         # memory than one.)
         assert hair("Laid among")["laid_mb"] > after["laid_mb"], (hair("Laid among"), after)
 
+        # For measuring only (numbers the settings window doesn't show), by
+        # point and laid out: the hidden-hair test made with nothing left
+        # out ("hair_skip_hidden" 4) is the picture with every hair sent, to
+        # the pixel; and hair into one pixel of the picture's corner
+        # ("hair_measure" 1) sends as many pieces and leaves the picture
+        # with no hair in it (every piece left out, "hair_skip_hidden" 3),
+        # but for that pixel at most.
+        for layout in (0, 1):
+            change("Laid", hair_layout=layout, hair_skip_hidden=0, hair_measure=-1)
+            every = settled("Laid", layout)
+            sent = shot(c, "Laid")
+            change("Laid", hair_skip_hidden=4)
+            tested = settled("Laid", layout)
+            off = differ(sent, shot(c, "Laid"))
+            print("Laid, layout %d: the test made with nothing left out, %d pixels differ from every hair sent; %s"
+                  % (layout, off, tested))
+            assert off == 0 and tested["skips_hidden"] and not every["skips_hidden"], (off, every, tested)
+            assert tested["pieces"] == every["pieces"], (every, tested)
+            change("Laid", hair_skip_hidden=3)
+            settled("Laid", layout)
+            bare = shot(c, "Laid")
+            assert differ(sent, bare) > 200, differ(sent, bare)
+            change("Laid", hair_skip_hidden=0, hair_measure=1)
+            measured = settled("Laid", layout)
+            off = differ(bare, shot(c, "Laid"))
+            print("Laid, layout %d: hair into one pixel, %d pixels differ from no hair at all; %s"
+                  % (layout, off, measured))
+            assert off <= 1 and measured["pieces"] == every["pieces"], (off, every, measured)
+            assert measured["draws"] == every["draws"], (every, measured)
+        # (Making the layouts took some time, and it's told.)
+        assert hair("Laid")["laid_ms"] > 0, hair("Laid")
+        change("Laid", hair_skip_hidden=-1, hair_measure=-1)
+
         # Posed by the CPU: nothing's laid out, and the picture's as it was.
         change("Laid", hair_layout=1)
+        settled("Laid", 1)
         on_card = shot(c, "Laid")
         change("Laid", card_posing=False)
         assert wait_for(lambda: not st("Laid")["on_card"], 10, 0.1), st("Laid")

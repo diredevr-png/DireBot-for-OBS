@@ -243,6 +243,9 @@ public:
 		// (HairPlan::layout 1), and how much of the card's memory all the
 		// hair laid out that way takes (bytes; what's been made of it).
 		size_t laid = 0, laid_bytes = 0;
+		// (And how long making it took, all told: a pause the first time
+		// hair is drawn in a form - milliseconds.)
+		float laid_ms = 0;
 		float share = 1, ms = -1;
 		bool skips = false;
 	};
@@ -292,6 +295,7 @@ private:
 			gs_indexbuffer_t *ib = nullptr;
 			bool tried = false, none = false; // (none: it has no pieces of that sort)
 			size_t bytes = 0;                 // of the card's memory
+			float ms = 0;                     // making it took
 		};
 		Laid laid[2][2];
 		std::vector<uint32_t> laid_from[2];
