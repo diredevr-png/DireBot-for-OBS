@@ -1503,17 +1503,25 @@ def test_hair_on_the_card_keeps_only_what_its_drawn_from(obs):
         assert len(a) == len(b) and len(a[0]) == len(b[0])
         return sum(1 for a_row, b_row in zip(a, b) for x, y in zip(a_row, b_row) if tuple(x) != tuple(y))
 
+    # (Hairs this thin, this small in the picture: not every one of them is
+    # drawn - as many as its size on screen asks for, the same ones in
+    # every form.)
+    drawn = []
+
     def settled(lines, laid=True):
-        """All its hair drawn in the form asked for, laid out as drawn (or
-        by point), nothing being made - the same twice."""
+        """Its hair drawn in the form asked for, laid out as drawn (or by
+        point), nothing being made - the same twice."""
         def right():
             h = hair()
-            return (h["drawn"] == strands and h["pieces"] > 0 and h["forming"] == 0
+            return (h["loaded"] == strands and 0 < h["drawn"] <= strands and h["drawn"] == (drawn or [h["drawn"]])[0]
+                    and h["pieces"] > 0 and h["forming"] == 0
                     and h["laid"] == (h["pieces"] if laid else 0)
                     and h["lines"] == (h["pieces"] if lines else 0))
-        assert wait_for(right, 20, 0.1), (lines, laid, hair(), obs.log())
+        if not wait_for(right, 20, 0.1):
+            print("\nNOT SETTLED (lines %s, laid %s): %s" % (lines, laid, json.dumps(hair())))
+            assert False, (lines, laid, obs.log())
         time.sleep(0.8)
-        assert right(), (lines, laid, hair())
+        assert right(), (lines, laid, json.dumps(hair()))
         return hair()
     try:
         c.send("CreateScene", {"sceneName": "Kept scene"}, raw=True)
@@ -1530,6 +1538,7 @@ def test_hair_on_the_card_keeps_only_what_its_drawn_from(obs):
 
         # As ribbons: laid out by itself, nothing of it by point.
         ribbons = settled(False)
+        drawn.append(ribbons["drawn"])
         print("\nRibbons, as it comes: %s" % ribbons)
         assert ribbons["point_mb"] == 0 and ribbons["laid_mb"] > 0 and ribbons["laid_ms"] > 0, ribbons
         as_ribbons = shot(c, "Kept")
