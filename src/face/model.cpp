@@ -2115,6 +2115,10 @@ void read_nodes(const json &doc, Model &m)
 		const json &n = nodes[i];
 		Node &node = m.nodes[i];
 		node.name = text(n, "name");
+		// (A switch: true, or a number that isn't 0 - Blender writes a
+		// ticked box either way.)
+		const json &sw = field(field(field(n, "extras"), "direbot"), "switch");
+		node.size_switch = sw.is_boolean() ? sw.get<bool>() : sw.is_number() && sw.get<double>() != 0;
 		node.mesh = index_of(n, "mesh");
 		node.skin = index_of(n, "skin");
 		if (node.mesh >= (int)list(doc, "meshes").size())

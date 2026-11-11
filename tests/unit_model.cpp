@@ -3503,6 +3503,119 @@ static void test_own_move_once()
 	CHECK(near3(direction(rig.world()[p.head], {0, 0, 1}), {0, 0, 1}, 1e-4f));
 }
 
+// A part shown or put away by its size (0.001 while it's away), marked a
+// switch in its file ("extras": {"direbot": {"switch": true}}): its size
+// track that jumps (STEP) is never played part-way - a move easing in or
+// out plays all of it as soon as it plays at all. Not marked, or a track
+// that doesn't jump: blended over how it stood, as ever.
+static void test_a_size_switch()
+{
+	Person p = make_person(false);
+	Builder &b = p.b;
+	// Four props on the head: marked with true, marked with 1 (as Blender
+	// may write a ticked box), not marked, marked with 0.
+	int prop[5];
+	const char *names[5] = {"marked", "marked 1", "plain", "marked 0", "marked, straight"};
+	for (int i = 0; i < 5; i++) {
+		prop[i] = b.node({{"name", names[i]}, {"translation", {0.1f * (float)i, 0.3f, 0}}});
+		b.doc["nodes"][p.head]["children"].push_back(prop[i]);
+	}
+	b.doc["nodes"][prop[0]]["extras"] = {{"direbot", {{"switch", true}}}};
+	b.doc["nodes"][prop[1]]["extras"] = {{"direbot", {{"switch", 1}}}};
+	b.doc["nodes"][prop[3]]["extras"] = {{"direbot", {{"switch", 0}}}};
+	b.doc["nodes"][prop[4]]["extras"] = {{"direbot", {{"switch", true}}}};
+	// "Away": each as it stands until half a second, then put away. The
+	// last one's track runs straight between its keys.
+	const int t2 = b.floats({0, 0.5f, 1}, 1, "SCALAR");
+	const int away = b.floats({1, 1, 1, 0.001f, 0.001f, 0.001f, 0.001f, 0.001f, 0.001f}, 3, "VEC3");
+	json channels = json::array();
+	for (int i = 0; i < 5; i++)
+		channels.push_back({{"sampler", i == 4 ? 1 : 0}, {"target", {{"node", prop[i]}, {"path", "scale"}}}});
+	b.doc["animations"] = json::array(
+		{{{"name", "Away"},
+		  {"samplers",
+		   {{{"input", t2}, {"output", away}, {"interpolation", "STEP"}}, {{"input", t2}, {"output", away}}}},
+		  {"channels", channels}},
+		 // (And one that leaves them alone.)
+		 {{"name", "Nod"},
+		  {"samplers",
+		   {{{"input", b.floats({0, 1}, 1, "SCALAR")},
+		     {"output", b.floats({0, 0, 0, 1, 0, 0, 0, 1}, 4, "VEC4")}}}},
+		  {"channels", {{{"sampler", 0}, {"target", {{"node", p.head}, {"path", "rotation"}}}}}}}});
+	auto m = std::make_shared<Model>();
+	CHECK(load(b.glb(), *m));
+	CHECK(m->animations.size() == 2);
+	if (m->animations.size() != 2)
+		return;
+	CHECK(m->nodes[prop[0]].size_switch && m->nodes[prop[1]].size_switch && !m->nodes[prop[2]].size_switch &&
+	      !m->nodes[prop[3]].size_switch && m->nodes[prop[4]].size_switch && !m->nodes[p.head].size_switch);
+	RigOptions o;
+	o.springs = false;
+	Rig rig(m, o);
+	auto size = [&](int i) {
+		const M4 &a = rig.world()[prop[i]];
+		return length(V3{a.m[0], a.m[1], a.m[2]});
+	};
+	Drive d = still();
+	MoveNow mv;
+	mv.animation = 0;
+	mv.time = 0.75f;
+	mv.amount = 1;
+	d.body = {mv};
+	// All of the move: every one put away.
+	rig.pose(d);
+	for (int i = 0; i < 5; i++)
+		CHECK(near(size(i), 0.001, 1e-6));
+	// Half of it, a quarter, a hundredth (easing in or out): the switches
+	// away whole, the rest part-way.
+	for (float amount : {0.5f, 0.25f, 0.01f}) {
+		d.body[0].amount = amount;
+		rig.pose(d);
+		const double part = 1 + (0.001 - 1) * amount;
+		CHECK(near(size(0), 0.001, 1e-6) && near(size(1), 0.001, 1e-6));
+		CHECK(near(size(2), part, 1e-5) && near(size(3), part, 1e-5) && near(size(4), part, 1e-5));
+	}
+	// Before it jumps: all as they stand, whatever the amount.
+	d.body[0].time = 0.25f;
+	rig.pose(d);
+	for (int i = 0; i < 4; i++)
+		CHECK(near(size(i), 1, 1e-6));
+	// (The straight one is half way to its second key by then.)
+	CHECK(near(size(4), 1 + (0.5005 - 1) * 0.01, 1e-5));
+	// Not playing: as they stand.
+	d.body[0].time = 0.75f;
+	d.body[0].amount = 0;
+	rig.pose(d);
+	for (int i = 0; i < 5; i++)
+		CHECK(near(size(i), 1, 1e-6));
+	rig.pose(still());
+	for (int i = 0; i < 5; i++)
+		CHECK(near(size(i), 1, 1e-6));
+
+	// Its own animation played over and over (an idle chosen for it),
+	// fading in over the one before from where the parts are away: the
+	// same - the marked one away at once, the plain one part-way.
+	Rig idle(m, o);
+	idle.set_animation(1);
+	Drive on = still();
+	for (int i = 0; i < 5; i++)
+		idle.pose(on);
+	idle.set_animation(0, 0.4f, 0.6f);
+	bool whole = true;
+	int away_frames = 0, part_frames = 0;
+	for (int i = 0; i < 12; i++) {
+		idle.pose(on);
+		const M4 &a = idle.world()[prop[0]], &c = idle.world()[prop[2]];
+		const float marked = length(V3{a.m[0], a.m[1], a.m[2]}), plain = length(V3{c.m[0], c.m[1], c.m[2]});
+		whole = whole && (near(marked, 1, 1e-5) || near(marked, 0.001, 1e-6));
+		away_frames += near(marked, 0.001, 1e-6) ? 1 : 0;
+		part_frames += plain > 0.01f && plain < 0.99f ? 1 : 0;
+	}
+	std::printf("unit_model: a size switch fading in: away whole in %d of 12 frames, the plain one part-way in %d\n",
+		    away_frames, part_frames);
+	CHECK(whole && away_frames >= 10 && part_frames >= 5);
+}
+
 static void test_faces_on_cue()
 {
 	Person p = make_person(false);
@@ -4838,6 +4951,7 @@ int main()
 	test_names_and_sides();
 	test_springs();
 	test_own_animation();
+	test_a_size_switch();
 	test_link_chain();
 	test_spots_on_a_vrm();
 	test_spots_on_two_characters();

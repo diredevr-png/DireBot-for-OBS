@@ -1703,6 +1703,14 @@ void Rig::play_motion(const Motion &mo, float t, float amount)
 	}
 }
 
+// A size track that's a switch: one that jumps (STEP), of a part its file
+// marks as one.
+bool Rig::size_switched(const AnimChannel &c) const
+{
+	return c.ease == AnimChannel::Step && c.node >= 0 && c.node < (int)model_->nodes.size() &&
+	       model_->nodes[c.node].size_switch;
+}
+
 // One of its own animations, once, at `t` seconds.
 void Rig::play_own(int animation, float t, float amount)
 {
@@ -1717,7 +1725,12 @@ void Rig::play_own(int animation, float t, float amount)
 		if (c.path == AnimChannel::Move) {
 			t_[c.node] = t_[c.node] + (V3{v[0], v[1], v[2]} - t_[c.node]) * k;
 		} else if (c.path == AnimChannel::Size) {
-			s_[c.node] = s_[c.node] + (V3{v[0], v[1], v[2]} - s_[c.node]) * k;
+			// (A switch - model.hpp's Node::size_switch: all of it as
+			// soon as the move plays at all.)
+			if (size_switched(c))
+				s_[c.node] = k > 0 ? V3{v[0], v[1], v[2]} : s_[c.node];
+			else
+				s_[c.node] = s_[c.node] + (V3{v[0], v[1], v[2]} - s_[c.node]) * k;
 		} else {
 			r_[c.node] = normalized(slerp(r_[c.node], normalized(Quat{v[0], v[1], v[2], v[3]}), k));
 			moved_[c.node] = 1 - (1 - moved_[c.node]) * (1 - k);
@@ -1868,7 +1881,10 @@ void Rig::apply_animation(int which, float t, float amount)
 			t_[c.node] = k >= 1 ? to : t_[c.node] + (to - t_[c.node]) * k;
 		} else if (c.path == AnimChannel::Size) {
 			const V3 to{v[0], v[1], v[2]};
-			s_[c.node] = k >= 1 ? to : s_[c.node] + (to - s_[c.node]) * k;
+			if (size_switched(c))
+				s_[c.node] = k > 0 ? to : s_[c.node];
+			else
+				s_[c.node] = k >= 1 ? to : s_[c.node] + (to - s_[c.node]) * k;
 		} else {
 			const Quat to{v[0], v[1], v[2], v[3]};
 			r_[c.node] = k >= 1 ? to : normalized(slerp(r_[c.node], normalized(to), k));

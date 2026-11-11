@@ -569,6 +569,14 @@ straight back); its camera view glides to it while it stays, its
 companion can go (or bolt, scared) as it starts, and what's framed stays
 as the character stands, so a mount much wider than it isn't squeezed in.
 
+**Parts a move brings out and puts away (after 0.9.0).** A part shown or
+put away by its size (0.001 while it's away: a sword in the hand, a
+wolf's dark lip as it howls) is part-size for a moment while its move
+eases in or out over how the character stood. A bone its file marks
+`"extras": {"direbot": {"switch": true}}` never is: its size track that
+jumps (glTF's `STEP`) plays whole as soon as the move plays at all.
+Bones not marked, and size tracks that don't jump, ease as before.
+
 **Glowing parts: fire, sparks and smoke (0.9.0).** A see-through part
 (glTF's `BLEND`) whose material has `"extras": {"direbot": {"glow":
 {"soft": 1.5, "ragged": 0}}}` is drawn as a soft glowing gas - a

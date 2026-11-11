@@ -418,6 +418,7 @@ private:
 	float hips_height(int hips) const;
 	void play_builtin(BuiltIn b, float t, float amount);
 	void play_own(int animation, float t, float amount);
+	bool size_switched(const AnimChannel &c) const;
 	void measure_head();
 	void squish_head(const Drive &d);
 	void stand_upright(const Drive &d);

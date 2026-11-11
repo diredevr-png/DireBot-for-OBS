@@ -322,6 +322,11 @@ struct Node {
 	Quat r;
 	V3 s{1, 1, 1};
 	int mesh = -1, skin = -1;
+	// Its size is a switch (the file says so: "extras": {"direbot":
+	// {"switch": true}}): a part shown or put away by a size track that
+	// jumps (STEP) is never played part-way - not while a move eases in
+	// or out over how it stood (rig.cpp's play_own).
+	bool size_switch = false;
 	M4 local() const { return matrix_of(t, r, s); }
 };
 
