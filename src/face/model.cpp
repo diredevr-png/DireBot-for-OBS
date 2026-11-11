@@ -528,6 +528,13 @@ struct RawStrands {
 		std::vector<V3> moves;
 	};
 	std::vector<StrandMoves> strand_moves; // an expression's (none: empty)
+	// Its expressions' moves the usual way, read a point at a time
+	// (read_strand_moves: one for each of `targets`; not read: empty), and
+	// whether any of them moves each point (none does: empty). A point an
+	// expression moves unlike the points kept beside it is kept
+	// (shape_strand).
+	std::vector<Reader::Column> moves;
+	std::vector<uint8_t> moved;
 	float bend = 0;           // points that bend their strand less are left out (its units)
 	float turn = -1;          // ...unless it turns more than this between kept points (the angle's cosine)
 	float swing = 0;          // ...or its bones could bend it more than this there
@@ -726,13 +733,20 @@ void srgb_of(const double *linear, int comps, uint8_t *out)
 // points that it never turns far from one to the next (a small curl is
 // never far off a straight run, and would be left a row of corners). And
 // where its bones change along it, enough points for them to bend it: a
-// straight hair hung on a chain of bones still swings in a curve.
+// straight hair hung on a chain of bones still swings in a curve. And
+// where an expression moves a point unlike the points beside it (a hair
+// pressed aside in its middle, or curled), that point: no point left out
+// is moved further than that same limit from where the kept points
+// beside it carry it.
 struct StrandShape {
 	std::vector<uint32_t> at;
 	std::vector<float> arc, width;
 	std::vector<uint8_t> colour;
 	std::vector<uint16_t> joints; // 4 a point, and how much each holds it (adding up to 1)
 	std::vector<float> weights;
+	// Each expression that moves any of its points (the usual way): every
+	// point's move, one expression's after another's.
+	std::vector<V3> moves;
 	std::vector<char> keep;
 	size_t kept = 0;
 	std::vector<std::pair<uint32_t, uint32_t>> todo;
@@ -782,6 +796,41 @@ void shape_strand(const RawStrands &raw, uint32_t root, StrandShape &s)
 			}
 			for (int k = 0; k < 4; k++)
 				s.weights.push_back(sum > 1e-6f ? wk[k] / sum : (k == 0 ? 1.0f : 0.0f));
+		}
+	}
+	// Its expressions' moves, of a strand any of them moves.
+	s.moves.clear();
+	bool moved = false;
+	if (!raw.moved.empty() && raw.bend > 0 && n >= 3) {
+		uint32_t low = s.at[0], high = s.at[0];
+		for (size_t i = 0; i < n; i++) {
+			moved = moved || raw.moved[s.at[i]];
+			low = std::min(low, s.at[i]);
+			high = std::max(high, s.at[i]);
+		}
+		for (size_t t = 0; moved && t < raw.moves.size(); t++) {
+			const Reader::Column &c = raw.moves[t];
+			if (c.comps != 3 || c.count != raw.pos.size())
+				continue;
+			// (One whose listed points are none of this strand's: not read.)
+			if (!c.data) {
+				const auto first = std::lower_bound(c.sparse_at.begin(), c.sparse_at.end(), low);
+				if (first == c.sparse_at.end() || *first > high)
+					continue;
+			}
+			const size_t from = s.moves.size();
+			s.moves.resize(from + n);
+			bool any = false;
+			for (size_t i = 0; i < n; i++) {
+				column_point(c, s.at[i], v);
+				const V3 m{(float)v[0], (float)v[1], (float)v[2]};
+				if (dot(m, m) > MOVES_NOTHING) {
+					s.moves[from + i] = m;
+					any = true;
+				}
+			}
+			if (!any)
+				s.moves.resize(from);
 		}
 	}
 	// How unlike point i's bones are to those `u` of the way from point
@@ -850,6 +899,11 @@ void shape_strand(const RawStrands &raw, uint32_t root, StrandShape &s)
 			// (Its bones not a steady change from one end's to the other's.)
 			if (raw.has_bones)
 				err = std::max(err, unlike(i, a, b, u) / 0.05f);
+			// (An expression's move of it, not one between the two ends'.)
+			for (size_t m = 0; m < s.moves.size(); m += n) {
+				const V3 ma = s.moves[m + a], mb = s.moves[m + b];
+				err = std::max(err, length(s.moves[m + i] - (ma + (mb - ma) * u)) / raw.bend);
+			}
 			if (err > worst) {
 				worst = err;
 				at = i;
@@ -877,6 +931,40 @@ void shape_strand(const RawStrands &raw, uint32_t root, StrandShape &s)
 			s.kept++;
 			s.todo.push_back({a, at});
 			s.todo.push_back({at, b});
+		}
+	}
+}
+
+// A strand part's expressions' moves the usual way, read for shape_strand
+// (RawStrands::moves, moved).
+void read_strand_moves(Reader &rd, RawStrands &raw)
+{
+	const size_t n = raw.pos.size();
+	raw.moves.assign(raw.targets.size(), Reader::Column());
+	raw.moved.clear();
+	auto mark = [&raw, n](size_t i) {
+		if (raw.moved.empty())
+			raw.moved.assign(n, 0);
+		raw.moved[i] = 1;
+	};
+	double v[4];
+	for (size_t t = 0; t < raw.targets.size(); t++) {
+		if (raw.targets[t] < 0)
+			continue;
+		Reader::Column &c = raw.moves[t];
+		c = rd.column(raw.targets[t], 3, MOST_STRAND_POINTS);
+		if (c.count != n)
+			fail("the file is damaged (an expression doesn't fit its part)");
+		if (c.data)
+			for (size_t i = 0; i < n; i++) {
+				c.get(i, v);
+				if (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] > (double)MOVES_NOTHING)
+					mark(i);
+			}
+		for (size_t k = 0; k < c.sparse_at.size(); k++) {
+			const double *m = &c.sparse_values[k * 3];
+			if (c.sparse_at[k] < n && m[0] * m[0] + m[1] * m[1] + m[2] * m[2] > (double)MOVES_NOTHING)
+				mark(c.sparse_at[k]);
 		}
 	}
 }
@@ -1425,12 +1513,15 @@ float anchor_strands(Reader &rd, const RawStrands &raw, const std::vector<uint32
 {
 	Strands &h = p.hair;
 	const size_t n = p.pos.size(), strands = h.strands(), morphs = raw.targets.size();
-	std::vector<Reader::Column> cols(morphs);
+	// (Read already for its strands' shapes - read_strand_moves: those.)
+	std::vector<Reader::Column> read(raw.moves.empty() ? morphs : 0);
+	const std::vector<Reader::Column> &cols = raw.moves.empty() ? read : raw.moves;
 	bool any = false;
 	for (size_t t = 0; t < morphs; t++) {
 		if (raw.targets[t] < 0)
 			continue;
-		cols[t] = rd.column(raw.targets[t], 3, MOST_STRAND_POINTS);
+		if (raw.moves.empty())
+			read[t] = rd.column(raw.targets[t], 3, MOST_STRAND_POINTS);
 		if (cols[t].count != raw.pos.size())
 			fail("the file is damaged (an expression doesn't fit its part)");
 		any = any || cols[t].data || !cols[t].sparse_at.empty();
@@ -2538,6 +2629,9 @@ void read_meshes(Reader &rd, const json &doc, Model &m, const LoadOptions &optio
 		pd.raw.swing = std::max(0.0f, options.strand_swing) * size;
 		pd.raw.turn = options.strand_turn > 0 ? std::cos(std::min(180.0f, options.strand_turn) * 0.01745329252f)
 						      : -1.0f;
+		// (Its expressions' moves, for the shapes of the strands kept.)
+		if (allowed && pd.raw.bend > 0)
+			read_strand_moves(rd, pd.raw);
 		predict_strands(pd.raw);
 		predicted += pd.raw.predicted;
 	}

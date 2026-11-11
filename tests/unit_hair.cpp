@@ -5171,6 +5171,116 @@ static std::string refused(Builder &b, const LoadOptions &options = LoadOptions(
 	return ended ? said : std::string("crashed");
 }
 
+// Points left out of a strand (LoadOptions::strand_bend) and its
+// expressions: a point an expression moves unlike the points kept beside
+// it stays, so the hair is where its file puts it with the expression on.
+static void test_points_an_expression_shapes()
+{
+	// A straight hair of 9 points 0.8 long (the file's size: its bend
+	// limit a hundredth of that, 0.008).
+	auto hair = [] {
+		Groom g;
+		g.straight({0, 0, 0}, {0, 0.8f, 0}, 9);
+		return g;
+	};
+	const LoadOptions some = options_with(0.01f);
+	auto kept = [&](Builder &b, const Groom &g) {
+		const Model m = loaded(b, some);
+		return kept_of(g, part_of(m));
+	};
+	// No expression: its root and its tip.
+	{
+		Groom g = hair();
+		Builder b = file_of({g});
+		CHECK((kept(b, g) == std::vector<int>{0, 8}));
+	}
+	// One that presses its middle point aside, alone: that point stays -
+	// and the ones either side of it, which it leaves where they were.
+	// The spots move each kept point just as the file says.
+	{
+		Groom g = hair();
+		g.shapes.assign(1, std::vector<V3>(9));
+		g.shapes[0][4] = {0.05f, 0, 0};
+		Builder b = file_of({g});
+		const Model m = loaded(b, some);
+		const Primitive &h = part_of(m);
+		CHECK((kept_of(g, h) == std::vector<int>{0, 3, 4, 5, 8}));
+		CHECK(h.hair.anchors() == 2 && worst_move(g, h, 0) < 1e-9f);
+		// Every point left out, with the expression on: no further than
+		// the limit from the run between the kept points beside it.
+		const std::vector<int> at = kept_of(g, h);
+		for (size_t k = 0; k + 1 < at.size(); k++)
+			for (int i = at[k] + 1; i < at[k + 1]; i++) {
+				const V3 a = g.pos[(size_t)at[k]] + g.shapes[0][(size_t)at[k]];
+				const V3 c = g.pos[(size_t)at[k + 1]] + g.shapes[0][(size_t)at[k + 1]];
+				CHECK(off_run(g.pos[(size_t)i] + g.shapes[0][(size_t)i], a, c) <= 0.008f + 1e-6f);
+			}
+		// Every point kept anyway (no limit): as ever.
+		const Model all = loaded(b, options_with(0));
+		CHECK(part_of(all).pos.size() == 9);
+	}
+	// The same, the expression a short list of the points it moves (a
+	// sparse one) - and a second hair it doesn't touch keeps its two.
+	{
+		Groom g = hair();
+		g.straight({0.1f, 0, 0}, {0.1f, 0.8f, 0}, 9);
+		Builder b = file_of({g});
+		const std::vector<uint32_t> at = {4};
+		const std::vector<float> by = {0.05f, 0, 0};
+		b.doc["accessors"].push_back(
+			{{"componentType", 5126},
+			 {"count", g.pos.size()},
+			 {"type", "VEC3"},
+			 {"sparse",
+			  {{"count", 1},
+			   {"indices", {{"bufferView", b.view(at.data(), 4)}, {"componentType", 5125}}},
+			   {"values", {{"bufferView", b.view(by.data(), 12)}}}}}});
+		b.doc["meshes"][0]["primitives"][0]["targets"] = {{{"POSITION", (int)b.doc["accessors"].size() - 1}}};
+		std::vector<int> got = kept(b, g);
+		std::sort(got.begin(), got.end());
+		CHECK((got == std::vector<int>{0, 3, 4, 5, 8, 9, 17}));
+	}
+	// A move that changes steadily along the hair (it leans over): a
+	// straight run between its ends is all of it - nothing more kept. And
+	// one too small to see (under the limit): nothing more.
+	{
+		Groom g = hair();
+		g.shapes.assign(2, std::vector<V3>(9));
+		for (int i = 0; i < 9; i++)
+			g.shapes[0][(size_t)i] = {0.02f * (float)i, 0, 0};
+		g.shapes[1][4] = {0.007f, 0, 0};
+		Builder b = file_of({g});
+		CHECK((kept(b, g) == std::vector<int>{0, 8}));
+		// Past the limit: kept.
+		g.shapes[1][4] = {0.009f, 0, 0};
+		Builder c = file_of({g});
+		CHECK((kept(c, g) == std::vector<int>{0, 4, 8}));
+	}
+	// Two expressions, each pressing a point of its own: both stay.
+	{
+		Groom g = hair();
+		g.shapes.assign(2, std::vector<V3>(9));
+		g.shapes[0][2] = {0, 0, 0.05f};
+		g.shapes[1][6] = {0.05f, 0, 0};
+		Builder b = file_of({g});
+		CHECK((kept(b, g) == std::vector<int>{0, 1, 2, 3, 5, 6, 7, 8}));
+	}
+	// Moved a strand at a time (extras.direbot.strand_morphs): a whole
+	// hair moves alike, so nothing more is kept.
+	{
+		Groom g = hair();
+		g.straight({0.1f, 0, 0}, {0.1f, 0.8f, 0}, 9);
+		Builder b = file_of({g});
+		b.doc["meshes"][0]["primitives"][0]["targets"] = json::array();
+		const std::vector<V3> zeros(g.pos.size());
+		b.doc["meshes"][0]["primitives"][0]["targets"].push_back({{"POSITION", b.vec3s(zeros)}});
+		b.doc["meshes"][0]["primitives"][0]["extras"] = strand_morphs(b, {0, 9, 18}, {{{1}, {{0.05f, 0, 0}}}});
+		std::vector<int> got = kept(b, g);
+		std::sort(got.begin(), got.end());
+		CHECK((got == std::vector<int>{0, 8, 9, 17}));
+	}
+}
+
 static void test_expressions_by_strand()
 {
 	// 120 hairs of 3 points, as test_expressions' first: the first
@@ -5728,8 +5838,10 @@ static void test_posed_here()
 		if (m->meshes.size() != 2)
 			return;
 		// (Every point kept; or as loaded: 8 of each hair's 10, the two on
-		// the straight run its last bone holds alone left out.)
-		CHECK(m->meshes[0].parts[0].pos.size() == (simplified ? 240u : 300u));
+		// the straight run its last bone holds alone left out - but for
+		// the 10 hairs its second expression curls, which keep those two
+		// as well: the curl is theirs to show.)
+		CHECK(m->meshes[0].parts[0].pos.size() == (simplified ? 260u : 300u));
 		CHECK(m->meshes[0].parts[0].hair.moves.size() == 2 && m->meshes[1].parts[0].hair.moves.size() == 2);
 		// Nothing showing: every point where its bones put it.
 		Drive d = still();
@@ -6082,7 +6194,7 @@ static void test_for_the_card()
 	card.set_strand_points(150000);
 	card.set_gpu_skin(false);
 	card.pose(d);
-	CHECK(!posed_part(card, c.hair_node)->gpu && posed_part(card, c.hair_node)->pos.size() == 240);
+	CHECK(!posed_part(card, c.hair_node)->gpu && posed_part(card, c.hair_node)->pos.size() == 260);
 
 	// More bones than the card's list holds (255): a part with 256 or
 	// more is posed here even so - capped as any posed here is - and one
@@ -6266,6 +6378,7 @@ int main()
 	test_hull_layout();
 	test_expressions();
 	test_expressions_by_strand();
+	test_points_an_expression_shapes();
 	test_stand_in_hair();
 	test_posed_here();
 	test_first_bone();
