@@ -616,7 +616,7 @@ RawStrands open_strands(Reader &rd, const json &pj, const json &attr, int mode, 
 		if (!ic.sparse_at.empty() || ic.type == 5126)
 			fail("the file has numbers DireBot can't read");
 		auto at = [&](size_t i) {
-			double d;
+			double d = -1;
 			ic.get(i, &d);
 			if (d < 0 || d >= (double)n)
 				fail("the file is damaged (a triangle past its points)");
