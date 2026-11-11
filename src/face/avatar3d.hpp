@@ -246,7 +246,13 @@ public:
 		// (And how long making it took, all told: a pause the first time
 		// hair is drawn in a form - milliseconds.)
 		float laid_ms = 0;
-		float share = 1, ms = -1;
+		// The hull (the hairs' inner layers, drawn into the picture of the
+		// solid parts' distances): its pieces and its draws.
+		size_t hull_pieces = 0, hull_draws = 0;
+		// `ms` is two of the card's clocks added up: `depth_ms`, the picture
+		// of the solid parts' distances with the hull in it, and the hairs
+		// themselves (-1: not known).
+		float share = 1, ms = -1, depth_ms = -1;
 		bool skips = false;
 	};
 	const HairDrawn &hair_drawn() const { return hair_drawn_; }
@@ -299,6 +305,11 @@ private:
 		};
 		Laid laid[2][2];
 		std::vector<uint32_t> laid_from[2];
+		// Its hull laid out as drawn (lay_hull), and where each group's
+		// pieces are in it (hair.hpp's StrandHull, but for its points and
+		// corners: the card has those).
+		Laid hull;
+		StrandHull hull_lay;
 		bool was_morphed = false;
 		bool posed_here = false; // a card part's points last sent posed here
 	};
@@ -359,7 +370,10 @@ private:
 	// distances: the inner layers of some of the `count` strands drawn
 	// (as much wider), each written further off than it is by how far its
 	// group's inner layers reach - what's behind that is hidden.
-	void draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t drawn_h, size_t count);
+	void draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t drawn_h, size_t count, HairDrawn &drawn);
+	// Its hull laid out as drawn, made the first time it's drawn so (false:
+	// it can't be - by point, as before).
+	bool lay_hull(Part &part, const Primitive &p);
 	// What the Depth techniques read of a material.
 	void set_depth_material(const Material &m, const std::vector<gs_texture_t *> *textures = nullptr);
 	// A thing's parts: its solid ones, or its see-through ones (or all of
@@ -402,11 +416,13 @@ private:
 	HairClock clocks_[CLOCKS];
 	size_t clock_at_ = 0;
 	bool clocks_work_ = true;
-	std::vector<float> took_; // the last readings (hair_took: their middle one)
+	// The last readings (hair_took: their middle one), and of each the
+	// picture of the solid parts' distances alone.
+	std::vector<float> took_, took_depth_;
 	void turn_clock();
 	HairClock *start_clock(float share);
 	void clocks_lost();
-	float hair_took() const;
+	static float hair_took(const std::vector<float> &readings);
 	std::vector<float> spots_; // a strand part's spots' moves, as the effect has them
 	float opacity_ = 1;
 	float outline_share_ = 0, height_ = 1, world_scale_ = 1, fov_ = 0.35f;

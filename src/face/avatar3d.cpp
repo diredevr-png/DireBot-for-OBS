@@ -478,6 +478,10 @@ void Avatar3D::free_part(Part &part)
 		}
 	for (auto &from : part.laid_from)
 		from.clear();
+	gs_vertexbuffer_destroy(part.hull.vb);
+	gs_indexbuffer_destroy(part.hull.ib);
+	part.hull = Part::Laid();
+	part.hull_lay = StrandHull();
 }
 
 namespace {
@@ -700,6 +704,54 @@ bool Avatar3D::lay_strands(Part &part, const Primitive &p, int sort, bool lines)
 	}
 	// (52 bytes a corner, 4 a corner of a piece.)
 	l.bytes = points * sides * 52 + lay.corners.size() * 4;
+	l.ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - began).count();
+	return true;
+}
+
+// A strand part's hull laid out as it's drawn (posed on the card;
+// HairPlan::layout 1; hair.hpp's strand_hull): by point its pieces - a few
+// points of every fourth strand, a layer at a time - are as far apart in
+// the card's memory as a run's are, and each group's each layer is a draw
+// of its own. Here a group's pieces follow each other by strand, a draw a
+// group. The same corners as by point, so the same picture.
+bool Avatar3D::lay_hull(Part &part, const Primitive &p)
+{
+	Part::Laid &l = part.hull;
+	if (l.tried)
+		return l.none || (l.vb && l.ib);
+	l.tried = true;
+	const Strands &h = p.hair;
+	const size_t n = p.pos.size();
+	if (!part.skin || !n || h.pieces.empty() || h.runs.size() < 2 || h.width.size() != n || h.along.size() != n ||
+	    p.normal.size() != n)
+		return false;
+	const auto began = std::chrono::steady_clock::now();
+	StrandHull lay = strand_hull(h);
+	if (lay.corners.empty()) {
+		l.none = true;
+		return true;
+	}
+	const size_t points = lay.points.size();
+	if (points * 2 > 0xFFFFFFF0u)
+		return false;
+	StrandFill fill(p, part.boned);
+	fill.make(points * 2, true);
+	for (size_t k = 0; k < points; k++)
+		for (size_t side = 0; side < 2; side++)
+			fill.corner(k * 2 + side, lay.points[k], side == 1);
+	l.vb = gs_vertexbuffer_create(fill.vb, 0);
+	l.ib = make_ib(lay.corners);
+	if (!l.vb || !l.ib) {
+		gs_vertexbuffer_destroy(l.vb);
+		gs_indexbuffer_destroy(l.ib);
+		l.vb = nullptr;
+		l.ib = nullptr;
+		return false;
+	}
+	l.bytes = points * 2 * 52 + lay.corners.size() * 4;
+	std::vector<uint32_t>().swap(lay.points);
+	std::vector<uint32_t>().swap(lay.corners);
+	part.hull_lay = std::move(lay);
 	l.ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - began).count();
 	return true;
 }
@@ -1054,6 +1106,18 @@ void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int>
 	const size_t layers = (size_t)std::max(1, h.layers);
 	if (layer >= layers)
 		return;
+	// (A measure - HairPlan::measure 5: a stretch in two draws, its first
+	// half and its second.)
+	const bool halves = hair_plan_.measure == 5;
+	auto send = [&](uint32_t from, uint32_t pieces) {
+		const uint32_t first = halves && pieces > 1 ? pieces / 2 : pieces;
+		gs_draw(shape, from * corners, first * corners);
+		drawn.draws++;
+		if (first < pieces) {
+			gs_draw(shape, (from + first) * corners, (pieces - first) * corners);
+			drawn.draws++;
+		}
+	};
 	if (laid) {
 		const Part::Laid *loaded = nullptr;
 		while (gs_effect_loop(effect_, technique)) {
@@ -1071,12 +1135,11 @@ void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int>
 						gs_load_indexbuffer(l.ib);
 						loaded = &l;
 					}
-					gs_draw(shape, part.laid_from[k][run] * corners, some[k].count * corners);
+					send(part.laid_from[k][run], some[k].count);
 					drawn.pieces += some[k].count;
 					drawn.laid += some[k].count;
 					if (lines)
 						drawn.lines += some[k].count;
-					drawn.draws++;
 				}
 			}
 		}
@@ -1098,31 +1161,55 @@ void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int>
 			for (const Strands::Stretch &one : some) {
 				if (!one.count)
 					continue;
-				gs_draw(shape, one.from * corners, one.count * corners);
+				send(one.from, one.count);
 				drawn.pieces += one.count;
 				if (lines)
 					drawn.lines += one.count;
-				drawn.draws++;
 			}
 		}
 }
 
-void Avatar3D::draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t drawn_h, size_t count)
+void Avatar3D::draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t drawn_h, size_t count,
+			 HairDrawn &drawn)
 {
 	const Strands &h = p.prim->hair;
 	const size_t layers = (size_t)std::max(1, h.layers), core = (size_t)std::max(0, std::min(h.core, h.layers));
-	if (!core || !count)
+	// (A measure - HairPlan::measure 4: no hull.)
+	if (!core || !count || hair_plan_.measure == 4)
 		return;
 	// A quarter of the strands drawn (the first of them), each as much
 	// wider.
-	const size_t some = std::max(std::min<size_t>(count, 16), count / 4);
+	const size_t some = hull_strands(count);
 	const float upto = h.threshold_of(some);
+	// Laid out as drawn (posed on the card), made before the first time
+	// it's drawn; one that can't be made: by point, as before.
+	Part &part = parts_[i];
+	const bool laid = hair_plan_.layout == 1 && p.gpu && part.skin && p.prim && lay_hull(part, *p.prim);
 	set_camera();
 	set_strand(v, drawn_h, upto, p.scale, nullptr);
-	if (!load_strands(i, p))
+	if (!load_strands(i, p, false, laid))
 		return;
 	const char *technique = p.gpu ? "HullSk" : "Hull";
 	check_(technique);
+	if (laid) {
+		if (part.hull.none || part.hull_lay.from.size() != h.groups.size() + 1)
+			return;
+		gs_load_vertexbuffer(part.hull.vb);
+		gs_load_indexbuffer(part.hull.ib);
+		while (gs_effect_loop(effect_, technique))
+			for (size_t g = 0; g < h.groups.size(); g++) {
+				// (A group's first so many strands' pieces: the start of
+				// its stretch.)
+				const uint32_t pieces = part.hull_lay.pieces_of(h, g, some);
+				if (!pieces)
+					continue;
+				set_vec4(p_strand_lod, upto, 1.5f * h.groups[g].reach * p.scale, 0.0f, 0.0f);
+				gs_draw(GS_TRIS, part.hull_lay.from[g] * 6, pieces * 6);
+				drawn.hull_pieces += pieces;
+				drawn.hull_draws++;
+			}
+		return;
+	}
 	while (gs_effect_loop(effect_, technique))
 		for (size_t g = 0; g < h.groups.size(); g++) {
 			// (Half as far again as its inner layers reach: a hair's
@@ -1132,8 +1219,11 @@ void Avatar3D::draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t
 				Strands::Stretch both[2];
 				h.pieces_of(g * layers + l, some, both);
 				for (const Strands::Stretch &one : both)
-					if (one.count)
+					if (one.count) {
 						gs_draw(GS_TRIS, one.from * 6, one.count * 6);
+						drawn.hull_pieces += one.count;
+						drawn.hull_draws++;
+					}
 			}
 		}
 }
@@ -1523,14 +1613,19 @@ void Avatar3D::turn_clock()
 		// No answer: enough of them in a row and the budget has no
 		// clock to go by (and what hair took isn't known any more).
 		budget_.unread();
-		if (budget_.silent())
+		if (budget_.silent()) {
 			took_.clear();
+			took_depth_.clear();
+		}
 		return;
 	}
 	budget_.read((float)ms, c.share);
 	took_.push_back((float)ms);
+	took_depth_.push_back((float)((double)depth * 1000.0 / (double)frequency));
 	if (took_.size() > 31)
 		took_.erase(took_.begin());
+	if (took_depth_.size() > 31)
+		took_depth_.erase(took_depth_.begin());
 }
 
 // This frame's clocks started (null: there are none - hair's time isn't
@@ -1567,11 +1662,11 @@ void Avatar3D::clocks_lost()
 		c.used = false;
 }
 
-float Avatar3D::hair_took() const
+float Avatar3D::hair_took(const std::vector<float> &readings)
 {
-	if (took_.empty())
+	if (readings.empty())
 		return -1;
-	std::vector<float> sorted = took_;
+	std::vector<float> sorted = readings;
 	std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
 	return sorted[sorted.size() / 2];
 }
@@ -1582,7 +1677,8 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 	const bool character = upload(rig);
 	turn_clock();
 	hair_drawn_ = HairDrawn();
-	hair_drawn_.ms = hair_took();
+	hair_drawn_.ms = hair_took(took_);
+	hair_drawn_.depth_ms = hair_took(took_depth_);
 	// 0.9.0: the others beside it, each onto the graphics card too.
 	struct Drawn {
 		Avatar3D *a;
@@ -1734,6 +1830,8 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 						hair_drawn_.laid_bytes += l.bytes;
 						hair_drawn_.laid_ms += l.ms;
 					}
+				hair_drawn_.laid_bytes += dr.a->parts_[i].hull.bytes;
+				hair_drawn_.laid_ms += dr.a->parts_[i].hull.ms;
 			}
 	}
 	hair_drawn_.share = budget;
@@ -1853,7 +1951,8 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 			for (Drawn &dr : all)
 				for (size_t i = 0; i < dr.hair.size(); i++)
 					if (dr.hair[i].count)
-						dr.a->draw_hull(i, (*dr.posed)[i], v, drawn_h, dr.hair[i].count);
+						dr.a->draw_hull(i, (*dr.posed)[i], v, drawn_h, dr.hair[i].count,
+								hair_drawn_);
 			gs_blend_op(GS_BLEND_OP_ADD);
 			gs_blend_state_pop();
 			gs_enable_depth_test(false);

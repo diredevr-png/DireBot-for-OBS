@@ -100,7 +100,10 @@ struct HairPlan {
 	// none of their pixels: what hair costs but for its pixels. 2 and 3
 	// (posed on the card): every piece is left out, and of a corner's 52
 	// bytes the card reads only its place and bones (32), or its place
-	// alone (16, not posed): what reading a strand's numbers costs.
+	// alone (16, not posed): what reading a strand's numbers costs. 4 the
+	// hull isn't drawn (hair behind other hair isn't hidden by it): what
+	// the hull costs. 5 each run's pieces go to the card in two draws, its
+	// first half and its second (the same picture): what a draw costs.
 	int measure = 0;
 };
 
@@ -335,6 +338,89 @@ inline StrandLayout strand_layout(const Strands &h, int sort, bool lines)
 			}
 		}
 	}
+	return out;
+}
+
+// The hull (Avatar3D's draw_hull): the inner layers - the first `core` of
+// them - of a quarter of the strands drawn (the first of them; of a few
+// strands, all), each as much wider, into the picture of the solid parts'
+// distances.
+inline size_t hull_strands(size_t count)
+{
+	return std::max(std::min<size_t>(count, 16), count / 4);
+}
+
+// A strand part's hull laid out as it's drawn (HairPlan::layout 1). The
+// picture it's drawn into keeps the nearest distance at each pixel, so the
+// order its pieces go to the card in changes nothing: they lie a group at
+// a time (each group has its own reach) and inside a group by strand, a
+// strand's pieces after each other, whichever layer or sort they're in.
+// So the first so many strands' pieces of a group are the start of its
+// stretch, the card reads them straight through, and a group is one draw.
+// Only the strands the hull can ever draw: the first hull_strands of all
+// of them.
+//   points   each point laid out: which of the part's points it is (two
+//            corners each, its sides: 2 x its place and 2 x its place + 1)
+//   corners  its pieces' corners, 6 a piece, as strand_corners has them
+//   from     a group: how many pieces come before its own (one more entry
+//            than groups: all of them)
+//   starts   each piece laid out: the point it starts at (they rise
+//            inside a group)
+struct StrandHull {
+	std::vector<uint32_t> points, corners, from, starts;
+
+	// How many of group `g`'s pieces - the start of its stretch - belong
+	// to the first `count` strands.
+	uint32_t pieces_of(const Strands &h, size_t g, size_t count) const
+	{
+		if (g + 1 >= from.size())
+			return 0;
+		const uint32_t a = from[g], b = from[g + 1];
+		if (count >= h.strands())
+			return b - a;
+		return (uint32_t)(std::lower_bound(starts.begin() + a, starts.begin() + b, h.first[count]) -
+				  (starts.begin() + a));
+	}
+};
+
+inline StrandHull strand_hull(const Strands &h)
+{
+	StrandHull out;
+	const size_t layers = (size_t)std::max(1, h.layers), core = (size_t)std::max(0, std::min(h.core, h.layers));
+	const size_t groups = h.groups.size();
+	if (!core || !groups || !h.strands() || h.runs.size() < groups * layers + 1)
+		return out;
+	const size_t most = hull_strands(h.strands());
+	out.from.assign(groups + 1, 0);
+	std::vector<uint32_t> some;
+	for (size_t g = 0; g < groups; g++) {
+		out.from[g] = (uint32_t)out.starts.size();
+		some.clear();
+		for (size_t l = 0; l < core; l++) {
+			Strands::Stretch both[2];
+			h.pieces_of(g * layers + l, most, both);
+			for (const Strands::Stretch &one : both)
+				some.insert(some.end(), h.pieces.begin() + one.from,
+					    h.pieces.begin() + one.from + one.count);
+		}
+		std::sort(some.begin(), some.end());
+		uint32_t end = 0; // (the piece before's end's first corner)
+		for (size_t k = 0; k < some.size(); k++) {
+			const uint32_t i = some[k];
+			uint32_t a0 = end;
+			if (k == 0 || i != some[k - 1] + 1) {
+				a0 = (uint32_t)(out.points.size() * 2);
+				out.points.push_back(i);
+			}
+			const uint32_t b0 = (uint32_t)(out.points.size() * 2);
+			out.points.push_back(i + 1);
+			end = b0;
+			const uint32_t six[6] = {a0, b0, a0 + 1, a0 + 1, b0, b0 + 1};
+			out.corners.insert(out.corners.end(), six, six + 6);
+			out.starts.push_back(i);
+		}
+	}
+	out.from[groups] = (uint32_t)out.starts.size();
 	return out;
 }
 

@@ -3730,6 +3730,172 @@ static void test_layout()
 	CHECK(none.points.empty() && none.corners.empty() && none.from.empty());
 }
 
+// A strand part's hull laid out as it's drawn (strand_hull): for any
+// number of strands drawn, each group's stretch holds exactly the pieces
+// the hull draws by point - its inner layers' pieces of the first
+// hull_strands of them, both sorts - each once, with the corners by point
+// has; a group's pieces rise by strand, a point shared only by a piece and
+// the piece before it. `pieces`: how many it holds; `points`: how many
+// points.
+static bool hull_right(const Primitive &p, size_t *pieces = nullptr, size_t *points = nullptr)
+{
+	const Strands &h = p.hair;
+	const StrandHull hull = strand_hull(h);
+	const size_t layers = (size_t)std::max(1, h.layers), core = (size_t)std::max(0, std::min(h.core, h.layers));
+	const size_t groups = h.groups.size();
+	if (pieces)
+		*pieces = hull.starts.size();
+	if (points)
+		*points = hull.points.size();
+	if (!core || !groups || !h.strands())
+		return hull.points.empty() && hull.corners.empty() && hull.from.empty() && hull.starts.empty();
+	if (hull.from.size() != groups + 1 || hull.from[0] != 0 || hull.from[groups] != hull.starts.size() ||
+	    hull.corners.size() != hull.starts.size() * 6)
+		return false;
+	// Its corners: each piece's start and end, both sides of each, as by
+	// point; its points in the order the pieces use them.
+	std::vector<uint32_t> by_point(6);
+	size_t next = 0;
+	for (size_t g = 0; g < groups; g++) {
+		if (hull.from[g] > hull.from[g + 1])
+			return false;
+		for (uint32_t k = hull.from[g]; k < hull.from[g + 1]; k++) {
+			const uint32_t i = hull.starts[k];
+			strand_corners(&i, nullptr, 1, false, by_point.data());
+			const uint32_t *got = hull.corners.data() + (size_t)k * 6;
+			for (size_t c = 0; c < 6; c++) {
+				const size_t place = got[c] / 2;
+				if (place >= hull.points.size() || hull.points[place] != by_point[c] / 2 ||
+				    got[c] % 2 != by_point[c] % 2)
+					return false;
+			}
+			const bool first = k == hull.from[g];
+			if (!first && hull.starts[k] <= hull.starts[k - 1])
+				return false;
+			const bool runs_on = !first && i == hull.starts[k - 1] + 1;
+			if (got[0] / 2 != (runs_on ? next - 1 : next))
+				return false;
+			next += runs_on ? 0 : 1;
+			if (got[1] / 2 != next++)
+				return false;
+		}
+	}
+	if (next != hull.points.size())
+		return false;
+	// For a few counts of strands drawn: a group's stretch is the set of
+	// pieces the hull draws by point.
+	const size_t all = h.strands();
+	for (size_t count :
+	     {(size_t)1, (size_t)7, (size_t)16, (size_t)17, (size_t)64, all / 5, all / 2, all - 1, all}) {
+		if (!count || count > all)
+			continue;
+		const size_t some = hull_strands(count);
+		for (size_t g = 0; g < groups; g++) {
+			std::vector<uint32_t> want;
+			for (size_t l = 0; l < core; l++) {
+				Strands::Stretch both[2];
+				h.pieces_of(g * layers + l, some, both);
+				for (const Strands::Stretch &one : both)
+					want.insert(want.end(), h.pieces.begin() + one.from,
+						    h.pieces.begin() + one.from + one.count);
+			}
+			std::sort(want.begin(), want.end());
+			const uint32_t n = hull.pieces_of(h, g, some);
+			if (n != want.size() || hull.from[g] + n > hull.from[g + 1])
+				return false;
+			if (!std::equal(want.begin(), want.end(), hull.starts.begin() + hull.from[g]))
+				return false;
+		}
+	}
+	return true;
+}
+
+// The hull of hair posed on the card, laid out in its memory as it's drawn.
+static void test_hull_layout()
+{
+	// (A quarter of the strands drawn; of a few, all of them.)
+	CHECK(hull_strands(0) == 0 && hull_strands(5) == 5 && hull_strands(16) == 16 && hull_strands(40) == 16 &&
+	      hull_strands(64) == 16 && hull_strands(100) == 25 && hull_strands(400000) == 100000);
+	// The long coat of 400 hairs on two bones, in 5 layers of which 3 are
+	// inner: the hull of its first 100 hairs, a group at a time.
+	const Groom g = long_coat(400);
+	Builder b = file_of({g}, {{5, 0, 0}, {15, 0, 0}});
+	const Model m = loaded(b, options_with(0));
+	const Primitive &h = part_of(m);
+	size_t pieces = 0, points = 0;
+	CHECK(h.hair.groups.size() == 2 && h.hair.layers == 5 && h.hair.core == 3 && hull_right(h, &pieces, &points));
+	// (Its inner layers' pieces of a quarter of the strands: fewer than a
+	// quarter of all its pieces, and some; a hair's inner pieces run on
+	// from each other, so well under two points a piece.)
+	CHECK(pieces > 0 && pieces < h.hair.pieces.size() / 4 && points > pieces && points < pieces + pieces / 2);
+	{
+		// (Every piece of the first 100 strands in an inner layer, and no
+		// other.)
+		const StrandHull hull = strand_hull(h.hair);
+		size_t inner = 0;
+		const size_t L = 5;
+		for (size_t r = 0; r + 1 < h.hair.runs.size(); r++)
+			if (r % L < 3)
+				for (uint32_t q = h.hair.runs[r]; q < h.hair.runs[r + 1]; q++)
+					inner += h.hair.pieces[q] < h.hair.first[100] ? 1 : 0;
+		CHECK(hull.starts.size() == inner);
+		// (No strands drawn, or more than it has: none, and all.)
+		CHECK(hull.pieces_of(h.hair, 0, 0) == 0 && hull.pieces_of(h.hair, 2, 100) == 0);
+		CHECK(hull.pieces_of(h.hair, 0, 100) + hull.pieces_of(h.hair, 1, 100) == inner);
+		CHECK(hull.pieces_of(h.hair, 0, 400) == hull.from[1] &&
+		      hull.pieces_of(h.hair, 0, 9999) == hull.from[1]);
+		// (Fewer strands: the start of each group's stretch.)
+		CHECK(hull.pieces_of(h.hair, 0, 10) < hull.pieces_of(h.hair, 0, 50) &&
+		      hull.pieces_of(h.hair, 0, 50) < hull.pieces_of(h.hair, 0, 100));
+	}
+	// Other numbers of layers (one: no inner layers apart - all of it).
+	for (int layers : {1, 2, 3, 16}) {
+		LoadOptions o = options_with(0);
+		o.strand_layers = layers;
+		const Model n = loaded(b, o);
+		CHECK(hull_right(part_of(n)));
+	}
+	// Two sorts (every fifth hair wide): a group's wide and thin pieces
+	// together, by strand.
+	{
+		Groom two = long_coat(400);
+		for (size_t s = 0; s < 400; s++)
+			two.width.insert(two.width.end(), two.first[s + 1] - two.first[s],
+					 s % 5 == 0 ? 0.0005f : 0.0001f);
+		Builder file = file_of({two}, {{5, 0, 0}, {15, 0, 0}});
+		const Model n = loaded(file, options_with(0));
+		size_t count = 0;
+		CHECK(!part_of(n).hair.thin.empty() && hull_right(part_of(n), &count) && count == pieces);
+	}
+	// Hairs that narrow from root to tip (a hair in both sorts): right too.
+	{
+		Groom taper;
+		for (int k = 0; k < 200; k++) {
+			taper.straight({(float)(k % 20), 0, (float)(k / 20)}, {(float)(k % 20), 0.9f, (float)(k / 20)},
+				       10);
+			for (int i = 0; i < 10; i++)
+				taper.width.push_back(0.001f - 0.0001f * (float)i);
+		}
+		const Model n = loaded(taper, options_with(0));
+		size_t count = 0;
+		CHECK(!part_of(n).hair.thin.empty() && hull_right(part_of(n), &count) && count > 0);
+	}
+	// A few hairs (under 16: all of them are the hull's), and a coat short
+	// of points.
+	{
+		const Groom few = long_coat(9);
+		const Model n = loaded(few, options_with(0));
+		size_t count = 0;
+		CHECK(part_of(n).hair.strands() == 9 && hull_right(part_of(n), &count) && count > 0);
+		const Model short_of = loaded(b, rated(g.pos.size() / 2));
+		CHECK(part_of(short_of).hair.strands() < 400 && hull_right(part_of(short_of)));
+	}
+	// No hair: nothing.
+	const StrandHull none = strand_hull(Strands());
+	CHECK(none.points.empty() && none.corners.empty() && none.from.empty() && none.starts.empty());
+	CHECK(none.pieces_of(Strands(), 0, 5) == 0);
+}
+
 static void test_two_sorts()
 {
 	// The long coat of 400 hairs on two bones, every fifth hair 0.0005
@@ -5315,6 +5481,7 @@ int main()
 	test_layers_and_pieces();
 	test_two_sorts();
 	test_layout();
+	test_hull_layout();
 	test_expressions();
 	test_expressions_by_strand();
 	test_stand_in_hair();

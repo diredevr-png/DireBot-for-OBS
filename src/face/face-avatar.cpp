@@ -1105,9 +1105,9 @@ struct FaceAvatar {
 	// 0 by point, 1 as it's drawn; under 0: the setting's.
 	// HairPlan::layout.)
 	std::atomic<int> hair_layout{-1};
-	// (And, for measuring only, its pixels all but left out, or less of
-	// each of its corners read - "hair_measure": HairPlan::measure; under
-	// 0: not.)
+	// (And, for measuring only, its pixels all but left out, less of each
+	// of its corners read, its hull left out, or a run sent in two draws -
+	// "hair_measure": HairPlan::measure; under 0: not.)
 	std::atomic<int> hair_measure{-1};
 	// Whether characters can be posed on the card here (known for sure
 	// once the drawing's made): their hair is kept for how it's posed.
@@ -6720,6 +6720,9 @@ struct FaceAvatar {
 					{"laid_ms", r(st.hair.laid_ms, 10)},
 					{"skips_hidden", st.hair.skips},
 					{"draws", st.hair.draws},
+					{"hull_pieces", st.hair.hull_pieces},
+					{"hull_draws", st.hair.hull_draws},
+					{"depth_ms", r(st.hair.depth_ms, 1000)},
 					{"share", r(st.hair.share, 1000)},
 					{"ms", r(st.hair.ms, 1000)},
 					{"budget_ms", r(st.hair_budget_ms, 1000)}}},

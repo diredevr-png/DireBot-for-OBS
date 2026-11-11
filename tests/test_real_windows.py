@@ -915,7 +915,9 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
     it's drawn in ("hair_layout" 1, a number the settings window doesn't
     show; FaceGetState's "laid": the pieces drawn from memory laid out that
     way, "laid_mb": how much of it there is, and "laid_ms": how long making
-    it took). It's the same hair: the
+    it took). Its hull - the inner layers of some of its strands, which
+    hide the hair well behind them - is laid out too, a draw a group
+    ("hull_pieces", "hull_draws"). It's the same hair: the
     picture is the same to the pixel as with a point's numbers once, where
     its strand is ("hair_layout" 0) - as ribbons, as lines, with its thin
     hairs alone as lines, with only some of its strands drawn (small in the
@@ -986,8 +988,11 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
             print("%s, %s: %d of %d drawn pixels differ laid out as drawn; by point %s; laid out %s"
                   % (name, what, off, drawn_px(by_point), before, after))
             assert drawn_px(by_point) > least and off == 0, (name, what, off, drawn_px(by_point))
-            for key in ("drawn", "pieces", "lines", "skips_hidden"):
+            for key in ("drawn", "pieces", "lines", "skips_hidden", "hull_pieces"):
                 assert before[key] == after[key], (name, what, key, before, after)
+            # (Its hull laid out: a draw a group, never more than by point.)
+            assert after["hull_draws"] <= before["hull_draws"], (name, what, before, after)
+            assert (after["hull_draws"] > 0) == (after["hull_pieces"] > 0), (name, what, after)
             assert before["laid_mb"] >= 0 and after["laid_mb"] > 0, (before, after)
             return before, after
 
@@ -997,6 +1002,11 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
         assert after["lines"] == 0 and after["drawn"] == strands and after["skips_hidden"], after
         # (One draw a run, as by point.)
         assert after["draws"] == before["draws"], (before, after)
+        # (Its hull: some of its inner pieces; laid out, fewer draws.)
+        assert 0 < after["hull_pieces"] < after["pieces"], after
+        assert 0 < after["hull_draws"] < before["hull_draws"], (before, after)
+        # (What hair took is two clocks added up: one of them told apart.)
+        assert (after["ms"] < 0) == (after["depth_ms"] < 0) and after["depth_ms"] <= after["ms"] + 1e-6, after
         # Every hair sent, and only the hair that would be left out.
         both("Laid", "every hair sent", hair_skip_hidden=0)
         both("Laid", "only what's left out", hair_skip_hidden=2)
@@ -1064,6 +1074,21 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
                       % (layout, measure, off, lean))
                 assert off == 0 and lean["pieces"] == every["pieces"] and lean["draws"] == every["draws"], (
                     measure, off, every, lean)
+            # (In two draws a run - "hair_measure" 5: the picture with every
+            # hair sent, from more draws. With no hull - 4: none of its
+            # pieces are drawn, the hairs as ever.)
+            change("Laid", hair_measure=5)
+            two = settled("Laid", layout)
+            off = differ(sent, shot(c, "Laid"))
+            print("Laid, layout %d: in two draws a run, %d pixels differ from every hair sent; %s" % (layout, off, two))
+            assert off == 0 and two["pieces"] == every["pieces"], (off, every, two)
+            assert every["draws"] < two["draws"] <= 2 * every["draws"], (every, two)
+            assert two["hull_pieces"] == every["hull_pieces"] > 0, (every, two)
+            change("Laid", hair_measure=4)
+            none = settled("Laid", layout)
+            print("Laid, layout %d: no hull; %s" % (layout, none))
+            assert none["hull_pieces"] == 0 and none["hull_draws"] == 0, none
+            assert none["pieces"] == every["pieces"] and none["draws"] == every["draws"], (every, none)
         # (Making the layouts took some time, and it's told.)
         assert hair("Laid")["laid_ms"] > 0, hair("Laid")
         change("Laid", hair_skip_hidden=-1, hair_measure=-1)

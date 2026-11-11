@@ -933,7 +933,11 @@ def test_hair_into_one_pixel_for_measuring(run):
     ever, and drawn into one pixel of the picture's corner - no hair is in
     the picture, the rest of the character is. Left alone, or 0: as ever -
     and so are 2 and 3 here (they measure hair posed on the graphics card:
-    test_real_windows.py)."""
+    test_real_windows.py). 4: its hull isn't drawn (FaceGetState's
+    "hull_pieces" and "hull_draws": none), so no hair is hidden by other
+    hair. 5: each run's pieces go in two draws - more draws, the same
+    picture. And "depth_ms": the part of "ms" that's the picture of the
+    solid parts' distances, hull and all."""
     figure = os.path.join(run.home, "measured.vrm")
     strands = hair_character(figure, width=0.0006, wide_every=5)
     s = Stage(run, "Measured")
@@ -943,6 +947,8 @@ def test_hair_into_one_pixel_for_measuring(run):
         s.add("Told 2", figure, hair_measure=2)
         s.add("Told 3", figure, hair_measure=3)
         s.add("One pixel", figure, hair_measure=1)
+        s.add("No hull", figure, hair_measure=4)
+        s.add("Two draws", figure, hair_measure=5)
         s.shown()
         assert wait_for(lambda: all(s.hair(name)["drawn"] > 0 for name in s.names), 10, 0.1)
         time.sleep(0.5)
@@ -950,19 +956,37 @@ def test_hair_into_one_pixel_for_measuring(run):
         for name in s.names:
             print(f"{name}: {h[name]}")
             assert "problem" not in s.model(name), s.model(name)
-        for key in ("drawn", "pieces", "lines", "draws"):
+            # (The clock of the solid parts' distances is one of the two
+            # "ms" adds up; neither is known where the card has no clock.)
+            assert (h[name]["ms"] < 0) == (h[name]["depth_ms"] < 0), h[name]
+            assert h[name]["depth_ms"] <= h[name]["ms"] + 1e-6, h[name]
+        for key in ("drawn", "pieces", "lines"):
             assert len({h[name][key] for name in s.names}) == 1, (key, h)
+        for key in ("draws", "hull_pieces", "hull_draws"):
+            assert len({h[name][key] for name in s.names if name not in ("No hull", "Two draws")}) == 1, (key, h)
         assert h["As ever"]["pieces"] > strands, h
+        # Its hull: some of its inner pieces, a few draws; with none, none.
+        assert 0 < h["As ever"]["hull_pieces"] < h["As ever"]["pieces"] and h["As ever"]["hull_draws"] > 0, h
+        assert h["No hull"]["hull_pieces"] == 0 and h["No hull"]["hull_draws"] == 0, h["No hull"]
+        assert h["No hull"]["draws"] == h["As ever"]["draws"], h
+        # In two draws a run: more draws (twice at most), the hull as ever.
+        assert h["As ever"]["draws"] < h["Two draws"]["draws"] <= 2 * h["As ever"]["draws"], h
+        assert h["Two draws"]["hull_pieces"] == h["As ever"]["hull_pieces"], h
         a, c = s.shot("As ever"), s.shot("One pixel")
-        off = sum(1 for name in ("Told 0", "Told 2", "Told 3")
+        off = sum(1 for name in ("Told 0", "Told 2", "Told 3", "Two draws")
                   for ra, rb in zip(a, s.shot(name)) for x, y in zip(ra, rb) if tuple(x) != tuple(y))
         hair_a, hair_c = count(a, magenta), count(c, magenta)
         solid_a, solid_c = (sum(1 for row in p for px in row if any(px)) for p in (a, c))
         print(f"as ever {hair_a} pixels of hair, {solid_a} drawn; into one pixel {hair_c}, {solid_c} drawn; "
-              f"told 0, 2 and 3: {off} pixels differ")
+              f"told 0, 2, 3 and in two draws: {off} pixels differ")
         assert off == 0 and hair_a > 1500 and hair_c <= 1, (off, hair_a, hair_c)
         # (The character under its hair is still there.)
         assert 0.2 * solid_a < solid_c < solid_a, (solid_a, solid_c)
+        # With no hull no hair hides other hair: as much hair in the
+        # picture, or more.
+        hair_n = count(s.shot("No hull"), magenta)
+        print(f"with no hull {hair_n} pixels of hair")
+        assert hair_n >= hair_a, (hair_n, hair_a)
     finally:
         s.close()
 
