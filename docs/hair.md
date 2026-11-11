@@ -142,14 +142,49 @@ Held at a share of the hairs, laid out: as lines about 0.40 ms + 0.21 ms for eve
 Making the layouts: the wolf's took 270 ms when first drawn and 87 ms more when its thin hairs first became lines;
 the beard's 216 ms. That was measured while they were made on the drawing thread, one after another, with every
 form kept (495 MB and 412 MB of the card's memory). Since then they are made off the drawing thread side by side
-and unused forms are freed; that has not been measured on the real card.
+and unused forms are freed. As built (the game test below): the work before a character's hair is first drawn took
+278 to 320 ms for the wolf and 217 ms for the beard; held on screen the wolf's hair keeps 224 MB, the beard's 156
+MB, the two together 380 MB.
 
-With a game (a heavy shooter at 1080p, recording in OBS, the same card): posing on the card instead of the CPU cost
-the game nothing measurable and halved OBS's own time a frame. With no limit the wolf took 2.6 ms and about 25
-frames a second off the game in a match; at the 1 ms limit there was no clear cost (the game itself swings by 15
-frames a second from minute to minute). Hair's time on the card reads the same with or without a game, which is why
-the per-hair numbers above need no game. The other rule and a companion sharing the limit have not been measured
-under a game yet.
+### With a game
+
+Earlier game tests (a heavy shooter at 1080p, recording in OBS, the same card): posing on the card instead of the
+CPU cost the game nothing measurable and halved OBS's own time a frame. With no limit the wolf took 2.6 ms and
+about 25 frames a second off the game in a match; at the 1 ms limit there was no clear cost (the game itself swings
+by 15 frames a second from minute to minute).
+
+The build as it is now (11 November 2026; someone playing; six states of 31 s, five times round: two rounds in
+menus, one at the start of a match, two in a match; the card 60 to 108% busy):
+
+| state | hair ms (worst sampled) | hairs drawn | draws | OBS's share of the card | OBS render ms | frames OBS missed |
+|---|---|---|---|---|---|---|
+| nothing shown (the capture only) | | | | 3.9% | 0.94 | 0 |
+| the beard, as built | 0.556 (0.61) | 39,559, every hair | 20 | 8.0% | 1.95 | 2 |
+| the wolf, as built | 0.857 (0.963); 0.82 to 0.95 by round | 318,672; 297,201 to 364,546 by round | 275 | 10.3% | 1.66 | 3 |
+| the wolf, the first rule | 0.845 (0.972) | 313,787 | 275 | 10.1% | 1.73 | 1 |
+| the beard with the wolf as its companion | 0.737 (0.795) | 303,246 of 500,861, the share 1 | 295 | 9.4% | 2.70 | 5 |
+| the wolf, merged draws | 0.851 (1.073) | 314,890 | 10 | 9.9% | 1.47 | 0 |
+
+- The limit held. Read twice a second no state as built went over 1 ms. The budget reads every frame, and in the
+  match rounds it met sets of readings over the limit (the wolf at shares 0.76 and 0.81, the pair at 1) and drew
+  fewer: the pair went to 0.97 of its hairs for a while.
+- No cost to the game could be read. With nothing shown the game ran at 85 and at 115 frames a second in the two
+  match rounds; the states with hair read from 10 under to 23 over the "nothing" of their round, and two states
+  that cost the card the same (the wolf by either rule) were 9 frames a second apart. By share: a character with
+  its hair took 4 to 6% of the card.
+- OBS missed 1 to 5 frames a state (of about 9,300) with hair shown, all in the match rounds with the card at 95%
+  or more; none with nothing shown or with merged draws. The avatar in use before this work was not in the test.
+- **The same hairs read 10 to 20% cheaper than with no game**: the wolf held at a share of 0.70 took 0.85 ms (1.06
+  with no game, the same hairs, pieces and lines to within 1%), the beard 0.556 (0.653), and the distances pass,
+  whose drawing had not changed, 0.243 (0.269) and 0.177 (0.216). The hull was drawn (the same share of the pieces
+  as before). So the likely cause is the card: it runs faster while a game keeps it busy than when OBS alone draws
+  a little each frame. **Not proven**: the two were different builds on different hours. A reading with no game
+  from the same build in the same session settles it, and every game test should take one. Until then the no-game
+  numbers above are an upper bound for real use, not a measure of it.
+- Because hair read cheaper, **the first rule did as well as the other** here (it never reached the share under
+  0.65 where a coat's thin hairs stop being lines and it gets stuck). The other rule's gain is for where hair costs
+  more: a slower card, a heavier coat.
+- The encoder's load was not measured (its counter gave nothing). Lighter was not in the test.
 
 ## 5. What worked
 
@@ -180,11 +215,15 @@ under a game yet.
 | Estimating the card's cost from a software renderer | the direction was right and the sizes wrong every time (a 40% saving predicted, 5% measured; 1.57 ms predicted, 0.80 measured) | measure on a real card before deciding |
 | Every one of the wolf's hairs inside 1 ms | not reached: 1.32 ms with all of them | stopped at 253,000 hairs by decision; see below |
 
-Built but **off**, because it was never measured on a real card: **merged draws** (`HairPlan::merge` 1, the hidden
-setting `hair_merge`; `StrandMerge` in `hair.hpp`, `Avatar3D::draw_merged`). A layer's groups go to the card in one
-draw from an index buffer made in the groups' order; rows that still hold are reused when the order turns and the
-buffer is made again after a rest. The picture is the same to the pixel on Direct3D (40 draws become 5 in the
-test). From the cost of a draw above, the estimate is about 0.13 ms saved on the wolf.
+Built but **off**: **merged draws** (`HairPlan::merge` 1, the hidden setting `hair_merge`; `StrandMerge` in
+`hair.hpp`, `Avatar3D::draw_merged`). A layer's groups go to the card in one draw from an index buffer made in the
+groups' order; rows that still hold are reused when the order turns and the buffer is made again after a rest. The
+picture is the same to the pixel on Direct3D (40 draws become 5 in the test). The estimate from the cost of a draw
+above was 0.13 ms saved on the wolf. **Measured in the game test it saved nothing on the card**: 275 draws became
+10 and hair took 0.851 ms against 0.857 at the same share. It saved OBS's own thread 0.19 ms a frame (1.47 against
+1.66) and missed no frames. But it was not steady: in its first two rounds the share changed 17 times (2 for the
+wolf as built) between 0.52 and 0.82, and one reading was 1.073 ms. Likely each change of share makes its index
+buffers again, which costs, which changes the share; not looked into. It stays off until that is understood.
 
 Ideas not built: a smaller record a corner (the card reads 52 bytes a corner; reading 16 with every piece left out
 took 0.29 ms less, but exact floats need the 52, so it would need a lossy record and tolerance tests); cheaper
@@ -233,7 +272,10 @@ The method that gave the numbers above:
 5. With a game: someone plays normally (standing still makes some games idle at 30 frames a second) while the
    states change by themselves; the game's frame times come from Windows' own present events; each state is
    compared with the "nothing shown" state of the same pass, because the game changes from minute to minute; and the
-   scene holds the same screen or game capture as when live, or the card carries less than it would.
+   scene holds the same screen or game capture as when live, or the card carries less than it would. Say which
+   rounds were in a match and which in menus. Take the same states once with no game in the same session (the card
+   may read cheaper under a game), and record `hull_pieces`, `hull_draws` and `depth_ms` for every state, so a
+   difference can be traced to its part.
 6. A test build is unsigned: back up the installed add-on first, put it back after, and check its files' hashes and
    signature.
 
@@ -254,9 +296,12 @@ tested until the Windows jobs have run.
 
 ## 9. Limits that stand
 
-- Every hair of a coat as big as the wolf's does not fit 1 ms on this card (1.32 ms); at the limit it draws 253,000
-  of 436,000, each wider. Kept lines make such a coat very slightly darker and thinner than ribbons would.
-- The first time a character's hair is drawn the picture waits for its layouts.
+- Every hair of a coat as big as the wolf's does not fit 1 ms on this card (1.32 ms with no game); at the limit it
+  draws 253,000 of 436,000 with no game and 297,000 to 365,000 under one, each wider. Kept lines make such a coat
+  very slightly darker and thinner than ribbons would.
+- The first time a character's hair is drawn the picture waits for its layouts (about 0.2 s for the beard, 0.3 s
+  for the wolf; the length of the pause itself was not timed, only the work).
+- With the card full (a game at 95% or more) OBS missed up to 5 frames in two and a half minutes with hair shown.
 - Lighter keeps the first budget rule; the other has not been measured at 0.5 ms.
 - Hair casts no shadow on itself or the body.
 - The layers are not true depth: crossing locks (a braid) show through each other a little, and two see-through
