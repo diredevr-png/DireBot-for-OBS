@@ -202,6 +202,48 @@ StrandSkOut VSStrandSk(SkinStrandIn v)
 	return k;
 }
 
+// For measuring only (hair.hpp's HairPlan::measure 2 and 3): what the card
+// spends reading a strand's numbers. Every piece is left out - no hair in
+// the picture - and of a corner's 52 bytes only its place and its bones
+// are read (32; posed as ever), or its place alone (16; not posed).
+struct LeanStrandIn {
+	float4 pos : POSITION;
+	float4 jw  : TEXCOORD0;
+};
+
+struct BareStrandIn {
+	float4 pos : POSITION;
+};
+
+StrandSkOut left_out(float3 pos)
+{
+	StrandSkOut k;
+	k.pos = mul(float4(pos, 1.0), ViewProj);
+	k.lit = float4(0.0, 0.0, 0.0, 0.0);
+	k.shine = float3(0.0, 0.0, 0.0);
+	k.uv = float4(0.0, 0.0, 0.0, 0.0);
+	k.depth = k.pos.w;
+	k.shown = -1.0;
+	return k;
+}
+
+StrandSkOut VSStrandSkLean(LeanStrandIn v)
+{
+	float4 j = floor(v.jw);
+	Skinned s = skinned(v.pos.xyz, float3(0.0, 0.0, 1.0), float3(1.0, 0.0, 0.0), j, (v.jw - j) / 0.999);
+	return left_out(s.pos);
+}
+
+StrandSkOut VSStrandSkBare(BareStrandIn v)
+{
+	return left_out(v.pos.xyz);
+}
+
+float4 PSLeftOut(StrandOut v) : TARGET
+{
+	return float4(0.0, 0.0, 0.0, 0.0);
+}
+
 HullOut VSHullSk(SkinStrandIn v)
 {
 	float spot = floor(v.norm.w);
@@ -254,6 +296,24 @@ technique StrandSk
 	{
 		vertex_shader = VSStrandSk(v);
 		pixel_shader  = PSStrand(v);
+	}
+}
+
+technique StrandSkLean
+{
+	pass
+	{
+		vertex_shader = VSStrandSkLean(v);
+		pixel_shader  = PSLeftOut(v);
+	}
+}
+
+technique StrandSkBare
+{
+	pass
+	{
+		vertex_shader = VSStrandSkBare(v);
+		pixel_shader  = PSLeftOut(v);
 	}
 }
 

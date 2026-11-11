@@ -919,13 +919,17 @@ def test_hair_into_one_pixel_for_measuring(run):
     """For measuring what hair costs but for its pixels ("hair_measure" 1,
     a number the settings window doesn't show): every piece is sent as
     ever, and drawn into one pixel of the picture's corner - no hair is in
-    the picture, the rest of the character is. Left alone, or 0: as ever."""
+    the picture, the rest of the character is. Left alone, or 0: as ever -
+    and so are 2 and 3 here (they measure hair posed on the graphics card:
+    test_real_windows.py)."""
     figure = os.path.join(run.home, "measured.vrm")
     strands = hair_character(figure, width=0.0006, wide_every=5)
     s = Stage(run, "Measured")
     try:
         s.add("As ever", figure)
         s.add("Told 0", figure, hair_measure=0)
+        s.add("Told 2", figure, hair_measure=2)
+        s.add("Told 3", figure, hair_measure=3)
         s.add("One pixel", figure, hair_measure=1)
         s.shown()
         assert wait_for(lambda: all(s.hair(name)["drawn"] > 0 for name in s.names), 10, 0.1)
@@ -935,14 +939,15 @@ def test_hair_into_one_pixel_for_measuring(run):
             print(f"{name}: {h[name]}")
             assert "problem" not in s.model(name), s.model(name)
         for key in ("drawn", "pieces", "lines", "draws"):
-            assert h["As ever"][key] == h["One pixel"][key] == h["Told 0"][key], (key, h)
+            assert len({h[name][key] for name in s.names}) == 1, (key, h)
         assert h["As ever"]["pieces"] > strands, h
-        a, b, c = s.shot("As ever"), s.shot("Told 0"), s.shot("One pixel")
-        off = sum(1 for ra, rb in zip(a, b) for x, y in zip(ra, rb) if tuple(x) != tuple(y))
+        a, c = s.shot("As ever"), s.shot("One pixel")
+        off = sum(1 for name in ("Told 0", "Told 2", "Told 3")
+                  for ra, rb in zip(a, s.shot(name)) for x, y in zip(ra, rb) if tuple(x) != tuple(y))
         hair_a, hair_c = count(a, magenta), count(c, magenta)
         solid_a, solid_c = (sum(1 for row in p for px in row if any(px)) for p in (a, c))
         print(f"as ever {hair_a} pixels of hair, {solid_a} drawn; into one pixel {hair_c}, {solid_c} drawn; "
-              f"told 0: {off} pixels differ")
+              f"told 0, 2 and 3: {off} pixels differ")
         assert off == 0 and hair_a > 1500 and hair_c <= 1, (off, hair_a, hair_c)
         # (The character under its hair is still there.)
         assert 0.2 * solid_a < solid_c < solid_a, (solid_a, solid_c)

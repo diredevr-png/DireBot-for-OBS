@@ -97,7 +97,10 @@ struct HairPlan {
 	// For measuring only ("hair_measure"): 1 hair is drawn into a single
 	// pixel of the picture's corner (a scissor) - the card poses every
 	// piece and puts its triangles together as ever, and fills next to
-	// none of their pixels: what hair costs but for its pixels.
+	// none of their pixels: what hair costs but for its pixels. 2 and 3
+	// (posed on the card): every piece is left out, and of a corner's 52
+	// bytes the card reads only its place and bones (32), or its place
+	// alone (16, not posed): what reading a strand's numbers costs.
 	int measure = 0;
 };
 

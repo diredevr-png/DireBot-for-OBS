@@ -2113,9 +2113,13 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 						dr.a->set_material(material_of(dr, part.i), v, false, false, false);
 						dr.a->set_strand(v, drawn_h, dr.hair[part.i].upto, p.scale, depth_map,
 								 lines, skips && p.gpu ? hair_plan_.skip_hidden : 0);
+						// (Measures 2 and 3: less of each corner read.)
+						const char *technique = !p.gpu                    ? "Strand"
+									: hair_plan_.measure == 2 ? "StrandSkLean"
+									: hair_plan_.measure == 3 ? "StrandSkBare"
+												  : "StrandSk";
 						dr.a->draw_strands(part.i, p, part.order, layer, dr.hair[part.i].count,
-								   p.gpu ? "StrandSk" : "Strand", lines, sort,
-								   hair_drawn_);
+								   technique, lines, sort, hair_drawn_);
 					}
 				}
 			if (one_pixel)

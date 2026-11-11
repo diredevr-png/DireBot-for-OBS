@@ -90,6 +90,8 @@ inline const std::vector<EffectNeeds> &face_3d_skin_needs()
 			 {"cam", "base_map", "emissive_map", "base_colour", "look", "surface", "emissive", "key_dir",
 			  "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light", "key_tint", "room_tint",
 			  "eye_pos", "strand", "strand_lod", "strand_view", "depth_map", "bone_cols", "spot_moves"}},
+			{"StrandSkLean", {"bone_cols"}},
+			{"StrandSkBare", {}},
 			{"HullSk", {"cam", "eye_pos", "strand", "strand_lod", "bone_cols", "spot_moves"}},
 		};
 		all.insert(all.end(), skin.begin(), skin.end());

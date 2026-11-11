@@ -1012,7 +1012,8 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
         # the pixel; and hair into one pixel of the picture's corner
         # ("hair_measure" 1) sends as many pieces and leaves the picture
         # with no hair in it (every piece left out, "hair_skip_hidden" 3),
-        # but for that pixel at most.
+        # but for that pixel at most; so do "hair_measure" 2 and 3, which
+        # read less of each corner and leave every piece out.
         for layout in (0, 1):
             change("Laid", hair_layout=layout, hair_skip_hidden=0, hair_measure=-1)
             every = settled("Laid", layout)
@@ -1035,6 +1036,16 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
                   % (layout, off, measured))
             assert off <= 1 and measured["pieces"] == every["pieces"], (off, every, measured)
             assert measured["draws"] == every["draws"], (every, measured)
+            # (And with less of each corner read - "hair_measure" 2: its
+            # place and bones, 3: its place alone - every piece left out.)
+            for measure in (2, 3):
+                change("Laid", hair_measure=measure)
+                lean = settled("Laid", layout)
+                off = differ(bare, shot(c, "Laid"))
+                print("Laid, layout %d: measure %d, %d pixels differ from no hair at all; %s"
+                      % (layout, measure, off, lean))
+                assert off == 0 and lean["pieces"] == every["pieces"] and lean["draws"] == every["draws"], (
+                    measure, off, every, lean)
         # (Making the layouts took some time, and it's told.)
         assert hair("Laid")["laid_ms"] > 0, hair("Laid")
         change("Laid", hair_skip_hidden=-1, hair_measure=-1)
