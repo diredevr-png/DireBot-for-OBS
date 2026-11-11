@@ -19,6 +19,7 @@ import base64
 import json
 import math
 import os
+import re
 import shutil
 import socket
 import struct
@@ -74,6 +75,7 @@ def put_in_add_on():
 
 class WindowsObs:
     def __init__(self):
+        self.ended = None       # its log, once it has closed
         self.home = os.path.join(os.environ["RUNNER_TEMP"] if "RUNNER_TEMP" in os.environ
                                  else os.environ["TEMP"], "direbot-obs-test")
         shutil.rmtree(self.home, ignore_errors=True)
@@ -108,6 +110,8 @@ class WindowsObs:
         self.link = json.load(open(self.link_path))
 
     def log(self):
+        if self.ended is not None:
+            return self.ended
         try:
             newest = max(os.listdir(self.logs))
             return open(os.path.join(self.logs, newest), errors="replace").read()
@@ -117,6 +121,52 @@ class WindowsObs:
     def client(self):
         return obsws.ReqClient(host="127.0.0.1", port=self.link["port"],
                                password=self.link["password"], timeout=30)
+
+    def windows(self):
+        """Its windows on the screen: (handle, title) of each."""
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        each_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [each_type, wintypes.LPARAM]
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        found = []
+
+        def each(handle, _):
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
+            if pid.value == self.proc.pid and user32.IsWindowVisible(handle):
+                title = ctypes.create_unicode_buffer(300)
+                user32.GetWindowTextW(handle, title, 300)
+                found.append((handle, title.value))
+            return True
+        user32.EnumWindows(each_type(each), 0)
+        return found
+
+    def close(self, wait=180):
+        """Closed the way the X on its window closes it, so OBS takes
+        everything down in order and its log ends with how much was never
+        given back. False: it's still there after `wait` seconds."""
+        import ctypes
+        from ctypes import wintypes
+        if self.proc.poll() is None:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            seen = self.windows()
+            mains = [handle for handle, title in seen if title.startswith("OBS ")]
+            assert mains, ("OBS's own window isn't there", seen)
+            for handle in mains:
+                user32.PostMessageW(handle, 0x0010, 0, 0)       # (WM_CLOSE)
+            try:
+                self.proc.wait(timeout=wait)
+            except subprocess.TimeoutExpired:
+                return False
+        self.out.close()
+        self.ended = self.log()
+        return True
 
     def kill(self):
         if self.proc.poll() is None:
@@ -784,3 +834,82 @@ def test_gaming_hands_read_this_pc(obs):
         except Exception:
             pass
         c.disconnect()
+
+
+def leaks(log):
+    """How many things OBS's log says were never given back (None: it
+    doesn't say - OBS didn't close in order)."""
+    found = re.search(r"Number of memory leaks: (\d+)", log)
+    return int(found.group(1)) if found else None
+
+
+def test_closing_obs_leaves_nothing_behind(obs):
+    """(After every test above: it closes their OBS.) Closed the way the X
+    on its window closes it, with all the tests above done in it - the
+    pictures, the phone, the tracker app, characters posed on the graphics
+    card, hair strands on it, gaming hands - OBS's log says nothing was
+    left behind."""
+    closed = obs.close()
+    if not closed:
+        seen = obs.windows()
+        obs.kill()      # (so the next test's OBS has the machine to itself)
+        raise AssertionError(("OBS didn't close", seen, obs.log()[-3000:]))
+    log = obs.log()
+    assert leaks(log) == 0, (leaks(log), log[-3000:])
+
+
+def test_hair_on_the_card_leaves_nothing_behind():
+    """OBS started again, with one character with hair strands in its
+    scene: posed on the graphics card, the hair budget its own (the card's
+    clock read every frame), its hair detail changed to Light, to Today and
+    back, the budget far too small and its own again. Closed with the
+    character still in its scene, as a streamer closes OBS: nothing left
+    behind."""
+    o = WindowsObs()
+    try:
+        figure = os.path.join(o.home, "hair-kept.vrm")
+        strands = hair_character(figure, standin=True)
+        c = o.client()
+
+        def st():
+            return vendor(c, "FaceGetState", {"source": "Kept"})["model"]
+
+        def change(**settings):
+            c.send("SetInputSettings", {"inputName": "Kept", "inputSettings": settings}, raw=True)
+
+        def reloaded():
+            time.sleep(0.5)
+            assert wait_for(lambda: not st()["loading"] and st()["shown"], 60, 0.1), (st(), o.log())
+            time.sleep(0.8)
+        try:
+            c.send("CreateScene", {"sceneName": "Kept scene"}, raw=True)
+            c.send("CreateInput", {"sceneName": "Kept scene", "inputName": "Kept",
+                                   "inputKind": "direbot_face_avatar",
+                                   "inputSettings": {"model": figure, "width": 200, "height": 200,
+                                                     "size": 60, "framing": "whole", "style": "drawn",
+                                                     "mirror": False, "smoothing": 0, "breathing": 0,
+                                                     "sway": 0, "eye_moves": False}}, raw=True)
+            c.send("SetCurrentProgramScene", {"sceneName": "Kept scene"}, raw=True)
+            assert wait_for(lambda: st()["shown"], 60, 0.2), o.log()
+            assert wait_for(lambda: st()["on_card"], 10, 0.1), (st(), o.log())
+            assert wait_for(lambda: st()["hair"]["drawn"] > 0, 10, 0.1), (st()["hair"], o.log())
+            # Its own budget: the card's clock answers.
+            assert wait_for(lambda: st()["hair"]["ms"] >= 0, 20, 0.1), (st()["hair"], o.log())
+            assert st()["hair"]["budget_ms"] > 0 and st()["hair"]["strands"] == strands, st()["hair"]
+            for detail in ("light", "today", "full"):
+                change(hair_detail=detail)
+                reloaded()
+                assert st()["hair"]["detail"] == detail, st()["hair"]
+            change(hair_budget_ms=0.001)
+            assert wait_for(lambda: st()["hair"]["share"] < 0.5, 20, 0.05), (st()["hair"], o.log())
+            change(hair_budget_ms=-1)
+            time.sleep(1.5)
+            print("\nHair on the card, kept till OBS closes: %s" % st()["hair"])
+        finally:
+            c.disconnect()
+        assert o.close(), ("OBS didn't close", o.windows(), o.log())
+        log = o.log()
+        print("\n----- OBS's log, closed with a hair character in its scene -----\n" + log)
+        assert leaks(log) == 0, (leaks(log), log[-3000:])
+    finally:
+        o.kill()
