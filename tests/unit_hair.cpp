@@ -426,6 +426,11 @@ static void test_plans()
 		CHECK(plan.budget_rule == 0 && plan.line_loss == HAIR_LINE_LOSS);
 	for (const HairPlan &plan : {full, light, today, made})
 		CHECK(plan.line_cost == HAIR_LINE_COST && plan.share == 0);
+	// Posed on the card it's laid out as it's drawn, whatever the setting
+	// (a layout a part's no longer drawn from kept for a while); a layer's
+	// groups a draw each; nothing measured.
+	for (const HairPlan &plan : {full, light, today, made})
+		CHECK(plan.layout == 1 && plan.idle == 1800 && plan.merge == 0 && plan.measure == 0);
 	CHECK(HAIR_LINE_LOSS == 0.05f && HAIR_LINE_COST == 0.5f && HAIR_LINE_LOSS_KEPT == 0.4f);
 	CHECK(HAIR_LINE_LOSS_KEPT == Strands::LINE_LOSS[Strands::LINE_LOSSES - 1]);
 

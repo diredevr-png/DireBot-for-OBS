@@ -92,8 +92,16 @@ struct HairPlan {
 	// corners point into them: a run's are far apart); 1 as it's drawn -
 	// each run's corners one after another in the order its pieces go to
 	// the card (Avatar3D's lay_strands), so the card reads them straight
-	// through.
-	int layout = 0;
+	// through. (Measured on a Radeon RX 9070 XT, 11-11: a coat of 436,000
+	// hairs 2.5 ms by point, 1.3 laid out - the same picture to the pixel.
+	// Each form a part is drawn in is made off the drawing thread, and by
+	// point its numbers aren't kept at all.)
+	int layout = 1;
+	// Laid out so, a part keeps each form it's drawn in (ribbons, lines)
+	// in the card's memory: one it hasn't been drawn in for this many
+	// frames is freed (and made again, off the drawing thread, if it's
+	// drawn so again).
+	uint32_t idle = 1800;
 	// Laid out as drawn, a layer's groups in one draw (StrandMerge): 0 a
 	// draw a group, 1 one draw while its groups keep their order (made
 	// again once they haven't for a while), 2 (tests) the same, never made

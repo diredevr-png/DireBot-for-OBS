@@ -1109,6 +1109,9 @@ struct FaceAvatar {
 	// 0 a draw a group, 1 together, 2 together and never made again for a
 	// new order (tests); under 0: the setting's. HairPlan::merge.)
 	std::atomic<int> hair_merge{-1};
+	// (And how many frames a layout a part is no longer drawn from is kept
+	// - "hair_idle"; 0 or under: the setting's. HairPlan::idle.)
+	std::atomic<int> hair_idle{-1};
 	// (And, for measuring only, its pixels all but left out, less of each
 	// of its corners read, its hull left out, or a run sent in two draws -
 	// "hair_measure": HairPlan::measure; under 0: not.)
@@ -3245,6 +3248,8 @@ struct FaceAvatar {
 			hair.layout = own;
 		if (const int own = hair_merge; own >= 0)
 			hair.merge = own;
+		if (const int own = hair_idle; own > 0)
+			hair.idle = (uint32_t)own;
 		if (const int own = hair_measure; own >= 0)
 			hair.measure = own;
 		if (const int own = hair_budget_rule; own >= 0)
@@ -5479,6 +5484,7 @@ struct FaceAvatar {
 		hair_solid = (float)obs_data_get_double(settings, "hair_solid");
 		hair_layout = (int)obs_data_get_int(settings, "hair_layout");
 		hair_merge = (int)obs_data_get_int(settings, "hair_merge");
+		hair_idle = (int)obs_data_get_int(settings, "hair_idle");
 		hair_measure = (int)obs_data_get_int(settings, "hair_measure");
 		hair_budget_rule = (int)obs_data_get_int(settings, "hair_budget_rule");
 		hair_line_loss = (float)obs_data_get_double(settings, "hair_line_loss");
@@ -6747,6 +6753,8 @@ struct FaceAvatar {
 					{"laid", st.hair.laid},
 					{"laid_mb", r((float)((double)st.hair.laid_bytes / 1048576.0), 10)},
 					{"laid_ms", r(st.hair.laid_ms, 10)},
+					{"forming", st.hair.forming},
+					{"point_mb", r((float)((double)st.hair.point_bytes / 1048576.0), 10)},
 					{"merged", st.hair.merged},
 					{"merges", st.hair.merges},
 					{"skips_hidden", st.hair.skips},
@@ -7223,6 +7231,7 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "hair_solid", -1.0);
 	obs_data_set_default_int(settings, "hair_layout", -1);
 	obs_data_set_default_int(settings, "hair_merge", -1);
+	obs_data_set_default_int(settings, "hair_idle", -1);
 	obs_data_set_default_int(settings, "hair_measure", -1);
 	obs_data_set_default_int(settings, "hair_budget_rule", -1);
 	obs_data_set_default_double(settings, "hair_line_loss", -1.0);

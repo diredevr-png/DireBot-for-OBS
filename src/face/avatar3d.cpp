@@ -28,6 +28,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <random>
 #include <string>
 
@@ -673,34 +674,184 @@ void Avatar3D::make_strand_part(Part &part, const Primitive &p, bool boned)
 // a point of two runs once in each. As ribbons both its sides; as lines
 // only its first (a line's corners are all first sides). The first so
 // many strands' pieces are still the start of each run's stretch.
-bool Avatar3D::lay_strands(Part &part, const Primitive &p, int sort, bool lines)
+// Made off the drawing thread (LaidJob): making a big coat's takes a tenth
+// of a second, a pause in the picture if the drawing waited for it. So it
+// waits only where there's nothing else to draw the part from (the first
+// time its hair is drawn); a part being drawn already goes on as it was -
+// by point, or in the form it had - until it's ready.
+struct Avatar3D::LaidJob {
+	// What's made: the points' numbers and the pieces' corners, as the card
+	// is handed them (it takes them over), and where each run or group
+	// starts.
+	struct Made {
+		gs_vb_data *vb = nullptr;
+		uint32_t *corners = nullptr;
+		size_t corner_count = 0, points = 0;
+		std::vector<uint32_t> from;
+		StrandHull hull;
+		bool none = false;
+		float ms = 0;
+	};
+	// (The model kept: the part it reads can't go while it's being made.)
+	std::shared_ptr<const Model> model;
+	std::future<Made> made;
+
+	static void drop(Made &m)
+	{
+		gs_vbdata_destroy(m.vb);
+		bfree(m.corners);
+		m.vb = nullptr;
+		m.corners = nullptr;
+	}
+	// What it made (nothing, if it couldn't).
+	Made take()
+	{
+		Made m;
+		if (!made.valid())
+			return m;
+		try {
+			m = made.get();
+		} catch (...) {
+			m = Made();
+		}
+		return m;
+	}
+	// (One that couldn't be given a thread of its own - begin - is made as
+	// it's taken: ready, as far as waiting goes.)
+	bool ready() const
+	{
+		return !made.valid() || made.wait_for(std::chrono::seconds(0)) != std::future_status::timeout;
+	}
+	// Begun: on a thread of its own - or, where Windows has none to give,
+	// made when it's taken.
+	template<typename Make> void begin(Make make)
+	{
+		try {
+			made = std::async(std::launch::async, make);
+		} catch (...) {
+			made = std::async(std::launch::deferred, make);
+		}
+	}
+	~LaidJob()
+	{
+		Made m = take();
+		drop(m);
+	}
+
+	static uint32_t *copied(const std::vector<uint32_t> &corners)
+	{
+		uint32_t *out = static_cast<uint32_t *>(bmalloc(sizeof(uint32_t) * corners.size()));
+		std::memcpy(out, corners.data(), sizeof(uint32_t) * corners.size());
+		return out;
+	}
+	static float since(std::chrono::steady_clock::time_point began)
+	{
+		return std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - began).count();
+	}
+	// One sort's pieces, as ribbons or as lines (hair.hpp's strand_layout).
+	static Made strands(const Primitive &p, int sort, bool lines, bool boned)
+	{
+		Made out;
+		const auto began = std::chrono::steady_clock::now();
+		StrandLayout lay = strand_layout(p.hair, sort ? 1 : 0, lines);
+		out.from = std::move(lay.from);
+		const size_t sides = lines ? 1 : 2, points = lay.points.size();
+		if (lay.corners.empty()) {
+			out.none = true;
+			return out;
+		}
+		if (points * sides > 0xFFFFFFF0u)
+			return out;
+		StrandFill fill(p, boned);
+		fill.make(points * sides, true);
+		for (size_t k = 0; k < points; k++)
+			for (size_t side = 0; side < sides; side++)
+				fill.corner(k * sides + side, lay.points[k], side == 1);
+		out.vb = fill.vb;
+		out.points = points * sides;
+		out.corners = copied(lay.corners);
+		out.corner_count = lay.corners.size();
+		out.ms = since(began);
+		return out;
+	}
+	// Its hull (hair.hpp's strand_hull).
+	static Made hull_of(const Primitive &p, bool boned)
+	{
+		Made out;
+		const auto began = std::chrono::steady_clock::now();
+		StrandHull lay = strand_hull(p.hair);
+		const size_t points = lay.points.size();
+		if (lay.corners.empty()) {
+			out.none = true;
+			return out;
+		}
+		if (points * 2 > 0xFFFFFFF0u)
+			return out;
+		StrandFill fill(p, boned);
+		fill.make(points * 2, true);
+		for (size_t k = 0; k < points; k++)
+			for (size_t side = 0; side < 2; side++)
+				fill.corner(k * 2 + side, lay.points[k], side == 1);
+		out.vb = fill.vb;
+		out.points = points * 2;
+		out.corners = copied(lay.corners);
+		out.corner_count = lay.corners.size();
+		// (The card has its points and corners now: only where its groups'
+		// pieces are is kept.)
+		std::vector<uint32_t>().swap(lay.points);
+		std::vector<uint32_t>().swap(lay.corners);
+		out.hull = std::move(lay);
+		out.ms = since(began);
+		return out;
+	}
+};
+
+// Whether a strand part posed on the card can be laid out at all: it has
+// points and pieces, each with what rides with it.
+static bool can_lay(bool skin, const Primitive &p)
+{
+	const Strands &h = p.hair;
+	const size_t n = p.pos.size();
+	return skin && n && !h.pieces.empty() && h.runs.size() >= 2 && h.width.size() == n && h.along.size() == n &&
+	       p.normal.size() == n;
+}
+
+bool Avatar3D::lay_strands(Part &part, const Primitive &p, int sort, bool lines, bool wait)
 {
 	Part::Laid &l = part.laid[sort ? 1 : 0][lines ? 1 : 0];
 	if (l.tried)
 		return l.none || (l.vb && l.ib);
-	l.tried = true;
-	const Strands &h = p.hair;
-	const size_t n = p.pos.size();
-	if (!part.skin || !n || h.pieces.empty() || h.runs.size() < 2 || h.width.size() != n || h.along.size() != n ||
-	    p.normal.size() != n)
+	if (!l.job) {
+		if (!can_lay(part.skin, p)) {
+			l.tried = true;
+			return false;
+		}
+		l.job = std::make_shared<LaidJob>();
+		l.job->model = model_;
+		const Primitive *prim = &p;
+		const bool boned = part.boned;
+		l.job->begin([prim, sort, lines, boned] { return LaidJob::strands(*prim, sort, lines, boned); });
+	}
+	if (!wait && !l.job->ready())
 		return false;
+	LaidJob::Made made = l.job->take();
+	l.job.reset();
+	l.tried = true;
+	l.idle = 0;
 	const auto began = std::chrono::steady_clock::now();
-	StrandLayout lay = strand_layout(h, sort ? 1 : 0, lines);
-	part.laid_from[sort ? 1 : 0] = std::move(lay.from);
-	if (lay.corners.empty()) {
+	if (made.none) {
+		part.laid_from[sort ? 1 : 0] = std::move(made.from);
 		l.none = true;
 		return true;
 	}
-	const size_t sides = lines ? 1 : 2, points = lay.points.size();
-	if (points * sides > 0xFFFFFFF0u)
+	if (!made.vb || !made.corners) {
+		LaidJob::drop(made);
 		return false;
-	StrandFill fill(p, part.boned);
-	fill.make(points * sides, true);
-	for (size_t k = 0; k < points; k++)
-		for (size_t side = 0; side < sides; side++)
-			fill.corner(k * sides + side, lay.points[k], side == 1);
-	l.vb = gs_vertexbuffer_create(fill.vb, 0);
-	l.ib = make_ib(lay.corners);
+	}
+	part.laid_from[sort ? 1 : 0] = std::move(made.from);
+	// (The card takes its numbers over.)
+	l.vb = gs_vertexbuffer_create(made.vb, 0);
+	l.ib = gs_indexbuffer_create(GS_UNSIGNED_LONG, made.corners, made.corner_count, 0);
 	if (!l.vb || !l.ib) {
 		gs_vertexbuffer_destroy(l.vb);
 		gs_indexbuffer_destroy(l.ib);
@@ -709,8 +860,8 @@ bool Avatar3D::lay_strands(Part &part, const Primitive &p, int sort, bool lines)
 		return false;
 	}
 	// (52 bytes a corner, 4 a corner of a piece.)
-	l.bytes = points * sides * 52 + lay.corners.size() * 4;
-	l.ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - began).count();
+	l.bytes = made.points * 52 + made.corner_count * 4;
+	l.ms = made.ms + LaidJob::since(began);
 	return true;
 }
 
@@ -720,33 +871,38 @@ bool Avatar3D::lay_strands(Part &part, const Primitive &p, int sort, bool lines)
 // the card's memory as a run's are, and each group's each layer is a draw
 // of its own. Here a group's pieces follow each other by strand, a draw a
 // group. The same corners as by point, so the same picture.
-bool Avatar3D::lay_hull(Part &part, const Primitive &p)
+bool Avatar3D::lay_hull(Part &part, const Primitive &p, bool wait)
 {
 	Part::Laid &l = part.hull;
 	if (l.tried)
 		return l.none || (l.vb && l.ib);
-	l.tried = true;
-	const Strands &h = p.hair;
-	const size_t n = p.pos.size();
-	if (!part.skin || !n || h.pieces.empty() || h.runs.size() < 2 || h.width.size() != n || h.along.size() != n ||
-	    p.normal.size() != n)
+	if (!l.job) {
+		if (!can_lay(part.skin, p)) {
+			l.tried = true;
+			return false;
+		}
+		l.job = std::make_shared<LaidJob>();
+		l.job->model = model_;
+		const Primitive *prim = &p;
+		const bool boned = part.boned;
+		l.job->begin([prim, boned] { return LaidJob::hull_of(*prim, boned); });
+	}
+	if (!wait && !l.job->ready())
 		return false;
+	LaidJob::Made made = l.job->take();
+	l.job.reset();
+	l.tried = true;
 	const auto began = std::chrono::steady_clock::now();
-	StrandHull lay = strand_hull(h);
-	if (lay.corners.empty()) {
+	if (made.none) {
 		l.none = true;
 		return true;
 	}
-	const size_t points = lay.points.size();
-	if (points * 2 > 0xFFFFFFF0u)
+	if (!made.vb || !made.corners) {
+		LaidJob::drop(made);
 		return false;
-	StrandFill fill(p, part.boned);
-	fill.make(points * 2, true);
-	for (size_t k = 0; k < points; k++)
-		for (size_t side = 0; side < 2; side++)
-			fill.corner(k * 2 + side, lay.points[k], side == 1);
-	l.vb = gs_vertexbuffer_create(fill.vb, 0);
-	l.ib = make_ib(lay.corners);
+	}
+	l.vb = gs_vertexbuffer_create(made.vb, 0);
+	l.ib = gs_indexbuffer_create(GS_UNSIGNED_LONG, made.corners, made.corner_count, 0);
 	if (!l.vb || !l.ib) {
 		gs_vertexbuffer_destroy(l.vb);
 		gs_indexbuffer_destroy(l.ib);
@@ -754,12 +910,78 @@ bool Avatar3D::lay_hull(Part &part, const Primitive &p)
 		l.ib = nullptr;
 		return false;
 	}
-	l.bytes = points * 2 * 52 + lay.corners.size() * 4;
-	std::vector<uint32_t>().swap(lay.points);
-	std::vector<uint32_t>().swap(lay.corners);
-	part.hull_lay = std::move(lay);
-	l.ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - began).count();
+	l.bytes = made.points * 52 + made.corner_count * 4;
+	part.hull_lay = std::move(made.hull);
+	l.ms = made.ms + LaidJob::since(began);
 	return true;
+}
+
+bool Avatar3D::forms_ready(Part &part, const Primitive &p, bool lines, bool thin, bool hull)
+{
+	bool ready = true;
+	// (Its thin pieces alone as lines: its wide ones ribbons. Else both
+	// sorts in the one form.)
+	for (int k = 0; k < 2; k++) {
+		const bool as_lines = thin ? k == 1 : lines;
+		lay_strands(part, p, k, as_lines, false);
+		ready = ready && part.laid[k][as_lines ? 1 : 0].tried;
+	}
+	if (!hull)
+		return ready;
+	lay_hull(part, p, false);
+	return ready && part.hull.tried;
+}
+
+bool Avatar3D::by_point(Part &part, const Primitive &p)
+{
+	if (!part.hair)
+		return false;
+	if (!part.vb || !part.ib) {
+		gs_vertexbuffer_destroy(part.vb);
+		gs_indexbuffer_destroy(part.ib);
+		part.vb = nullptr;
+		part.ib = nullptr;
+		make_strand_part(part, p, part.hung);
+	}
+	return part.vb && part.ib;
+}
+
+void Avatar3D::free_idle(Part &part, uint32_t idle)
+{
+	// (Only what's posed on the card: posed here its by-point buffers are
+	// all it has.)
+	if (!part.strands || !part.skin)
+		return;
+	for (int k = 0; k < 2; k++)
+		for (int form = 0; form < 2; form++) {
+			Part::Laid &l = part.laid[k][form];
+			if (l.job || !(l.vb || l.ib) || ++l.idle <= idle)
+				continue;
+			gs_vertexbuffer_destroy(l.vb);
+			gs_indexbuffer_destroy(l.ib);
+			l = Part::Laid();
+			// (And its layers' stretches together, made of its corners.)
+			for (Part::Merged &m : part.merged[k])
+				if (m.ib && m.lines == (form == 1)) {
+					gs_indexbuffer_destroy(m.ib);
+					m = Part::Merged();
+				}
+		}
+	// (Its hull laid out, where it's drawn by point or not at all.)
+	if (!part.hull.job && (part.hull.vb || part.hull.ib) && ++part.hull.idle > idle) {
+		gs_vertexbuffer_destroy(part.hull.vb);
+		gs_indexbuffer_destroy(part.hull.ib);
+		part.hull = Part::Laid();
+		part.hull_lay = StrandHull();
+	}
+	if ((part.vb || part.ib || part.ib_lines) && ++part.point_idle > idle) {
+		gs_vertexbuffer_destroy(part.vb);
+		gs_indexbuffer_destroy(part.ib);
+		gs_indexbuffer_destroy(part.ib_lines);
+		part.vb = nullptr;
+		part.ib = part.ib_lines = nullptr;
+		part.point_idle = 0;
+	}
 }
 
 // The hidden head shape: a ball the shape of a head, in the face's own
@@ -839,7 +1061,17 @@ void Avatar3D::make_parts()
 					  (node.skin < 0 || m.skins[node.skin].joints.size() <= Rig::GPU_MOST_BONES);
 			if (p.strands) {
 				part.skin = card;
-				make_strand_part(part, p, node.skin >= 0);
+				part.hung = node.skin >= 0;
+				const size_t n = p.pos.size();
+				part.hair = n && !p.hair.pieces.empty() && p.hair.width.size() == n &&
+					    p.hair.along.size() == n && p.normal.size() == n;
+				part.boned = part.hung && p.joints.size() == n * 4 && p.weights.size() == n * 4;
+				// (Posed on the card, its numbers go to it when it's first
+				// drawn: laid out as drawn - lay_strands - or by point -
+				// by_point - as the hair plan then says. Not both: a big
+				// coat's are hundreds of megabytes either way.)
+				if (!card)
+					make_strand_part(part, p, part.hung);
 				parts_.push_back(part);
 				continue;
 			}
@@ -1058,7 +1290,11 @@ void Avatar3D::set_depth_material(const Material &m, const std::vector<gs_textur
 bool Avatar3D::load_strands(size_t i, const Rig::Part &p, bool lines, bool laid)
 {
 	Part &part = parts_[i];
-	if (!part.vb || !part.ib || !p.prim)
+	if (!p.prim || !part.hair)
+		return false;
+	// (By point: its buffers, made now if it's posed on the card and has
+	// only been drawn laid out.)
+	if (!laid && !(part.skin ? by_point(part, *p.prim) : part.vb && part.ib))
 		return false;
 	if (lines && !laid && !part.ib_lines) {
 		// (Its pieces as lines: made the first time it's drawn that way.)
@@ -1086,6 +1322,7 @@ bool Avatar3D::load_strands(size_t i, const Rig::Part &p, bool lines, bool laid)
 	}
 	if (laid)
 		return true;
+	part.point_idle = 0;
 	gs_load_vertexbuffer(part.vb);
 	gs_load_indexbuffer(lines ? part.ib_lines : part.ib);
 	return true;
@@ -1101,9 +1338,11 @@ void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int>
 	const HairPlan &plan = whose.hair_plan_;
 	HairDrawn &drawn = whose.hair_drawn_;
 	bool laid = plan.layout == 1 && p.gpu && part.skin && p.prim;
+	// (One still being made: by point meanwhile if it has those buffers,
+	// else waited for - there's nothing else to draw it from.)
 	for (int k = 0; laid && k < 2; k++)
 		if (sort != 1 - k)
-			laid = lay_strands(part, *p.prim, k, lines);
+			laid = lay_strands(part, *p.prim, k, lines, !(part.vb && part.ib));
 	if (!load_strands(i, p, lines, laid))
 		return;
 	// (A piece: two triangles' six corners, or a line's two.)
@@ -1150,11 +1389,12 @@ void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int>
 				for (int k = 0; k < 2; k++) {
 					if (!some[k].count || sort == 1 - k || run >= part.laid_from[k].size())
 						continue;
-					const Part::Laid &l = part.laid[k][lines ? 1 : 0];
+					Part::Laid &l = part.laid[k][lines ? 1 : 0];
 					if (loaded != &l) {
 						gs_load_vertexbuffer(l.vb);
 						gs_load_indexbuffer(l.ib);
 						loaded = &l;
+						l.idle = 0;
 					}
 					send(part.laid_from[k][run], some[k].count);
 					drawn.pieces += some[k].count;
@@ -1193,11 +1433,12 @@ void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int>
 bool Avatar3D::draw_merged(Part &part, const Strands &h, int k, bool lines, const std::vector<int> &groups,
 			   size_t layer, size_t count, const char *technique, Avatar3D &whose)
 {
-	const Part::Laid &l = part.laid[k][lines ? 1 : 0];
+	Part::Laid &l = part.laid[k][lines ? 1 : 0];
 	const std::vector<uint32_t> &from = part.laid_from[k];
 	const size_t layers = (size_t)std::max(1, h.layers);
 	if (!l.vb || !l.ib || from.empty() || layer >= layers)
 		return false;
+	l.idle = 0;
 	if (part.merged[k].size() != layers) {
 		for (Part::Merged &m : part.merged[k])
 			gs_indexbuffer_destroy(m.ib);
@@ -1285,7 +1526,8 @@ void Avatar3D::draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t
 	// Laid out as drawn (posed on the card), made before the first time
 	// it's drawn; one that can't be made: by point, as before.
 	Part &part = parts_[i];
-	const bool laid = plan.layout == 1 && p.gpu && part.skin && p.prim && lay_hull(part, *p.prim);
+	const bool laid = plan.layout == 1 && p.gpu && part.skin && p.prim &&
+			  lay_hull(part, *p.prim, !(part.vb && part.ib));
 	set_camera();
 	set_strand(v, drawn_h, upto, p.scale, nullptr);
 	if (!load_strands(i, p, false, laid))
@@ -1295,6 +1537,7 @@ void Avatar3D::draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t
 	if (laid) {
 		if (part.hull.none || part.hull_lay.from.size() != h.groups.size() + 1)
 			return;
+		part.hull.idle = 0;
 		gs_load_vertexbuffer(part.hull.vb);
 		gs_load_indexbuffer(part.hull.ib);
 		while (gs_effect_loop(effect_, technique))
@@ -1602,7 +1845,9 @@ bool Avatar3D::upload(const Rig *rig)
 		Part &part = parts_[i];
 		const Rig::Part &p = posed[i];
 		if (p.gpu) {
-			if (!part.vb || !part.skin || p.hidden)
+			// (Hair strands posed on the card may have no by-point buffers:
+			// their bones are wanted all the same.)
+			if (!(part.vb || (part.strands && part.hair)) || !part.skin || p.hidden)
 				continue;
 			// Its points as made, with its expressions while any shows
 			// (and once more as made when they stop). (Hair strands'
@@ -1868,8 +2113,10 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 			for (size_t i = 0; i < posed.size(); i++) {
 				Part &part = dr.a->parts_[i];
 				const Rig::Part &p = posed[i];
-				if (!part.strands || !part.vb || !part.ib || part.skin != p.gpu || p.hidden ||
-				    p.collapsed || !p.prim) {
+				// (Posed on the card its buffers are made as it's drawn; posed
+				// here it has them, by point.)
+				if (!part.strands || !part.hair || !(part.skin || (part.vb && part.ib)) ||
+				    part.skin != p.gpu || p.hidden || p.collapsed || !p.prim) {
 					part.as_lines = part.thin_lines = part.formed = false;
 					continue;
 				}
@@ -1877,11 +2124,36 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 				// (Posed here: those the rig posed, the first of them.)
 				const size_t loaded = p.gpu ? h.strands() : h.strands_in(p.pos.size());
 				// (As lines where its hairs are thin enough: hair.hpp.)
-				const HairForm form = hair_form(h, loaded, p.scale, dr.distance[i], pixel, 1.0f,
-								hair_plan_.solid, budget,
-								dr.a->p_strand_view ? hair_plan_.lines : 0,
-								part.as_lines, part.thin_lines, hair_plan_.line_loss,
-								hair_plan_.line_cost, hair_plan_.budget_rule == 1);
+				HairForm form = hair_form(h, loaded, p.scale, dr.distance[i], pixel, 1.0f,
+							  hair_plan_.solid, budget,
+							  dr.a->p_strand_view ? hair_plan_.lines : 0, part.as_lines,
+							  part.thin_lines, hair_plan_.line_loss, hair_plan_.line_cost,
+							  hair_plan_.budget_rule == 1);
+				// Laid out as drawn (posed on the card), a form it hasn't
+				// been drawn in yet is made off the drawing thread. Until
+				// it's ready, a part with by-point buffers is drawn from
+				// them (draw_strands), and one drawn laid out the frame
+				// before goes on in the form it had - no pause in the
+				// picture. (Neither - the first time its hair is drawn: it's
+				// waited for, there.)
+				if (p.gpu && hair_plan_.layout == 1 && form.share.count) {
+					auto made = [&part](bool lines, bool thin) {
+						for (int sort = 0; sort < 2; sort++)
+							if (!part.laid[sort][(thin ? sort == 1 : lines) ? 1 : 0].tried)
+								return false;
+						return true;
+					};
+					// (Its hull too, where it's drawn - a measure's 4: not.)
+					if (!dr.a->forms_ready(part, *p.prim, form.lines, form.thin,
+							       hair_plan_.measure != 4) &&
+					    !(part.vb && part.ib) && part.formed && part.last.share.count &&
+					    made(part.last.lines, part.last.thin))
+						form = part.last;
+				}
+				part.last = form;
+				// (What it hasn't been drawn from for a while: freed.)
+				if (form.share.count)
+					free_idle(part, hair_plan_.idle);
 				dr.hair[i] = form.share;
 				// (How often a part drawn the frame before changes between
 				// lines and ribbons: counted.)
@@ -1943,6 +2215,20 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 					}
 				hair_drawn_.laid_bytes += dr.a->parts_[i].hull.bytes;
 				hair_drawn_.laid_ms += dr.a->parts_[i].hull.ms;
+				// (Those being made; and what it holds by point: 52 bytes
+				// a corner posed on the card, 36 posed here, 4 a corner
+				// of a piece.)
+				const Part &held = dr.a->parts_[i];
+				for (const auto &sort : held.laid)
+					for (const Part::Laid &l : sort)
+						hair_drawn_.forming += l.job ? 1 : 0;
+				hair_drawn_.forming += held.hull.job ? 1 : 0;
+				if (held.vb)
+					hair_drawn_.point_bytes += held.points * (held.skin ? 52 : 36);
+				if (held.ib)
+					hair_drawn_.point_bytes += h.pieces.size() * 6 * sizeof(uint32_t);
+				if (held.ib_lines)
+					hair_drawn_.point_bytes += h.pieces.size() * 2 * sizeof(uint32_t);
 				// (And a layer's stretches together: their corners again.)
 				for (const auto &sort : dr.a->parts_[i].merged)
 					for (const Part::Merged &m : sort)

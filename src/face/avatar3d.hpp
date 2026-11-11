@@ -29,6 +29,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #pragma once
 
 #include <condition_variable>
+#include <future>
 #include <map>
 #include <cstdint>
 #include <memory>
@@ -247,9 +248,15 @@ public:
 		// 1; hair.hpp's StrandMerge), and how many times such a stretch has
 		// been made since this was (each a copy of a layer's corners).
 		size_t merged = 0, merges = 0;
-		// (And how long making it took, all told: a pause the first time
-		// hair is drawn in a form - milliseconds.)
+		// (And how long making it took, all told - milliseconds, off the
+		// drawing thread but for the first time a part's hair is drawn;
+		// and how many layouts are being made right now.)
 		float laid_ms = 0;
+		size_t forming = 0;
+		// How much of the card's memory hair posed on it takes by point (a
+		// point's numbers once, its pieces' corners pointing into them):
+		// none of a part drawn only from memory laid out as drawn.
+		size_t point_bytes = 0;
 		// The hull (the hairs' inner layers, drawn into the picture of the
 		// solid parts' distances): its pieces and its draws.
 		size_t hull_pieces = 0, hull_draws = 0;
@@ -286,6 +293,8 @@ public:
 			   const std::vector<Other> &others = {});
 
 private:
+	// A strand part's layout being made off the drawing thread (the .cpp).
+	struct LaidJob;
 	struct Part {
 		gs_vertbuffer_t *vb = nullptr;
 		gs_indexbuffer_t *ib = nullptr;
@@ -294,6 +303,9 @@ private:
 		// Hair strands (model.hpp's Strands): two points here a point of
 		// its strands, its two sides.
 		bool strands = false;
+		// (One that can be drawn: it has points and pieces, each with what
+		// rides with it. And whether its node has a skin.)
+		bool hair = false, hung = false;
 		// Its pieces as lines (hair.hpp's strand_corners), made the first
 		// time it's drawn that way; and whether it was last frame.
 		gs_indexbuffer_t *ib_lines = nullptr;
@@ -307,12 +319,17 @@ private:
 		// pieces, or all of them with one sort; 1: its thin ones) and form
 		// (0 ribbons, 1 lines), each made the first time it's drawn so.
 		// `from`: a run's first piece's place among its sort's.
+		// Made off the drawing thread (`job`, while it's being made:
+		// LaidJob), and freed again once the part has been drawn without
+		// it for a while (`idle`: for how many frames; HairPlan::idle).
 		struct Laid {
 			gs_vertbuffer_t *vb = nullptr;
 			gs_indexbuffer_t *ib = nullptr;
 			bool tried = false, none = false; // (none: it has no pieces of that sort)
 			size_t bytes = 0;                 // of the card's memory
 			float ms = 0;                     // making it took
+			std::shared_ptr<LaidJob> job;
+			uint32_t idle = 0;
 		};
 		Laid laid[2][2];
 		std::vector<uint32_t> laid_from[2];
@@ -339,6 +356,12 @@ private:
 		// corners: the card has those).
 		Laid hull;
 		StrandHull hull_lay;
+		// Posed on the card its by-point buffers (vb, ib, ib_lines) are made
+		// only when it's drawn from them (by_point), and freed once it
+		// hasn't been for a while: how many frames. And how it was drawn
+		// the frame before (while `formed`).
+		uint32_t point_idle = 0;
+		HairForm last;
 		bool was_morphed = false;
 		bool posed_here = false; // a card part's points last sent posed here
 	};
@@ -400,9 +423,22 @@ private:
 	// loads each sort's own points and pieces).
 	bool load_strands(size_t i, const Rig::Part &p, bool lines = false, bool laid = false);
 	// A strand part's pieces of one sort laid out as they're drawn, as
-	// ribbons or as lines (Part::laid), made if they aren't yet: whether
-	// they can be drawn that way.
-	bool lay_strands(Part &part, const Primitive &p, int sort, bool lines);
+	// ribbons or as lines (Part::laid): whether they can be drawn that way
+	// now. One not made yet is begun off the drawing thread; `wait`: and
+	// waited for (else false until it's ready).
+	bool lay_strands(Part &part, const Primitive &p, int sort, bool lines, bool wait = true);
+	// Whether all a card-posed strand part needs to be drawn laid out in a
+	// form - all its pieces lines (`lines`), its thin ones only (`thin`),
+	// or none - and (`hull`) its hull are made, or can't be; what isn't is
+	// begun off the drawing thread.
+	bool forms_ready(Part &part, const Primitive &p, bool lines, bool thin, bool hull);
+	// A card-posed strand part's by-point buffers, made if they aren't
+	// (false: they can't be).
+	bool by_point(Part &part, const Primitive &p);
+	// A strand part drawn this frame: what it hasn't been drawn from for
+	// `idle` frames freed - a layout in a form it's no longer in (its
+	// hull's, drawn by point), its by-point buffers once it's laid out.
+	static void free_idle(Part &part, uint32_t idle);
 	// A part's buffers freed.
 	static void free_part(Part &part);
 	// A hair-strand part's hull into the picture of the solid parts'
@@ -411,9 +447,9 @@ private:
 	// group's inner layers reach - what's behind that is hidden.
 	// (`whose`: as draw_strands'.)
 	void draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t drawn_h, size_t count, Avatar3D &whose);
-	// Its hull laid out as drawn, made the first time it's drawn so (false:
-	// it can't be - by point, as before).
-	bool lay_hull(Part &part, const Primitive &p);
+	// Its hull laid out as drawn (false: it can't be, or - without `wait`
+	// - isn't ready yet: by point).
+	bool lay_hull(Part &part, const Primitive &p, bool wait = true);
 	// What the Depth techniques read of a material.
 	void set_depth_material(const Material &m, const std::vector<gs_texture_t *> *textures = nullptr);
 	// A thing's parts: its solid ones, or its see-through ones (or all of

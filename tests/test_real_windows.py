@@ -1288,7 +1288,10 @@ def test_a_layer_of_hair_in_one_draw_on_the_card(obs):
             assert off == 0, (name, off)
             for key in ("drawn", "pieces", "lines", "hull_pieces", "hull_draws", "skips_hidden"):
                 assert h[key] == was["main"][key], (name, key, was["main"], h)
-            assert h["merges"] >= least and h["laid_mb"] > was["main"]["laid_mb"], (name, was["main"], h)
+            # (Each a copy of a layer's corners: never less of the card's
+            # memory - told to a tenth of a megabyte, which so few lines'
+            # corners don't always show in.)
+            assert h["merges"] >= least and h["laid_mb"] >= was["main"]["laid_mb"], (name, was["main"], h)
 
             # Seen from one side, then the other: its groups' order turns
             # round. At once the rows that still hold are a draw each - the
@@ -1455,11 +1458,125 @@ def test_a_companions_hair_is_drawn_as_its_owners(obs):
         print("\nA companion's hair: %d pixels differ laid out with its layers' groups together; by point %s; "
               "together %s" % (off, by_point, hair()))
         assert off == 0 and together["pieces"] == by_point["pieces"], (off, by_point, together)
+        # Left to the setting: laid out as drawn without being asked, a
+        # draw a group - the same picture again.
+        change(hair_layout=-1, hair_merge=-1)
+        as_set = settled(True, False)
+        off = sum(1 for a, b in zip(shot(c, "Owner"), before) for x, y in zip(a, b) if tuple(x) != tuple(y))
+        print("A companion's hair, left to the setting: %d pixels differ; %s" % (off, as_set))
+        assert off == 0 and as_set["draws"] == by_point["draws"] and as_set["laid_mb"] > 0, (off, by_point, as_set)
         log = obs.log()
         assert "3D effect" not in log and "Windows won't draw" not in log, log
     finally:
         try:
             c.send("RemoveInput", {"inputName": "Owner"}, raw=True)
+        except Exception:
+            pass
+        c.disconnect()
+
+
+def test_hair_on_the_card_keeps_only_what_its_drawn_from(obs):
+    """Hair posed on the graphics card is laid out as it's drawn without
+    being asked (FaceGetState's "laid": all its pieces), and by point none
+    of its numbers are on the card at all ("point_mb" 0). Each form it's
+    drawn in - ribbons, lines - is made the first time it's needed, off the
+    drawing thread ("forming": how many are being made now), and one it
+    hasn't been drawn in for a while ("hair_idle" frames, a number the
+    settings window doesn't show: 30 here) is freed again ("laid_mb" back
+    down). Asked for by point ("hair_layout" 0), its by-point buffers are
+    made and its layouts freed in their turn - and back. The picture is the
+    same to the pixel through it all."""
+    figure = os.path.join(obs.home, "kept.vrm")
+    strands = hair_character(figure, width=0.0006)
+    c = obs.client()
+
+    def st():
+        return vendor(c, "FaceGetState", {"source": "Kept"})["model"]
+
+    def hair():
+        return st()["hair"]
+
+    def change(**settings):
+        c.send("SetInputSettings", {"inputName": "Kept", "inputSettings": settings}, raw=True)
+
+    def differ(a, b):
+        assert len(a) == len(b) and len(a[0]) == len(b[0])
+        return sum(1 for a_row, b_row in zip(a, b) for x, y in zip(a_row, b_row) if tuple(x) != tuple(y))
+
+    def settled(lines, laid=True):
+        """All its hair drawn in the form asked for, laid out as drawn (or
+        by point), nothing being made - the same twice."""
+        def right():
+            h = hair()
+            return (h["drawn"] == strands and h["pieces"] > 0 and h["forming"] == 0
+                    and h["laid"] == (h["pieces"] if laid else 0)
+                    and h["lines"] == (h["pieces"] if lines else 0))
+        assert wait_for(right, 20, 0.1), (lines, laid, hair(), obs.log())
+        time.sleep(0.8)
+        assert right(), (lines, laid, hair())
+        return hair()
+    try:
+        c.send("CreateScene", {"sceneName": "Kept scene"}, raw=True)
+        c.send("CreateInput", {"sceneName": "Kept scene", "inputName": "Kept",
+                               "inputKind": "direbot_face_avatar",
+                               "inputSettings": {"model": figure, "width": 300, "height": 300,
+                                                 "size": 100, "framing": "whole", "style": "drawn",
+                                                 "mirror": False, "smoothing": 0, "breathing": 0,
+                                                 "sway": 0, "eye_moves": False, "hair_budget_ms": 0,
+                                                 "hair_lines": 0, "hair_idle": 30}}, raw=True)
+        c.send("SetCurrentProgramScene", {"sceneName": "Kept scene"}, raw=True)
+        assert wait_for(lambda: st()["shown"], 60, 0.2), obs.log()
+        assert wait_for(lambda: st()["on_card"], 10, 0.1), (st(), obs.log())
+
+        # As ribbons: laid out by itself, nothing of it by point.
+        ribbons = settled(False)
+        print("\nRibbons, as it comes: %s" % ribbons)
+        assert ribbons["point_mb"] == 0 and ribbons["laid_mb"] > 0 and ribbons["laid_ms"] > 0, ribbons
+        as_ribbons = shot(c, "Kept")
+        assert sum(1 for row in as_ribbons for px in row if magenta(px)) > 300
+
+        # As lines: that form made too - and, not drawn from any more, its
+        # ribbons freed (a line's corners are fewer: less memory than the
+        # ribbons took).
+        change(hair_lines=2)
+        lines = settled(True)
+        assert wait_for(lambda: hair()["laid_mb"] < ribbons["laid_mb"], 15, 0.1), (ribbons, hair())
+        lines = settled(True)
+        print("Lines, its ribbons freed: %s" % lines)
+        assert lines["point_mb"] == 0 and 0 < lines["laid_mb"] < ribbons["laid_mb"], (ribbons, lines)
+        print("As lines, %d pixels differ from its ribbons" % differ(shot(c, "Kept"), as_ribbons))
+
+        # Ribbons again: made again, the lines freed, the picture as it was.
+        change(hair_lines=0)
+        settled(False)
+        assert wait_for(lambda: hair()["laid_mb"] == ribbons["laid_mb"], 15, 0.1), (ribbons, hair())
+        again = settled(False)
+        off = differ(shot(c, "Kept"), as_ribbons)
+        print("Ribbons again: %d pixels differ; %s" % (off, again))
+        assert off == 0 and again["point_mb"] == 0, (off, again)
+
+        # By point: its by-point buffers made, and its layouts freed.
+        change(hair_layout=0)
+        by_point = settled(False, laid=False)
+        assert wait_for(lambda: hair()["laid_mb"] == 0, 15, 0.1), hair()
+        by_point = settled(False, laid=False)
+        off = differ(shot(c, "Kept"), as_ribbons)
+        print("By point: %d pixels differ; %s" % (off, by_point))
+        assert off == 0 and by_point["point_mb"] > 0, (off, by_point)
+
+        # And as it comes again: laid out, its by-point buffers freed.
+        change(hair_layout=-1)
+        settled(False)
+        assert wait_for(lambda: hair()["point_mb"] == 0, 15, 0.1), hair()
+        back = settled(False)
+        off = differ(shot(c, "Kept"), as_ribbons)
+        print("Laid out again: %d pixels differ; %s" % (off, back))
+        assert off == 0 and back["laid_mb"] == ribbons["laid_mb"], (off, ribbons, back)
+        log = obs.log()
+        assert "3D effect" not in log and "Windows won't draw" not in log, log
+    finally:
+        try:
+            c.send("RemoveInput", {"inputName": "Kept"}, raw=True)
         except Exception:
             pass
         c.disconnect()
