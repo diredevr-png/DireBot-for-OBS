@@ -169,16 +169,17 @@ ModelLoader::~ModelLoader()
 	thread_.join();
 }
 
-void ModelLoader::want(const std::string &path, bool again)
+void ModelLoader::want(const std::string &path, bool again, const LoadOptions &options)
 {
 	// The same file changed since (made again in its place): loaded anew.
 	const std::string stamp = file_stamp(path);
 	{
 		std::lock_guard<std::mutex> l(lock_);
-		if (path == asked_ && stamp == stamp_ && !again)
+		if (path == asked_ && stamp == stamp_ && options == options_ && !again)
 			return;
 		asked_ = path;
 		stamp_ = stamp;
+		options_ = options;
 		want_ = path;
 		pending_ = true;
 	}
@@ -201,12 +202,14 @@ void ModelLoader::run()
 {
 	for (;;) {
 		std::string path;
+		LoadOptions options;
 		{
 			std::unique_lock<std::mutex> l(lock_);
 			wake_.wait(l, [this] { return stop_ || pending_; });
 			if (stop_)
 				return;
 			path = want_;
+			options = options_;
 			pending_ = false;
 			working_ = true;
 		}
@@ -215,7 +218,7 @@ void ModelLoader::run()
 		if (!path.empty()) {
 			auto model = std::make_shared<Model>();
 			std::string problem;
-			if (load_model(path, *model, &problem)) {
+			if (load_model(path, *model, &problem, options)) {
 				pack->pictures = read_pictures(*model);
 				pack->model = model;
 			} else {
@@ -297,7 +300,10 @@ void PropLoader::run()
 		pack->path = path;
 		auto model = std::make_shared<Model>();
 		std::string problem;
-		if (load_model(path, *model, &problem)) {
+		// (Hair strands in a thing aren't drawn: none kept.)
+		LoadOptions options;
+		options.strand_points = options.strand_points_bare = 0;
+		if (load_model(path, *model, &problem, options)) {
 			if (model->points > MOST_PROP_POINTS) {
 				pack->problem = "it's too detailed to throw (" + std::to_string(model->points) +
 						" points; at most " + std::to_string(MOST_PROP_POINTS) + ")";
@@ -375,6 +381,9 @@ Avatar3D::Avatar3D()
 		p_flat_at = param("flat_at");
 		p_eye = param("eye_pos");
 		p_strand = param("strand");
+		p_strand_lod = param("strand_lod");
+		p_depth_map = param("depth_map");
+		p_spots = param("spot_moves");
 		p_bones = param("bone_cols");
 		p_skin = param("skin_info");
 		// Posing on the graphics card, where the effect has it (an older
@@ -395,10 +404,24 @@ Avatar3D::Avatar3D()
 	black_ = gs_texture_create(1, 1, GS_RGBA, 1, &b, 0);
 	flat_ = gs_texture_create(1, 1, GS_RGBA, 1, &f, 0);
 	make_head();
+#ifdef _WIN32
+	// (The graphics card lost: see clocks_lost.)
+	gs_device_loss lost = {};
+	lost.device_loss_release = [](void *data) {
+		static_cast<Avatar3D *>(data)->clocks_lost();
+	};
+	lost.device_loss_rebuild = [](void *, void *) {
+	};
+	lost.data = this;
+	gs_register_loss_callbacks(&lost);
+#endif
 }
 
 Avatar3D::~Avatar3D()
 {
+#ifdef _WIN32
+	gs_unregister_loss_callbacks(this);
+#endif
 	clear();
 	gs_vertexbuffer_destroy(head_.vb);
 	gs_indexbuffer_destroy(head_.ib);
@@ -407,7 +430,22 @@ Avatar3D::~Avatar3D()
 	gs_texture_destroy(flat_);
 	gs_texrender_destroy(scene_);
 	gs_texrender_destroy(out_);
+	gs_texrender_destroy(depth_);
+	for (HairClock &c : clocks_) {
+		if (c.depth)
+			gs_timer_destroy(c.depth);
+		if (c.hair)
+			gs_timer_destroy(c.hair);
+		if (c.range)
+			gs_timer_range_destroy(c.range);
+	}
 	gs_effect_destroy(effect_);
+}
+
+void Avatar3D::set_hair(const HairPlan &plan)
+{
+	hair_plan_ = plan;
+	budget_.set_limit(plan.budget_ms);
 }
 
 void Avatar3D::clear()
@@ -429,8 +467,7 @@ namespace {
 // A buffer of `n` points (with tangents: `tangents`); a still one (not
 // `dynamic`) is filled from `points` now, as OBS keeps no copy of it to
 // change later.
-gs_vertbuffer_t *make_vb(size_t n, bool dynamic, const V3 *points = nullptr, bool tangents = false,
-			 bool strands = false, bool skin = false)
+gs_vertbuffer_t *make_vb(size_t n, bool dynamic, const V3 *points = nullptr, bool tangents = false, bool skin = false)
 {
 	gs_vb_data *vb = gs_vbdata_create();
 	vb->num = n;
@@ -443,13 +480,12 @@ gs_vertbuffer_t *make_vb(size_t n, bool dynamic, const V3 *points = nullptr, boo
 		vec3_set(&vb->normals[i], 0, 0, 1);
 	}
 	vb->colors = static_cast<uint32_t *>(bzalloc(sizeof(uint32_t) * n));
-	// Hair strands: their widths and own numbers too (a second set).
 	// Posed on the graphics card: each point's 4 bones and how much each
-	// moves it (after those).
-	vb->num_tex = (strands ? 2 : 1) + (skin ? 2 : 0);
+	// moves it (after its UVs).
+	vb->num_tex = 1 + (skin ? 2 : 0);
 	vb->tvarray = static_cast<gs_tvertarray *>(bzalloc(sizeof(gs_tvertarray) * vb->num_tex));
 	for (size_t t = 0; t < vb->num_tex; t++) {
-		vb->tvarray[t].width = t < (strands ? 2u : 1u) ? 2 : 4;
+		vb->tvarray[t].width = t < 1u ? 2 : 4;
 		vb->tvarray[t].array = bzalloc(sizeof(float) * vb->tvarray[t].width * n);
 	}
 	return gs_vertexbuffer_create(vb, dynamic ? GS_DYNAMIC : 0);
@@ -462,7 +498,112 @@ gs_indexbuffer_t *make_ib(const std::vector<uint32_t> &index)
 	return gs_indexbuffer_create(GS_UNSIGNED_LONG, ix, index.size(), 0);
 }
 
+// A direction folded onto a square (two numbers; the effect's oct_dir
+// unfolds it): the way a strand runs, small enough to ride with a hair
+// point's other numbers.
+void folded(V3 n, float *e)
+{
+	const float l = std::fabs(n.x) + std::fabs(n.y) + std::fabs(n.z);
+	if (!(l > 0)) {
+		e[0] = e[1] = 0;
+		return;
+	}
+	float x = n.x / l, y = n.y / l;
+	if (n.z < 0) {
+		const float ox = (1 - std::fabs(y)) * (x >= 0 ? 1.0f : -1.0f);
+		const float oy = (1 - std::fabs(x)) * (y >= 0 ? 1.0f : -1.0f);
+		x = ox;
+		y = oy;
+	}
+	e[0] = x;
+	e[1] = y;
+}
+
 } // namespace
+
+// A hair-strand part (model.hpp's Strands) onto the graphics card, as the
+// effect's Strand techniques read it. Each of its points twice, its two
+// sides:
+//   points   x y z, and w: + or - (which side) 1 and its strand's key
+//            and rate as one whole number (strand_order)
+//   normals  x y: the way its strand runs, folded; z: its width; w: its
+//            expression spot's number plus how far along its strand it
+//            is (0 root to 0.9995 tip)
+//   colours  its own
+//   (posed on the card) one set of 4: each of its 4 bones' number plus
+//            how much it moves the point (0 to 0.999)
+// 52 bytes a side on the card, 36 posed here; then its pieces, 6 corners
+// each, in the order they're drawn in (Strands::pieces). Posed on the
+// card it never changes; posed here its places and runs are sent each
+// frame (upload).
+// A strand's key and rate (Strands::key, rate) as the one number the
+// graphics card is told (the effect's strand_out takes it apart): its
+// key in steps of 1 / 32768 (under 4: 131072 of them), and its rate's
+// step x 131072 - a whole number under 2^23, which a float holds exactly.
+static float strand_order(const Strands &h, size_t s)
+{
+	const float key = s < h.key.size() ? h.key[s] : (float)((double)s / (double)std::max<uint32_t>(1, h.in_file));
+	const float rate = s < h.rate.size() ? h.rate[s] : 1.0f;
+	const float steps = std::min(131071.0f, std::max(0.0f, std::floor(key * 32768.0f)));
+	return steps + 131072.0f * (float)Strands::rate_step(rate);
+}
+
+void Avatar3D::make_strand_part(Part &part, const Primitive &p, bool boned)
+{
+	const Strands &h = p.hair;
+	const size_t n = p.pos.size(), count = n * 2;
+	if (!n || h.pieces.empty() || h.width.size() != n || h.along.size() != n || p.normal.size() != n)
+		return;
+	gs_vb_data *vb = gs_vbdata_create();
+	vb->num = count;
+	vb->points = static_cast<vec3 *>(bzalloc(sizeof(vec3) * count));
+	vb->normals = static_cast<vec3 *>(bzalloc(sizeof(vec3) * count));
+	vb->colors = static_cast<uint32_t *>(bzalloc(sizeof(uint32_t) * count));
+	float *jw = nullptr;
+	if (part.skin) {
+		vb->num_tex = 1;
+		vb->tvarray = static_cast<gs_tvertarray *>(bzalloc(sizeof(gs_tvertarray)));
+		vb->tvarray[0].width = 4;
+		vb->tvarray[0].array = bzalloc(sizeof(float) * 4 * count);
+		jw = static_cast<float *>(vb->tvarray[0].array);
+	}
+	boned = boned && p.joints.size() == n * 4 && p.weights.size() == n * 4;
+	const bool spots = h.anchor.size() == n;
+	const bool coloured = h.colour.size() == n * 4;
+	const uint8_t white[4] = {255, 255, 255, 255};
+	for (size_t s = 0; s < h.strands(); s++) {
+		const float order = 1.0f + strand_order(h, s);
+		for (uint32_t i = h.first[s]; i < h.first[s + 1]; i++) {
+			float e[2];
+			folded(p.normal[i], e);
+			const float along = std::min(1.0f, std::max(0.0f, h.along[i])) * 0.9995f +
+					    (spots ? (float)h.anchor[i] : 0.0f);
+			for (size_t side = 0; side < 2; side++) {
+				const size_t k = (size_t)i * 2 + side;
+				vec3_set(&vb->points[k], p.pos[i].x, p.pos[i].y, p.pos[i].z);
+				vb->points[k].w = side ? order : -order;
+				vec3_set(&vb->normals[k], e[0], e[1], h.width[i]);
+				vb->normals[k].w = along;
+				std::memcpy(&vb->colors[k], coloured ? &h.colour[(size_t)i * 4] : white, 4);
+				// Its bones (none: its node's world as bone 0, all of it).
+				for (int j = 0; jw && j < 4; j++)
+					jw[k * 4 + j] =
+						boned ? (float)std::min<uint16_t>(254, p.joints[(size_t)i * 4 + j]) +
+								std::min(1.0f, p.weights[(size_t)i * 4 + j]) * 0.999f
+						      : (j == 0 ? 0.999f : 0.0f);
+			}
+		}
+	}
+	part.vb = gs_vertexbuffer_create(vb, part.skin ? 0 : GS_DYNAMIC);
+	part.points = count;
+	uint32_t *ix = static_cast<uint32_t *>(bmalloc(sizeof(uint32_t) * h.pieces.size() * 6));
+	for (size_t k = 0; k < h.pieces.size(); k++) {
+		const uint32_t a0 = h.pieces[k] * 2, a1 = a0 + 1, b0 = a0 + 2, b1 = a0 + 3;
+		const uint32_t six[6] = {a0, b0, a1, a1, b0, b1};
+		std::memcpy(&ix[k * 6], six, sizeof(six));
+	}
+	part.ib = gs_indexbuffer_create(GS_UNSIGNED_LONG, ix, h.pieces.size() * 6, 0);
+}
 
 // The hidden head shape: a ball the shape of a head, in the face's own
 // centimetres (MediaPipe's face at rest: its middle at 0, the eyes 3 in
@@ -538,11 +679,18 @@ void Avatar3D::make_parts()
 			Part part;
 			part.points = p.pos.size();
 			part.bumped = p.tangent.size() == part.points * 4;
-			part.strands = p.strands && p.strand.size() == part.points * 2;
+			part.strands = p.strands;
+			const bool card = gpu_skin_ &&
+					  (node.skin < 0 || m.skins[node.skin].joints.size() <= Rig::GPU_MOST_BONES);
+			if (p.strands) {
+				part.skin = card;
+				make_strand_part(part, p, node.skin >= 0);
+				parts_.push_back(part);
+				continue;
+			}
 			if (part.points && !p.index.empty()) {
-				part.skin = gpu_skin_ && (node.skin < 0 || m.skins[node.skin].joints.size() <=
-										   Rig::GPU_MOST_BONES);
-				part.vb = make_vb(part.points, true, nullptr, part.bumped, part.strands, part.skin);
+				part.skin = card;
+				part.vb = make_vb(part.points, true, nullptr, part.bumped, part.skin);
 				part.ib = make_ib(p.index);
 			}
 			if (part.vb) {
@@ -558,14 +706,11 @@ void Avatar3D::make_parts()
 						srgb_bytes(&p.colour[i * 4], c);
 					std::memcpy(&d->colors[i], c, 4);
 				}
-				if (part.strands)
-					std::memcpy(d->tvarray[1].array, p.strand.data(), sizeof(float) * 2 * part.points);
 				if (part.skin) {
 					// Its points as made, and its bones (none: its node's
 					// world as bone 0, all of it).
-					const size_t first = part.strands ? 2 : 1;
-					float *jt = static_cast<float *>(d->tvarray[first].array);
-					float *wt = static_cast<float *>(d->tvarray[first + 1].array);
+					float *jt = static_cast<float *>(d->tvarray[1].array);
+					float *wt = static_cast<float *>(d->tvarray[2].array);
 					const bool boned = node.skin >= 0 && p.joints.size() == part.points * 4 &&
 							   p.weights.size() == part.points * 4;
 					for (size_t i = 0; i < part.points; i++) {
@@ -719,20 +864,118 @@ void Avatar3D::draw_part(size_t i, const Rig::Part &p, const char *technique)
 		gs_draw(GS_TRIS, 0, 0);
 }
 
-void Avatar3D::set_strand(const View3D &v, uint32_t drawn_w, uint32_t drawn_h)
+void Avatar3D::set_strand(const View3D &v, uint32_t drawn_h, float upto, float scale, gs_texture_t *depth)
 {
 	const M4 to_world = inverse(cam_);
 	const V3 eye = move_of(to_world);
 	set_vec3(p_eye, &eye.x);
 	// One pixel's width a unit from the camera; hairs at least 1 pixel of
-	// the picture as drawn (twice the size: half a pixel of the one shown).
+	// the picture as drawn (twice the size: half a pixel of the one
+	// shown). A hair's root sits on the skin: it shows up to 2 mm (of a
+	// character in metres) behind a solid part - the hair further along
+	// less, its tip not at all.
 	const float pixel = 2 * std::tan(v.fov / 2) / std::max(1u, drawn_h);
-	set_vec4(p_strand, pixel, 1.0f, (float)drawn_w, (float)drawn_h);
+	set_vec4(p_strand, pixel, 1.0f, scale, 0.002f * scale);
+	set_vec4(p_strand_lod, upto, 0.0f, 0.0f, 0.0f);
+	gs_effect_set_texture(p_depth_map, depth ? depth : white_);
 }
 
-void Avatar3D::draw_prop(Prop3D &prop, const View3D &v, bool see_through)
+void Avatar3D::set_depth_material(const Material &m, const std::vector<gs_texture_t *> *textures)
+{
+	set_camera();
+	const std::vector<gs_texture_t *> &pics = textures ? *textures : textures_;
+	const int image = m.base_map.image;
+	gs_effect_set_texture(p_base_map, image >= 0 && image < (int)pics.size() && pics[image] ? pics[image] : white_);
+	set_vec4(p_base, m.base[0], m.base[1], m.base[2], m.base[3]);
+	set_vec4(p_surface, m.metallic, m.roughness, m.alpha == AlphaMode::Mask ? std::max(0.001f, m.cutoff) : 0.0f,
+		 0.0f);
+	set_vec4(p_uv, m.base_map.offset[0], m.base_map.offset[1], m.base_map.scale[0], m.base_map.scale[1]);
+}
+
+bool Avatar3D::load_strands(size_t i, const Rig::Part &p)
+{
+	const Part &part = parts_[i];
+	if (!part.vb || !part.ib || !p.prim)
+		return false;
+	if (p.gpu) {
+		auto b = bone_cols_.find(p.bones);
+		if (b == bone_cols_.end() || b->second.cols.empty())
+			return false;
+		gs_effect_set_val(p_bones, b->second.cols.data(), b->second.cols.size() * sizeof(float));
+		// Its spots' moves: always the whole list (Direct3D wants every
+		// number of it).
+		spots_.assign((Strands::MOST_ANCHORS + 1) * 4, 0.0f);
+		for (size_t a = 0; a < p.spot_moves.size() && a <= Strands::MOST_ANCHORS; a++) {
+			spots_[a * 4] = p.spot_moves[a].x;
+			spots_[a * 4 + 1] = p.spot_moves[a].y;
+			spots_[a * 4 + 2] = p.spot_moves[a].z;
+		}
+		gs_effect_set_val(p_spots, spots_.data(), spots_.size() * sizeof(float));
+	}
+	gs_load_vertexbuffer(part.vb);
+	gs_load_indexbuffer(part.ib);
+	return true;
+}
+
+void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int> &groups, size_t layer, size_t count,
+			    const char *technique, HairDrawn &drawn)
+{
+	if (!load_strands(i, p))
+		return;
+	const Strands &h = p.prim->hair;
+	check_(technique);
+	const size_t layers = (size_t)std::max(1, h.layers);
+	if (layer >= layers)
+		return;
+	while (gs_effect_loop(effect_, technique))
+		for (int g : groups) {
+			const size_t run = (size_t)g * layers + layer;
+			const uint32_t pieces = h.pieces_of(run, count);
+			if (!pieces)
+				continue;
+			gs_draw(GS_TRIS, h.runs[run] * 6, pieces * 6);
+			drawn.pieces += pieces;
+			drawn.draws++;
+		}
+}
+
+void Avatar3D::draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t drawn_h, size_t count)
+{
+	const Strands &h = p.prim->hair;
+	const size_t layers = (size_t)std::max(1, h.layers), core = (size_t)std::max(0, std::min(h.core, h.layers));
+	if (!core || !count)
+		return;
+	// A quarter of the strands drawn (the first of them), each as much
+	// wider.
+	const size_t some = std::max(std::min<size_t>(count, 16), count / 4);
+	const float upto = h.threshold_of(some);
+	set_camera();
+	set_strand(v, drawn_h, upto, p.scale, nullptr);
+	if (!load_strands(i, p))
+		return;
+	const char *technique = p.gpu ? "HullSk" : "Hull";
+	check_(technique);
+	while (gs_effect_loop(effect_, technique))
+		for (size_t g = 0; g < h.groups.size(); g++) {
+			// (Half as far again as its inner layers reach: a hair's
+			// root, straight behind its own inner end, always shows.)
+			set_vec4(p_strand_lod, upto, 1.5f * h.groups[g].reach * p.scale, 0.0f, 0.0f);
+			for (size_t l = 0; l < core; l++) {
+				const size_t run = g * layers + l;
+				const uint32_t pieces = h.pieces_of(run, some);
+				if (pieces)
+					gs_draw(GS_TRIS, h.runs[run] * 6, pieces * 6);
+			}
+		}
+}
+
+void Avatar3D::draw_prop(Prop3D &prop, const View3D &v, bool see_through, bool depth_only)
 {
 	if (!(prop.opacity_ > 0.001f))
+		return;
+	// (A thing fading in or out hides no hair: it's drawn over it, as
+	// see-through as it is.)
+	if (depth_only && prop.opacity_ < 0.999f)
 		return;
 	static const Material plain;
 	const Model &m = *prop.model_;
@@ -745,6 +988,21 @@ void Avatar3D::draw_prop(Prop3D &prop, const View3D &v, bool see_through)
 			continue;
 		const int mi = part.prim->material;
 		Material mat = mi >= 0 && mi < (int)m.materials.size() ? m.materials[mi] : plain;
+		if (depth_only) {
+			// Its solid parts' distances, for the hairs behind them
+			// (strands in a thing aren't drawn at all).
+			if (mat.alpha == AlphaMode::Blend || mat.glow || part.prim->strands)
+				continue;
+			set_depth_material(mat, &prop.textures_);
+			gs_set_cull_mode(cull_of(mat, prop.handed_));
+			gs_load_vertexbuffer(part.vb);
+			gs_load_indexbuffer(part.ib);
+			check_("Depth");
+			while (gs_effect_loop(effect_, "Depth"))
+				gs_draw(GS_TRIS, 0, 0);
+			gs_set_cull_mode(GS_NEITHER);
+			continue;
+		}
 		if ((mat.alpha == AlphaMode::Blend || fading) != see_through)
 			continue;
 		if (mi >= 0 && mi < (int)prop.tints_.size()) {
@@ -987,8 +1245,9 @@ bool Avatar3D::upload(const Rig *rig)
 			if (!part.vb || !part.skin || p.hidden)
 				continue;
 			// Its points as made, with its expressions while any shows
-			// (and once more as made when they stop).
-			if (p.morphed || part.was_morphed || part.posed_here) {
+			// (and once more as made when they stop). (Hair strands'
+			// stay as made: the card moves them by their spots.)
+			if (!part.strands && (p.morphed || part.was_morphed || part.posed_here)) {
 				const Primitive &prim = *p.prim;
 				const bool now = p.morphed && p.rest_pos.size() == part.points &&
 						 p.rest_normal.size() == part.points;
@@ -1022,6 +1281,31 @@ bool Avatar3D::upload(const Rig *rig)
 			}
 			continue;
 		}
+		if (part.strands) {
+			// Hair strands posed here: each point's place and the way
+			// its strand runs, for both its sides (the rest of what
+			// rides with them stays as made).
+			// (Only those the rig posed: the first of them.)
+			if (!part.vb || part.skin || p.hidden || p.collapsed || p.pos.empty() ||
+			    p.pos.size() * 2 > part.points || p.normal.size() != p.pos.size())
+				continue;
+			gs_vb_data *d = gs_vertexbuffer_get_data(part.vb);
+			for (size_t k = 0; k < p.pos.size(); k++) {
+				float e[2];
+				folded(p.normal[k], e);
+				for (size_t side = 0; side < 2; side++) {
+					vec3 &at = d->points[k * 2 + side], &run = d->normals[k * 2 + side];
+					at.x = p.pos[k].x, at.y = p.pos[k].y, at.z = p.pos[k].z;
+					run.x = e[0], run.y = e[1];
+				}
+			}
+			gs_vb_data moved = {};
+			moved.num = d->num;
+			moved.points = d->points;
+			moved.normals = d->normals;
+			gs_vertexbuffer_flush_direct(part.vb, &moved);
+			continue;
+		}
 		if (!part.vb || p.hidden || p.pos.size() != part.points)
 			continue;
 		// (A part made for the card, posed here this once - measuring:
@@ -1050,10 +1334,86 @@ bool Avatar3D::upload(const Rig *rig)
 	return true;
 }
 
+// The graphics card's clocks turned on one: what the frame CLOCKS back
+// took, read now (asked sooner, OBS waits for the card) and told to the
+// hair budget.
+void Avatar3D::turn_clock()
+{
+	clock_at_ = (clock_at_ + 1) % CLOCKS;
+	HairClock &c = clocks_[clock_at_];
+	if (!c.used)
+		return;
+	c.used = false;
+	bool disjoint = false;
+	uint64_t frequency = 0, depth = 0, hair = 0;
+	// (Disjoint: the card's clock jumped part way - a reading to leave out.)
+	bool read = gs_timer_range_get_data(c.range, &disjoint, &frequency) && frequency;
+	read = read && gs_timer_get_data(c.depth, &depth) && gs_timer_get_data(c.hair, &hair) && !disjoint;
+	const double ms = read ? ((double)depth + (double)hair) * 1000.0 / (double)frequency : -1;
+	if (!(ms >= 0) || ms > 10000) {
+		// No answer: enough of them in a row and the budget has no
+		// clock to go by (and what hair took isn't known any more).
+		budget_.unread();
+		if (budget_.silent())
+			took_.clear();
+		return;
+	}
+	budget_.read((float)ms, c.share);
+	took_.push_back((float)ms);
+	if (took_.size() > 31)
+		took_.erase(took_.begin());
+}
+
+// This frame's clocks started (null: there are none - hair's time isn't
+// known, and the hair budget leaves hair as it is).
+Avatar3D::HairClock *Avatar3D::start_clock(float share)
+{
+	if (!clocks_work_)
+		return nullptr;
+	HairClock &c = clocks_[clock_at_];
+	if (!c.depth || !c.hair) {
+		if (!c.depth)
+			c.depth = gs_timer_create();
+		if (!c.hair)
+			c.hair = gs_timer_create();
+		if (!c.range)
+			c.range = gs_timer_range_create();
+		// (OpenGL has no range: its clocks are always in nanoseconds.)
+		if (!c.depth || !c.hair || (!c.range && gs_get_device_type() != GS_DEVICE_OPENGL)) {
+			clocks_work_ = false;
+			return nullptr;
+		}
+	}
+	c.used = true;
+	c.share = share;
+	gs_timer_range_begin(c.range);
+	return &c;
+}
+
+// The graphics card was lost (Windows: its driver restarted): the clocks
+// asked before it never answer.
+void Avatar3D::clocks_lost()
+{
+	for (HairClock &c : clocks_)
+		c.used = false;
+}
+
+float Avatar3D::hair_took() const
+{
+	if (took_.empty())
+		return -1;
+	std::vector<float> sorted = took_;
+	std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+	return sorted[sorted.size() / 2];
+}
+
 gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<PropAt> &props,
 			     const std::vector<Other> &others)
 {
 	const bool character = upload(rig);
+	turn_clock();
+	hair_drawn_ = HairDrawn();
+	hair_drawn_.ms = hair_took();
 	// 0.9.0: the others beside it, each onto the graphics card too.
 	struct Drawn {
 		Avatar3D *a;
@@ -1062,13 +1422,18 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 		std::vector<V3> middle; // each part's middle, in the world (a glowing part's depth)
 		bool own_outlines = false;
 		bool main = false;
+		// Hair strands: how many of each strand part's are drawn (none:
+		// it isn't), and whether any are - its stand-in hair is then
+		// left out.
+		std::vector<HairShare> hair;
+		bool strands = false;
 	};
 	std::vector<Drawn> all;
 	static const std::vector<Rig::Part> nothing;
-	all.push_back({this, character ? &rig->parts() : &nothing, {}, {}, false, true});
+	all.push_back({this, character ? &rig->parts() : &nothing, {}, {}, false, true, {}, false});
 	for (const Other &o : others)
 		if (o.avatar && o.avatar != this && o.avatar->effect_ && o.avatar->upload(o.rig))
-			all.push_back({o.avatar, &o.rig->parts(), {}, {}, false, false});
+			all.push_back({o.avatar, &o.rig->parts(), {}, {}, false, false, {}, false});
 	if (!effect_ || !v.w || !v.h || (!character && props.empty() && all.size() < 2))
 		return nullptr;
 
@@ -1112,18 +1477,228 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 				dr.own_outlines = dr.own_outlines || mat.outline != Outline::None;
 	}
 
-	gs_texrender_reset(scene_);
-	if (!gs_texrender_begin(scene_, v.w * k, v.h * k))
-		return nullptr;
-	vec4 clear_colour;
-	vec4_zero(&clear_colour);
-	gs_clear(GS_CLEAR_COLOR | GS_CLEAR_DEPTH, &clear_colour, 1.0f, 0);
-	gs_perspective(v.fov * 180 / 3.14159265f, (float)v.w / v.h, v.near, v.far);
+	// Hair strands: how many of each part's are drawn - what its size on
+	// screen asks for (hair.hpp's hair_share), the hair budget's share of
+	// that, and no more pieces in all than the plan allows.
+	const uint32_t drawn_h = v.h * k;
+	const float budget = clocks_work_ ? budget_.share() : 1.0f;
+	bool any_hair = false;
+	{
+		const float pixel = 2 * std::tan(v.fov / 2) / std::max(1u, drawn_h);
+		// (The pieces of a part's first `count` strands: a strand's are
+		// one fewer than its points.)
+		auto pieces_of = [](const Strands &h, size_t count) {
+			return count < h.first.size() ? (size_t)h.first[count] - count : 0;
+		};
+		size_t pieces = 0;
+		for (Drawn &dr : all) {
+			const std::vector<Rig::Part> &posed = *dr.posed;
+			dr.hair.assign(posed.size(), HairShare());
+			for (size_t i = 0; i < posed.size(); i++) {
+				const Part &part = dr.a->parts_[i];
+				const Rig::Part &p = posed[i];
+				if (!part.strands || !part.vb || !part.ib || part.skin != p.gpu || p.hidden ||
+				    p.collapsed || !p.prim)
+					continue;
+				const Strands &h = p.prim->hair;
+				// (Posed here: those the rig posed, the first of them.)
+				const size_t loaded = p.gpu ? h.strands() : h.strands_in(p.pos.size());
+				dr.hair[i] = hair_share(h, loaded, p.scale, dr.distance[i], pixel, 1.0f,
+							hair_plan_.solid, budget);
+				pieces += pieces_of(h, dr.hair[i].count);
+			}
+		}
+		// Too many pieces in all: every part's threshold as much lower as
+		// brings them under (found by halving).
+		float lower = 1;
+		if (hair_plan_.pieces && pieces > hair_plan_.pieces) {
+			auto count_at = [](const Strands &h, const HairShare &s, float f) {
+				return std::max(std::min<size_t>(s.count, 16),
+						std::min(s.count, h.strands_under(s.upto * f)));
+			};
+			float most = 1;
+			lower = 0;
+			for (int step = 0; step < 20; step++) {
+				const float f = 0.5f * (lower + most);
+				size_t sum = 0;
+				for (const Drawn &dr : all)
+					for (size_t i = 0; i < dr.hair.size(); i++)
+						if (dr.hair[i].count)
+							sum += pieces_of((*dr.posed)[i].prim->hair,
+									 count_at((*dr.posed)[i].prim->hair, dr.hair[i],
+										  f));
+				(sum > hair_plan_.pieces ? most : lower) = f;
+			}
+			for (Drawn &dr : all)
+				for (size_t i = 0; i < dr.hair.size(); i++) {
+					HairShare &s = dr.hair[i];
+					if (!s.count)
+						continue;
+					const Strands &h = (*dr.posed)[i].prim->hair;
+					s.count = count_at(h, s, lower);
+					s.upto = h.threshold_of(s.count);
+				}
+		}
+		for (Drawn &dr : all)
+			for (size_t i = 0; i < dr.hair.size(); i++) {
+				const HairShare &s = dr.hair[i];
+				if (!s.count)
+					continue;
+				const Strands &h = (*dr.posed)[i].prim->hair;
+				dr.strands = any_hair = true;
+				hair_drawn_.in_file += h.in_file;
+				hair_drawn_.loaded += (*dr.posed)[i].gpu ? h.strands()
+									 : h.strands_in((*dr.posed)[i].pos.size());
+				hair_drawn_.drawn += s.count;
+			}
+	}
+	hair_drawn_.share = budget;
+
+	static const Material plain;
+	auto material_of = [&](const Drawn &dr, size_t i) -> const Material & {
+		const int mi = (*dr.posed)[i].prim->material;
+		const Model *m = dr.a->model_.get();
+		return m && mi >= 0 && mi < (int)m->materials.size() ? m->materials[mi] : plain;
+	};
+	// Not hidden by its rig - nor a character's stand-in hair, while its
+	// strands are drawn.
+	auto shows = [&](const Drawn &dr, size_t i) {
+		const Rig::Part &p = (*dr.posed)[i];
+		if (p.hidden || p.collapsed)
+			return false;
+		return !(dr.strands && !dr.a->parts_[i].strands && material_of(dr, i).hair_standin);
+	};
+	// Anything with it put where it goes (the same one may be in several
+	// places: its points are worked out again for each).
+	std::map<Prop3D *, const PropAt *> put_at;
+	auto put = [&](const PropAt &at) {
+		const PropAt *&last = put_at[at.prop];
+		if (last == &at)
+			return;
+		last = &at;
+		for (size_t n = 0; n < at.shapes.size(); n++)
+			at.prop->set_shape((int)n, at.shapes[n]);
+		at.prop->place(at.place, at.opacity);
+	};
 	// The camera's view as OBS's 3D wants it: y down, looking along -z.
 	// The same on Direct3D and OpenGL: OBS's Direct3D turns z round
 	// itself, so turning it here too would put the model behind the
 	// camera.
 	const matrix4 view = obs_matrix(obs_view(v.view));
+	const bool hides_head = character && v.hide_behind_head && head_.vb && head_.ib;
+
+	// Hairs are drawn with no depth test of their own (so that hairs over
+	// one another all show through), and write no depth: first a picture
+	// of every solid part's distance from the camera, which hides the
+	// hairs behind them. Timed on the graphics card, with the hairs: the
+	// hair budget's reading.
+	gs_texture_t *depth_map = nullptr;
+	HairClock *clock = any_hair ? start_clock(budget) : nullptr;
+	int hair_timer = 0; // 0 not started, 1 running, 2 stopped
+	auto stop_clock = [&] {
+		if (!clock)
+			return;
+		if (hair_timer == 0)
+			gs_timer_begin(clock->hair);
+		if (hair_timer < 2)
+			gs_timer_end(clock->hair);
+		gs_timer_range_end(clock->range);
+		clock = nullptr;
+	};
+	if (any_hair) {
+		if (clock)
+			gs_timer_begin(clock->depth);
+		if (!depth_)
+			depth_ = gs_texrender_create(GS_R32F, GS_Z24_S8);
+		if (depth_)
+			gs_texrender_reset(depth_);
+		if (depth_ && gs_texrender_begin(depth_, v.w * k, v.h * k)) {
+			vec4 far_away;
+			vec4_set(&far_away, 1e9f, 0.0f, 0.0f, 1.0f);
+			gs_clear(GS_CLEAR_COLOR | GS_CLEAR_DEPTH, &far_away, 1.0f, 0);
+			gs_perspective(v.fov * 180 / 3.14159265f, (float)v.w / v.h, v.near, v.far);
+			gs_matrix_set(&view);
+			const gs_cull_mode cull = gs_get_cull_mode();
+			gs_set_cull_mode(GS_NEITHER);
+			gs_enable_depth_test(true);
+			gs_depth_function(GS_LESS);
+			// (Written as it is: blended, a distance would be mixed with
+			// the one before.)
+			gs_blend_state_push();
+			gs_enable_blending(false);
+			if (hides_head) {
+				// The hidden head shape: the face's centimetres -> the view.
+				gs_matrix_push();
+				const matrix4 head = obs_matrix(v.head);
+				gs_matrix_mul(&head);
+				const M4 was = cam_;
+				cam_ = v.view * v.head;
+				set_depth_material(plain);
+				cam_ = was;
+				gs_load_vertexbuffer(head_.vb);
+				gs_load_indexbuffer(head_.ib);
+				check_("Depth");
+				while (gs_effect_loop(effect_, "Depth"))
+					gs_draw(GS_TRIS, 0, 0);
+				gs_matrix_pop();
+			}
+			for (Drawn &dr : all)
+				for (size_t i = 0; i < dr.posed->size(); i++) {
+					const Material &mat = material_of(dr, i);
+					if (!shows(dr, i) || dr.a->parts_[i].strands || mat.alpha == AlphaMode::Blend ||
+					    mat.glow)
+						continue;
+					const Rig::Part &p = (*dr.posed)[i];
+					dr.a->set_depth_material(mat);
+					gs_set_cull_mode(cull_of(mat, p.handed));
+					dr.a->draw_part(i, p, p.gpu ? "DepthSk" : "Depth");
+					gs_set_cull_mode(GS_NEITHER);
+				}
+			for (const PropAt &at : props) {
+				if (!at.prop)
+					continue;
+				put(at);
+				draw_prop(*at.prop, v, false, true);
+			}
+			// The hairs' own inner layers too (the hull), each pixel
+			// keeping the nearest: hair well behind another part's hair
+			// is hidden by it, as it is by the part itself.
+			gs_enable_blending(true);
+			gs_blend_function(GS_BLEND_ONE, GS_BLEND_ONE);
+			gs_blend_op(GS_BLEND_OP_MIN);
+			for (Drawn &dr : all)
+				for (size_t i = 0; i < dr.hair.size(); i++)
+					if (dr.hair[i].count)
+						dr.a->draw_hull(i, (*dr.posed)[i], v, drawn_h, dr.hair[i].count);
+			gs_blend_op(GS_BLEND_OP_ADD);
+			gs_blend_state_pop();
+			gs_enable_depth_test(false);
+			gs_set_cull_mode(cull);
+			gs_texrender_end(depth_);
+			depth_map = gs_texrender_get_texture(depth_);
+		}
+		if (clock)
+			gs_timer_end(clock->depth);
+		if (!depth_map) {
+			// (No picture: no hair - its stand-in hair, where it has any.)
+			any_hair = false;
+			for (Drawn &dr : all) {
+				dr.strands = false;
+				dr.hair.assign(dr.hair.size(), HairShare());
+			}
+			hair_drawn_.drawn = 0;
+		}
+	}
+
+	gs_texrender_reset(scene_);
+	if (!gs_texrender_begin(scene_, v.w * k, v.h * k)) {
+		stop_clock();
+		return nullptr;
+	}
+	vec4 clear_colour;
+	vec4_zero(&clear_colour);
+	gs_clear(GS_CLEAR_COLOR | GS_CLEAR_DEPTH, &clear_colour, 1.0f, 0);
+	gs_perspective(v.fov * 180 / 3.14159265f, (float)v.w / v.h, v.near, v.far);
 	gs_matrix_set(&view);
 
 	const gs_cull_mode cull = gs_get_cull_mode();
@@ -1133,7 +1708,7 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 
-	if (character && v.hide_behind_head && head_.vb && head_.ib) {
+	if (hides_head) {
 		gs_matrix_push();
 		const matrix4 head = obs_matrix(v.head);
 		gs_matrix_mul(&head);
@@ -1149,12 +1724,6 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 		gs_matrix_pop();
 	}
 
-	static const Material plain;
-	auto material_of = [&](const Drawn &dr, size_t i) -> const Material & {
-		const int mi = (*dr.posed)[i].prim->material;
-		const Model *m = dr.a->model_.get();
-		return m && mi >= 0 && mi < (int)m->materials.size() ? m->materials[mi] : plain;
-	};
 	// Skin is the main character's (the others' materials aren't in its
 	// list).
 	auto is_skin = [&](const Drawn &dr, size_t i) {
@@ -1166,21 +1735,36 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 		const Material &mat = material_of(dr, i);
 		const bool flat_look = v.look == 3 || (v.look == 0 && mat.shading == Shading::Unlit);
 		const bool sk = (*dr.posed)[i].gpu;
-		if (dr.a->parts_[i].strands)
-			return sk ? "StrandSk" : "Strand";
 		if (dr.a->parts_[i].bumped && v.detail && !flat_look && mat.normal_map.used())
 			return sk ? "DrawBumpedSk" : "DrawBumped";
 		return sk ? "DrawSk" : "Draw";
-	};
-	auto shows = [&](const Drawn &dr, size_t i) {
-		return !(*dr.posed)[i].hidden && !(*dr.posed)[i].collapsed;
 	};
 	// Outlines (only their far side, so they show round the edges), then
 	// the solid parts over them, then the see-through ones far to near.
 	// The outline setting draws one round every part - but a character
 	// with outlines of its own keeps them off the parts it has none on (a
 	// face, its eyes).
-	std::vector<std::pair<size_t, size_t>> blended; // (which of `all`, its part)
+	// What's see-through, drawn last, far to near: a part, all a
+	// character's hair strands, or (while there's hair) the see-through
+	// parts of a thing.
+	struct See {
+		int queue = 0;
+		float distance = 0;
+		size_t w = 0, i = 0; // which of `all`, its part
+		bool hair = false;   // all its hair strands
+		const PropAt *prop = nullptr;
+	};
+	std::vector<See> blended;
+	// A character's hair strands: its strand parts far to near, and each
+	// one's groups of strands (those a bone holds: Strands::groups) far
+	// to near.
+	struct HairPart {
+		size_t i = 0;
+		float distance = 0;
+		std::vector<std::pair<float, int>> groups; // (how far, which)
+		std::vector<int> order;
+	};
+	std::vector<std::vector<HairPart>> hair(all.size());
 	// Outlines with both sides (their near side is left out as they're
 	// drawn), the rest with only the sides their materials show.
 	for (Drawn &dr : all)
@@ -1200,44 +1784,140 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 				continue;
 			const Material &mat = material_of(dr, i);
 			const Rig::Part &p = (*dr.posed)[i];
-			// Hair strands are drawn with the solid parts, however
-			// see-through: their see-through is a share of their pixels.
-			const bool strands = dr.a->parts_[i].strands;
-			if (!strands && (mat.alpha == AlphaMode::Blend || v.opacity < 0.999f)) {
-				blended.push_back({w, i});
+			if (dr.a->parts_[i].strands) {
+				// Hair strands: each group where its bone has it now (posed
+				// on the card: its middle as made, moved by its bone; posed
+				// here: a point near its middle).
+				if (!dr.hair[i].count)
+					continue;
+				const Strands &h = p.prim->hair;
+				const BoneCols *bones = nullptr;
+				if (p.gpu) {
+					auto b = dr.a->bone_cols_.find(p.bones);
+					if (b != dr.a->bone_cols_.end())
+						bones = &b->second;
+				}
+				HairPart part;
+				part.i = i;
+				part.distance = dr.distance[i];
+				for (size_t g = 0; g < h.groups.size(); g++) {
+					const Strands::Group &group = h.groups[g];
+					V3 at = dr.middle[i];
+					if (bones && group.joint >= 0 &&
+					    ((size_t)group.joint + 1) * 16 <= bones->cols.size()) {
+						M4 bone;
+						std::memcpy(bone.m, &bones->cols[(size_t)group.joint * 16],
+							    sizeof(float) * 16);
+						at = point(bone, group.middle);
+					} else if (!p.gpu && group.sample < p.pos.size()) {
+						at = p.pos[group.sample];
+					}
+					part.groups.push_back({-point(v.view, at).z, (int)g});
+				}
+				std::stable_sort(part.groups.begin(), part.groups.end(),
+						 [](const std::pair<float, int> &a, const std::pair<float, int> &b) {
+							 return a.first > b.first;
+						 });
+				for (const auto &g : part.groups)
+					part.order.push_back(g.second);
+				if (hair[w].empty()) {
+					// (Its place among what's see-through: its first strand
+					// part's.)
+					See s;
+					s.queue = mat.queue;
+					s.distance = dr.distance[i];
+					s.w = w;
+					s.hair = true;
+					blended.push_back(s);
+				}
+				hair[w].push_back(std::move(part));
+				continue;
+			}
+			if (mat.alpha == AlphaMode::Blend || v.opacity < 0.999f) {
+				See s;
+				s.queue = mat.queue;
+				s.distance = dr.distance[i];
+				s.w = w;
+				s.i = i;
+				blended.push_back(s);
 				continue;
 			}
 			dr.a->part_distance_ = dr.distance[i];
 			dr.a->set_material(mat, v, false, is_skin(dr, i), sides_shown(mat, p.handed) == Sides::Front);
-			if (strands)
-				dr.a->set_strand(v, v.w * k, v.h * k);
-			gs_set_cull_mode(strands ? GS_NEITHER : cull_of(mat, p.handed));
+			gs_set_cull_mode(cull_of(mat, p.handed));
 			dr.a->draw_part(i, p, technique_of(dr, i));
 			gs_set_cull_mode(GS_NEITHER);
 		}
 	}
-	// Anything with it, each put where it goes (the same one may be in
-	// several places): its solid parts, then its see-through ones.
+	// Anything with it: its solid parts, then its see-through ones - with
+	// hair in the picture, those in their turn with the rest that's
+	// see-through (hairs aren't hidden by what's see-through: a thing
+	// fading away in front of a beard is drawn after it).
 	for (const PropAt &at : props) {
 		if (!at.prop)
 			continue;
-		for (size_t n = 0; n < at.shapes.size(); n++)
-			at.prop->set_shape((int)n, at.shapes[n]);
-		at.prop->place(at.place, at.opacity);
+		put(at);
 		draw_prop(*at.prop, v, false);
-		draw_prop(*at.prop, v, true);
+		if (!any_hair) {
+			draw_prop(*at.prop, v, true);
+			continue;
+		}
+		See s;
+		s.distance = -point(v.view, point(at.place, (at.prop->low() + at.prop->high()) * 0.5f)).z;
+		s.prop = &at;
+		blended.push_back(s);
 	}
-	std::stable_sort(blended.begin(), blended.end(),
-			 [&](const std::pair<size_t, size_t> &a, const std::pair<size_t, size_t> &b) {
-				 const int qa = material_of(all[a.first], a.second).queue,
-					   qb = material_of(all[b.first], b.second).queue;
-				 if (qa != qb)
-					 return qa < qb;
-				 return all[a.first].distance[a.second] > all[b.first].distance[b.second];
-			 });
-	for (const auto &bi : blended) {
-		Drawn &dr = all[bi.first];
-		const size_t i = bi.second;
+	std::stable_sort(blended.begin(), blended.end(), [](const See &a, const See &b) {
+		if (a.queue != b.queue)
+			return a.queue < b.queue;
+		return a.distance > b.distance;
+	});
+	size_t last_hair = blended.size();
+	for (size_t at = 0; at < blended.size(); at++)
+		if (blended[at].hair)
+			last_hair = at;
+	for (size_t at = 0; at < blended.size(); at++) {
+		const See &s = blended[at];
+		if (s.prop) {
+			put(*s.prop);
+			draw_prop(*s.prop->prop, v, true);
+			continue;
+		}
+		Drawn &dr = all[s.w];
+		if (s.hair) {
+			// All its hair strands, a layer at a time from the roots out
+			// (the tips lie over the roots), and in each layer the far
+			// parts and groups first. Both sides, no depth test (the
+			// picture of the solid parts' distances hides them).
+			std::vector<HairPart> &parts = hair[s.w];
+			std::stable_sort(parts.begin(), parts.end(),
+					 [](const HairPart &a, const HairPart &b) { return a.distance > b.distance; });
+			size_t layers = 0;
+			for (const HairPart &part : parts)
+				layers = std::max<size_t>(layers, (size_t)(*dr.posed)[part.i].prim->hair.layers);
+			if (clock && hair_timer == 0) {
+				gs_timer_begin(clock->hair);
+				hair_timer = 1;
+			}
+			gs_set_cull_mode(GS_NEITHER);
+			gs_enable_depth_test(false);
+			for (size_t layer = 0; layer < layers; layer++)
+				for (const HairPart &part : parts) {
+					const Rig::Part &p = (*dr.posed)[part.i];
+					dr.a->part_distance_ = part.distance;
+					dr.a->set_material(material_of(dr, part.i), v, false, false, false);
+					dr.a->set_strand(v, drawn_h, dr.hair[part.i].upto, p.scale, depth_map);
+					dr.a->draw_strands(part.i, p, part.order, layer, dr.hair[part.i].count,
+							   p.gpu ? "StrandSk" : "Strand", hair_drawn_);
+				}
+			gs_enable_depth_test(true);
+			if (clock && hair_timer == 1 && at >= last_hair) {
+				gs_timer_end(clock->hair);
+				hair_timer = 2;
+			}
+			continue;
+		}
+		const size_t i = s.i;
 		const Material &mat = material_of(dr, i);
 		const Rig::Part &p = (*dr.posed)[i];
 		dr.a->part_distance_ = dr.distance[i];
@@ -1257,6 +1937,7 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 		}
 		gs_set_cull_mode(GS_NEITHER);
 	}
+	stop_clock();
 
 	gs_blend_state_pop();
 	gs_enable_depth_test(false);

@@ -121,6 +121,11 @@ struct Material {
 	// (data/effects/direbot-face-3d.effect).
 	bool glow = false;
 	float glow_soft = 1.5f, glow_ragged = 0;
+	// Stand-in hair (glTF's extras.direbot.hair_standin: true): strips,
+	// shells or pictures a character wears where its file also has real
+	// hair strands. Drawn only while its strands aren't (the "today's
+	// style" hair setting, or a file loaded with no strands).
+	bool hair_standin = false;
 };
 
 // Which of a part's sides are drawn (glTF's front and back): both, its
@@ -146,6 +151,96 @@ struct MorphTarget {
 	V3 pos_of(uint32_t v) const;
 };
 
+// A part's hair strands (a glTF LINES or LINE_STRIP part), made ready to
+// draw. The part's points (Primitive::pos, each once), its strands back to
+// back from root to tip, in the order they're drawn in: strand 0 first,
+// and however few are drawn they're spread evenly over the coat (so hair
+// thins by drawing only the first so many, each a little wider). A big
+// groom is kept only as far as the points allowed (LoadOptions): the
+// file's first strands in that order, each with the points that shape it
+// (points on a straight stretch left out).
+//
+// Not every hair is worth as much. Where the coat is thin - short fur
+// over the skin, a muzzle, the edge of a beard - each hair shows, and a
+// few wide ones in their place look like string. Where it's deep, the
+// hairs under the top ones only fill. So each strand has a `rate`: 1
+// where the coat is thinnest, less the deeper it is there (never under
+// 1 / LoadOptions::strand_uneven), and a `key`: its place among the
+// file's strands (0 to 1, evenly spread) / its rate. The draw order is
+// by key, and the strands drawn are those with keys under a threshold
+// t: min(1, t x rate) of the hairs everywhere, each drawn as much wider.
+// So thinning takes from the deep coat first, down to its rate, and then
+// from all of it alike. A coat the same all over: every rate 1, its keys
+// its strands' places, t the share drawn.
+struct Strands {
+	uint32_t in_file = 0;        // how many strands the file has
+	std::vector<uint32_t> first; // strand s: points first[s] up to first[s + 1] (one more entry than strands)
+	std::vector<float> width;    // a point: its width (the file's _WIDTH, its units; 0.0001 if none)
+	std::vector<float> along;    // a point: how far along its strand (0 root, 1 tip)
+	std::vector<uint8_t> colour; // 4 a point, sRGB (empty: none)
+	std::vector<float> key;      // a strand: where it comes in the draw order (they rise; under 4)
+	std::vector<float> rate;     // a strand: 0.25 to 1, one of RATES steps (rate_of)
+	// The threshold all its kept strands are drawn at: the key of the
+	// file's first strand not kept (all kept: 1 / its lowest rate).
+	float full = 1;
+	// Its hairs' width along their lengths, as drawn at `full` (a strand
+	// of whose neighbours only a share are kept: that much wider).
+	float mean_width = 0;
+	size_t strands() const { return first.empty() ? 0 : first.size() - 1; }
+	// How many of its strands (the first of them) lie wholly in its first
+	// `points` points.
+	size_t strands_in(size_t points) const;
+	// How many of its strands (the first of them) have keys under
+	// `threshold`, and the threshold its first `count` strands are drawn
+	// at.
+	size_t strands_under(float threshold) const;
+	float threshold_of(size_t count) const;
+	// A rate as kept (and as the graphics card is told it): the nearest
+	// of RATES steps from 0.25 to 1.
+	static constexpr int RATES = 64;
+	static int rate_step(float rate);
+	static float rate_of(int step) { return 0.25f + 0.75f * (float)step / (float)(RATES - 1); }
+
+	// The order its pieces are drawn in (a piece: two triangles from one
+	// point to the next of its strand). Hairs are see-through, so they're
+	// blended from the back: by `groups` - the strands that hang from one
+	// bone, far groups first (worked out each frame) - and inside a group
+	// by `layers`, the pieces nearest their roots first (a coat's tips lie
+	// over its roots), and inside a layer by strand, so the first so many
+	// strands' pieces are the start of each run.
+	struct Group {
+		int joint = 0;       // its skin's joint (no bones: 0)
+		V3 middle;           // its strands' middle, as made
+		uint32_t sample = 0; // a point near it
+		// How far from their roots its inner layers (the first `core` of
+		// them) reach, in its file's units: where its outer layers'
+		// pieces start, or where the inner ones' end on average (hairs
+		// of a piece or two), whichever is further.
+		float reach = 0;
+	};
+	std::vector<Group> groups;
+	int layers = 0;
+	// The inner layers: the hull, which hides hair well behind it (the
+	// drawing's; none with a single layer).
+	int core = 0;
+	std::vector<uint32_t> pieces; // each: the point it starts at
+	// groups x layers runs of `pieces`, a group's layers back to back:
+	// run g * layers + l is pieces runs[g * layers + l] up to the next.
+	std::vector<uint32_t> runs;
+	// How many of a run's pieces belong to the first `count` strands.
+	uint32_t pieces_of(size_t run, size_t count) const;
+
+	// Expressions (the mesh's morph targets) move hair with the skin it
+	// grows from: each point follows one of up to MOST_ANCHORS spots
+	// (anchor[point], 0: it never moves), and expression k moves spot a by
+	// moves[k][a] at full strength. Points close together that an
+	// expression moves alike share a spot.
+	static constexpr size_t MOST_ANCHORS = 2047;
+	std::vector<uint16_t> anchor;       // a point (empty: none move)
+	std::vector<std::vector<V3>> moves; // an expression: each spot's move (spot 0: none)
+	size_t anchors() const { return moves.empty() ? 0 : moves[0].size(); }
+};
+
 struct Primitive {
 	std::vector<V3> pos, normal;  // normal: made from the triangles if the file has none
 	std::vector<float> uv;        // 2 a point (empty: none)
@@ -161,16 +256,14 @@ struct Primitive {
 	// out from its UVs (tangents_of).
 	std::vector<float> tangent;
 	bool own_tangents = false; // its tangents are the file's (not worked out)
-	// Hair strands (a glTF LINES or LINE_STRIP part): each point of the
-	// file's strands is here twice, its two sides (uv x 0 and 1, uv y how
-	// far along its strand, 0 root to 1 tip), and each piece between two
-	// points two triangles - drawn by the effect's Strand technique, which
-	// spreads the two sides apart facing the camera. `normal` is the way
-	// its strand runs there (bones turn it as they turn a facing).
+	// Hair strands (a glTF LINES or LINE_STRIP part): `pos` its strands'
+	// points (see Strands), `normal` the way its strand runs at each
+	// (bones turn it as they turn a facing), `joints` and `weights` each
+	// point's; no uv, colour (hair.colour), index (hair.pieces) or morphs
+	// (hair.moves). Drawn by the effect's Strand technique, each piece a
+	// ribbon facing the camera.
 	bool strands = false;
-	// 2 a point with strands: its width (the file's _WIDTH, its units;
-	// 0.0001 if none) and a number 0 to 1 for its own strand.
-	std::vector<float> strand;
+	Strands hair;
 };
 // A part's tangents worked out from its points, facings and UVs with
 // MikkTSpace, as glTF asks (its UVs' v going down the picture, a normal
@@ -326,6 +419,49 @@ struct Model {
 	// Its size standing as it is (no expressions, bones at rest).
 	V3 low, high;
 	size_t points = 0, triangles = 0;
+	// Its hair strands: how many its file has, those kept (LoadOptions)
+	// and their points; and whether it wears stand-in hair too
+	// (Material::hair_standin).
+	size_t strands_in_file = 0, strands = 0, strand_points = 0;
+	bool hair_standins = false;
+};
+
+// How a file is loaded.
+struct LoadOptions {
+	// Hair strands: the most points kept, all its strand parts together
+	// (the first strands of each in their draw order, a part's share by
+	// its size). 0: none - but a character with no stand-in hair
+	// (Material::hair_standin) to wear instead keeps `strand_points_bare`.
+	size_t strand_points = 2'000'000;
+	size_t strand_points_bare = 800'000;
+	// A strand's points that bend it less than this share of the
+	// character's size are left out (0: all kept).
+	float strand_bend = 0.0003f;
+	// ...unless the strand turns more than this many degrees between the
+	// points kept either side (a curl stays round; 0: no such limit).
+	float strand_turn = 20.0f;
+	// ...unless its bones could bend the strand more than this share of
+	// the character's size there (a straight hair on a chain of bones
+	// keeps enough points to swing in a curve).
+	float strand_swing = 0.004f;
+	// How many layers each group of strands is drawn in (Strands::layers).
+	int strand_layers = 5;
+	// When not every strand can be kept, which are (Strands::rate): hair
+	// that covers its skin up to `strand_cover` times over (its hairs'
+	// own widths x lengths, over the skin they grow from) is kept first,
+	// deeper hair less - as much less as it's deeper, down to
+	// 1 / `strand_uneven` of the thin hair's share (1: all alike; at
+	// most 4).
+	float strand_cover = 1.5f;
+	float strand_uneven = 3.0f;
+	bool operator==(const LoadOptions &o) const
+	{
+		return strand_points == o.strand_points && strand_points_bare == o.strand_points_bare &&
+		       strand_bend == o.strand_bend && strand_turn == o.strand_turn && strand_swing == o.strand_swing &&
+		       strand_layers == o.strand_layers && strand_cover == o.strand_cover &&
+		       strand_uneven == o.strand_uneven;
+	}
+	bool operator!=(const LoadOptions &o) const { return !(*this == o); }
 };
 
 // A channel at `t` seconds (before its first key: its first; after its
@@ -336,10 +472,11 @@ int animation_named(const Model &m, const std::string &name);
 
 // Loads a .glb, .vrm or .gltf (with its files beside it). False, with why
 // in plain words, if it can't.
-bool load_model(const std::string &path, Model &out, std::string *problem = nullptr);
+bool load_model(const std::string &path, Model &out, std::string *problem = nullptr,
+		const LoadOptions &options = LoadOptions());
 // From memory: `folder` is where a .gltf's other files are ("" for none).
 bool load_model(const uint8_t *bytes, size_t size, const std::string &folder, Model &out,
-		std::string *problem = nullptr);
+		std::string *problem = nullptr, const LoadOptions &options = LoadOptions());
 
 // A skin's dangly parts: every line of bones, parent to child, that
 // hangs off the rest of it and ends free - a chain of links (all of

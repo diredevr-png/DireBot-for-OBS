@@ -33,6 +33,7 @@ obsws = pytest.importorskip("obsws_python")
 
 from test_real_face import (PretendPhone, PretendVmcApp, arms_character, camera_picture,  # noqa: E402
                             character_picture, middle_of, read_bmp, unity_turn, write_gif)
+from test_real_hair import LIFT, hair_character, magenta, per_metre, settles, top_of, yellow  # noqa: E402
 from test_real_obs import VERSION, free_port, vendor, wait_for  # noqa: E402
 
 ROOT = os.environ.get("DIREBOT_OBS_ROOT", "")
@@ -462,6 +463,171 @@ def test_posed_on_the_graphics_card(obs):
     finally:
         try:
             c.send("RemoveInput", {"inputName": "Posed"}, raw=True)
+        except Exception:
+            pass
+        c.disconnect()
+
+
+def test_hair_strands_on_the_graphics_card(obs):
+    """Hair and fur work: a character with hair strands on Windows
+    (Direct3D). Its strands are posed on the graphics card (the -skin
+    effect: by its bones, and by its expression's spots) and look the same
+    as posed by the CPU - at rest, with its expression showing (the hair
+    on its head lifted) and with its neck tipped over (its own animation,
+    holding still). FaceGetState says how many are kept and drawn; the
+    hair budget, far too small, brings the share drawn down to its least
+    by the graphics card's own clock, and none lets them all back; the
+    hair detail setting keeps its strands for Light and wears its stand-in
+    hair for Today."""
+    figure = os.path.join(obs.home, "hair.vrm")
+    strands = hair_character(figure, standin=True)
+    c = obs.client()
+
+    def st():
+        return vendor(c, "FaceGetState", {"source": "Hair"})["model"]
+
+    def hair():
+        return st()["hair"]
+
+    def change(**settings):
+        c.send("SetInputSettings", {"inputName": "Hair", "inputSettings": settings}, raw=True)
+
+    def reloaded():
+        """After a change that loads its file again: wait for it."""
+        time.sleep(0.5)
+        assert wait_for(lambda: not st()["loading"] and st()["shown"], 60, 0.1), (st(), obs.log())
+        time.sleep(0.8)
+
+    def cue(**data):
+        return vendor(c, "FaceReact", {"source": "Hair", **data})
+
+    def poses():
+        """Its picture at rest, with its expression showing, and with its
+        neck tipped over."""
+        out = {}
+        time.sleep(0.8)
+        out["rest"] = shot(c, "Hair")
+        answer = cue(do="face", face="happy", seconds=60)
+        assert answer["ok"] and answer["shows"], answer
+        assert wait_for(lambda: st()["expressions"].get("happy", 0) >= 0.99, 10, 0.05), st()["expressions"]
+        time.sleep(0.5)
+        out["lifted"] = shot(c, "Hair")
+        assert cue(do="stop")["ok"]
+        assert wait_for(lambda: st()["expressions"].get("happy", 0) == 0, 10, 0.05), st()["expressions"]
+        change(animation="Tilt")
+        assert wait_for(lambda: st()["animation"] == "Tilt", 10, 0.1), st()
+        time.sleep(0.8)
+        out["tilted"] = shot(c, "Hair")
+        change(animation="")
+        assert wait_for(lambda: st()["animation"] == "", 10, 0.1), st()
+        return out
+
+    def pixels(rows, test):
+        return sum(1 for row in rows for px in row if test(px))
+
+    def unlike(a, b):
+        assert len(a) == len(b) and len(a[0]) == len(b[0])
+        return sum(1 for a_row, b_row in zip(a, b) for x, y in zip(a_row, b_row)
+                   if max(abs(int(p) - int(q)) for p, q in zip(x, y)) > 24)
+    try:
+        c.send("CreateScene", {"sceneName": "Hair scene"}, raw=True)
+        # (Smaller than its spot, so there's room over its head for its
+        # hair to lift into; the hair budget off, so the same picture comes
+        # every time.)
+        c.send("CreateInput", {"sceneName": "Hair scene", "inputName": "Hair",
+                               "inputKind": "direbot_face_avatar",
+                               "inputSettings": {"model": figure, "width": 200, "height": 200,
+                                                 "size": 60, "framing": "whole", "style": "drawn",
+                                                 "mirror": False, "smoothing": 0, "breathing": 0,
+                                                 "sway": 0, "eye_moves": False,
+                                                 "hair_budget_ms": 0}}, raw=True)
+        c.send("SetCurrentProgramScene", {"sceneName": "Hair scene"}, raw=True)
+        assert wait_for(lambda: st()["shown"], 60, 0.2), obs.log()
+        assert wait_for(lambda: st()["on_card"], 10, 0.1), (st(), obs.log())
+        assert wait_for(lambda: hair()["drawn"] > 0, 10, 0.1), (hair(), obs.log())
+        time.sleep(0.5)
+        h = hair()
+        print("\nHair on the card: %s" % h)
+        assert h["detail"] == "full" and h["standin"] and h["strands"] == strands, h
+        assert h["loaded"] == strands and h["shown_strands"] == strands and h["shown_loaded"] == strands, h
+        assert h["drawn"] == strands and h["pieces"] > strands and h["draws"] > 0, h
+        assert h["share"] == 1 and h["budget_ms"] == 0, h
+        log = obs.log()
+        assert "3D effect" not in log and "Windows won't draw" not in log, log
+
+        # Posed on the card: at rest, its expression, its neck tipped.
+        card = poses()
+        metre = per_metre(card["rest"])
+        up = top_of(card["rest"], magenta) - top_of(card["lifted"], magenta)
+        print("Its expression on the card: the top of its hair up %d pixels (%.3f m; the file says %s)"
+              % (up, up / metre, LIFT))
+        assert abs(up / metre - LIFT) < 0.03, (up, metre)
+        assert unlike(card["tilted"], card["rest"]) > 300, unlike(card["tilted"], card["rest"])
+        for name, rows in card.items():
+            assert pixels(rows, magenta) > 600 and pixels(rows, yellow) == 0, (name, pixels(rows, magenta))
+
+        # The hair budget, by the graphics card's own clock: far too
+        # small, the share drawn falls to its least and no further (still
+        # over, it stays there), and the count with it; none, all of them
+        # again.
+        assert wait_for(lambda: hair()["ms"] >= 0, 10, 0.1), \
+            ("the graphics card's clock never answered", hair(), obs.log())
+        change(hair_budget_ms=0.001)
+        assert wait_for(lambda: hair()["share"] < 0.5, 20, 0.05), (hair(), obs.log())
+        least = settles(lambda: hair()["share"])
+        h = hair()
+        print("A hair budget far too small: its least share %s: %s" % (least, h))
+        assert least is not None and 0 < least < 0.25, (h, obs.log())
+        assert h["share"] == least and h["ms"] > h["budget_ms"], h
+        assert h["loaded"] == strands and 16 <= h["drawn"] < 0.25 * strands, h
+        assert abs(h["drawn"] - least * strands) <= 0.02 * strands, (h, least)
+        change(hair_budget_ms=0)
+        assert wait_for(lambda: hair()["share"] == 1 and hair()["drawn"] == strands, 10, 0.1), hair()
+
+        # The hair detail setting: Light keeps its strands (all of so few),
+        # Today wears its stand-in hair instead, Full brings them back.
+        change(hair_detail="light")
+        reloaded()
+        h = hair()
+        assert h["detail"] == "light" and h["loaded"] == strands and h["drawn"] == strands, h
+        assert st()["on_card"] and pixels(shot(c, "Hair"), magenta) > 600
+        change(hair_detail="today")
+        reloaded()
+        h = hair()
+        assert h["detail"] == "today" and h["strands"] == strands, h
+        assert h["loaded"] == 0 and h["drawn"] == 0 and h["pieces"] == 0 and h["shown_strands"] == 0, h
+        rows = shot(c, "Hair")
+        assert pixels(rows, magenta) == 0 and pixels(rows, yellow) > 150, (pixels(rows, magenta),
+                                                                          pixels(rows, yellow))
+        change(hair_detail="full")
+        reloaded()
+        assert wait_for(lambda: hair()["drawn"] == strands, 10, 0.1), hair()
+        assert hair()["loaded"] == strands and st()["on_card"], (hair(), st())
+        time.sleep(0.5)
+        again = unlike(shot(c, "Hair"), card["rest"])
+        assert again <= 20, again
+
+        # Posed by the CPU: the same pictures.
+        change(card_posing=False)
+        assert wait_for(lambda: not st()["on_card"], 10, 0.1), st()
+        reloaded()
+        assert wait_for(lambda: hair()["drawn"] == strands, 10, 0.1), hair()
+        cpu = poses()
+        for name in ("rest", "lifted", "tilted"):
+            drawn = sum(1 for row in cpu[name] for px in row if max(px) > 40)
+            off = unlike(card[name], cpu[name])
+            print("Hair posed on the card vs by the CPU, %s: %d of %d pixels differ (%d drawn, %d of hair)"
+                  % (name, off, len(cpu[name]) * len(cpu[name][0]), drawn, pixels(cpu[name], magenta)))
+            assert drawn > 1500 and pixels(cpu[name], magenta) > 600, (name, drawn)
+            assert off <= max(20, drawn // 100), (name, off)
+        log = obs.log()
+        assert "3D effect" not in log and "Windows won't draw" not in log, log
+        # Back on the card.
+        change(card_posing=True)
+        assert wait_for(lambda: st()["on_card"], 10, 0.1), st()
+    finally:
+        try:
+            c.send("RemoveInput", {"inputName": "Hair"}, raw=True)
         except Exception:
             pass
         c.disconnect()

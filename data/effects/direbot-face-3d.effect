@@ -10,12 +10,18 @@
 //            its far side drawn, so it shows round the edge
 //   Hidden   the hidden head shape: only depth, so what's behind your
 //            head is hidden
-//   Strand   hair strands (a file's lines: model.hpp's Primitive::strands),
-//            each piece a thin ribbon turned to face the camera, at least
-//            `strand.y` pixels wide (thinner hairs cover as much of their
-//            pixels as they would: some of the pixels drawn, at random),
-//            lit as hair is: across its length, with a white shine and a
-//            coloured one from inside it
+//   Strand   hair strands (a file's lines: model.hpp's Strands), each
+//            piece a thin ribbon turned to face the camera, at least
+//            `strand.y` pixels wide - a thinner hair is as see-through as
+//            it's thinner, so many of them over one another blend smoothly
+//            (drawn from the back: avatar3d.cpp). Only the first share of
+//            a part's strands is sent (`strand_lod.x`), each as much wider
+//            as makes up for the rest. Lit as hair is - across its length,
+//            with a white shine and a coloured one from inside it - at
+//            its points, and hidden where a solid part is in front by the
+//            picture of their depths (`depth_map`: hairs write no depth)
+//   Depth    a solid part's distance from the camera, for that picture
+//   Hull     the inner layers of the hairs into that picture too
 //   Down     the picture drawn twice the size, halved: smooth edges
 // Points come already moved by the bones and expressions, in the world;
 // `cam` takes them to the camera's view (x right, y up, looking along -z)
@@ -56,11 +62,17 @@ uniform float4 gas;
 // itself or the puffs drawn before it (OBS can't draw without writing
 // depth); w 0: as they are.
 uniform float4 flat_at;
-// Strand: where the camera is (the world), and how wide one pixel is
-// a unit away (x), the thinnest a hair is drawn (y, pixels), the picture's
-// size in pixels (zw).
+// Strand: where the camera is (the world); `strand`: how wide one pixel
+// is a unit from the camera (x), the thinnest a hair is drawn, in pixels
+// (y), how much bigger its bones make it (z: its widths are the file's)
+// and how far behind a solid part its root still shows (w: it sits on the
+// skin); `strand_lod`: the threshold its strands are drawn up to (x: the
+// ones whose keys are under it), and (Hull) how much further off than it
+// is a hair of the hull is written (y).
 uniform float3 eye_pos;
 uniform float4 strand;
+uniform float4 strand_lod;
+uniform texture2d depth_map;
 // Outline: how far out (world units), its colour, how much it's lit.
 uniform float outline_width;
 uniform float4 outline_colour;
@@ -263,6 +275,11 @@ float4 shade_point(float2 uv, float4 vcol, float3 V, float3 N, float3 Ng)
 	float alpha = base.a * look.w;
 	if (surface.z > 0.0 && base.a < surface.z)
 		discard;
+	// A see-through part's empty pixels (none of its picture or points
+	// there: a hair card's gaps) aren't drawn at all, so they don't hide
+	// what's behind them.
+	if (surface.w >= 0.5 && saturate(tex.a * vcol.a) * look.w < 0.004)
+		discard;
 	if (surface.w < 0.5)
 		alpha = look.w;
 	float3 glow = emissive * lin(glow_tex.rgb);
@@ -404,128 +421,232 @@ float4 PSHidden(VertOut v) : TARGET
 	return float4(0.0, 0.0, 0.0, 0.0);
 }
 
-// Hair strands: see Strand at the top. Its points come twice, its two
-// sides (uv.x 0 and 1); uv.y how far along its strand (0 root, 1 tip);
-// `ws` its width (world units) and its strand's own number (0 to 1). The
-// facing (NORMAL) is the way the strand runs.
+// A solid part's distance from the camera (the picture hairs are hidden
+// by): its cut-out pixels left out, as they are when it's drawn.
+float4 PSDepth(VertOut v) : TARGET
+{
+	float4 tex = base_map.Sample(wrapSampler, v.uv);
+	if (surface.z > 0.0 && base_colour.a * tex.a * v.col.a < surface.z)
+		discard;
+	return float4(-v.vpos.z, 0.0, 0.0, 1.0);
+}
+
+// Hair strands: see Strand at the top. Each point comes twice, its two
+// sides: `pos.w` + or - (which side) 1 and its strand's key and rate as
+// one whole number (strand_share takes it apart); `norm` the way its strand
+// runs (xy: folded onto a square, oct_dir unfolds it), its width (z, the
+// file's units) and (w) its expression spot's number plus how far along
+// its strand it is (0 root to 0.9995 tip).
 struct StrandIn {
 	float4 pos  : POSITION;
 	float4 norm : NORMAL;
 	float4 col  : COLOR;
-	float2 uv   : TEXCOORD0;
-	float2 ws   : TEXCOORD1;
 };
 
+// lit: what its picture's colour is multiplied by (rgb) and how much of
+// its pixels it covers (a); shine: added on top; uv: where its pictures
+// are read (x its strand's own number, y how far along), which side of
+// the ribbon (z, -1 to 1) and how much it's rounded across (w: a hair
+// wider than a pixel or two); depth: its distance from the camera.
 struct StrandOut {
-	float4 pos  : POSITION;
-	float4 col  : COLOR;
-	float2 uv   : TEXCOORD0;
-	float3 vpos : TEXCOORD1;
-	float3 vtan : TEXCOORD2;
-	float4 clip : TEXCOORD3;
-	float2 cs   : TEXCOORD4;
+	float4 pos   : POSITION;
+	float4 lit   : TEXCOORD0;
+	float3 shine : TEXCOORD1;
+	float4 uv    : TEXCOORD2;
+	float  depth : TEXCOORD3;
 };
 
-StrandOut strand_out(float3 pos, float3 norm, float4 col, float2 uv, float2 ws)
+float3 oct_dir(float2 e)
+{
+	float3 n = float3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+	float t = max(-n.z, 0.0);
+	n.x += n.x >= 0.0 ? -t : t;
+	n.y += n.y >= 0.0 ? -t : t;
+	return normalize(n);
+}
+
+// A strand's `order`: its key in steps of 1 / 32768 (under 131072 of
+// them) and its rate's step (0 to 63: 0.25 to 1) x 131072. Its key says
+// where it comes in the draw order: the strands drawn are the ones whose
+// keys are under the threshold (strand_lod.x), the last tenth of them
+// thinning away, so none pops in or out as the threshold changes. Its
+// rate says how much of the hair round it that draws: threshold x rate
+// of it (all of it at 1 and over) - thin fur at a higher rate than deep,
+// so the deep coat is thinned first. Each hair is drawn as much wider as
+// makes up for the ones left out. Returns its key (x), how much of it is
+// left where it's thinning away (y), the share of the hair round it
+// that's drawn (z) and how much wider it's drawn for that (w).
+float4 strand_share(float order)
+{
+	float level = floor(order / 131072.0);
+	float key = (order - level * 131072.0) / 32768.0;
+	float rate = 0.25 + 0.75 * level / 63.0;
+	float upto = max(strand_lod.x, 0.000001);
+	float fade = saturate((upto - key) / (upto * 0.1));
+	// (How much of its hair that leaves, with the thinning ones counted
+	// for what's left of them.)
+	float a = upto * rate;
+	float left = 0.95 * a;
+	if (a > 1.0)
+		left = a >= 1.1111111 ? 1.0 : 0.9 * a + (0.01 * a * a - (a - 1.0) * (a - 1.0)) / (0.2 * a);
+	return float4(key, fade, min(a, 1.0), fade / left);
+}
+
+StrandOut strand_out(float3 pos, float3 run, float4 col, float width, float along, float order, float side)
 {
 	StrandOut o;
 	float3 P = pos;
-	float3 T = normalize(norm);
+	float3 T = normalize(run);
 	float3 E = eye_pos - P;
 	float d = max(length(E), 0.0001);
 	float3 S = cross(T, E / d);
 	float sl = length(S);
 	S = sl > 0.00001 ? S / sl : normalize(cross(T, float3(0.0, 1.0, 0.001)));
-	// As wide as it is, but never thinner than strand.y pixels: then it
-	// covers only its share of them (cs.x).
-	float w = max(ws.x, 0.0);
-	float wd = max(w, d * strand.x * strand.y);
-	float side = uv.x * 2.0 - 1.0;
+	// (Only some of the strands are drawn, each as much wider.)
+	float4 drawn = strand_share(order);
+	float w = max(width, 0.0) * strand.z * drawn.w;
+	// As wide as that, but never thinner than strand.y pixels: then it
+	// covers only its share of them.
+	float px = d * strand.x;
+	float wd = max(w, px * strand.y);
 	P = P + S * (side * wd * 0.5);
 	o.pos = mul(float4(P, 1.0), ViewProj);
-	o.clip = o.pos;
-	o.col = col;
-	o.uv = uv;
-	o.vpos = mul(float4(P, 1.0), cam).xyz;
-	o.vtan = mul(float4(T, 0.0), cam).xyz;
-	o.cs = float2(wd > 0.0 ? w / wd : 0.0, ws.y);
+	float3 vpos = mul(float4(P, 1.0), cam).xyz;
+	o.depth = -vpos.z;
+	float t = saturate(along);
+	// Its strand's own number, 0 to 1, as good as random.
+	float seed = frac(sin(drawn.x * 12345.678 + 0.5) * 43758.5453);
+	// How much of its pixels it covers: thinner than drawn, its tip
+	// fading, its material's and points' see-through, the whole avatar's.
+	float cover = (wd > 0.0 ? w / wd : 0.0) * saturate(base_colour.a * col.a) * saturate((1.0 - t) * 10.0) * look.w;
+	float wide = saturate(wd / max(px, 0.0000001) - 1.5);
+
+	float3 V = normalize(-vpos);
+	float3 Tv = normalize(mul(float4(T, 0.0), cam).xyz);
+	float bl = length(cross(Tv, V));
+	// Its facing: the middle of the hair, towards the camera.
+	float3 F = V - Tv * dot(Tv, V);
+	float fl = length(F);
+	float3 N = fl > 0.00001 ? F / fl : V;
+	// Each hair's a little lighter or darker than the next - less so the
+	// fewer are drawn: a hair drawn wide stands for several, their mix.
+	float3 tint = base_colour.rgb * lin(col.rgb) * (1.0 + (frac(seed * 13.7) - 0.5) * 0.24 * sqrt(drawn.z));
+	float3 lit = tint;
+	float3 shine = float3(0.0, 0.0, 0.0);
+	if (look.x < 1.5) {
+		float3 L = key_dir;
+		float3 L2 = fill_dir;
+		// Lit across its length (Kajiya-Kay), softened round its back.
+		float tl = dot(Tv, L), tl2 = dot(Tv, L2);
+		float across = sqrt(saturate(1.0 - tl * tl)), across2 = sqrt(saturate(1.0 - tl2 * tl2));
+		float wrap = saturate(dot(N, L) * 0.6 + 0.4), wrap2 = saturate(dot(N, L2) * 0.6 + 0.4);
+		float3 ambient = lerp(room_down, room_up, N.y * 0.5 + 0.5);
+		if (look.x > 0.5) {
+			float l = saturate((across * wrap - 0.4) * 6.0);
+			lit = tint * (lerp(0.55, 1.0, l) * key_tint + 0.12 * room_tint);
+		} else {
+			lit = tint * (ambient + key_colour * (across * wrap) + fill_colour * (across2 * wrap2));
+			// Two shines (Marschner's, as games draw them): white off its
+			// surface, tilted towards the tip; and its own colour from
+			// inside it, broader and tilted towards the root. Each hair's
+			// a little different.
+			float rough = saturate(surface.y);
+			float e1 = lerp(320.0, 24.0, rough), e2 = e1 * 0.35;
+			float jitter = (frac(seed * 7.31) - 0.5) * 0.12;
+			float3 H = normalize(L + V);
+			float3 T1 = normalize(Tv + N * (-0.10 + jitter));
+			float3 T2 = normalize(Tv + N * (0.12 + jitter));
+			float th1 = dot(T1, H), th2 = dot(T2, H);
+			float s1 = pow(sqrt(saturate(1.0 - th1 * th1)), e1);
+			float s2 = pow(sqrt(saturate(1.0 - th2 * th2)), e2);
+			// (a hair pointing at the camera shows no shine along it)
+			float strength = (1.0 - rough * 0.8) * saturate(bl * 3.0);
+			shine = key_colour * key_tint * (s1 * 0.06 * strength * wrap);
+			lit = lit + tint * key_tint * (s2 * 0.8 * strength * wrap);
+		}
+		float nv = saturate(dot(N, V));
+		shine = shine + rim_light.rgb * pow(1.0 - nv, max(rim_light.w, 0.001));
+	} else {
+		wide = 0.0;
+	}
+	o.lit = float4(lit, cover);
+	o.shine = shine;
+	o.uv = float4(seed, t, side, wide);
 	return o;
+}
+
+// The hull: the inner layers of the hairs, drawn into the picture of the
+// solid parts' distances (the nearest kept) a little further off than
+// they are (strand_lod.y) - so hair well behind another part's hair is
+// hidden by it, as it is by the part itself.
+struct HullOut {
+	float4 pos : POSITION;
+	float2 at  : TEXCOORD0;
+};
+
+HullOut hull_out(float3 pos, float3 run, float4 col, float width, float order, float side)
+{
+	HullOut o;
+	float3 T = normalize(run);
+	float3 E = eye_pos - pos;
+	float d = max(length(E), 0.0001);
+	float3 S = cross(T, E / d);
+	float sl = length(S);
+	S = sl > 0.00001 ? S / sl : normalize(cross(T, float3(0.0, 1.0, 0.001)));
+	float4 drawn = strand_share(order);
+	float fade = drawn.y;
+	float w = max(width, 0.0) * strand.z * drawn.w;
+	float wd = max(w, d * strand.x * strand.y);
+	float3 P = pos + S * (side * wd * 0.5);
+	o.pos = mul(float4(P, 1.0), ViewProj);
+	// (A see-through hair is no part of it. Every number a point comes
+	// with has to be read: OpenGL won't draw with one left out.)
+	o.at = float2(-mul(float4(P, 1.0), cam).z, col.a >= 0.5 ? fade : 0.0);
+	return o;
+}
+
+HullOut VSHull(StrandIn v)
+{
+	return hull_out(v.pos.xyz, oct_dir(v.norm.xy), v.col, v.norm.z, abs(v.pos.w) - 1.0,
+			v.pos.w < 0.0 ? -1.0 : 1.0);
+}
+
+float4 PSHull(HullOut v) : TARGET
+{
+	if (v.at.y < 0.5)
+		discard;
+	return float4(v.at.x + strand_lod.y, 0.0, 0.0, 1.0);
 }
 
 StrandOut VSStrand(StrandIn v)
 {
-	return strand_out(v.pos.xyz, v.norm.xyz, v.col, v.uv, v.ws);
+	float spot = floor(v.norm.w);
+	return strand_out(v.pos.xyz, oct_dir(v.norm.xy), v.col, v.norm.z, (v.norm.w - spot) / 0.9995, abs(v.pos.w) - 1.0,
+			  v.pos.w < 0.0 ? -1.0 : 1.0);
 }
 
 float4 PSStrand(StrandOut v) : TARGET
 {
-	float t = saturate(v.uv.y);
-	float seed = v.cs.y;
-	// How much of this pixel the hair covers (thinner than drawn, its tip
-	// fading, its material's and points' see-through, the whole avatar's):
-	// that share of its pixels drawn, picked at random for each hair, so
-	// many thin hairs over one another add up as they would (and the
-	// picture drawn twice the size, halved, smooths it).
-	float a = v.cs.x * saturate(base_colour.a * v.col.a) * saturate((1.0 - t) * 10.0) * look.w;
-	float2 px = floor((v.clip.xy / v.clip.w * 0.5 + 0.5) * strand.zw);
-	float h = frac(sin(dot(px + float2(seed * 131.0, seed * 71.0), float2(12.9898, 78.233))) * 43758.5453);
-	if (a <= h)
+	// Behind a solid part: hidden (the picture of their distances says;
+	// hairs are drawn with no depth test of their own, so that hairs over
+	// one another all show through).
+	// (Its root sits on the skin, so there it still shows a little behind
+	// one, strand.w - less and less further along it, and at its tip not
+	// at all: a hair's end never shows through an eye or a nose.)
+	float solid = depth_map.Load(int3(v.pos.xy, 0)).r;
+	float behind = strand.w * (1.0 - v.uv.y) * (1.0 - v.uv.y);
+	if (v.depth > solid + behind)
 		discard;
-
-	float3 V = normalize(-v.vpos);
-	float3 T = normalize(v.vtan);
-	// Round: its facing goes from one side of the hair, through towards
-	// the camera, to the other.
-	float side = v.uv.x * 2.0 - 1.0;
-	float3 B = cross(T, V);
-	float bl = length(B);
-	B = bl > 0.00001 ? B / bl : float3(0.0, 0.0, 0.0);
-	float3 F = V - T * dot(T, V);
-	float fl = length(F);
-	F = fl > 0.00001 ? F / fl : V;
-	float3 N = normalize(B * side + F * sqrt(saturate(1.0 - side * side)));
-
-	float4 tex = base_map.Sample(wrapSampler, float2(seed, t));
-	float3 albedo = base_colour.rgb * lin(tex.rgb) * lin(v.col.rgb) * (0.88 + 0.24 * frac(seed * 13.7));
-	float3 glow = emissive * lin(emissive_map.Sample(wrapSampler, float2(seed, t)).rgb);
-	if (look.x > 1.5)
-		return float4(srgb(albedo + glow), 1.0);
-
-	float3 L = key_dir;
-	float3 L2 = fill_dir;
-	// Lit across its length (Kajiya-Kay), softened round its back.
-	float tl = dot(T, L), tl2 = dot(T, L2);
-	float across = sqrt(saturate(1.0 - tl * tl)), across2 = sqrt(saturate(1.0 - tl2 * tl2));
-	float wrap = saturate(dot(N, L) * 0.6 + 0.4), wrap2 = saturate(dot(N, L2) * 0.6 + 0.4);
-	float3 ambient = lerp(room_down, room_up, N.y * 0.5 + 0.5);
-	float3 col;
-	if (look.x > 0.5) {
-		float lit = saturate((across * wrap - 0.4) * 6.0);
-		col = albedo * lerp(0.55, 1.0, lit) * key_tint + albedo * 0.12 * room_tint;
-	} else {
-		col = albedo * (ambient + key_colour * (across * wrap) + fill_colour * (across2 * wrap2));
-		// Two shines (Marschner's, as games draw them): white off its
-		// surface, tilted towards the tip; and its own colour from inside
-		// it, broader and tilted towards the root. Each hair's a little
-		// different.
-		float rough = saturate(surface.y);
-		float e1 = lerp(320.0, 24.0, rough), e2 = e1 * 0.35;
-		float jitter = (frac(seed * 7.31) - 0.5) * 0.12;
-		float3 H = normalize(L + V);
-		float3 T1 = normalize(T + N * (-0.10 + jitter));
-		float3 T2 = normalize(T + N * (0.12 + jitter));
-		float th1 = dot(T1, H), th2 = dot(T2, H);
-		float s1 = pow(sqrt(saturate(1.0 - th1 * th1)), e1);
-		float s2 = pow(sqrt(saturate(1.0 - th2 * th2)), e2);
-		// (a hair pointing at the camera shows no shine along it)
-		float strength = (1.0 - rough * 0.8) * saturate(bl * 3.0);
-		col = col + key_colour * key_tint * (s1 * 0.06 * strength * wrap);
-		col = col + albedo * key_tint * (s2 * 0.8 * strength * wrap);
-	}
-	float nv = saturate(dot(N, V));
-	col = col + rim_light.rgb * pow(1.0 - nv, max(rim_light.w, 0.001));
-	col = col + glow;
-	return float4(srgb(col), 1.0);
+	float a = v.lit.a;
+	if (a < 0.004)
+		discard;
+	// A wide hair is round: darker towards its sides.
+	float side = v.uv.z;
+	float round = lerp(1.0, 0.55 + 0.45 * sqrt(saturate(1.0 - side * side)), v.uv.w);
+	float4 tex = base_map.Sample(wrapSampler, v.uv.xy);
+	float3 glow = emissive * lin(emissive_map.Sample(wrapSampler, v.uv.xy).rgb);
+	float3 c = lin(tex.rgb) * v.lit.rgb * round + v.shine + glow;
+	return float4(srgb(c) * a, a);
 }
 
 struct DownData {
@@ -586,6 +707,24 @@ technique Hidden
 	{
 		vertex_shader = VSDraw(v);
 		pixel_shader  = PSHidden(v);
+	}
+}
+
+technique Depth
+{
+	pass
+	{
+		vertex_shader = VSDraw(v);
+		pixel_shader  = PSDepth(v);
+	}
+}
+
+technique Hull
+{
+	pass
+	{
+		vertex_shader = VSHull(v);
+		pixel_shader  = PSHull(v);
 	}
 }
 

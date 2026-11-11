@@ -1081,6 +1081,29 @@ struct FaceAvatar {
 	// Characters posed on the graphics card (Windows; else, or off, by
 	// the CPU) - the "card_posing" setting, on unless turned off.
 	std::atomic<bool> card_posing{true};
+	// Hair strands (hair.hpp): the "hair_detail" setting - how many of a
+	// character's (and its companion's) strands are kept and drawn - and
+	// a limit of its own for hair's time on the graphics card
+	// ("hair_budget_ms", for measuring; under 0: the setting's).
+	std::atomic<int> hair_detail{(int)HairDetail::Full};
+	std::atomic<float> hair_budget{-1.0f};
+	// Whether characters can be posed on the card here (known for sure
+	// once the drawing's made): their hair is kept for how it's posed.
+#ifdef _WIN32
+	std::atomic<bool> card_able{true};
+#else
+	std::atomic<bool> card_able{false};
+#endif
+	LoadOptions hair_options() const
+	{
+		return hair_load_options((HairDetail)hair_detail.load(), card_posing && card_able);
+	}
+	// The character's file as last asked for (model_lock), and how its
+	// and its companion's were (graphics thread): asked again when the
+	// hair detail or how it's posed changes.
+	std::mutex model_lock;
+	std::string model_asked;
+	LoadOptions model_options, companion_options;
 	// Your real eyes and mouth, or its own drawn face, moved by yours.
 	std::atomic<bool> drawn_style{false};
 	// Worn on your head: the source is the camera, with the character on
@@ -1495,6 +1518,13 @@ struct FaceAvatar {
 		float framed_w = 0, framed_h = 0;
 		float yaw = 0, pitch = 0, x = 0, y = 0;
 		std::map<std::string, float> values;
+		// Hair strands: those its file has and those kept, whether it
+		// has stand-in hair to wear instead, and what the last picture
+		// drew, its companion's with it (Avatar3D::HairDrawn).
+		size_t hair_strands = 0, hair_loaded = 0;
+		bool hair_standin = false;
+		Avatar3D::HairDrawn hair;
+		float hair_budget_ms = 0;
 	};
 	State3D state3d;
 	// The mouth from your mic (voice.hpp): its sound comes in on OBS's
@@ -2626,6 +2656,17 @@ struct FaceAvatar {
 	void pick_companion()
 	{
 		bool fresh = false;
+		// (Its hair kept another way now: its file loaded anew.)
+		if (const LoadOptions lo = hair_options(); lo != companion_options) {
+			companion_options = lo;
+			std::string file;
+			{
+				std::lock_guard<std::mutex> l(companion_lock);
+				file = companion_ask.file;
+			}
+			if (!file.empty())
+				companion_loader.want(file, false, lo);
+		}
 		if (std::shared_ptr<ModelPack> pack = companion_loader.take()) {
 			if (!companion3d)
 				companion3d = std::make_unique<Avatar3D>();
@@ -2788,6 +2829,19 @@ struct FaceAvatar {
 	// (made anew when how it swings or faces changes).
 	void pick_model()
 	{
+		// (Its hair kept another way now - the hair detail setting, or how
+		// it's posed: its file loaded anew.)
+		if (avatar3d)
+			card_able = avatar3d->can_gpu_skin();
+		if (const LoadOptions lo = hair_options(); lo != model_options) {
+			model_options = lo;
+			std::string file;
+			{
+				std::lock_guard<std::mutex> l(model_lock);
+				file = model_asked;
+			}
+			loader.want(file, false, lo);
+		}
 		if (std::shared_ptr<ModelPack> pack = loader.take()) {
 			if (!avatar3d)
 				avatar3d = std::make_unique<Avatar3D>();
@@ -2814,6 +2868,9 @@ struct FaceAvatar {
 				st.author = m.meta.author;
 				st.points = m.points;
 				st.triangles = m.triangles;
+				st.hair_strands = m.strands_in_file;
+				st.hair_loaded = m.strands;
+				st.hair_standin = m.hair_standins;
 				for (const Animation &a : m.animations) {
 					st.animations.push_back(a.name);
 					st.animation_lengths.push_back(a.length);
@@ -3130,11 +3187,17 @@ struct FaceAvatar {
 			const V3 toward = normalized(cross(f.right, f.up), {0, 0, 1});
 			d.knock = (right * k.x + f.up * k.y + toward * k.z) * head_world;
 		}
-		// Posed on the graphics card or by the CPU, as set (and as it can).
+		// Posed on the graphics card or by the CPU, as set (and as it can);
+		// its hair as the hair detail setting has it.
+		HairPlan hair = hair_plan((HairDetail)hair_detail.load());
+		if (const float own = hair_budget; own >= 0)
+			hair.budget_ms = own;
 		if (avatar3d) {
 			avatar3d->set_gpu_skin(card_posing);
 			rig->set_gpu_skin(avatar3d->gpu_skin());
+			avatar3d->set_hair(hair);
 		}
+		rig->set_strand_points(hair.points_cpu);
 		if (state3d.on_card != rig->gpu_skin()) {
 			std::lock_guard<std::mutex> l(state_lock);
 			state3d.on_card = rig->gpu_skin();
@@ -3159,6 +3222,7 @@ struct FaceAvatar {
 			cd.body = companion_now.moves;
 			companion3d->set_gpu_skin(card_posing);
 			companion_rig->set_gpu_skin(companion3d->gpu_skin());
+			companion_rig->set_strand_points(hair.points_cpu);
 			companion_rig->pose(cd);
 			others.push_back({companion3d.get(), companion_rig.get()});
 			companion_drawn = true;
@@ -3215,6 +3279,8 @@ struct FaceAvatar {
 		gs_texture_t *tex = show ? avatar3d->draw(rig.get(), v, with, others) : nullptr;
 		{
 			std::lock_guard<std::mutex> l(state_lock);
+			state3d.hair = show ? avatar3d->hair_drawn() : Avatar3D::HairDrawn();
+			state3d.hair_budget_ms = hair.budget_ms;
 			companion_state.drawn = companion_drawn && tex != nullptr;
 			companion_state.size = companion_drawn ? companion_tall : 0;
 		}
@@ -5336,11 +5402,18 @@ struct FaceAvatar {
 			alive_options = ao;
 			body_follow = clampf((float)obs_data_get_int(settings, "body_follow") / 100.0f, 0, 1);
 		}
-		const char *model_file = obs_data_get_string(settings, "model");
-		loader.want(model_file ? model_file : "");
 		mirror = obs_data_get_bool(settings, "mirror");
 		easy = obs_data_get_bool(settings, "easy");
 		card_posing = obs_data_get_bool(settings, "card_posing");
+		const char *hair = obs_data_get_string(settings, "hair_detail");
+		hair_detail = (int)hair_detail_of(hair ? hair : "");
+		hair_budget = (float)obs_data_get_double(settings, "hair_budget_ms");
+		const char *model_file = obs_data_get_string(settings, "model");
+		{
+			std::lock_guard<std::mutex> l(model_lock);
+			model_asked = model_file ? model_file : "";
+		}
+		loader.want(model_file ? model_file : "", false, hair_options());
 		const char *style = obs_data_get_string(settings, "style");
 		drawn_style = style && std::strcmp(style, "drawn") == 0;
 		// Your face from a phone app (VTube Studio's, MeowFace, or
@@ -5869,7 +5942,7 @@ struct FaceAvatar {
 				a.clips_seq++;
 			}
 			take_place(a);
-			companion_loader.want(file);
+			companion_loader.want(file, false, hair_options());
 			const bool ready = a.ready == file && a.ready_seq == a.clips_seq;
 			if (action == "come") {
 				const bool instant = flag(data, "instant");
@@ -6585,6 +6658,19 @@ struct FaceAvatar {
 				      {"triangles", st.triangles},
 				      {"springs", st.springs},
 				      {"on_card", st.on_card},
+				      {"hair",
+				       {{"detail", hair_detail_name((HairDetail)hair_detail.load())},
+					{"strands", st.hair_strands},
+					{"loaded", st.hair_loaded},
+					{"standin", st.hair_standin},
+					{"shown_strands", st.hair.in_file},
+					{"shown_loaded", st.hair.loaded},
+					{"drawn", st.hair.drawn},
+					{"pieces", st.hair.pieces},
+					{"draws", st.hair.draws},
+					{"share", r(st.hair.share, 1000)},
+					{"ms", r(st.hair.ms, 1000)},
+					{"budget_ms", r(st.hair_budget_ms, 1000)}}},
 				      {"animations", animations},
 				      {"animation", st.animation},
 				      {"swinging_chain", st.chain},
@@ -7038,6 +7124,8 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "sway", 50);
 	obs_data_set_default_bool(settings, "eye_moves", true);
 	obs_data_set_default_bool(settings, "card_posing", true);
+	obs_data_set_default_string(settings, "hair_detail", "full");
+	obs_data_set_default_double(settings, "hair_budget_ms", -1);
 	obs_data_set_default_bool(settings, "auto_blink", false);
 	obs_data_set_default_string(settings, "model_place", "");
 	obs_data_set_default_string(settings, "model_setup", "");
@@ -7190,6 +7278,11 @@ obs_properties_t *get_properties(void *data)
 	obs_property_int_set_suffix(p, "%");
 	obs_properties_add_bool(props, "easy", text("FaceAvatar.Easy"));
 	obs_properties_add_bool(props, "card_posing", text("FaceAvatar.CardPosing"));
+	obs_property_t *hair = obs_properties_add_list(props, "hair_detail", text("FaceAvatar.HairDetail"),
+						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(hair, text("FaceAvatar.HairDetail.Full"), "full");
+	obs_property_list_add_string(hair, text("FaceAvatar.HairDetail.Light"), "light");
+	obs_property_list_add_string(hair, text("FaceAvatar.HairDetail.Today"), "today");
 	obs_properties_add_bool(props, "worn", text("FaceAvatar.Worn"));
 	obs_properties_add_bool(props, "show_camera", text("FaceAvatar.ShowCamera"));
 	p = obs_properties_add_int_slider(props, "worn_size", text("FaceAvatar.WornSize"), 50, 300, 5);

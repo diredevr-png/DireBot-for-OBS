@@ -54,10 +54,12 @@ inline const std::vector<EffectNeeds> &face_3d_needs()
 		 {"cam", "uv_place", "outline_width", "base_map", "surface", "base_colour", "outline_colour", "look",
 		  "key_tint"}},
 		{"Hidden", {"cam", "uv_place", "flat_at"}},
+		{"Depth", {"cam", "uv_place", "flat_at", "base_map", "surface", "base_colour"}},
 		{"Strand",
 		 {"cam", "base_map", "emissive_map", "base_colour", "look", "surface", "emissive", "key_dir",
 		  "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light", "key_tint", "room_tint",
-		  "eye_pos", "strand"}},
+		  "eye_pos", "strand", "strand_lod", "depth_map"}},
+		{"Hull", {"cam", "eye_pos", "strand", "strand_lod"}},
 		{"Down", {"image", "texel"}},
 	};
 	return needs;
@@ -83,10 +85,12 @@ inline const std::vector<EffectNeeds> &face_3d_skin_needs()
 			{"OutlineSk",
 			 {"cam", "uv_place", "outline_width", "base_map", "surface", "base_colour", "outline_colour", "look",
 			  "key_tint", "bone_cols"}},
+			{"DepthSk", {"cam", "uv_place", "flat_at", "base_map", "surface", "base_colour", "bone_cols"}},
 			{"StrandSk",
 			 {"cam", "base_map", "emissive_map", "base_colour", "look", "surface", "emissive", "key_dir",
 			  "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light", "key_tint", "room_tint",
-			  "eye_pos", "strand", "bone_cols"}},
+			  "eye_pos", "strand", "strand_lod", "depth_map", "bone_cols", "spot_moves"}},
+			{"HullSk", {"cam", "eye_pos", "strand", "strand_lod", "bone_cols", "spot_moves"}},
 		};
 		all.insert(all.end(), skin.begin(), skin.end());
 		return all;

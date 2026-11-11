@@ -4469,9 +4469,11 @@ static void test_bones_that_follow()
 // Posed on the graphics card (Windows): the rig hands over each part's
 // bones and its points as made; the card's sums (the -skin effect's
 // skinned(), done here the same way) land every point where the CPU puts
-// it - a chain swinging, a hair strand (a file's line, made 2 points a
-// point) on it, a part with no bones. Measuring still works every point
-// out, and leaves the parts as posed for the card.
+// it - a chain swinging, a hair strand on it (a file's line: the points
+// that shape it, each once), a part with no bones - and with an
+// expression showing too: the chain's points as the rig moved them, the
+// strand's each moved by its spot's move before its bones. Measuring
+// still works every point out, and leaves the parts as posed for the card.
 static void test_posed_on_the_card()
 {
 	Builder b;
@@ -4504,19 +4506,28 @@ static void test_posed_on_the_card()
 		hair_weights.insert(hair_weights.end(), {1 - share, share, 0, 0});
 		width.push_back(0.002f);
 	}
+	// An expression: the chain's lower rings pushed out, the strand's
+	// lower points bent aside (each its own way).
+	std::vector<V3> push(pos.size()), bend(hair.size());
+	for (size_t i = 12; i < push.size(); i++)
+		push[i] = {0, 0, 0.02f};
+	for (size_t i = 4; i < bend.size(); i++)
+		bend[i] = {0.004f * i, 0, 0.002f * i};
 	const json skinned_tri = {
 		{"attributes",
 		 {{"POSITION", b.vec3s(pos)},
 		  {"JOINTS_0", b.accessor(b.view(joints.data(), joints.size()), 5121, pos.size(), "VEC4")},
 		  {"WEIGHTS_0", b.floats(weights, 4, "VEC4")}}},
-		{"indices", b.indices(ix)}};
+		{"indices", b.indices(ix)},
+		{"targets", {{{"POSITION", b.vec3s(push)}}}}};
 	const json strand = {
 		{"attributes",
 		 {{"POSITION", b.vec3s(hair)},
 		  {"JOINTS_0", b.accessor(b.view(hair_joints.data(), hair_joints.size()), 5121, hair.size(), "VEC4")},
 		  {"WEIGHTS_0", b.floats(hair_weights, 4, "VEC4")},
 		  {"_WIDTH", b.floats(width, 1, "SCALAR")}}},
-		{"mode", 3}};
+		{"mode", 3},
+		{"targets", {{{"POSITION", b.vec3s(bend)}}}}};
 	b.doc["meshes"].push_back({{"primitives", json::array({skinned_tri, strand})}});
 	// A part with no bones, on a node of its own.
 	const std::vector<V3> square = {{0, 0, 0}, {0.1f, 0, 0}, {0, 0.1f, 0}};
@@ -4538,18 +4549,38 @@ static void test_posed_on_the_card()
 	CHECK(m->meshes.size() == 2 && m->meshes[0].parts.size() == 2);
 	if (m->meshes.size() != 2 || m->meshes[0].parts.size() != 2)
 		return;
+	// The strand: one point each, 8 of its 10 (the two on the straight run
+	// its last bone holds alone are left out), each with the way it runs
+	// and its bones; no triangles, no shapes of its own - the points its
+	// expression moves follow 4 spots (file points 4, 5, 6 and 9).
 	const Primitive &h = m->meshes[0].parts[1];
-	CHECK(h.strands && h.pos.size() == 20 && h.strand.size() == 40 && h.index.size() == 9 * 6);
-	CHECK(h.joints.size() == 80 && h.weights.size() == 80);
+	CHECK(h.strands && h.pos.size() == 8 && h.normal.size() == 8 && h.hair.in_file == 1 && h.hair.strands() == 1);
+	CHECK(h.index.empty() && h.uv.empty() && h.morphs.empty() && h.hair.pieces.size() == 7);
+	CHECK(h.joints.size() == 32 && h.weights.size() == 32);
+	CHECK(h.pos.size() == 8 && near3(h.pos[6], hair[6], 0) && near3(h.pos[7], hair[9], 0) &&
+	      near3(h.normal[3], {0, -1, 0}, 1e-6f));
+	CHECK(h.hair.moves.size() == 1 && h.hair.anchors() == 5 && h.hair.anchor.size() == 8);
+	if (h.hair.moves.size() == 1 && h.hair.anchors() == 5 && h.hair.anchor.size() == 8) {
+		const int from[8] = {0, 1, 2, 3, 4, 5, 6, 9};
+		std::set<int> spots;
+		for (int i = 0; i < 8; i++) {
+			CHECK((h.hair.anchor[i] != 0) == (from[i] >= 4) && h.hair.anchor[i] < 5);
+			CHECK(near3(h.hair.moves[0][h.hair.anchor[i] % 5], bend[from[i]], 1e-8f));
+			if (h.hair.anchor[i])
+				spots.insert(h.hair.anchor[i]);
+		}
+		CHECK(spots.size() == 4);
+	}
 
-	Rig cpu(m, RigOptions()), card(m, RigOptions());
-	card.set_gpu_skin(true);
-	const Bounds a = cpu.rest_bounds(), c = card.rest_bounds();
-	CHECK(a.found && c.found && near3(a.low, c.low, 1e-6f) && near3(a.high, c.high, 1e-6f));
-	auto card_point = [&](const Rig::Part &p, size_t i) {
+	// What the card works out for point i of a part: its point as made
+	// (the rig's, with its expressions on it; a strand's moved by its
+	// spot's move), moved by its bones.
+	auto card_point = [](const Rig &card, const Rig::Part &p, size_t i) {
 		const std::vector<M4> &set = card.bones(p.bones);
 		const Primitive &prim = *p.prim;
-		const V3 at = p.morphed ? p.rest_pos[i] : prim.pos[i];
+		V3 at = p.morphed ? p.rest_pos[i] : prim.pos[i];
+		if (prim.strands && i < prim.hair.anchor.size() && prim.hair.anchor[i] < p.spot_moves.size())
+			at = at + p.spot_moves[prim.hair.anchor[i]];
 		V3 sum{};
 		for (int k = 0; k < 4; k++) {
 			const bool boned = !prim.joints.empty();
@@ -4560,33 +4591,60 @@ static void test_posed_on_the_card()
 		}
 		return sum;
 	};
-	Drive t = still();
-	t.place = matrix_of(axis_angle({0, 0, 1}, 0.5f));
-	for (int f = 0; f < 90; f++) {
-		cpu.pose(t);
-		card.pose(t);
-		if (f == 30) {
-			// Measuring between frames (it settles the springs: both).
-			cpu.rest_bounds();
-			card.rest_bounds();
-			CHECK(card.parts()[0].gpu && card.parts()[0].pos.empty());
+	// The same file with its expression showing.
+	auto showing = std::make_shared<Model>(*m);
+	showing->meshes[0].weights = {1.0f};
+	V3 strand_tip[2];
+	for (int shown = 0; shown < 2; shown++) {
+		const std::shared_ptr<Model> &model = shown ? showing : m;
+		Rig cpu(model, RigOptions()), card(model, RigOptions());
+		card.set_gpu_skin(true);
+		const Bounds a = cpu.rest_bounds(), c = card.rest_bounds();
+		CHECK(a.found && c.found && near3(a.low, c.low, 1e-6f) && near3(a.high, c.high, 1e-6f));
+		Drive t = still();
+		t.place = matrix_of(axis_angle({0, 0, 1}, 0.5f));
+		for (int f = 0; f < 90; f++) {
+			cpu.pose(t);
+			card.pose(t);
+			if (f == 30) {
+				// Measuring between frames (it settles the springs: both).
+				cpu.rest_bounds();
+				card.rest_bounds();
+				CHECK(card.parts()[0].gpu && card.parts()[0].pos.empty());
+				CHECK(card.parts()[1].gpu && card.parts()[1].pos.empty());
+			}
 		}
-	}
-	CHECK(cpu.parts().size() == 3 && card.parts().size() == 3);
-	float worst = 0;
-	size_t checked = 0;
-	for (size_t pi = 0; pi < card.parts().size(); pi++) {
-		const Rig::Part &g = card.parts()[pi], &r = cpu.parts()[pi];
-		CHECK(g.gpu && !r.gpu && g.pos.empty() && g.bones >= 0);
-		for (size_t i = 0; i < r.pos.size(); i++, checked++) {
-			const float d = length(card_point(g, i) - r.pos[i]);
-			if (d > 1e-4f)
-				std::printf("  part %zu point %zu off %.5f\n", pi, i, d);
-			worst = std::max(worst, d);
+		CHECK(cpu.parts().size() == 3 && card.parts().size() == 3);
+		if (cpu.parts().size() != 3 || card.parts().size() != 3)
+			continue;
+		float worst = 0;
+		size_t checked = 0;
+		for (size_t pi = 0; pi < card.parts().size(); pi++) {
+			const Rig::Part &g = card.parts()[pi], &r = cpu.parts()[pi];
+			CHECK(g.gpu && !r.gpu && g.pos.empty() && g.normal.empty() && g.bones >= 0);
+			for (size_t i = 0; i < r.pos.size(); i++, checked++) {
+				const float d = length(card_point(card, g, i) - r.pos[i]);
+				if (d > 1e-4f)
+					std::printf("  part %zu point %zu off %.5f\n", pi, i, d);
+				worst = std::max(worst, d);
+			}
 		}
+		CHECK(checked == 20 + 8 + 3);
+		CHECK(worst < 1e-4f);
+		// The chain's points handed over as the expression moved them; the
+		// strand's left as made, with each spot's move beside them.
+		const Rig::Part &chain = card.parts()[0], &strands = card.parts()[1];
+		CHECK(chain.morphed == (shown == 1) && chain.rest_pos.size() == (shown ? 20u : 0u));
+		CHECK(!strands.morphed && strands.rest_pos.empty() && strands.spot_moves.size() == (shown ? 5u : 0u));
+		CHECK(cpu.parts()[1].spot_moves.size() == strands.spot_moves.size() && near(strands.scale, 1, 1e-5));
+		if (shown && strands.spot_moves.size() == 5 && h.hair.anchor.size() == 8)
+			CHECK(near3(strands.spot_moves[0], {}, 0) &&
+			      near3(strands.spot_moves[h.hair.anchor[7]], bend[9], 1e-8f));
+		strand_tip[shown] = cpu.parts()[1].pos.size() == 8 ? cpu.parts()[1].pos[7] : V3{};
 	}
-	CHECK(checked == 20 + 20 + 3);
-	CHECK(worst < 1e-4f);
+	// (The expression does move the strand: its tip by about as far as
+	// the file says, 0.04.)
+	CHECK(near(length(strand_tip[1] - strand_tip[0]), length(bend[9]), 0.01));
 	// More bones than the card's list holds: posed here.
 	CHECK(Rig::GPU_MOST_BONES * 4 == 1020);
 }
@@ -4635,9 +4693,10 @@ static void test_expressions_kept_where_they_move()
 	const json small = {{"attributes", {{"POSITION", b.vec3s(tri)}, {"NORMAL", b.vec3s({{0, 0, 1}, {0, 0, 1}, {0, 0, 1}})}}},
 			    {"indices", b.indices({0, 1, 2})},
 			    {"targets", small_targets}};
-	// A hair strand of 4 points whose shape lifts point 2 (and would turn
-	// it: a strand's facing is the way it runs, left out).
-	const std::vector<V3> hair = {{0, 0, 0}, {0, 0.01f, 0}, {0, 0.02f, 0}, {0, 0.03f, 0}};
+	// A hair strand of 4 points (a bent one: each of them shapes it, so
+	// each is kept) whose shape lifts point 2 (and would turn it: a
+	// strand's facing is the way it runs, left out).
+	const std::vector<V3> hair = {{0, 0, 0}, {0, 0.01f, 0}, {0.002f, 0.02f, 0}, {0, 0.03f, 0}};
 	const std::vector<V3> lift = {{}, {}, {0.005f, 0, 0}, {}}, turn = {{}, {}, {0, 0, 1}, {}};
 	const json strand = {{"attributes", {{"POSITION", b.vec3s(hair)}}},
 			     {"mode", 3},
@@ -4677,13 +4736,18 @@ static void test_expressions_kept_where_they_move()
 		      near3(q.morphs[1].normal[0], {0, 0.2f, 0}, 1e-7f));
 		CHECK(q.morphs[2].at.empty() && q.morphs[2].pos.empty() && q.morphs[2].normal.empty());
 	}
+	// The strand keeps no shapes of its own: the one point they move
+	// follows a spot (spot 1; the rest spot 0, which never moves), and each
+	// shape is kept as how far it moves that spot.
 	const Primitive &h = m.meshes[1].parts[1];
-	CHECK(h.strands && h.pos.size() == 8 && h.morphs.size() == 3);
-	if (h.morphs.size() == 3) {
-		// Point 2's two sides, 4 and 5.
-		CHECK((h.morphs[0].at == std::vector<uint32_t>{4, 5}) && h.morphs[0].normal.empty() &&
-		      near3(h.morphs[0].pos[0], {0.005f, 0, 0}, 1e-9f) && near3(h.morphs[0].pos[1], {0.005f, 0, 0}, 1e-9f));
-		CHECK(h.morphs[1].at == h.morphs[0].at && h.morphs[2].at.empty());
+	CHECK(h.strands && h.pos.size() == 4 && h.morphs.empty());
+	CHECK((h.hair.anchor == std::vector<uint16_t>{0, 0, 1, 0}) && h.hair.moves.size() == 3 &&
+	      h.hair.anchors() == 2);
+	if (h.hair.moves.size() == 3 && h.hair.anchors() == 2) {
+		CHECK(near3(h.hair.moves[0][1], {0.005f, 0, 0}, 1e-9f) &&
+		      near3(h.hair.moves[1][1], {0.005f, 0, 0}, 1e-9f) && near3(h.hair.moves[2][1], {}, 0));
+		CHECK(near3(h.hair.moves[0][0], {}, 0) && near3(h.hair.moves[1][0], {}, 0) &&
+		      h.hair.moves[2].size() == 2);
 	}
 
 	// Posed with the small part's shapes on: moved and turned there, the
@@ -4692,10 +4756,23 @@ static void test_expressions_kept_where_they_move()
 	posed->meshes[1].weights = {1, 1, 0};
 	Rig rig(posed, RigOptions());
 	rig.pose(still());
-	const Rig::Part *sp = nullptr;
-	for (const Rig::Part &part : rig.parts())
+	const Rig::Part *sp = nullptr, *hp = nullptr;
+	for (const Rig::Part &part : rig.parts()) {
 		if (part.prim == &posed->meshes[1].parts[0])
 			sp = &part;
+		if (part.prim == &posed->meshes[1].parts[1])
+			hp = &part;
+	}
+	// The strand with them: its spot moved by both shapes' lifts, the
+	// point that follows it moved as far, the rest where they were.
+	CHECK(hp && hp->pos.size() == 4 && hp->spot_moves.size() == 2);
+	if (hp && hp->pos.size() == 4 && hp->spot_moves.size() == 2) {
+		const M4 &w = rig.world()[hp->node];
+		CHECK(near3(hp->spot_moves[0], {}, 0) && near3(hp->spot_moves[1], {0.01f, 0, 0}, 1e-8f));
+		CHECK(near3(hp->pos[0], point(w, hair[0]), 1e-6f) && near3(hp->pos[1], point(w, hair[1]), 1e-6f) &&
+		      near3(hp->pos[2], point(w, hair[2] + V3{0.01f, 0, 0}), 1e-6f) &&
+		      near3(hp->pos[3], point(w, hair[3]), 1e-6f));
+	}
 	CHECK(sp && sp->pos.size() == 3 && sp->normal.size() == 3);
 	if (sp && sp->pos.size() == 3 && sp->normal.size() == 3) {
 		const M4 &w = rig.world()[sp->node];

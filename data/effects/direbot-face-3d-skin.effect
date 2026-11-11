@@ -2,9 +2,11 @@
 // (src/face/avatar3d.cpp; Windows - Direct3D 11 - only: OBS's OpenGL sends
 // only the first of a list of numbers, so there the CPU poses them):
 // everything in direbot-face-3d.effect, and
-//   DrawSk, DrawBumpedSk, OutlineSk, StrandSk  Draw, DrawBumped, Outline,
-//            Strand with the points as made, moved here by up to 4 bones
-//            each
+//   DrawSk, DrawBumpedSk, OutlineSk, DepthSk, StrandSk, HullSk  Draw,
+//            DrawBumped, Outline, Depth, Strand and Hull with the points
+//            as made, moved
+//            here by up to 4 bones each (a strand's points first by their
+//            expression spot's move)
 // A file of its own so OpenGL never builds the long list below.
 
 #include "direbot-face-3d.effect"
@@ -15,6 +17,9 @@
 // out (its tangents' w).
 uniform float4 bone_cols[1020];
 uniform float4 skin_info;
+// Hair strands: how far its expressions move each of its spots now
+// (model.hpp's Strands::moves; spot 0: not at all), up to 2047 of them.
+uniform float4 spot_moves[2048];
 
 // ---- Posed on the graphics card (the Sk techniques) ----
 // The same sums as the CPU's (rig.cpp's skin): each bone's share of the
@@ -92,14 +97,13 @@ struct SkinBumpIn {
 	float4 wgt  : TEXCOORD2;
 };
 
+// A strand's point: as StrandIn, and its 4 bones, each one number: the
+// bone's, plus how much it moves the point (0 to 0.999).
 struct SkinStrandIn {
 	float4 pos  : POSITION;
 	float4 norm : NORMAL;
 	float4 col  : COLOR;
-	float2 uv   : TEXCOORD0;
-	float2 ws   : TEXCOORD1;
-	float4 jnt  : TEXCOORD2;
-	float4 wgt  : TEXCOORD3;
+	float4 jw   : TEXCOORD0;
 };
 
 VertOut VSDrawSk(SkinIn v)
@@ -122,8 +126,23 @@ VertOut VSOutlineSk(SkinIn v)
 
 StrandOut VSStrandSk(SkinStrandIn v)
 {
-	Skinned s = skinned(v.pos.xyz, v.norm.xyz, float3(1.0, 0.0, 0.0), v.jnt, v.wgt);
-	return strand_out(s.pos, s.norm, v.col, v.uv, v.ws);
+	float spot = floor(v.norm.w);
+	int at = int(min(spot, 2047.0));
+	float3 made = v.pos.xyz + spot_moves[at].xyz;
+	float4 j = floor(v.jw);
+	Skinned s = skinned(made, oct_dir(v.norm.xy), float3(1.0, 0.0, 0.0), j, (v.jw - j) / 0.999);
+	return strand_out(s.pos, s.norm, v.col, v.norm.z, (v.norm.w - spot) / 0.9995, abs(v.pos.w) - 1.0,
+			  v.pos.w < 0.0 ? -1.0 : 1.0);
+}
+
+HullOut VSHullSk(SkinStrandIn v)
+{
+	float spot = floor(v.norm.w);
+	int at = int(min(spot, 2047.0));
+	float3 made = v.pos.xyz + spot_moves[at].xyz;
+	float4 j = floor(v.jw);
+	Skinned s = skinned(made, oct_dir(v.norm.xy), float3(1.0, 0.0, 0.0), j, (v.jw - j) / 0.999);
+	return hull_out(s.pos, s.norm, v.col, v.norm.z, abs(v.pos.w) - 1.0, v.pos.w < 0.0 ? -1.0 : 1.0);
 }
 
 technique DrawSk
@@ -153,11 +172,29 @@ technique OutlineSk
 	}
 }
 
+technique DepthSk
+{
+	pass
+	{
+		vertex_shader = VSDrawSk(v);
+		pixel_shader  = PSDepth(v);
+	}
+}
+
 technique StrandSk
 {
 	pass
 	{
 		vertex_shader = VSStrandSk(v);
 		pixel_shader  = PSStrand(v);
+	}
+}
+
+technique HullSk
+{
+	pass
+	{
+		vertex_shader = VSHullSk(v);
+		pixel_shader  = PSHull(v);
 	}
 }

@@ -242,6 +242,17 @@ float scale_of(const M4 &m)
 {
 	return length(V3{m.m[0], m.m[1], m.m[2]});
 }
+// The bone that holds a part's first point most (a part with bones).
+size_t first_bone(const Primitive &p)
+{
+	if (p.joints.size() < 4 || p.weights.size() < 4)
+		return p.joints.empty() ? 0 : p.joints[0];
+	int best = 0;
+	for (int k = 1; k < 4; k++)
+		if (p.weights[k] > p.weights[best])
+			best = k;
+	return p.joints[best];
+}
 // Its biggest stretch any way (0.9.0: a part shrunk away is small all
 // ways, not just along one).
 float largest_scale(const M4 &m)
@@ -2490,6 +2501,18 @@ void Rig::skin()
 		}
 	}
 	const float hide_below = HIDDEN_SCALE * std::max(1e-12f, largest_scale(root_));
+	// Hair strands posed here: how many points there are of them, for
+	// each part's share of the most posed (set_strand_points).
+	size_t strands_here = 0;
+	for (const Node &node : m.nodes) {
+		if (node.mesh < 0)
+			continue;
+		const bool card = gpu_skin_ && !measuring_ &&
+				  (node.skin < 0 || m.skins[node.skin].joints.size() <= GPU_MOST_BONES);
+		for (const Primitive &p : m.meshes[node.mesh].parts)
+			if (p.strands && !card)
+				strands_here += p.pos.size();
+	}
 	size_t at = 0;
 	std::vector<V3> mp, mn;
 	std::vector<M4> joint;
@@ -2540,7 +2563,16 @@ void Rig::skin()
 				out.tangent.clear();
 				continue;
 			}
-			const size_t n = p.pos.size();
+			size_t n = p.pos.size();
+			if (p.strands && !gpu && strands_here > strand_points_) {
+				// Only the first of its strands: its share of the most
+				// posed here (never fewer than a few).
+				const Strands &h = p.hair;
+				const size_t share =
+					(size_t)((double)n * (double)strand_points_ / (double)strands_here);
+				const size_t keep = std::max(h.strands_in(share), std::min<size_t>(h.strands(), 16));
+				n = keep < h.first.size() ? h.first[keep] : n;
+			}
 			const V3 *src_p = p.pos.data(), *src_n = p.normal.data();
 			bool morphed = false;
 			for (size_t k = 0; k < p.morphs.size() && k < w.size(); k++) {
@@ -2560,6 +2592,34 @@ void Rig::skin()
 			if (morphed) {
 				src_p = mp.data();
 				src_n = mn.data();
+			}
+			// Hair strands: each point moved by its spot's move (the
+			// card's to do, posed there).
+			out.spot_moves.clear();
+			if (p.strands) {
+				const Strands &h = p.hair;
+				bool any = false;
+				for (size_t k = 0; k < h.moves.size() && k < w.size(); k++) {
+					if (std::fabs(w[k]) < 1e-4f || h.moves[k].empty())
+						continue;
+					if (!any) {
+						out.spot_moves.assign(h.moves[k].size(), V3{});
+						any = true;
+					}
+					for (size_t a = 0; a < h.moves[k].size() && a < out.spot_moves.size(); a++)
+						out.spot_moves[a] = out.spot_moves[a] + h.moves[k][a] * w[k];
+				}
+				if (any && !gpu && h.anchor.size() >= n) {
+					mp.assign(p.pos.begin(), p.pos.begin() + n);
+					for (size_t i = 0; i < n; i++)
+						if (h.anchor[i] && h.anchor[i] < out.spot_moves.size())
+							mp[i] = mp[i] + out.spot_moves[h.anchor[i]];
+					src_p = mp.data();
+				}
+				const bool boned = skin && !p.joints.empty();
+				out.scale = boned ? (first_bone(p) < joint.size() ? largest_scale(joint[first_bone(p)])
+										  : 1.0f)
+						  : largest_scale(world_[ni]);
 			}
 			auto handed = [](const M4 &a) {
 				const V3 x{a.m[0], a.m[1], a.m[2]}, y{a.m[4], a.m[5], a.m[6]}, z{a.m[8], a.m[9], a.m[10]};
@@ -2582,8 +2642,9 @@ void Rig::skin()
 					std::vector<V3>().swap(out.rest_normal);
 				}
 				const bool skinned = skin && !p.joints.empty();
-				out.handed = skinned ? (p.joints[0] < joint.size() ? handed(joint[p.joints[0]]) : 1.0f)
-						     : handed(world_[ni]);
+				out.handed =
+					skinned ? (first_bone(p) < joint.size() ? handed(joint[first_bone(p)]) : 1.0f)
+						: handed(world_[ni]);
 				V3 sum;
 				size_t count = 0;
 				for (size_t i = 0; i < n; i += 17, count++) {
@@ -2605,15 +2666,18 @@ void Rig::skin()
 				continue;
 			}
 			out.gpu = false;
-			out.collapsed = false;
+			// (Hair strands of a face not drawn: left out whole - points
+			// all in one place would still be drawn as specks.)
+			out.collapsed = p.strands && hide_face_ && own_face_[ni] && n;
 			out.pos.resize(n);
 			out.normal.resize(n);
 			// Its tangents turned as its facings are (the drawing squares
 			// them up with the facing).
 			const bool tangents = p.tangent.size() == n * 4;
 			out.tangent.resize(tangents ? n : 0);
-			out.handed = skin && !p.joints.empty() ? (p.joints[0] < joint.size() ? handed(joint[p.joints[0]]) : 1.0f)
-							       : handed(world_[ni]);
+			out.handed = skin && !p.joints.empty()
+					     ? (first_bone(p) < joint.size() ? handed(joint[first_bone(p)]) : 1.0f)
+					     : handed(world_[ni]);
 			auto tangent_of = [&p](size_t i) {
 				return V3{p.tangent[i * 4], p.tangent[i * 4 + 1], p.tangent[i * 4 + 2]};
 			};

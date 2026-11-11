@@ -42,6 +42,11 @@ using json = nlohmann::json;
 constexpr size_t MOST_FILE = 512u << 20;
 constexpr size_t MOST_POINTS = 4'000'000;
 constexpr size_t MOST_INDEX = 24'000'000;
+// Hair strands: the most points a file's strands may have, all its strand
+// parts together (how many of them are kept is LoadOptions' to say), and
+// the most groups a part's strands are drawn in.
+constexpr size_t MOST_STRAND_POINTS = 20'000'000;
+constexpr size_t MOST_STRAND_GROUPS = 32;
 constexpr size_t MOST_NODES = 100'000;
 constexpr size_t MOST_MORPHS = 512;
 // An expression's move of a point too small to see (squared lengths:
@@ -377,6 +382,90 @@ struct Reader {
 		return out;
 	}
 
+	// An accessor's numbers read a point at a time (a big groom's are
+	// read only for the strands kept): `get` reads the file's own, and
+	// its sparse entries (the points they replace, their numbers after)
+	// are listed beside them. data null: all zeros.
+	struct Column {
+		const uint8_t *data = nullptr;
+		size_t stride = 0, count = 0;
+		int comps = 0, type = 0, csize = 0;
+		bool normalized = false;
+		std::vector<uint32_t> sparse_at;
+		std::vector<double> sparse_values;
+		void get(size_t i, double *out) const
+		{
+			if (!data) {
+				for (int c = 0; c < comps; c++)
+					out[c] = 0;
+				return;
+			}
+			const uint8_t *p = data + i * stride;
+			for (int c = 0; c < comps; c++)
+				out[c] = value(p + (size_t)c * csize, type, normalized);
+		}
+	};
+	Column column(int a, int want_comps, size_t most)
+	{
+		const json &accessors = list(doc, "accessors");
+		if (a < 0 || a >= (int)accessors.size())
+			fail("the file is damaged (a missing accessor)");
+		const json &acc = accessors[a];
+		Column col;
+		col.type = index_of(acc, "componentType");
+		col.comps = comps_of(text(acc, "type"));
+		col.csize = size_of(col.type);
+		if (!col.csize || !col.comps || col.comps > 4 || (want_comps && col.comps != want_comps))
+			fail("the file has numbers DireBot can't read");
+		const long long count = (long long)whole(acc, "count", -1);
+		if (count < 0 || (size_t)count > most)
+			fail("the file is too big or damaged");
+		col.count = (size_t)count;
+		col.normalized = flag(acc, "normalized", false);
+		const int view_i = index_of(acc, "bufferView");
+		const size_t elem = (size_t)col.comps * col.csize;
+		if (view_i >= 0 && count > 0) {
+			const View v = view(view_i);
+			const double off = whole(acc, "byteOffset", 0);
+			col.stride = v.stride ? v.stride : elem;
+			if (off < 0 || off + (double)col.stride * (count - 1) + elem > (double)v.size)
+				fail("the file is damaged (numbers past their end)");
+			col.data = v.data + (size_t)off;
+		}
+		const json &sparse = field(acc, "sparse");
+		if (sparse.is_object()) {
+			const long long n = (long long)whole(sparse, "count", 0);
+			const json &ix = field(sparse, "indices"), &vals = field(sparse, "values");
+			const int itype = index_of(ix, "componentType");
+			const int isize = size_of(itype);
+			if (n < 0 || n > count || !isize || itype == 5126)
+				fail("the file is damaged (sparse numbers)");
+			if (n > 0) {
+				const View iv = view(index_of(ix, "bufferView"));
+				const View vv = view(index_of(vals, "bufferView"));
+				const double ioff = whole(ix, "byteOffset", 0), voff = whole(vals, "byteOffset", 0);
+				if (ioff < 0 || voff < 0 || ioff + (double)n * isize > (double)iv.size ||
+				    voff + (double)n * elem > (double)vv.size)
+					fail("the file is damaged (sparse numbers past their end)");
+				col.sparse_at.resize((size_t)n);
+				col.sparse_values.resize((size_t)n * col.comps);
+				for (long long k = 0; k < n; k++) {
+					const double at =
+						value(iv.data + (size_t)ioff + (size_t)k * isize, itype, false);
+					if (at < 0 || at >= (double)count)
+						fail("the file is damaged (sparse numbers)");
+					col.sparse_at[(size_t)k] = (uint32_t)at;
+					for (int c = 0; c < col.comps; c++)
+						col.sparse_values[(size_t)k * col.comps + c] =
+							value(vv.data + (size_t)voff +
+								      ((size_t)k * col.comps + c) * col.csize,
+							      col.type, col.normalized);
+				}
+			}
+		}
+		return col;
+	}
+
 	std::vector<V3> vec3s(int a)
 	{
 		size_t n = 0;
@@ -397,98 +486,1043 @@ struct Reader {
 	}
 };
 
-// A part of hair strands (glTF LINES, mode 1, or one LINE_STRIP, mode 3)
-// made ready to draw: see Primitive::strands. Each strand's points are
-// found by following its pieces from its root (the point no piece comes
-// into); its width is the file's _WIDTH (one number a point).
-void make_strands(Primitive &p, const std::vector<uint32_t> &ix, int mode, Reader &rd, const json &attr)
+// ---- Hair strands (model.hpp's Strands) ----
+
+constexpr uint32_t NO_POINT = 0xFFFFFFFFu;
+
+// A file's strand part (glTF LINES, mode 1, or one LINE_STRIP, mode 3)
+// while it's read: its points as the file has them, each strand's found
+// by following its pieces from its root (the point no piece comes into),
+// and its strands in the order they're kept and drawn in. The rest of
+// what the file says of each point is read only for the points kept.
+struct RawStrands {
+	std::vector<V3> pos;
+	std::vector<uint32_t> next; // the point after each on its strand (NO_POINT: a tip)
+	std::vector<uint32_t> root; // each strand's root, in draw order
+	// Each of those strands' place among them spread evenly (spread_order),
+	// and its rate (Strands::rate) - empty: its place in `root`, and 1.
+	std::vector<uint32_t> rank;
+	std::vector<float> rate;
+	// Its highest rate before they were made 1 at most: its keys / this
+	// are measured as every other part's are.
+	float top = 1;
+	// Every so-manyth strand: its place spread evenly, the points it
+	// would keep, and its key.
+	struct Sample {
+		uint32_t rank = 0, kept = 0;
+		double key = 0;
+	};
+	std::vector<Sample> sample;
+	bool has_width = false, has_colour = false, has_bones = false;
+	Reader::Column width, colour, joints, weights;
+	std::vector<int> targets; // its expressions' moves: each one's accessor (-1: none)
+	// Its expressions' moves strand by strand (this add-on's own extra in
+	// the file, extras.direbot.strand_morphs: a groom whose every point's
+	// move would make the file too big). Strand k of them is points
+	// strand_start[k] up to strand_start[k + 1]; each expression lists
+	// the strands it moves (rising) and how far each - all of a strand's
+	// points alike. On top of any moves the usual way.
+	std::vector<uint32_t> strand_start;
+	struct StrandMoves {
+		std::vector<uint32_t> strands;
+		std::vector<V3> moves;
+	};
+	std::vector<StrandMoves> strand_moves; // an expression's (none: empty)
+	float bend = 0;           // points that bend their strand less are left out (its units)
+	float turn = -1;          // ...unless it turns more than this between kept points (the angle's cosine)
+	float swing = 0;          // ...or its bones could bend it more than this there
+	double predicted = 0;     // the points all its strands would keep
+	size_t allowed = 0;       // the points it may keep
+	int material = -1;
+};
+
+// The order a part's strands are kept and drawn in: however many of the
+// first are taken, they're spread evenly over the coat. Their roots are
+// put in order along a curve that fills their box (near on it: near in
+// space), then picked by halving it: the middle one, the quarters, the
+// eighths...
+std::vector<uint32_t> spread_order(const std::vector<V3> &pos, const std::vector<uint32_t> &roots)
 {
-	const size_t n = p.pos.size();
-	std::vector<std::pair<uint32_t, uint32_t>> pieces;
-	if (mode == 1)
-		for (size_t i = 0; i + 1 < ix.size(); i += 2)
-			pieces.push_back({ix[i], ix[i + 1]});
-	else
-		for (size_t i = 0; i + 1 < ix.size(); i++)
-			pieces.push_back({ix[i], ix[i + 1]});
-	constexpr uint32_t NONE = 0xFFFFFFFFu;
-	std::vector<uint32_t> next(n, NONE), prev(n, NONE);
-	for (const auto &pc : pieces)
-		if (pc.first != pc.second && next[pc.first] == NONE && prev[pc.second] == NONE) {
-			next[pc.first] = pc.second;
-			prev[pc.second] = pc.first;
-		}
-	std::vector<float> along(n, 0), seed(n, 0);
-	std::vector<char> seen(n, 0);
-	for (uint32_t root = 0; root < n; root++) {
-		if (prev[root] != NONE || next[root] == NONE)
-			continue;
-		// Its length, then how far along it each point is.
-		float total = 0;
-		size_t steps = 0;
-		for (uint32_t a = root; next[a] != NONE && steps < n; a = next[a], steps++)
-			total += length(p.pos[next[a]] - p.pos[a]);
-		uint32_t h = root * 2654435761u;
-		h ^= h >> 15;
-		const float own = (float)(h & 0xFFFFFF) / (float)0x1000000;
-		float run = 0;
-		steps = 0;
-		for (uint32_t a = root; a != NONE && !seen[a] && steps <= n; steps++) {
-			seen[a] = 1;
-			along[a] = total > 0 ? run / total : 0;
-			seed[a] = own;
-			if (next[a] != NONE)
-				run += length(p.pos[next[a]] - p.pos[a]);
-			a = next[a];
-		}
+	const size_t n = roots.size();
+	V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+	for (uint32_t r : roots) {
+		const V3 v = pos[r];
+		lo = {std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+		hi = {std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
 	}
-	std::vector<float> width(n, 0.0001f);
-	if (index_of(attr, "_WIDTH") >= 0) {
-		const std::vector<float> w = rd.floats(index_of(attr, "_WIDTH"), 1);
-		if (w.size() == n)
-			for (size_t i = 0; i < n; i++)
-				width[i] = std::max(0.0f, w[i]);
-	}
-	Primitive s;
-	s.strands = true;
-	s.material = p.material;
-	s.pos.resize(n * 2);
-	s.normal.resize(n * 2);
-	s.uv.resize(n * 4);
-	s.strand.resize(n * 4);
-	if (!p.colour.empty())
-		s.colour.resize(n * 8);
-	if (!p.joints.empty()) {
-		s.joints.resize(n * 8);
-		s.weights.resize(n * 8);
-	}
+	const float size = std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 1e-20f});
+	auto apart = [](float f) {
+		uint32_t v = (uint32_t)std::min(1023.0f, std::max(0.0f, f));
+		v = (v | v << 16) & 0x030000FFu;
+		v = (v | v << 8) & 0x0300F00Fu;
+		v = (v | v << 4) & 0x030C30C3u;
+		v = (v | v << 2) & 0x09249249u;
+		return v;
+	};
+	std::vector<std::pair<uint32_t, uint32_t>> coded(n);
 	for (size_t i = 0; i < n; i++) {
-		const V3 a = prev[i] != NONE ? p.pos[prev[i]] : p.pos[i];
-		const V3 b = next[i] != NONE ? p.pos[next[i]] : p.pos[i];
-		const V3 run = normalized(b - a, {0, 1, 0});
-		for (size_t side = 0; side < 2; side++) {
-			const size_t k = i * 2 + side;
-			s.pos[k] = p.pos[i];
-			s.normal[k] = run;
-			s.uv[k * 2] = (float)side;
-			s.uv[k * 2 + 1] = along[i];
-			s.strand[k * 2] = width[i];
-			s.strand[k * 2 + 1] = seed[i];
-			if (!p.colour.empty())
-				std::memcpy(&s.colour[k * 4], &p.colour[i * 4], sizeof(float) * 4);
-			if (!p.joints.empty()) {
-				std::memcpy(&s.joints[k * 4], &p.joints[i * 4], sizeof(uint16_t) * 4);
-				std::memcpy(&s.weights[k * 4], &p.weights[i * 4], sizeof(float) * 4);
+		const V3 q = (pos[roots[i]] - lo) * (1023.99f / size);
+		coded[i] = {apart(q.x) | apart(q.y) << 1 | apart(q.z) << 2, (uint32_t)i};
+	}
+	std::sort(coded.begin(), coded.end());
+	int bits = 0;
+	while (((size_t)1 << bits) < n)
+		bits++;
+	std::vector<uint32_t> order;
+	order.reserve(n);
+	for (size_t k = 0; k < ((size_t)1 << bits); k++) {
+		size_t m = 0;
+		for (int b = 0; b < bits; b++)
+			if (k >> b & 1)
+				m |= (size_t)1 << (bits - 1 - b);
+		if (m < n)
+			order.push_back(roots[coded[m].second]);
+	}
+	return order;
+}
+
+RawStrands open_strands(Reader &rd, const json &pj, const json &attr, int mode, size_t morphs, size_t &file_points)
+{
+	RawStrands raw;
+	const Reader::Column pc = rd.column(index_of(attr, "POSITION"), 3, MOST_STRAND_POINTS);
+	const size_t n = pc.count;
+	file_points += n;
+	if (file_points > MOST_STRAND_POINTS)
+		fail("the file is too big (over 20 million hair points)");
+	auto v3 = [](const double *v) {
+		return V3{(float)v[0], (float)v[1], (float)v[2]};
+	};
+	raw.pos.resize(n);
+	double v[4];
+	for (size_t i = 0; i < n; i++) {
+		pc.get(i, v);
+		raw.pos[i] = v3(v);
+	}
+	for (size_t k = 0; k < pc.sparse_at.size(); k++)
+		raw.pos[pc.sparse_at[k]] = v3(&pc.sparse_values[k * 3]);
+	// Its pieces: pairs of points (lines), or each point to the next (a
+	// line strip). A point keeps the first piece out of it and into it.
+	raw.next.assign(n, NO_POINT);
+	std::vector<char> entered(n, 0);
+	auto link = [&](uint32_t a, uint32_t b) {
+		if (a != b && raw.next[a] == NO_POINT && !entered[b]) {
+			raw.next[a] = b;
+			entered[b] = 1;
+		}
+	};
+	const size_t step = mode == 1 ? 2 : 1;
+	if (index_of(pj, "indices") >= 0) {
+		const Reader::Column ic = rd.column(index_of(pj, "indices"), 1, MOST_STRAND_POINTS * 2);
+		if (!ic.sparse_at.empty() || ic.type == 5126)
+			fail("the file has numbers DireBot can't read");
+		auto at = [&](size_t i) {
+			double d;
+			ic.get(i, &d);
+			if (d < 0 || d >= (double)n)
+				fail("the file is damaged (a triangle past its points)");
+			return (uint32_t)d;
+		};
+		for (size_t i = 0; i + 1 < ic.count; i += step)
+			link(at(i), at(i + 1));
+	} else {
+		for (size_t i = 0; i + 1 < n; i += step)
+			link((uint32_t)i, (uint32_t)i + 1);
+	}
+	std::vector<uint32_t> roots;
+	for (uint32_t i = 0; i < n; i++)
+		if (!entered[i] && raw.next[i] != NO_POINT)
+			roots.push_back(i);
+	raw.root = spread_order(raw.pos, roots);
+
+	auto fits = [n](const Reader::Column &c) {
+		return c.count == n;
+	};
+	if (index_of(attr, "_WIDTH") >= 0) {
+		raw.width = rd.column(index_of(attr, "_WIDTH"), 1, MOST_STRAND_POINTS);
+		raw.has_width = fits(raw.width);
+	}
+	if (index_of(attr, "COLOR_0") >= 0) {
+		raw.colour = rd.column(index_of(attr, "COLOR_0"), 0, MOST_STRAND_POINTS);
+		raw.has_colour = fits(raw.colour) && (raw.colour.comps == 3 || raw.colour.comps == 4);
+	}
+	if (index_of(attr, "JOINTS_0") >= 0 && index_of(attr, "WEIGHTS_0") >= 0) {
+		raw.joints = rd.column(index_of(attr, "JOINTS_0"), 4, MOST_STRAND_POINTS);
+		raw.weights = rd.column(index_of(attr, "WEIGHTS_0"), 4, MOST_STRAND_POINTS);
+		if (!fits(raw.joints) || !fits(raw.weights))
+			fail("the file is damaged (its parts don't add up)");
+		raw.has_bones = true;
+	}
+	const json &targets = list(pj, "targets");
+	raw.targets.assign(morphs, -1);
+	for (size_t t = 0; t < targets.size() && t < morphs; t++)
+		raw.targets[t] = index_of(targets[t], "POSITION");
+	// Its moves strand by strand.
+	const json &by_strand = field(field(field(pj, "extras"), "direbot"), "strand_morphs");
+	if (by_strand.is_object() && index_of(by_strand, "strand_start") >= 0) {
+		// A list of whole numbers that never fall, none over `most`.
+		auto numbers = [&](int accessor, double most, bool rising) {
+			const Reader::Column c = rd.column(accessor, 1, MOST_STRAND_POINTS + 1);
+			if (!c.sparse_at.empty() || c.type == 5126)
+				fail("the file has numbers DireBot can't read");
+			std::vector<uint32_t> out(c.count);
+			double d = 0, last = -1;
+			for (size_t i = 0; i < c.count; i++) {
+				c.get(i, &d);
+				if (!(d >= 0) || d > most || d < last || (rising && d == last))
+					fail("the file is damaged (its hair's moves don't fit its strands)");
+				out[i] = (uint32_t)d;
+				last = d;
+			}
+			return out;
+		};
+		raw.strand_start = numbers(index_of(by_strand, "strand_start"), (double)n, false);
+		if (raw.strand_start.size() < 2)
+			fail("the file is damaged (its hair's moves don't fit its strands)");
+		const size_t in_all = raw.strand_start.size() - 1;
+		const json &each = list(by_strand, "targets");
+		raw.strand_moves.assign(morphs, {});
+		for (size_t t = 0; t < each.size() && t < morphs; t++) {
+			if (!each[t].is_object() || index_of(each[t], "strands") < 0)
+				continue;
+			RawStrands::StrandMoves &sm = raw.strand_moves[t];
+			sm.strands = numbers(index_of(each[t], "strands"), (double)in_all - 1, true);
+			sm.moves = rd.vec3s(index_of(each[t], "POSITION"));
+			if (sm.moves.size() != sm.strands.size())
+				fail("the file is damaged (its hair's moves don't fit its strands)");
+		}
+	}
+	raw.material = index_of(pj, "material");
+	return raw;
+}
+
+// A point's numbers, the file's own or its sparse entry's.
+void column_point(const Reader::Column &c, size_t i, double *out)
+{
+	c.get(i, out);
+	if (!c.sparse_at.empty()) {
+		auto it = std::lower_bound(c.sparse_at.begin(), c.sparse_at.end(), (uint32_t)i);
+		if (it != c.sparse_at.end() && *it == i) {
+			const size_t k = (size_t)(it - c.sparse_at.begin());
+			for (int j = 0; j < c.comps; j++)
+				out[j] = c.sparse_values[k * c.comps + j];
+		}
+	}
+}
+
+void srgb_of(const double *linear, int comps, uint8_t *out)
+{
+	for (int k = 0; k < 3; k++) {
+		const float v = std::min(1.0f, std::max(0.0f, (float)linear[k]));
+		out[k] = (uint8_t)std::lround(std::pow(v, 1 / 2.2f) * 255);
+	}
+	out[3] = comps > 3 ? (uint8_t)std::lround(std::min(1.0, std::max(0.0, linear[3])) * 255) : 255;
+}
+
+// One strand: its points root to tip, how far along it each is, its
+// widths, colours and bones - and which of them are kept: its root and
+// tip, and every point that bends it (or changes its width by a tenth of
+// its widest, or its colour by a shade you'd see) more than a straight
+// run between the kept points beside it would. Where it curls, enough
+// points that it never turns far from one to the next (a small curl is
+// never far off a straight run, and would be left a row of corners). And
+// where its bones change along it, enough points for them to bend it: a
+// straight hair hung on a chain of bones still swings in a curve.
+struct StrandShape {
+	std::vector<uint32_t> at;
+	std::vector<float> arc, width;
+	std::vector<uint8_t> colour;
+	std::vector<uint16_t> joints; // 4 a point, and how much each holds it (adding up to 1)
+	std::vector<float> weights;
+	std::vector<char> keep;
+	size_t kept = 0;
+	std::vector<std::pair<uint32_t, uint32_t>> todo;
+};
+
+void shape_strand(const RawStrands &raw, uint32_t root, StrandShape &s)
+{
+	s.at.clear();
+	s.arc.clear();
+	s.width.clear();
+	s.colour.clear();
+	s.joints.clear();
+	s.weights.clear();
+	float run = 0;
+	for (uint32_t a = root; a != NO_POINT && s.at.size() <= raw.pos.size(); a = raw.next[a]) {
+		if (!s.at.empty())
+			run += length(raw.pos[a] - raw.pos[s.at.back()]);
+		s.at.push_back(a);
+		s.arc.push_back(run);
+	}
+	const size_t n = s.at.size();
+	float widest = 0;
+	double v[4];
+	for (size_t i = 0; i < n; i++) {
+		float w = 0.0001f;
+		if (raw.has_width) {
+			column_point(raw.width, s.at[i], v);
+			w = std::max(0.0f, (float)v[0]);
+		}
+		s.width.push_back(w);
+		widest = std::max(widest, w);
+		if (raw.has_colour) {
+			column_point(raw.colour, s.at[i], v);
+			uint8_t c[4];
+			srgb_of(v, raw.colour.comps, c);
+			s.colour.insert(s.colour.end(), c, c + 4);
+		}
+		if (raw.has_bones) {
+			double j[4], w[4];
+			column_point(raw.joints, s.at[i], j);
+			column_point(raw.weights, s.at[i], w);
+			float sum = 0, wk[4];
+			for (int k = 0; k < 4; k++) {
+				s.joints.push_back(j[k] >= 0 && j[k] < 65536 ? (uint16_t)j[k] : 0);
+				wk[k] = std::max(0.0f, (float)w[k]);
+				sum += wk[k];
+			}
+			for (int k = 0; k < 4; k++)
+				s.weights.push_back(sum > 1e-6f ? wk[k] / sum : (k == 0 ? 1.0f : 0.0f));
+		}
+	}
+	// How unlike point i's bones are to those `u` of the way from point
+	// a's to point b's: 0 the same, 1 none shared.
+	auto unlike = [&s](uint32_t i, uint32_t a, uint32_t b, float u) {
+		auto held = [&s](uint32_t p, uint16_t joint) {
+			float w = 0;
+			for (int k = 0; k < 4; k++)
+				if (s.joints[p * 4 + k] == joint)
+					w += s.weights[p * 4 + k];
+			return w;
+		};
+		float sum = 0;
+		const uint32_t from[3] = {i, a, b};
+		for (int f = 0; f < 3; f++)
+			for (int k = 0; k < 4; k++) {
+				const uint16_t joint = s.joints[from[f] * 4 + k];
+				// (Each bone once: where it first comes up.)
+				bool seen = false;
+				for (int g = 0; g <= f && !seen; g++)
+					for (int q = 0; q < (g < f ? 4 : k) && !seen; q++)
+						seen = s.joints[from[g] * 4 + q] == joint;
+				if (!seen)
+					sum += std::fabs(held(i, joint) -
+							 (held(a, joint) * (1 - u) + held(b, joint) * u));
+			}
+		return sum * 0.5f;
+	};
+	s.keep.assign(n, raw.bend > 0 && n >= 3 ? 0 : 1);
+	s.kept = n;
+	if (!(raw.bend > 0) || n < 3)
+		return;
+	s.keep[0] = s.keep[n - 1] = 1;
+	s.kept = 2;
+	s.todo.clear();
+	s.todo.push_back({0u, (uint32_t)n - 1});
+	while (!s.todo.empty()) {
+		const uint32_t a = s.todo.back().first, b = s.todo.back().second;
+		s.todo.pop_back();
+		if (b <= a + 1)
+			continue;
+		const V3 pa = raw.pos[s.at[a]], ab = raw.pos[s.at[b]] - pa;
+		const float ab2 = dot(ab, ab), span = s.arc[b] - s.arc[a];
+		float worst = 1, furthest = -1;
+		uint32_t at = 0, far = a + 1;
+		for (uint32_t i = a + 1; i < b; i++) {
+			const V3 ap = raw.pos[s.at[i]] - pa;
+			const float t = ab2 > 0 ? std::min(1.0f, std::max(0.0f, dot(ap, ab) / ab2)) : 0.0f;
+			const float off = length(ap - ab * t);
+			if (off > furthest) {
+				furthest = off;
+				far = i;
+			}
+			float err = off / raw.bend;
+			const float u = span > 0 ? (s.arc[i] - s.arc[a]) / span : 0.0f;
+			if (widest > 0)
+				err = std::max(err,
+					       std::fabs(s.width[i] - (s.width[a] + (s.width[b] - s.width[a]) * u)) /
+						       (0.1f * widest));
+			if (raw.has_colour)
+				for (int k = 0; k < 4; k++) {
+					const float ca = s.colour[a * 4 + k], cb = s.colour[b * 4 + k];
+					err = std::max(err,
+						       std::fabs(s.colour[i * 4 + k] - (ca + (cb - ca) * u)) / 6.0f);
+				}
+			// (Its bones not a steady change from one end's to the other's.)
+			if (raw.has_bones)
+				err = std::max(err, unlike(i, a, b, u) / 0.05f);
+			if (err > worst) {
+				worst = err;
+				at = i;
+			}
+		}
+		// A run that turns too far from its start to its end: split where
+		// it's furthest off.
+		if (!at && raw.turn > -1) {
+			const V3 da = raw.pos[s.at[a + 1]] - pa, db = raw.pos[s.at[b]] - raw.pos[s.at[b - 1]];
+			const float la = length(da), lb = length(db);
+			if (la > 0 && lb > 0 && dot(da, db) < raw.turn * la * lb)
+				at = far;
+		}
+		// A run whose ends hang from different bones: they bend it by up to
+		// its length x how unlike they are - too much, and it's halved.
+		if (!at && raw.has_bones && raw.swing > 0 && unlike(a, a, b, 1.0f) * span > raw.swing) {
+			const float half = s.arc[a] + span * 0.5f;
+			at = a + 1;
+			for (uint32_t i = a + 1; i < b; i++)
+				if (std::fabs(s.arc[i] - half) < std::fabs(s.arc[at] - half))
+					at = i;
+		}
+		if (at) {
+			s.keep[at] = 1;
+			s.kept++;
+			s.todo.push_back({a, at});
+			s.todo.push_back({at, b});
+		}
+	}
+}
+
+// How many points all a part's strands would keep, from one of every so
+// many of them: one picked from each run of that many in a row (by a
+// rule that's the same every time), not the first of each - every
+// so-manyth strand of an order made by halving is no fair sample.
+void predict_strands(RawStrands &raw)
+{
+	const size_t n = raw.root.size(), step = std::max<size_t>(1, n / 2000);
+	StrandShape s;
+	double sum = 0;
+	size_t tried = 0;
+	uint32_t pick = 12345;
+	raw.sample.clear();
+	for (size_t from = 0; from < n; from += step, tried++) {
+		pick = pick * 1664525u + 1013904223u;
+		const size_t i = from + (size_t)(pick >> 8) % std::min(step, n - from);
+		shape_strand(raw, raw.root[i], s);
+		sum += (double)s.kept;
+		raw.sample.push_back({(uint32_t)i, (uint32_t)s.kept, (double)i / (double)n});
+	}
+	raw.predicted = tried ? sum / (double)tried * (double)n : 0;
+}
+
+// How thickly hair covers the skin at each of `at`, its strands' roots:
+// the areas of the hairs (`area`: each one's width x length) rooted near
+// it, over the skin's area there - 3 where the hair would cover its skin
+// three times over. Near: within a distance such that a few dozen roots
+// are, the nearer ones counting for more (so it changes smoothly from
+// root to root). The roots are put in boxes, and each box's hairs counted
+// as one lot at their middle.
+std::vector<float> cover_at(const std::vector<V3> &at, const std::vector<float> &area)
+{
+	const size_t n = at.size();
+	std::vector<float> cover(n, 0.0f);
+	if (!n)
+		return cover;
+	V3 lo = at[0], hi = at[0];
+	for (const V3 &v : at) {
+		lo = {std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+		hi = {std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
+	}
+	const double size = std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 1e-20f});
+	const double least = size / 1048576.0;
+	constexpr int64_t LAST = 2097151;
+	// The box a root is in, of boxes `g` on a side.
+	auto box_of = [&](const V3 &v, double g) {
+		auto one = [g](float d) {
+			return (uint64_t)std::min((double)LAST, std::max(0.0, std::floor((double)d / g)));
+		};
+		return one(v.x - lo.x) << 42 | one(v.y - lo.y) << 21 | one(v.z - lo.z);
+	};
+	// The size of box that holds 14 roots or so (on a skin: as many times
+	// more as its side is longer, squared), from every so-manyth root.
+	const size_t step = std::max<size_t>(1, n / 50000), some = (n + step - 1) / step;
+	double g = size / 32;
+	std::vector<uint64_t> boxes(some);
+	for (int pass = 0; pass < 8; pass++) {
+		for (size_t i = 0, k = 0; i < n; i += step, k++)
+			boxes[k] = box_of(at[i], g);
+		std::sort(boxes.begin(), boxes.end());
+		const double each = (double)some / (double)(std::unique(boxes.begin(), boxes.end()) - boxes.begin());
+		if ((each > 10 && each < 20) || (each <= 10 && g >= size) || (each >= 20 && g <= least))
+			break;
+		g = std::min(size, std::max(least, g * std::sqrt(14.0 / each)));
+	}
+	const double h = std::max(least, g / std::sqrt((double)step));
+	// The roots box by box; each box: where its roots start, their hairs'
+	// areas added up, and their middle.
+	std::vector<std::pair<uint64_t, uint32_t>> coded(n);
+	for (size_t i = 0; i < n; i++)
+		coded[i] = {box_of(at[i], h), (uint32_t)i};
+	std::sort(coded.begin(), coded.end());
+	std::vector<uint64_t> box;
+	std::vector<uint32_t> from;
+	std::vector<V3> middle;
+	std::vector<float> lot;
+	for (size_t k = 0; k < n; k++) {
+		if (!k || coded[k].first != coded[k - 1].first) {
+			box.push_back(coded[k].first);
+			from.push_back((uint32_t)k);
+			middle.push_back(V3{});
+			lot.push_back(0.0f);
+		}
+		middle.back() = middle.back() + at[coded[k].second];
+		lot.back() += area[coded[k].second];
+	}
+	from.push_back((uint32_t)n);
+	for (size_t b = 0; b < box.size(); b++)
+		middle[b] = middle[b] * (1.0f / (float)(from[b + 1] - from[b]));
+	// A lot `d` away counts (1 - d^2 / r^2)^2, r two boxes: over a flat
+	// skin that adds up to a third of the circle's area.
+	const double r = 2 * h;
+	const float r2 = (float)(r * r);
+	const double per = 3.0 / (3.14159265358979 * r * r);
+	std::vector<uint32_t> near;
+	for (size_t b = 0; b < box.size(); b++) {
+		const int64_t x = (int64_t)(box[b] >> 42), y = (int64_t)(box[b] >> 21 & 0x1FFFFF),
+			      z = (int64_t)(box[b] & 0x1FFFFF);
+		// The boxes within two of it that have roots (a row of them along
+		// z lies together in the list).
+		near.clear();
+		for (int64_t X = std::max<int64_t>(0, x - 2); X <= std::min(LAST, x + 2); X++)
+			for (int64_t Y = std::max<int64_t>(0, y - 2); Y <= std::min(LAST, y + 2); Y++) {
+				const uint64_t row = (uint64_t)X << 42 | (uint64_t)Y << 21;
+				const uint64_t first = row | (uint64_t)std::max<int64_t>(0, z - 2),
+					       last = row | (uint64_t)std::min(LAST, z + 2);
+				for (auto it = std::lower_bound(box.begin(), box.end(), first);
+				     it != box.end() && *it <= last; ++it)
+					near.push_back((uint32_t)(it - box.begin()));
+			}
+		for (uint32_t i = from[b]; i < from[b + 1]; i++) {
+			const V3 p = at[coded[i].second];
+			double sum = 0;
+			for (uint32_t c : near) {
+				const V3 d = middle[c] - p;
+				const float t = 1 - dot(d, d) / r2;
+				if (t > 0)
+					sum += (double)lot[c] * (double)(t * t);
+			}
+			cover[coded[i].second] = (float)(sum * per);
+		}
+	}
+	return cover;
+}
+
+// Which of a part's strands are kept and drawn first when not all can be
+// (Strands::rate, key): hair that covers its skin up to `cover` times
+// over at the full rate, deeper hair at as much less as it's deeper, down
+// to 1 / `uneven`; the strands put in the order of their keys.
+void rate_strands(RawStrands &raw, float cover, float uneven)
+{
+	const size_t n = raw.root.size();
+	if (n < 2 || !(uneven > 1) || !(cover > 0))
+		return;
+	// Each strand: where its root is, and its own area - its length x its
+	// width (its root's, middle's and tip's: 1, 4 and 1 parts).
+	std::vector<V3> at(n);
+	std::vector<float> area(n);
+	std::vector<uint32_t> chain;
+	double v[4];
+	auto width_at = [&](uint32_t point) {
+		column_point(raw.width, point, v);
+		return std::max(0.0f, (float)v[0]);
+	};
+	for (size_t i = 0; i < n; i++) {
+		chain.clear();
+		float run = 0;
+		for (uint32_t a = raw.root[i]; a != NO_POINT && chain.size() <= raw.pos.size(); a = raw.next[a]) {
+			if (!chain.empty())
+				run += length(raw.pos[a] - raw.pos[chain.back()]);
+			chain.push_back(a);
+		}
+		float w = 0.0001f;
+		if (raw.has_width)
+			w = (width_at(chain.front()) + 4 * width_at(chain[chain.size() / 2]) + width_at(chain.back())) /
+			    6;
+		at[i] = raw.pos[raw.root[i]];
+		area[i] = run * w;
+	}
+	const std::vector<float> covered = cover_at(at, area);
+	const float least = 1 / std::min(4.0f, uneven);
+	std::vector<float> rate(n);
+	float top = least;
+	for (size_t i = 0; i < n; i++) {
+		rate[i] = covered[i] > cover ? std::max(least, cover / covered[i]) : 1.0f;
+		top = std::max(top, rate[i]);
+	}
+	// (The highest: 1 - a coat deep all over is one the same all over.)
+	raw.top = top;
+	std::vector<double> key(n);
+	for (size_t i = 0; i < n; i++) {
+		rate[i] = Strands::rate_of(Strands::rate_step(rate[i] / top));
+		key[i] = (double)i / (double)n / (double)rate[i];
+	}
+	for (RawStrands::Sample &sm : raw.sample)
+		sm.key = key[sm.rank];
+	std::vector<uint32_t> order(n);
+	for (size_t i = 0; i < n; i++)
+		order[i] = (uint32_t)i;
+	std::stable_sort(order.begin(), order.end(), [&key](uint32_t a, uint32_t b) { return key[a] < key[b]; });
+	std::vector<uint32_t> root(n);
+	raw.rate.resize(n);
+	for (size_t i = 0; i < n; i++) {
+		root[i] = raw.root[order[i]];
+		raw.rate[i] = rate[order[i]];
+	}
+	raw.root.swap(root);
+	raw.rank.swap(order);
+}
+
+// The order a part's pieces are drawn in (Strands::groups, layers,
+// pieces, runs): its strands grouped by the bone that holds each one's
+// root most (the smallest groups joined to the one nearest, past
+// MOST_STRAND_GROUPS), each group's pieces in `layers` layers of as many
+// pieces each by how far from their roots they start, and a layer's by
+// strand.
+void arrange_strands(Primitive &p, int layers)
+{
+	Strands &h = p.hair;
+	const size_t strands = h.strands();
+	h.groups.clear();
+	h.pieces.clear();
+	h.runs.clear();
+	h.layers = std::max(1, std::min(16, layers));
+	h.core = 0;
+	if (!strands)
+		return;
+	const bool boned = p.joints.size() == p.pos.size() * 4 && p.weights.size() == p.pos.size() * 4;
+	std::vector<uint32_t> group_of(strands, 0);
+	struct Sum {
+		int joint = 0;
+		size_t count = 0;
+		V3 middle;
+	};
+	std::vector<Sum> sums;
+	std::map<int, uint32_t> by_joint;
+	for (size_t s = 0; s < strands; s++) {
+		int joint = 0;
+		const size_t r = h.first[s];
+		if (boned) {
+			int best = 0;
+			for (int k = 1; k < 4; k++)
+				if (p.weights[r * 4 + k] > p.weights[r * 4 + best])
+					best = k;
+			joint = p.joints[r * 4 + best];
+		}
+		auto it = by_joint.find(joint);
+		if (it == by_joint.end()) {
+			it = by_joint.emplace(joint, (uint32_t)sums.size()).first;
+			sums.push_back({joint, 0, V3{}});
+		}
+		group_of[s] = it->second;
+		Sum &g = sums[it->second];
+		g.count++;
+		g.middle = g.middle + p.pos[(h.first[s] + h.first[s + 1] - 1) / 2];
+	}
+	// Too many: the smallest joined to the one whose middle is nearest.
+	std::vector<uint32_t> into(sums.size());
+	for (size_t i = 0; i < sums.size(); i++)
+		into[i] = (uint32_t)i;
+	size_t alive = sums.size();
+	while (alive > MOST_STRAND_GROUPS) {
+		size_t small = sums.size();
+		for (size_t i = 0; i < sums.size(); i++)
+			if (sums[i].count && (small == sums.size() || sums[i].count < sums[small].count))
+				small = i;
+		const V3 at = sums[small].middle * (1.0f / (float)sums[small].count);
+		size_t near = sums.size();
+		float best = 0;
+		for (size_t i = 0; i < sums.size(); i++) {
+			if (i == small || !sums[i].count)
+				continue;
+			const float d = length(sums[i].middle * (1.0f / (float)sums[i].count) - at);
+			if (near == sums.size() || d < best) {
+				near = i;
+				best = d;
+			}
+		}
+		// (The bigger one's bone stays the group's.)
+		sums[near].count += sums[small].count;
+		sums[near].middle = sums[near].middle + sums[small].middle;
+		sums[small].count = 0;
+		for (uint32_t &t : into)
+			if (t == small)
+				t = (uint32_t)near;
+		alive--;
+	}
+	std::vector<uint32_t> number(sums.size(), 0);
+	for (size_t i = 0; i < sums.size(); i++) {
+		if (!sums[i].count)
+			continue;
+		number[i] = (uint32_t)h.groups.size();
+		Strands::Group g;
+		g.joint = sums[i].joint;
+		g.middle = sums[i].middle * (1.0f / (float)sums[i].count);
+		h.groups.push_back(g);
+	}
+	for (uint32_t &g : group_of)
+		g = number[into[g]];
+	// A point near each group's middle (posed on the CPU: where it is) -
+	// of its first strands where it has any there, as only the first of a
+	// part's strands may be posed.
+	std::vector<float> nearest(h.groups.size(), 1e30f);
+	const size_t early = std::max<size_t>(64, strands / 16);
+	for (size_t s = 0; s < strands; s++) {
+		const uint32_t mid = (h.first[s] + h.first[s + 1] - 1) / 2;
+		Strands::Group &g = h.groups[group_of[s]];
+		if (s >= early && nearest[group_of[s]] < 1e30f)
+			continue;
+		const float d = length(p.pos[mid] - g.middle);
+		if (d < nearest[group_of[s]]) {
+			nearest[group_of[s]] = d;
+			g.sample = mid;
+		}
+	}
+	// Each piece: how far along its strand it starts (the strand's own
+	// length, in its units).
+	const size_t groups = h.groups.size(), L = (size_t)h.layers;
+	std::vector<std::vector<float>> starts(groups);
+	std::vector<float> from(p.pos.size(), 0);
+	for (size_t s = 0; s < strands; s++) {
+		float run = 0;
+		for (uint32_t i = h.first[s]; i + 1 < h.first[s + 1]; i++) {
+			from[i] = run;
+			starts[group_of[s]].push_back(run);
+			run += length(p.pos[i + 1] - p.pos[i]);
+		}
+	}
+	// A group's layers: as many pieces in each.
+	std::vector<std::vector<float>> cut(groups);
+	for (size_t g = 0; g < groups; g++) {
+		std::vector<float> &v = starts[g];
+		std::sort(v.begin(), v.end());
+		for (size_t l = 1; l < L; l++)
+			cut[g].push_back(v.empty() ? 0.0f : v[std::min(v.size() - 1, v.size() * l / L)]);
+		std::vector<float>().swap(v);
+	}
+	// The inner layers (the hull): 3 of 5.
+	h.core = L >= 2 ? (int)std::min(L - 1, (L * 3 + 2) / 5) : 0;
+	auto layer_of = [&](uint32_t g, float start) {
+		size_t l = 0;
+		while (l + 1 < L && start > cut[g][l])
+			l++;
+		// (Pieces that start at the same distance go in the same layer,
+		// the one under the first cut they don't pass: every hair's root
+		// piece is in the first.)
+		return l;
+	};
+	// How far the inner layers reach: where the outer ones start - or, of
+	// hairs of a piece or two (whose pieces start at their roots or near),
+	// where the inner layers' pieces end, on average.
+	std::vector<double> ends(groups, 0.0);
+	std::vector<size_t> inner(groups, 0);
+	std::vector<uint32_t> count(groups * L + 1, 0);
+	for (size_t s = 0; s < strands; s++)
+		for (uint32_t i = h.first[s]; i + 1 < h.first[s + 1]; i++) {
+			const uint32_t g = group_of[s];
+			const size_t l = layer_of(g, from[i]);
+			count[g * L + l + 1]++;
+			if (l < (size_t)h.core) {
+				ends[g] += (double)from[i] + (double)length(p.pos[i + 1] - p.pos[i]);
+				inner[g]++;
+			}
+		}
+	for (size_t g = 0; g < groups; g++)
+		h.groups[g].reach = h.core ? std::max(cut[g][(size_t)h.core - 1],
+						      inner[g] ? (float)(ends[g] / (double)inner[g]) : 0.0f)
+					   : 0.0f;
+	for (size_t r = 0; r < groups * L; r++)
+		count[r + 1] += count[r];
+	h.runs = count;
+	h.pieces.resize(count[groups * L]);
+	std::vector<uint32_t> fill(count.begin(), count.end() - 1);
+	for (size_t s = 0; s < strands; s++)
+		for (uint32_t i = h.first[s]; i + 1 < h.first[s + 1]; i++)
+			h.pieces[fill[group_of[s] * L + layer_of(group_of[s], from[i])]++] = i;
+}
+
+// A strand part's kept strands made ready (Primitive::strands): the
+// first of them in draw order, as far as its allowed points go.
+Primitive finish_strands(const RawStrands &raw, int layers, std::vector<uint32_t> &which)
+{
+	Primitive p;
+	p.strands = true;
+	p.material = raw.material;
+	Strands &h = p.hair;
+	const size_t in_file = raw.root.size();
+	h.in_file = (uint32_t)in_file;
+	h.first.push_back(0);
+	which.clear();
+	StrandShape s;
+	auto rate_of = [&raw](size_t i) {
+		return raw.rate.empty() ? 1.0f : raw.rate[i];
+	};
+	auto key_of = [&](size_t i) {
+		const size_t rank = raw.rank.empty() ? i : raw.rank[i];
+		return (float)((double)rank / (double)in_file / (double)rate_of(i));
+	};
+	float lowest = 1;
+	for (size_t at = 0; at < in_file; at++) {
+		const uint32_t root = raw.root[at];
+		shape_strand(raw, root, s);
+		if (s.kept < 2 || p.pos.size() + s.kept > raw.allowed)
+			break;
+		h.key.push_back(key_of(at));
+		h.rate.push_back(rate_of(at));
+		lowest = std::min(lowest, h.rate.back());
+		const float total = s.arc.back();
+		const size_t from = p.pos.size();
+		for (size_t i = 0; i < s.at.size(); i++) {
+			if (!s.keep[i])
+				continue;
+			which.push_back(s.at[i]);
+			p.pos.push_back(raw.pos[s.at[i]]);
+			if (raw.has_bones) {
+				p.joints.insert(p.joints.end(), &s.joints[i * 4], &s.joints[i * 4] + 4);
+				p.weights.insert(p.weights.end(), &s.weights[i * 4], &s.weights[i * 4] + 4);
+			}
+			h.width.push_back(s.width[i]);
+			h.along.push_back(total > 0 ? s.arc[i] / total : 0.0f);
+			if (raw.has_colour)
+				h.colour.insert(h.colour.end(), &s.colour[i * 4], &s.colour[i * 4] + 4);
+		}
+		// The way it runs at each kept point: from the one before to the
+		// one after.
+		const size_t to = p.pos.size();
+		for (size_t i = from; i < to; i++) {
+			const V3 a = p.pos[i > from ? i - 1 : i], b = p.pos[i + 1 < to ? i + 1 : i];
+			p.normal.push_back(normalized(b - a, {0, 1, 0}));
+		}
+		h.first.push_back((uint32_t)to);
+	}
+	const size_t kept = h.strands();
+	h.full = kept < in_file ? key_of(kept) : 1 / lowest;
+	// Its hairs' mean width along their lengths (whichever of their points
+	// are kept), as drawn at `full`.
+	double width_sum = 0, length_sum = 0;
+	for (size_t k = 0; k < kept; k++) {
+		const double wider = 1 / std::min(1.0, (double)h.full * (double)h.rate[k]);
+		for (uint32_t i = h.first[k]; i + 1 < h.first[k + 1]; i++) {
+			const double piece = length(p.pos[i + 1] - p.pos[i]);
+			width_sum += 0.5 * ((double)h.width[i] + (double)h.width[i + 1]) * piece * wider;
+			length_sum += piece;
+		}
+	}
+	h.mean_width = length_sum > 0 ? (float)(width_sum / length_sum) : 0.0f;
+	p.joints.shrink_to_fit();
+	p.weights.shrink_to_fit();
+	p.pos.shrink_to_fit();
+	p.normal.shrink_to_fit();
+	h.first.shrink_to_fit();
+	h.key.shrink_to_fit();
+	h.rate.shrink_to_fit();
+	h.width.shrink_to_fit();
+	h.along.shrink_to_fit();
+	h.colour.shrink_to_fit();
+	arrange_strands(p, layers);
+	return p;
+}
+
+// A strand part's expressions (Strands::anchor, moves): every point an
+// expression moves follows one of up to MOST_ANCHORS spots. A strand
+// that moves all of a piece (hair riding the skin at its root) keeps to
+// one spot - found by where its root is - and any other point by where
+// it is; the spots are made by halving the box round the moved points,
+// the half that moves most and reaches furthest first, so hair that
+// moves a lot gets the most spots. Each spot's move is the mean of its
+// points'. Returns how far the worst point is left from where the file
+// would move it.
+float anchor_strands(Reader &rd, const RawStrands &raw, const std::vector<uint32_t> &which, Primitive &p)
+{
+	Strands &h = p.hair;
+	const size_t n = p.pos.size(), strands = h.strands(), morphs = raw.targets.size();
+	std::vector<Reader::Column> cols(morphs);
+	bool any = false;
+	for (size_t t = 0; t < morphs; t++) {
+		if (raw.targets[t] < 0)
+			continue;
+		cols[t] = rd.column(raw.targets[t], 3, MOST_STRAND_POINTS);
+		if (cols[t].count != raw.pos.size())
+			fail("the file is damaged (an expression doesn't fit its part)");
+		any = any || cols[t].data || !cols[t].sparse_at.empty();
+	}
+	for (const RawStrands::StrandMoves &sm : raw.strand_moves)
+		any = any || !sm.strands.empty();
+	if (!any || !n)
+		return 0;
+	std::vector<uint32_t> new_of;
+	// Moved strand by strand: which of the file's strands each kept point
+	// is of (none: NO_POINT), and where in an expression's list each of
+	// those strands is.
+	std::vector<uint32_t> strand_of, listed;
+	if (!raw.strand_start.empty()) {
+		const std::vector<uint32_t> &start = raw.strand_start;
+		strand_of.assign(n, NO_POINT);
+		for (size_t i = 0; i < n; i++) {
+			const auto past = std::upper_bound(start.begin(), start.end(), which[i]);
+			if (past != start.begin() && past != start.end())
+				strand_of[i] = (uint32_t)(past - start.begin()) - 1;
+		}
+		listed.assign(start.size() - 1, NO_POINT);
+	}
+	// One expression's moves of the kept points (those it doesn't move: none).
+	std::vector<V3> d(n);
+	auto moves_of = [&](size_t t) {
+		const Reader::Column &c = cols[t];
+		std::fill(d.begin(), d.end(), V3{});
+		bool moved = false;
+		auto put = [&](size_t i, const double *v) {
+			const V3 m{(float)v[0], (float)v[1], (float)v[2]};
+			if (dot(m, m) > MOVES_NOTHING) {
+				d[i] = m;
+				moved = true;
+			}
+		};
+		double v[4];
+		if (c.comps != 3) {
+			// (none the usual way)
+		} else if (c.data) {
+			for (size_t i = 0; i < n; i++) {
+				column_point(c, which[i], v);
+				put(i, v);
+			}
+		} else if (!c.sparse_at.empty()) {
+			if (new_of.empty()) {
+				new_of.assign(raw.pos.size(), NO_POINT);
+				for (size_t i = 0; i < n; i++)
+					new_of[which[i]] = (uint32_t)i;
+			}
+			for (size_t k = 0; k < c.sparse_at.size(); k++)
+				if (new_of[c.sparse_at[k]] != NO_POINT)
+					put(new_of[c.sparse_at[k]], &c.sparse_values[k * 3]);
+		}
+		if (t < raw.strand_moves.size() && !raw.strand_moves[t].strands.empty() && !strand_of.empty()) {
+			const RawStrands::StrandMoves &sm = raw.strand_moves[t];
+			for (size_t k = 0; k < sm.strands.size(); k++)
+				listed[sm.strands[k]] = (uint32_t)k;
+			for (size_t i = 0; i < n; i++) {
+				if (strand_of[i] == NO_POINT || listed[strand_of[i]] == NO_POINT)
+					continue;
+				const V3 m = d[i] + sm.moves[listed[strand_of[i]]];
+				d[i] = dot(m, m) > MOVES_NOTHING ? m : V3{};
+				moved = moved || dot(m, m) > MOVES_NOTHING;
+			}
+			for (uint32_t k : sm.strands)
+				listed[k] = NO_POINT;
+		}
+		return moved;
+	};
+	// How far each point is ever moved, and how far from its root's move.
+	std::vector<float> reach(n, 0), bent(strands, 0);
+	std::vector<char> used(morphs, 0);
+	for (size_t t = 0; t < morphs; t++) {
+		if (!moves_of(t))
+			continue;
+		used[t] = 1;
+		for (size_t s = 0; s < strands; s++) {
+			const V3 root = d[h.first[s]];
+			for (uint32_t i = h.first[s]; i < h.first[s + 1]; i++) {
+				reach[i] = std::max(reach[i], length(d[i]));
+				bent[s] = std::max(bent[s], length(d[i] - root));
 			}
 		}
 	}
-	for (const auto &pc : pieces) {
-		if (pc.first == pc.second)
+	// The moved points, each with the place its spot is found by.
+	std::vector<uint32_t> items;
+	std::vector<V3> key(n);
+	for (size_t s = 0; s < strands; s++) {
+		float most = 0;
+		for (uint32_t i = h.first[s]; i < h.first[s + 1]; i++)
+			most = std::max(most, reach[i]);
+		if (!(most > 0))
 			continue;
-		const uint32_t a0 = pc.first * 2, a1 = a0 + 1, b0 = pc.second * 2, b1 = b0 + 1;
-		s.index.insert(s.index.end(), {a0, b0, a1, a1, b0, b1});
+		const bool whole = bent[s] <= 0.05f * most + 1e-7f;
+		for (uint32_t i = h.first[s]; i < h.first[s + 1]; i++) {
+			if (whole)
+				reach[i] = most;
+			if (!(reach[i] > 0))
+				continue;
+			key[i] = whole ? p.pos[h.first[s]] : p.pos[i];
+			items.push_back(i);
+		}
 	}
-	p = std::move(s);
+	h.moves.assign(morphs, {});
+	if (items.empty())
+		return 0;
+	struct Cell {
+		uint32_t from = 0, to = 0;
+		V3 lo, hi;
+		float reach = 0;
+	};
+	auto measure_cell = [&](Cell &c) {
+		c.lo = {1e30f, 1e30f, 1e30f};
+		c.hi = {-1e30f, -1e30f, -1e30f};
+		c.reach = 0;
+		for (uint32_t k = c.from; k < c.to; k++) {
+			const V3 v = key[items[k]];
+			c.lo = {std::min(c.lo.x, v.x), std::min(c.lo.y, v.y), std::min(c.lo.z, v.z)};
+			c.hi = {std::max(c.hi.x, v.x), std::max(c.hi.y, v.y), std::max(c.hi.z, v.z)};
+			c.reach = std::max(c.reach, reach[items[k]]);
+		}
+	};
+	auto cost_of = [](const Cell &c) {
+		return length(c.hi - c.lo) * c.reach;
+	};
+	std::vector<Cell> cells(1);
+	cells[0].from = 0;
+	cells[0].to = (uint32_t)items.size();
+	measure_cell(cells[0]);
+	std::vector<std::pair<float, uint32_t>> heap;
+	heap.push_back({cost_of(cells[0]), 0u});
+	while (cells.size() < Strands::MOST_ANCHORS && !heap.empty()) {
+		std::pop_heap(heap.begin(), heap.end());
+		const uint32_t ci = heap.back().second;
+		const float cost = heap.back().first;
+		heap.pop_back();
+		if (!(cost > 0))
+			break;
+		Cell c = cells[ci];
+		const V3 size = c.hi - c.lo;
+		const int axis = size.x >= size.y && size.x >= size.z ? 0 : size.y >= size.z ? 1 : 2;
+		auto on = [axis](V3 v) {
+			return axis == 0 ? v.x : axis == 1 ? v.y : v.z;
+		};
+		const float mid = (on(c.lo) + on(c.hi)) * 0.5f;
+		const auto split = std::partition(items.begin() + c.from, items.begin() + c.to,
+						  [&](uint32_t i) { return on(key[i]) < mid; });
+		const uint32_t at = (uint32_t)(split - items.begin());
+		if (at == c.from || at == c.to)
+			continue; // (too small for a float to halve: left whole)
+		Cell a = c, b = c;
+		a.to = b.from = at;
+		measure_cell(a);
+		measure_cell(b);
+		cells[ci] = a;
+		cells.push_back(b);
+		heap.push_back({cost_of(a), ci});
+		std::push_heap(heap.begin(), heap.end());
+		heap.push_back({cost_of(b), (uint32_t)cells.size() - 1});
+		std::push_heap(heap.begin(), heap.end());
+	}
+	h.anchor.assign(n, 0);
+	for (size_t ci = 0; ci < cells.size(); ci++)
+		for (uint32_t k = cells[ci].from; k < cells[ci].to; k++)
+			h.anchor[items[k]] = (uint16_t)(ci + 1);
+	std::vector<uint32_t> count(cells.size() + 1, 0);
+	for (uint32_t i : items)
+		count[h.anchor[i]]++;
+	float worst = 0;
+	for (size_t t = 0; t < morphs; t++) {
+		h.moves[t].assign(cells.size() + 1, V3{});
+		if (!used[t] || !moves_of(t))
+			continue;
+		std::vector<V3> &mv = h.moves[t];
+		for (uint32_t i : items)
+			mv[h.anchor[i]] = mv[h.anchor[i]] + d[i];
+		for (size_t a = 1; a < mv.size(); a++)
+			if (count[a])
+				mv[a] = mv[a] * (1.0f / (float)count[a]);
+		for (uint32_t i : items)
+			worst = std::max(worst, length(d[i] - mv[h.anchor[i]]));
+	}
+	return worst;
 }
 
 // The triangles of a strip or fan, as a list.
@@ -698,6 +1732,8 @@ Material read_material(const json &doc, const json &m)
 		mat.glow_soft = std::clamp(num(glow, "soft", 1.5f), 0.0f, 16.0f);
 		mat.glow_ragged = std::clamp(num(glow, "ragged", 0.0f), 0.0f, 1.0f);
 	}
+	// Stand-in hair, worn while its real strands aren't drawn.
+	mat.hair_standin = flag(field(field(m, "extras"), "direbot"), "hair_standin", false);
 	return mat;
 }
 
@@ -1200,24 +2236,19 @@ void read_constraints(const json &doc, Model &m)
 
 // An expression's moves kept only where it moves a point (by more than
 // 1e-7, or turns its facing by more than 1e-5: less is nothing to see),
-// from the file's moves of all n points (dp or dn empty: none). For
-// hair strands (two points a file's point, its two sides) each moved
-// point is kept for both sides.
-MorphTarget only_moved(const std::vector<V3> &dp, const std::vector<V3> &dn, size_t n, bool strands)
+// from the file's moves of all n points (dp or dn empty: none).
+MorphTarget only_moved(const std::vector<V3> &dp, const std::vector<V3> &dn, size_t n)
 {
 	MorphTarget mt;
-	const size_t sides = strands ? 2 : 1;
 	for (size_t v = 0; v < n; v++) {
 		const V3 p = dp.empty() ? V3{} : dp[v];
 		const V3 f = dn.empty() ? V3{} : dn[v];
 		if (dot(p, p) <= MOVES_NOTHING && dot(f, f) <= TURNS_NOTHING)
 			continue;
-		for (size_t side = 0; side < sides; side++) {
-			mt.at.push_back((uint32_t)(v * sides + side));
-			mt.pos.push_back(p);
-			if (!dn.empty())
-				mt.normal.push_back(f);
-		}
+		mt.at.push_back((uint32_t)v);
+		mt.pos.push_back(p);
+		if (!dn.empty())
+			mt.normal.push_back(f);
 	}
 	mt.at.shrink_to_fit();
 	mt.pos.shrink_to_fit();
@@ -1225,9 +2256,23 @@ MorphTarget only_moved(const std::vector<V3> &dp, const std::vector<V3> &dn, siz
 	return mt;
 }
 
-void read_meshes(Reader &rd, const json &doc, Model &m)
+void read_meshes(Reader &rd, const json &doc, Model &m, const LoadOptions &options)
 {
-	size_t points = 0, indices = 0;
+	size_t points = 0, indices = 0, strand_points = 0;
+	// Its strand parts, finished once every part is read (how many of
+	// each one's strands are kept goes by them all).
+	struct Pending {
+		size_t mesh = 0, part = 0;
+		RawStrands raw;
+	};
+	std::vector<Pending> pending;
+	V3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+	auto reach = [&lo, &hi](const std::vector<V3> &pos) {
+		for (const V3 &v : pos) {
+			lo = {std::min(lo.x, v.x), std::min(lo.y, v.y), std::min(lo.z, v.z)};
+			hi = {std::max(hi.x, v.x), std::max(hi.y, v.y), std::max(hi.z, v.z)};
+		}
+	};
 	for (const json &mj : list(doc, "meshes")) {
 		Mesh mesh;
 		mesh.name = text(mj, "name");
@@ -1249,12 +2294,34 @@ void read_meshes(Reader &rd, const json &doc, Model &m)
 			const int pos_a = index_of(attr, "POSITION");
 			if (pos_a < 0)
 				continue;
+			const json &pnames = field(field(pj, "extras"), "targetNames");
+			const json &use = names.is_array() ? names : pnames;
+			if (use.is_array())
+				for (size_t t = 0; t < use.size() && t < morphs; t++)
+					if (use[t].is_string() && mesh.morph_names[t].empty())
+						mesh.morph_names[t] = use[t].get<std::string>();
 			Primitive p;
+			p.material = index_of(pj, "material");
+			if (p.material >= (int)m.materials.size())
+				p.material = -1;
+			if (strands) {
+				Pending pd;
+				pd.mesh = m.meshes.size();
+				pd.part = mesh.parts.size();
+				pd.raw = open_strands(rd, pj, attr, mode, morphs, strand_points);
+				pd.raw.material = p.material;
+				reach(pd.raw.pos);
+				pending.push_back(std::move(pd));
+				p.strands = true;
+				mesh.parts.push_back(std::move(p));
+				continue;
+			}
 			p.pos = rd.vec3s(pos_a);
 			const size_t n = p.pos.size();
 			points += n;
 			if (points > MOST_POINTS)
 				fail("the file is too big (over 4 million points)");
+			reach(p.pos);
 			if (index_of(attr, "NORMAL") >= 0) {
 				p.normal = rd.vec3s(index_of(attr, "NORMAL"));
 				if (p.normal.size() != n)
@@ -1322,15 +2389,8 @@ void read_meshes(Reader &rd, const json &doc, Model &m)
 				for (size_t i = 0; i < n; i++)
 					ix[i] = (uint32_t)i;
 			}
-			if (strands) {
-				make_strands(p, ix, mode, rd, attr);
-				points += p.pos.size() / 2;
-				if (points > MOST_POINTS)
-					fail("the file is too big (over 4 million points)");
-			} else {
-				p.index = triangles_of(ix, mode);
-				p.index.resize(p.index.size() / 3 * 3);
-			}
+			p.index = triangles_of(ix, mode);
+			p.index.resize(p.index.size() / 3 * 3);
 			indices += p.index.size();
 			if (indices > MOST_INDEX)
 				fail("the file is too big (over 8 million triangles)");
@@ -1342,28 +2402,17 @@ void read_meshes(Reader &rd, const json &doc, Model &m)
 				std::vector<V3> dp, dn;
 				if (index_of(targets[t], "POSITION") >= 0)
 					dp = rd.vec3s(index_of(targets[t], "POSITION"));
-				// A strand's facing is the way it runs: its normals'
-				// moves left out.
-				if (index_of(targets[t], "NORMAL") >= 0 && !strands)
+				if (index_of(targets[t], "NORMAL") >= 0)
 					dn = rd.vec3s(index_of(targets[t], "NORMAL"));
 				if ((!dp.empty() && dp.size() != n) || (!dn.empty() && dn.size() != n))
 					fail("the file is damaged (an expression doesn't fit its part)");
-				p.morphs[t] = only_moved(dp, dn, n, strands);
-				// Counted by what's kept: the points it moves (each
-				// strand point twice, its two sides), not every point.
+				p.morphs[t] = only_moved(dp, dn, n);
+				// Counted by what's kept: the points it moves, not every
+				// point.
 				points += (p.morphs[t].pos.size() + p.morphs[t].normal.size()) / 4;
 			}
 			if (points > MOST_POINTS * 2)
 				fail("the file is too big");
-			const json &pnames = field(field(pj, "extras"), "targetNames");
-			const json &use = names.is_array() ? names : pnames;
-			if (use.is_array())
-				for (size_t t = 0; t < use.size() && t < morphs; t++)
-					if (use[t].is_string() && mesh.morph_names[t].empty())
-						mesh.morph_names[t] = use[t].get<std::string>();
-			p.material = index_of(pj, "material");
-			if (p.material >= (int)m.materials.size())
-				p.material = -1;
 			mesh.parts.push_back(std::move(p));
 		}
 		float w[MOST_MORPHS];
@@ -1371,6 +2420,68 @@ void read_meshes(Reader &rd, const json &doc, Model &m)
 		numbers(mj, "weights", w, (int)morphs);
 		mesh.weights.assign(w, w + morphs);
 		m.meshes.push_back(std::move(mesh));
+	}
+	if (pending.empty())
+		return;
+	// Its hair strands: as many of each part's as the points allowed go
+	// round (as near as a sample of its strands can tell) - the strands
+	// under one threshold in every part (Strands::key: where its hair is
+	// thin first), or with every strand worth the same
+	// (LoadOptions::strand_uneven 1) each part the same share of its own.
+	// None wanted: a character with stand-in hair to wear instead keeps
+	// none, one with none keeps a few.
+	size_t allowed = options.strand_points;
+	if (!allowed && !m.hair_standins)
+		allowed = options.strand_points_bare;
+	const float size = lo.x <= hi.x ? length(hi - lo) : 0.0f;
+	double predicted = 0;
+	for (Pending &pd : pending) {
+		pd.raw.bend = std::max(0.0f, options.strand_bend) * size;
+		pd.raw.swing = std::max(0.0f, options.strand_swing) * size;
+		pd.raw.turn = options.strand_turn > 0 ? std::cos(std::min(180.0f, options.strand_turn) * 0.01745329252f)
+						      : -1.0f;
+		predict_strands(pd.raw);
+		predicted += pd.raw.predicted;
+	}
+	const bool short_of = predicted > (double)allowed;
+	if (short_of && allowed && options.strand_uneven > 1 && options.strand_cover > 0) {
+		struct One {
+			double key;
+			size_t part;
+			double points;
+		};
+		std::vector<One> all;
+		for (size_t k = 0; k < pending.size(); k++) {
+			RawStrands &raw = pending[k].raw;
+			rate_strands(raw, options.strand_cover, options.strand_uneven);
+			const double each = raw.sample.empty() ? 0
+							       : (double)raw.root.size() / (double)raw.sample.size();
+			for (const RawStrands::Sample &sm : raw.sample)
+				all.push_back({sm.key / (double)raw.top, k, (double)sm.kept * each});
+		}
+		std::stable_sort(all.begin(), all.end(), [](const One &a, const One &b) { return a.key < b.key; });
+		std::vector<double> points(pending.size(), 0.0);
+		double sum = 0;
+		for (size_t i = 0; i < all.size() && sum < (double)allowed; i++) {
+			points[all[i].part] += all[i].points;
+			sum += all[i].points;
+		}
+		for (size_t k = 0; k < pending.size(); k++)
+			pending[k].raw.allowed = sum > 0 ? (size_t)((double)allowed * (points[k] / sum)) : 0;
+	} else {
+		for (Pending &pd : pending)
+			pd.raw.allowed = short_of ? (size_t)((double)allowed * (pd.raw.predicted / predicted))
+						  : allowed;
+	}
+	for (Pending &pd : pending) {
+		std::vector<uint32_t> which;
+		Primitive p = finish_strands(pd.raw, options.strand_layers, which);
+		anchor_strands(rd, pd.raw, which, p);
+		m.strands_in_file += p.hair.in_file;
+		m.strands += p.hair.strands();
+		m.strand_points += p.pos.size();
+		m.meshes[pd.mesh].parts[pd.part] = std::move(p);
+		pd.raw = RawStrands();
 	}
 }
 
@@ -1550,7 +2661,7 @@ void load_buffers(Reader &rd, const json &doc)
 	}
 }
 
-void load_json(Reader &rd, const json &doc, Model &m)
+void load_json(Reader &rd, const json &doc, Model &m, const LoadOptions &options)
 {
 	const json &asset = field(doc, "asset");
 	const std::string version = text(asset, "version");
@@ -1568,7 +2679,14 @@ void load_json(Reader &rd, const json &doc, Model &m)
 		m.materials.push_back(read_material(doc, mj));
 	read_nodes(doc, m);
 	read_constraints(doc, m);
-	read_meshes(rd, doc, m);
+	// (Stand-in hair: only what some part wears.)
+	for (const json &mj : list(doc, "meshes"))
+		for (const json &pj : list(mj, "primitives")) {
+			const int mat = index_of(pj, "material");
+			if (mat >= 0 && mat < (int)m.materials.size() && m.materials[mat].hair_standin)
+				m.hair_standins = true;
+		}
+	read_meshes(rd, doc, m, options);
 	read_skins(rd, doc, m);
 	read_animations(rd, doc, m);
 	read_images(rd, doc, m);
@@ -2058,7 +3176,46 @@ std::vector<float> tangents_of(const Primitive &p)
 	return out;
 }
 
-bool load_model(const uint8_t *bytes, size_t size, const std::string &folder, Model &out, std::string *problem)
+size_t Strands::strands_in(size_t points) const
+{
+	if (first.empty())
+		return 0;
+	const auto past = std::upper_bound(first.begin(), first.end(), (uint32_t)std::min<size_t>(points, UINT32_MAX));
+	return past == first.begin() ? 0 : (size_t)(past - first.begin()) - 1;
+}
+
+size_t Strands::strands_under(float threshold) const
+{
+	const size_t n = std::min(strands(), key.size());
+	return (size_t)(std::lower_bound(key.begin(), key.begin() + (std::ptrdiff_t)n, threshold) - key.begin());
+}
+
+float Strands::threshold_of(size_t count) const
+{
+	return count < strands() && count < key.size() ? std::min(full, key[count]) : full;
+}
+
+int Strands::rate_step(float rate)
+{
+	const float r = rate >= 0.25f ? std::min(1.0f, rate) : 0.25f;
+	return (int)std::lround((r - 0.25f) / 0.75f * (float)(RATES - 1));
+}
+
+uint32_t Strands::pieces_of(size_t run, size_t count) const
+{
+	if (run + 1 >= runs.size())
+		return 0;
+	const uint32_t a = runs[run], b = runs[run + 1];
+	if (count >= strands())
+		return b - a;
+	// (A run's pieces are in strand order: those before the first point
+	// of strand `count`.)
+	return (uint32_t)(std::lower_bound(pieces.begin() + a, pieces.begin() + b, first[count]) -
+			  (pieces.begin() + a));
+}
+
+bool load_model(const uint8_t *bytes, size_t size, const std::string &folder, Model &out, std::string *problem,
+		const LoadOptions &options)
 {
 	out = Model();
 	try {
@@ -2072,7 +3229,7 @@ bool load_model(const uint8_t *bytes, size_t size, const std::string &folder, Mo
 		rd.folder = folder;
 		rd.glb = glb;
 		rd.bin = std::move(bin);
-		load_json(rd, doc, out);
+		load_json(rd, doc, out, options);
 		return true;
 	} catch (const Fail &f) {
 		if (problem)
@@ -2088,7 +3245,7 @@ bool load_model(const uint8_t *bytes, size_t size, const std::string &folder, Mo
 	return false;
 }
 
-bool load_model(const std::string &path, Model &out, std::string *problem)
+bool load_model(const std::string &path, Model &out, std::string *problem, const LoadOptions &options)
 {
 	std::vector<uint8_t> bytes;
 	if (!read_file(path, bytes)) {
@@ -2098,7 +3255,7 @@ bool load_model(const std::string &path, Model &out, std::string *problem)
 	}
 	const size_t slash = path.find_last_of("/\\");
 	const std::string folder = slash == std::string::npos ? "." : path.substr(0, slash);
-	return load_model(bytes.data(), bytes.size(), folder, out, problem);
+	return load_model(bytes.data(), bytes.size(), folder, out, problem, options);
 }
 
 void sample(const AnimChannel &c, float t, float *out)

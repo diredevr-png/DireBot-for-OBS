@@ -264,6 +264,13 @@ public:
 		int bones = -1;
 		bool morphed = false;
 		std::vector<V3> rest_pos, rest_normal;
+		// Hair strands (Primitive::strands): how much bigger its bones
+		// make it (its hairs' widths are in the file's units), and, posed
+		// on the card, how far its expressions move each of its spots
+		// now (Strands::moves; empty: none does) - the card moves each
+		// point by its spot's, so `morphed` stays off and rest_pos empty.
+		float scale = 1;
+		std::vector<V3> spot_moves;
 		// Its middle in the world (every 17th point, posed here), and,
 		// its own face hidden under your real one, not drawn at all.
 		V3 middle;
@@ -280,6 +287,11 @@ public:
 	// every point out here.
 	void set_gpu_skin(bool on) { gpu_skin_ = on; }
 	bool gpu_skin() const { return gpu_skin_; }
+	// Hair strands posed here (not on the card): the most points of them
+	// posed a frame, all its strand parts together - the first strands of
+	// each, in their draw order (hair.hpp's HairPlan::points_cpu). Its
+	// parts' `pos` and `normal` then hold only those.
+	void set_strand_points(size_t most) { strand_points_ = most; }
 	const std::vector<M4> &world() const { return world_; }
 	const Model &model() const { return *model_; }
 	// Whether it turns whole (no head bone) and round where (model space).
@@ -451,6 +463,7 @@ private:
 	std::vector<char> own_face_; // a node of its own drawn face
 	bool hide_face_ = false;
 	bool gpu_skin_ = false, measuring_ = false;
+	size_t strand_points_ = 150'000;
 	std::vector<std::vector<M4>> bone_sets_; // by node (Part::bones)
 	bool auto_chain_ = false;
 	bool settled_ = true;
