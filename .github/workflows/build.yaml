@@ -26,7 +26,17 @@ jobs:
       # too (its headers need simde's).
       - name: Install OBS and the test tools
         run: |
-          sudo add-apt-repository -y ppa:obsproject/obs-studio
+          # (Launchpad now and then answers a server error for the PPA's
+          # key: asked again a few times before giving up.)
+          added=
+          for try in 1 2 3 4 5; do
+            if sudo add-apt-repository -y ppa:obsproject/obs-studio; then
+              added=1
+              break
+            fi
+            sleep $((try * 15))
+          done
+          [ -n "$added" ]
           sudo apt-get update
           sudo apt-get install -y obs-studio libsimde-dev xvfb g++
           grep -q obs_canvas_t /usr/include/obs/obs.h || {
