@@ -649,6 +649,11 @@ FaceRegion face_region(const FaceSpots &fs, Quat facing);
 // +x (as the AR VTuber characters are).
 int guess_turn(const Model &m);
 
+// A part posed on the graphics card: how far apart the points its middle
+// is worked out from are (every 17th; in a part with more than about
+// 70,000 points further apart, so it's never more than a few thousand).
+size_t middle_step(size_t points);
+
 // A face VRM names (happy, angry, sad, relaxed, surprised) made from ARKit's
 // shapes, `amount` of it, into `moves` (each as much as it is or more).
 void face_into_moves(const std::string &face, float amount, float moves[EXPRESSIONS]);

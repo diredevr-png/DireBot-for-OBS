@@ -4782,6 +4782,46 @@ static void test_expressions_kept_where_they_move()
 		      near3(sp->normal[1], normalized(direction(w, {0.1f, 0, 1}), {}), 1e-5f) &&
 		      near3(sp->normal[2], normalized(direction(w, {0, 0.2f, 1}), {}), 1e-5f));
 	}
+
+	// Posed for the graphics card, a part is handed over as its
+	// expressions moved it (all its points copied, every frame) only while
+	// one that moves or turns it is showing. One that moves nothing of it
+	// - a body sharing its face's shapes - leaves it as made, however
+	// strongly it shows; posed here, it's where it was made too.
+	for (int moving = 0; moving < 2; moving++) {
+		auto on = std::make_shared<Model>(*posed);
+		on->meshes[0].weights.assign(41, 0.0f);
+		on->meshes[0].weights[moving ? 40 : 3] = 1;
+		on->meshes[1].weights = {0, moving ? 1.0f : 0.0f, moving ? 0.0f : 1.0f};
+		Rig card(on, RigOptions()), here(on, RigOptions());
+		card.set_gpu_skin(true);
+		card.pose(still());
+		here.pose(still());
+		const Primitive *big = &on->meshes[0].parts[0], *small_part = &on->meshes[1].parts[0];
+		int seen = 0;
+		for (size_t pi = 0; pi < card.parts().size() && pi < here.parts().size(); pi++) {
+			const Rig::Part &part = card.parts()[pi], &cpu = here.parts()[pi];
+			if (part.prim != big && part.prim != small_part)
+				continue;
+			seen++;
+			const size_t points = part.prim->pos.size();
+			CHECK(part.gpu && part.pos.empty() && !cpu.gpu && cpu.pos.size() == points);
+			CHECK(part.morphed == (moving == 1));
+			CHECK(part.rest_pos.size() == (moving ? points : 0) && part.rest_normal.size() == (moving ? points : 0));
+			const M4 &w = here.world()[cpu.node];
+			if (part.prim == big && cpu.pos.size() == n) {
+				const V3 moved_by = moving ? V3{0.02f, 0, 0} : V3{};
+				CHECK(near3(cpu.pos[77], point(w, pos[77] + moved_by), 1e-6f) &&
+				      near3(cpu.pos[76], point(w, pos[76]), 1e-6f));
+				if (moving && part.rest_pos.size() == n)
+					CHECK(near3(part.rest_pos[77], pos[77] + moved_by, 1e-7f) &&
+					      near3(part.rest_pos[76], pos[76], 0));
+			}
+			if (part.prim == small_part && cpu.normal.size() == 3)
+				CHECK(near3(cpu.normal[2], normalized(direction(w, {0, moving ? 0.2f : 0.0f, 1}), {}), 1e-5f));
+		}
+		CHECK(seen == 2);
+	}
 }
 
 int main()

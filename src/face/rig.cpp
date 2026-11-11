@@ -383,6 +383,20 @@ V3 nearest_on(V3 a, V3 b, V3 p)
 
 } // namespace
 
+// How far apart the points a part's middle is worked out from are, posed
+// on the graphics card: every 17th - further apart in a part with more
+// than about 70,000 points, so never more than a few thousand of them (a
+// coat's two million hair points, read every frame, took the CPU
+// milliseconds). Never a step a small number divides: hair strands of 8
+// points each, every 16th read, would be all roots.
+size_t middle_step(size_t points)
+{
+	size_t step = std::max<size_t>(17, (points + 4095) / 4096);
+	while (step % 2 == 0 || step % 3 == 0 || step % 5 == 0 || step % 7 == 0 || step % 11 == 0 || step % 13 == 0)
+		step++;
+	return step;
+}
+
 void face_into_moves(const std::string &face, float amount, float moves[EXPRESSIONS])
 {
 	const float k = clamp01(amount);
@@ -2576,7 +2590,9 @@ void Rig::skin()
 			const V3 *src_p = p.pos.data(), *src_n = p.normal.data();
 			bool morphed = false;
 			for (size_t k = 0; k < p.morphs.size() && k < w.size(); k++) {
-				if (std::fabs(w[k]) < 1e-4f)
+				// (An expression that moves nothing of this part - they're
+				// kept only where they move - is no reason to copy it.)
+				if (std::fabs(w[k]) < 1e-4f || p.morphs[k].at.empty())
 					continue;
 				if (!morphed) {
 					mp.assign(p.pos.begin(), p.pos.end());
@@ -2647,7 +2663,8 @@ void Rig::skin()
 						: handed(world_[ni]);
 				V3 sum;
 				size_t count = 0;
-				for (size_t i = 0; i < n; i += 17, count++) {
+				const size_t step = middle_step(n);
+				for (size_t i = 0; i < n; i += step, count++) {
 					V3 v;
 					if (skinned) {
 						for (int k = 0; k < 4; k++) {

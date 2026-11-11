@@ -4598,6 +4598,80 @@ static void test_for_the_card()
 	}
 }
 
+// A part posed on the graphics card has only its middle worked out here,
+// from some of its points: every 17th - but of a big coat never more than
+// a few thousand (two million hair points read every frame took the CPU
+// milliseconds), and never by a step that keeps landing on the same point
+// of every hair.
+static void test_a_big_coats_middle()
+{
+	// Up to about 70,000 points: every 17th, as it always was.
+	for (size_t n : {(size_t)0, (size_t)1, (size_t)16, (size_t)17, (size_t)2000, (size_t)69632})
+		CHECK(middle_step(n) == 17);
+	// More: no more than 4,096 of them read (and not far fewer), by a step
+	// that 2, 3, 5, 7, 11 and 13 don't divide.
+	size_t last = 17;
+	for (size_t n : {(size_t)69633, (size_t)73728, (size_t)98304, (size_t)250000, (size_t)715342, (size_t)1999771,
+			 (size_t)2000000, (size_t)16000000}) {
+		const size_t step = middle_step(n);
+		CHECK(step > 17 && step >= last && n / step <= 4096 && n / step >= 1800);
+		for (size_t d : {2, 3, 5, 7, 11, 13})
+			CHECK(step % d != 0);
+		last = step;
+	}
+	CHECK(middle_step(69633) == 19 && middle_step(98304) == 29 && middle_step(2000000) == 491);
+
+	// A coat of 12,288 hairs of 8 points each (kinked: every point shapes
+	// its hair, so every one is kept): 98,304 points, 24 times 4,096 -
+	// read every 24th (3 hairs on), each would be a root; by its step of
+	// 29 they're from all along the hairs, and the middle is the coat's.
+	const Groom g = lawn(128, 96, 8, true);
+	auto m = std::make_shared<Model>(loaded(g));
+	CHECK(m->meshes.size() == 1 && m->meshes[0].parts.size() == 1);
+	if (m->meshes.size() != 1 || m->meshes[0].parts.size() != 1)
+		return;
+	const Primitive &p = m->meshes[0].parts[0];
+	CHECK(p.strands && p.hair.strands() == 12288 && p.pos.size() == 98304);
+	bool eights = true;
+	for (size_t k = 0; k < p.hair.strands(); k++)
+		eights = eights && p.hair.first[k + 1] - p.hair.first[k] == 8;
+	CHECK(eights);
+	Rig cpu(m, RigOptions()), card(m, RigOptions());
+	card.set_gpu_skin(true);
+	cpu.set_strand_points(1000000);
+	Drive d = still();
+	d.place = moved({3.0f, 0.5f, -2.0f}) * matrix_of(axis_angle({0, 1, 0}, 0.7f));
+	cpu.pose(d);
+	card.pose(d);
+	CHECK(cpu.parts().size() == 1 && card.parts().size() == 1);
+	if (cpu.parts().size() != 1 || card.parts().size() != 1)
+		return;
+	const Rig::Part &r = cpu.parts()[0], &c = card.parts()[0];
+	CHECK(c.gpu && c.pos.empty() && !r.gpu && r.pos.size() == 98304);
+	double sum[3] = {0, 0, 0};
+	V3 roots{};
+	for (size_t i = 0; i < r.pos.size(); i++) {
+		sum[0] += r.pos[i].x, sum[1] += r.pos[i].y, sum[2] += r.pos[i].z;
+		if (i % 8 == 0)
+			roots = roots + r.pos[i] * (8.0f / (float)r.pos.size());
+	}
+	const V3 all{(float)(sum[0] / r.pos.size()), (float)(sum[1] / r.pos.size()), (float)(sum[2] / r.pos.size())};
+	// (The hairs stand 0.7 tall: all of them 0.35 above their roots.)
+	CHECK(near(all.y - roots.y, 0.35, 1e-3));
+	// Its middle: the coat's own, to a hundredth of its width (128) - and
+	// as far above its roots.
+	CHECK(near3(c.middle, all, 1.2f));
+	CHECK(near(c.middle.y, all.y, 0.02));
+	// (Worked out from just those points: every 29th, 3,390 of them.)
+	V3 some{};
+	size_t read = 0;
+	for (size_t i = 0; i < r.pos.size(); i += middle_step(r.pos.size()), read++)
+		some = some + r.pos[i];
+	CHECK(read == 3390 && near3(c.middle, some * (1.0f / (float)read), 2e-3f));
+	std::printf("unit_hair: a coat of %zu points, every %zuth read: its middle %.3f from the coat's own (%.3f up)\n",
+		    p.pos.size(), middle_step(p.pos.size()), length(c.middle - all), c.middle.y - all.y);
+}
+
 int main()
 {
 	test_detail_names();
@@ -4629,6 +4703,7 @@ int main()
 	test_first_bone();
 	test_fewer_posed();
 	test_for_the_card();
+	test_a_big_coats_middle();
 	std::printf("unit_hair: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;
 }
