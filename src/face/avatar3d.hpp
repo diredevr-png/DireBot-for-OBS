@@ -243,6 +243,10 @@ public:
 		// (HairPlan::layout 1), and how much of the card's memory all the
 		// hair laid out that way takes (bytes; what's been made of it).
 		size_t laid = 0, laid_bytes = 0;
+		// Of `laid`: those sent a layer's groups together (HairPlan::merge
+		// 1; hair.hpp's StrandMerge), and how many times such a stretch has
+		// been made since this was (each a copy of a layer's corners).
+		size_t merged = 0, merges = 0;
 		// (And how long making it took, all told: a pause the first time
 		// hair is drawn in a form - milliseconds.)
 		float laid_ms = 0;
@@ -312,6 +316,24 @@ private:
 		};
 		Laid laid[2][2];
 		std::vector<uint32_t> laid_from[2];
+		// A layer's stretches of one sort together, in the order its groups
+		// were drawn in when it was made (HairPlan::merge 1; hair.hpp's
+		// StrandMerge; draw_merged): by sort, one a layer - its corners
+		// copied out of that sort's layout, in the form (lines or not) it
+		// was last drawn in.
+		struct Merged {
+			gs_indexbuffer_t *ib = nullptr;
+			size_t room = 0; // (pieces)
+			bool lines = false;
+			StrandMerge made;
+			// What was asked of it last (how many strands, in which form),
+			// for how many frames running; and how many frames ago it was
+			// made.
+			size_t asked = 0;
+			bool asked_lines = false;
+			uint32_t steady = 0, age = 0;
+		};
+		std::vector<Merged> merged[2];
 		// Its hull laid out as drawn (lay_hull), and where each group's
 		// pieces are in it (hair.hpp's StrandHull, but for its points and
 		// corners: the card has those).
@@ -359,9 +381,19 @@ private:
 	// order, the pieces in `layer` of its first `count` strands - as
 	// ribbons or as lines; `sort` 0 its wide pieces only, 1 its thin ones
 	// only (a part in two sorts: Strands::thin), anything else all of
-	// them; what it drew added to `drawn`.
+	// them. `whose`: the character whose picture it's drawn in (itself, or
+	// the one it's a companion of) - by its plan, and what it drew added
+	// to its counts.
 	void draw_strands(size_t i, const Rig::Part &p, const std::vector<int> &groups, size_t layer, size_t count,
-			  const char *technique, bool lines, int sort, HairDrawn &drawn);
+			  const char *technique, bool lines, int sort, Avatar3D &whose);
+	// A layer of a laid-out strand part's pieces of one sort (`k`), its
+	// groups' stretches together (HairPlan::merge 1; hair.hpp's
+	// StrandMerge): in one draw while its groups keep the order they had
+	// when it was made, in a few once some have changed places - and made,
+	// or made again, when what's drawn has held still. False: not this
+	// frame (nothing drawn: a draw a group, as before).
+	bool draw_merged(Part &part, const Strands &h, int k, bool lines, const std::vector<int> &groups, size_t layer,
+			 size_t count, const char *technique, Avatar3D &whose);
 	// A hair-strand part's bones and spots' moves for the card, its points
 	// and pieces (as ribbons or as lines) loaded: whether it can be drawn.
 	// `laid`: laid out as drawn - only its bones and moves (draw_strands
@@ -377,7 +409,8 @@ private:
 	// distances: the inner layers of some of the `count` strands drawn
 	// (as much wider), each written further off than it is by how far its
 	// group's inner layers reach - what's behind that is hidden.
-	void draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t drawn_h, size_t count, HairDrawn &drawn);
+	// (`whose`: as draw_strands'.)
+	void draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t drawn_h, size_t count, Avatar3D &whose);
 	// Its hull laid out as drawn, made the first time it's drawn so (false:
 	// it can't be - by point, as before).
 	bool lay_hull(Part &part, const Primitive &p);
@@ -427,6 +460,11 @@ private:
 	// picture of the solid parts' distances alone.
 	std::vector<float> took_, took_depth_;
 	size_t form_changes_ = 0;
+	// Merged stretches (draw_merged): how many have been made, how many
+	// more bytes of them may be made this frame, and a frame's rows.
+	size_t merges_ = 0;
+	long long merge_left_ = 0;
+	std::vector<StrandMerge::Row> rows_;
 	void turn_clock();
 	HairClock *start_clock(float share);
 	void clocks_lost();

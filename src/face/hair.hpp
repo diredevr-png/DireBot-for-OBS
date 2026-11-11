@@ -94,6 +94,11 @@ struct HairPlan {
 	// the card (Avatar3D's lay_strands), so the card reads them straight
 	// through.
 	int layout = 0;
+	// Laid out as drawn, a layer's groups in one draw (StrandMerge): 0 a
+	// draw a group, 1 one draw while its groups keep their order (made
+	// again once they haven't for a while), 2 (tests) the same, never made
+	// again for a new order - a draw for each row that still holds.
+	int merge = 0;
 	// For measuring only ("hair_measure"): 1 hair is drawn into a single
 	// pixel of the picture's corner (a scissor) - the card poses every
 	// piece and puts its triangles together as ever, and fills next to
@@ -397,6 +402,119 @@ inline StrandLayout strand_layout(const Strands &h, int sort, bool lines)
 		}
 	}
 	return out;
+}
+
+// A layer of a strand part's pieces of one sort, all its groups' in one
+// draw (HairPlan::merge 1). Laid out as drawn (strand_layout) each group's
+// each layer is a stretch of its own, and a layer's groups go to the card
+// far to near - an order that changes as the character turns - so a layer
+// is a draw a group (a coat on 32 bones in 5 layers and two sorts: 277
+// draws; measured on a Radeon RX 9070 XT, 11-11: half a microsecond of the
+// card's time each, a tenth of that coat's whole cost). Here a layer's
+// stretches lie one after another in the order its groups were drawn in
+// when it was made - their corners copied out of the layout's, the first
+// `count` strands' pieces of each group - so while the groups keep that
+// order and that many strands are drawn, the layer is one draw: the same
+// corners in the same order as a draw a group, so the same picture. Once
+// groups have changed places, the stretches that still follow each other
+// go together - a draw for each such row (draws) - until it's made again.
+struct StrandMerge {
+	std::vector<int> order; // the groups, in the order it was made in
+	std::vector<uint32_t>
+		at; // each of those, in that order: how many pieces come before its own (and one more entry: all of them)
+	std::vector<int> place; // a group: its place in `order` (-1: it isn't in it)
+	size_t count = 0;       // the strands it was made for (the first so many)
+	bool made = false;
+
+	// A row of its pieces: one draw.
+	struct Row {
+		uint32_t from = 0, pieces = 0;
+	};
+	// The draws that send the groups `now`'s pieces in that order: `out`
+	// (emptied first). False - and nothing in `out` - if it wasn't made
+	// with every one of them.
+	bool draws(const std::vector<int> &now, std::vector<Row> &out) const
+	{
+		out.clear();
+		if (!made)
+			return false;
+		for (int g : now) {
+			if (g < 0 || (size_t)g >= place.size() || place[(size_t)g] < 0) {
+				out.clear();
+				return false;
+			}
+			const size_t k = (size_t)place[(size_t)g];
+			const uint32_t from = at[k], pieces = at[k + 1] - at[k];
+			if (!pieces)
+				continue;
+			if (!out.empty() && out.back().from + out.back().pieces == from)
+				out.back().pieces += pieces;
+			else
+				out.push_back({from, pieces});
+		}
+		return true;
+	}
+};
+
+// When one is made, and made again (Avatar3D's draw_merged): once the
+// strands drawn and their form have been the same for MERGE_STEADY frames;
+// again once its groups' order takes more than MERGE_ROWS draws, no sooner
+// than MERGE_REST frames after the last time; and in one frame no more of
+// them than about MERGE_BYTES of corners (one always): making one is a
+// copy of a layer's corners, on the CPU.
+constexpr uint32_t MERGE_STEADY = 20, MERGE_REST = 30;
+constexpr size_t MERGE_ROWS = 4, MERGE_BYTES = (size_t)2 << 20;
+
+// How many pieces a layer's merged stretch has room for: all of that
+// layer's pieces of the sort `from` is of (StrandLayout::from).
+inline size_t strand_merge_room(const Strands &h, const std::vector<uint32_t> &from, size_t layer)
+{
+	const size_t layers = (size_t)std::max(1, h.layers);
+	size_t room = 0;
+	for (size_t g = 0; layer < layers && g < h.groups.size(); g++) {
+		const size_t run = g * layers + layer;
+		if (run + 1 < from.size())
+			room += from[run + 1] - from[run];
+	}
+	return room;
+}
+
+// Makes one: layer `layer`'s pieces of sort `sort` (0 or 1) of the first
+// `count` strands, the groups in `order` (each of the part's groups once
+// at most). `from` and `corners`: that sort's layout (StrandLayout::from
+// and corners, `each` corners a piece - 6 as ribbons, 2 as lines); `out`:
+// where its corners go, with room for strand_merge_room pieces. Not made
+// (StrandMerge::made false) if `order` names a group twice or one the
+// part doesn't have.
+inline StrandMerge strand_merge(const Strands &h, const std::vector<uint32_t> &from, int sort, size_t layer,
+				size_t count, const std::vector<int> &order, const uint32_t *corners, size_t each,
+				uint32_t *out)
+{
+	StrandMerge m;
+	const size_t layers = (size_t)std::max(1, h.layers);
+	if (layer >= layers || !corners || !out || !each)
+		return m;
+	m.place.assign(h.groups.size(), -1);
+	m.count = count;
+	uint32_t pieces = 0;
+	for (int g : order) {
+		if (g < 0 || (size_t)g >= m.place.size() || m.place[(size_t)g] >= 0)
+			return StrandMerge();
+		const size_t run = (size_t)g * layers + layer;
+		Strands::Stretch some[2];
+		h.pieces_of(run, count, some);
+		const uint32_t n = run < from.size() ? some[sort ? 1 : 0].count : 0;
+		if (n)
+			std::copy(corners + (size_t)from[run] * each, corners + ((size_t)from[run] + n) * each,
+				  out + (size_t)pieces * each);
+		m.place[(size_t)g] = (int)m.order.size();
+		m.order.push_back(g);
+		m.at.push_back(pieces);
+		pieces += n;
+	}
+	m.at.push_back(pieces);
+	m.made = true;
+	return m;
 }
 
 // The hull (Avatar3D's draw_hull): the inner layers - the first `core` of

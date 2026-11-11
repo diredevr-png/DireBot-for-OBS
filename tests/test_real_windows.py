@@ -34,8 +34,9 @@ obsws = pytest.importorskip("obsws_python")
 
 from test_real_face import (PretendPhone, PretendVmcApp, arms_character, camera_picture,  # noqa: E402
                             character_picture, middle_of, read_bmp, unity_turn, write_gif)
-from test_real_hair import (LIFT, hair_character, hair_over_body, magenta, per_metre, settles, top_of,  # noqa: E402
-                            white, yellow)
+from test_real_hair import (LIFT, MAGENTA, WIDE_HAIR, Strands, add_strands, hair_character,  # noqa: E402
+                            hair_over_body, magenta, open_glb, per_metre, save_glb, settles, top_of, white,
+                            world_of, yellow)
 from test_real_obs import VERSION, free_port, vendor, wait_for  # noqa: E402
 
 ROOT = os.environ.get("DIREBOT_OBS_ROOT", "")
@@ -1152,6 +1153,315 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
                 c.send("RemoveInput", {"inputName": name}, raw=True)
             except Exception:
                 pass
+        c.disconnect()
+
+
+# The bones tufts_character's tufts stand on: across the picture from its
+# right hand to its left.
+TUFT_BONES = ("head", "chest", "leftUpperArm", "leftLowerArm", "leftHand", "rightUpperArm", "rightLowerArm",
+              "rightHand")
+
+
+def tufts_character(path, per=160, width=0.006, wide_every=0, vrm=True):
+    """arms_character with a tuft of `per` magenta strands (6 points each)
+    standing on each of TUFT_BONES, hung on it: eight groups of strands
+    side by side, whose order from far to near turns round as the camera
+    goes from one side of it to the other. Every hair `width` wide - but
+    with `wide_every`, every so-manyth WIDE_HAIR wide (two sorts). Returns
+    how many strands the file has."""
+    arms_character(path, vrm=vrm)
+    doc, blob = open_glb(path)
+    names = {n.get("name"): i for i, n in enumerate(doc["nodes"])}
+    bones = [names[b] for b in TUFT_BONES]
+    hair = Strands()
+    for k, bone in enumerate(bones):
+        at = world_of(doc, bone)
+        # (Its head's and its chest's stand in front of them, to be seen.)
+        out = 0.13 if k < 2 else 0.0
+        for i in range(per):
+            a, b = (i * 0.61803) % 1, (i * 0.75488) % 1
+            root = (at[0] - 0.04 + 0.08 * a, at[1] + 0.03, at[2] + out - 0.03 + 0.06 * b)
+            points = [(root[0] + (a - 0.5) * 0.05 * t, root[1] + 0.16 * t, root[2] + 0.02 * t * t)
+                      for t in (0, 0.2, 0.4, 0.6, 0.8, 1)]
+            hair.add(points, WIDE_HAIR if wide_every and i % wide_every == 0 else width, MAGENTA,
+                     [[(k, 1.0)]] * 6)
+    add_strands(doc, blob, hair, bones)
+    save_glb(path, doc, blob)
+    return hair.count
+
+
+def test_a_layer_of_hair_in_one_draw_on_the_card(obs):
+    """Laid out as drawn ("hair_layout" 1), a layer of a part's hair goes to
+    the card a group of strands at a time - those one bone holds, far groups
+    first: a draw a group. With "hair_merge" 1 (a number the settings window
+    doesn't show) a layer's groups go together - their corners copied in the
+    order they're drawn in - in one draw while they keep that order, and in
+    a few once some have changed places, until it's made again
+    (FaceGetState's "merged": the pieces sent so; "merges": how many times
+    such a stretch has been made; and fewer "draws"). The same corners in
+    the same order, so the same picture to the pixel: as ribbons, with thin
+    hairs as lines among wide ribbons, seen from either side (its groups'
+    order turned round), and with only a share of its strands drawn. Two
+    sorts drawn in one go (thin hairs among wide ones, all as ribbons) and
+    hair posed by the CPU stay a draw a group."""
+    figure = os.path.join(obs.home, "tufts.vrm")
+    strands = tufts_character(figure)
+    among = os.path.join(obs.home, "tufts-among.vrm")
+    assert tufts_character(among, width=0.0006, wide_every=5) == strands
+    views = json.dumps([{"name": "Left", "yaw": -100}, {"name": "Right", "yaw": 100}])
+    names = ("Tufts", "Tufts among")
+    groups, layers = len(TUFT_BONES), 5
+    c = obs.client()
+
+    def st(name):
+        return vendor(c, "FaceGetState", {"source": name})["model"]
+
+    def hair(name):
+        return st(name)["hair"]
+
+    def change(name, **settings):
+        c.send("SetInputSettings", {"inputName": name, "inputSettings": settings}, raw=True)
+
+    def differ(a, b):
+        assert len(a) == len(b) and len(a[0]) == len(b[0])
+        return sum(1 for a_row, b_row in zip(a, b) for x, y in zip(a_row, b_row) if tuple(x) != tuple(y))
+
+    def drawn_px(rows):
+        return sum(1 for row in rows for px in row if magenta(px))
+
+    def settled(name, merged, laid=True):
+        """Its hair drawn laid out - all of it a layer's groups together,
+        or none of it - the same twice."""
+        def right():
+            h = hair(name)
+            return (h["pieces"] > 0 and h["laid"] == (h["pieces"] if laid else 0)
+                    and h["merged"] == (h["pieces"] if merged else 0))
+        assert wait_for(right, 20, 0.1), (name, merged, hair(name), obs.log())
+        time.sleep(0.8)
+        assert right(), (name, merged, hair(name))
+        return hair(name)
+    try:
+        c.send("CreateScene", {"sceneName": "Tufts scene"}, raw=True)
+        for name, model in zip(names, (figure, among)):
+            c.send("CreateInput", {"sceneName": "Tufts scene", "inputName": name,
+                                   "inputKind": "direbot_face_avatar",
+                                   "inputSettings": {"model": model, "width": 300, "height": 300,
+                                                     "size": 100, "framing": "whole", "style": "drawn",
+                                                     "mirror": False, "smoothing": 0, "breathing": 0,
+                                                     "sway": 0, "eye_moves": False, "hair_budget_ms": 0,
+                                                     "hair_layout": 1, "hair_merge": 0, "views": views,
+                                                     "view": "main", "view_glide": 0}}, raw=True)
+        c.send("SetCurrentProgramScene", {"sceneName": "Tufts scene"}, raw=True)
+        for name in names:
+            assert wait_for(lambda: st(name)["shown"], 60, 0.2), obs.log()
+            assert wait_for(lambda: st(name)["on_card"], 10, 0.1), (st(name), obs.log())
+            assert wait_for(lambda: hair(name)["drawn"] == strands, 10, 0.1), (hair(name), obs.log())
+        print()
+        for name in names:
+            # A draw a group, from the front and from each side: the
+            # pictures to match.
+            plain, was = {}, {}
+            for view in ("main", "1", "2"):
+                change(name, view=view)
+                time.sleep(0.6)
+                was[view] = settled(name, False)
+                plain[view] = shot(c, name)
+                assert drawn_px(plain[view]) > 150, (name, view, drawn_px(plain[view]))
+            assert differ(plain["1"], plain["2"]) > 100 and differ(plain["main"], plain["1"]) > 100, name
+            sorts = 2 if name == "Tufts among" else 1
+            least = layers * sorts
+            # (Every group has pieces in every layer: a draw each.)
+            assert was["main"]["draws"] == groups * least, (name, was)
+            if sorts == 2:
+                assert 0 < was["main"]["lines"] < was["main"]["pieces"], was
+
+            # Together, from the front: one draw a layer (and sort), the
+            # same picture.
+            change(name, view="main", hair_merge=1)
+            time.sleep(0.6)
+            h = settled(name, True)
+            assert wait_for(lambda: hair(name)["draws"] == least, 10, 0.1), (name, hair(name))
+            h = hair(name)
+            off = differ(shot(c, name), plain["main"])
+            print("%s, its layers' groups together from the front: %d pixels differ; a draw a group %s; together %s"
+                  % (name, off, was["main"], h))
+            assert off == 0, (name, off)
+            for key in ("drawn", "pieces", "lines", "hull_pieces", "hull_draws", "skips_hidden"):
+                assert h[key] == was["main"][key], (name, key, was["main"], h)
+            assert h["merges"] >= least and h["laid_mb"] > was["main"]["laid_mb"], (name, was["main"], h)
+
+            # Seen from one side, then the other: its groups' order turns
+            # round. At once the rows that still hold are a draw each - the
+            # same picture, never more draws than a draw a group - and once
+            # it's made again, one draw a layer.
+            for view in ("1", "2"):
+                made = hair(name)["merges"]
+                change(name, view=view)
+                time.sleep(0.25)
+                soon = hair(name)
+                off = differ(shot(c, name), plain[view])
+                print("%s, turned to view %s: %d pixels differ at once (%d draws, %d stretches made so far)"
+                      % (name, view, off, soon["draws"], soon["merges"]))
+                assert off == 0, (name, view, off)
+                assert least <= soon["draws"] <= was[view]["draws"], (name, view, soon, was[view])
+                # (Never left with more than a few rows a layer.)
+                assert wait_for(lambda: hair(name)["draws"] <= 4 * least, 10, 0.1), (name, view, hair(name))
+                h = settled(name, True)
+                assert differ(shot(c, name), plain[view]) == 0, (name, view)
+            # (From one side to the other every arm's groups have turned
+            # round: made again, each layer in one draw.)
+            assert wait_for(lambda: hair(name)["draws"] == least, 10, 0.1), (name, hair(name))
+            assert hair(name)["merges"] >= made + least, (name, made, hair(name))
+
+            # Never made again for a new order ("hair_merge" 2, for this
+            # test): turned back, the rows that hold stay a draw each - more
+            # than one a layer, fewer than a draw a group - and the picture
+            # is still the same.
+            change(name, hair_merge=2)
+            time.sleep(0.5)
+            made = settled(name, True)["merges"]
+            change(name, view="1")
+            time.sleep(1.5)
+            h = settled(name, True)
+            off = differ(shot(c, name), plain["1"])
+            print("%s, turned back and not made again: %d pixels differ; %s" % (name, off, h))
+            assert off == 0 and h["merges"] == made, (name, off, made, h)
+            assert least < h["draws"] < was["1"]["draws"], (name, h, was["1"])
+
+            # A share of its strands held: made for those, the same picture
+            # as a draw a group.
+            change(name, view="main", hair_merge=0, hair_share=0.5)
+            time.sleep(0.6)
+            some = settled(name, False)
+            assert 0 < some["drawn"] < strands and some["pieces"] < was["main"]["pieces"], some
+            held = shot(c, name)
+            made = some["merges"]
+            change(name, hair_merge=1)
+            h = settled(name, True)
+            off = differ(shot(c, name), held)
+            print("%s, half its strands: %d pixels differ; a draw a group %s; together %s" % (name, off, some, h))
+            assert off == 0 and h["pieces"] == some["pieces"] and h["drawn"] == some["drawn"], (name, off, some, h)
+            assert h["merges"] > made and h["draws"] < some["draws"], (name, made, some, h)
+            change(name, hair_share=-1)
+            time.sleep(0.6)
+            h = settled(name, True)
+            assert h["drawn"] == strands and differ(shot(c, name), plain["main"]) == 0, (name, h)
+
+        # Two sorts drawn in one go - thin hairs among wide ones, all as
+        # ribbons: a group's wide pieces, then its thin ones, a group at a
+        # time. Nothing one draw can do: a draw a group, the picture as it
+        # is without.
+        change("Tufts among", hair_lines=0, hair_merge=0)
+        time.sleep(0.6)
+        before = settled("Tufts among", False)
+        ribbons = shot(c, "Tufts among")
+        change("Tufts among", hair_merge=1)
+        time.sleep(1.5)
+        after = settled("Tufts among", False)
+        assert after["lines"] == 0 and after["draws"] == before["draws"], (before, after)
+        assert differ(shot(c, "Tufts among"), ribbons) == 0
+        change("Tufts among", hair_lines=-1)
+
+        # A measure's two draws a run ("hair_measure" 5): as it was, not
+        # together.
+        change("Tufts", hair_measure=5)
+        time.sleep(0.6)
+        two = settled("Tufts", False)
+        assert two["draws"] == 2 * groups * layers, two
+        change("Tufts", hair_measure=-1)
+        settled("Tufts", True)
+
+        # Posed by the CPU: nothing laid out, nothing together.
+        change("Tufts", card_posing=False)
+        assert wait_for(lambda: not st("Tufts")["on_card"], 10, 0.1), st("Tufts")
+        time.sleep(0.5)
+        assert wait_for(lambda: not st("Tufts")["loading"] and st("Tufts")["shown"], 60, 0.1), (st("Tufts"), obs.log())
+        assert wait_for(lambda: hair("Tufts")["drawn"] == strands, 10, 0.1), hair("Tufts")
+        time.sleep(0.8)
+        h = hair("Tufts")
+        assert h["laid"] == 0 and h["merged"] == 0 and h["pieces"] > 0, h
+        log = obs.log()
+        assert "3D effect" not in log and "Windows won't draw" not in log, log
+    finally:
+        for name in names:
+            try:
+                c.send("RemoveInput", {"inputName": name}, raw=True)
+            except Exception:
+                pass
+        c.disconnect()
+
+
+def test_a_companions_hair_is_drawn_as_its_owners(obs):
+    """A companion beside a character is drawn in its picture, by its
+    settings: its hair too is laid out as drawn ("hair_layout" 1) and its
+    layers' groups sent together ("hair_merge" 1) when its owner's is - and
+    is the same picture to the pixel as by point, a draw a group."""
+    owner = os.path.join(obs.home, "owner.vrm")
+    arms_character(owner)
+    friend = os.path.join(obs.home, "friend.glb")
+    strands = tufts_character(friend, vrm=False)
+    c = obs.client()
+
+    def st():
+        return vendor(c, "FaceGetState", {"source": "Owner"})
+
+    def hair():
+        return st()["model"]["hair"]
+
+    def change(**settings):
+        c.send("SetInputSettings", {"inputName": "Owner", "inputSettings": settings}, raw=True)
+
+    def settled(laid, merged):
+        def right():
+            h = hair()
+            return (h["drawn"] == strands and h["pieces"] > 0 and h["laid"] == (h["pieces"] if laid else 0)
+                    and h["merged"] == (h["pieces"] if merged else 0))
+        assert wait_for(right, 20, 0.1), (laid, merged, hair(), obs.log())
+        time.sleep(0.8)
+        assert right(), (laid, merged, hair())
+        return hair()
+    try:
+        c.send("CreateScene", {"sceneName": "Owner scene"}, raw=True)
+        c.send("CreateInput", {"sceneName": "Owner scene", "inputName": "Owner",
+                               "inputKind": "direbot_face_avatar",
+                               "inputSettings": {"model": owner, "width": 300, "height": 300,
+                                                 "size": 100, "framing": "whole", "style": "drawn",
+                                                 "mirror": False, "smoothing": 0, "breathing": 0,
+                                                 "sway": 0, "eye_moves": False, "hair_budget_ms": 0,
+                                                 "hair_layout": 0, "hair_merge": 0}}, raw=True)
+        c.send("SetCurrentProgramScene", {"sceneName": "Owner scene"}, raw=True)
+        assert wait_for(lambda: st()["model"]["shown"], 60, 0.2), obs.log()
+        assert wait_for(lambda: st()["model"]["on_card"], 10, 0.1), (st()["model"], obs.log())
+        # (Its owner has no hair of its own.)
+        time.sleep(0.5)
+        assert hair()["drawn"] == 0 and hair()["pieces"] == 0, hair()
+        answer = vendor(c, "FaceReact", {"source": "Owner", "do": "companion", "action": "come", "file": friend,
+                                         "instant": True})
+        assert answer["ok"], answer
+        assert wait_for(lambda: st()["companion"]["drawn"], 60, 0.2), (st()["companion"], obs.log())
+        assert wait_for(lambda: st()["companion"]["phase"] == "out", 20, 0.1), st()["companion"]
+        by_point = settled(False, False)
+        time.sleep(1.0)
+        before = shot(c, "Owner")
+        assert sum(1 for row in before for px in row if magenta(px)) > 60, by_point
+        change(hair_layout=1)
+        laid = settled(True, False)
+        assert laid["draws"] == by_point["draws"] and laid["pieces"] == by_point["pieces"], (by_point, laid)
+        assert sum(1 for a, b in zip(shot(c, "Owner"), before) for x, y in zip(a, b) if tuple(x) != tuple(y)) == 0
+        change(hair_merge=1)
+        together = settled(True, True)
+        assert wait_for(lambda: hair()["draws"] == 5, 10, 0.1), hair()
+        off = sum(1 for a, b in zip(shot(c, "Owner"), before) for x, y in zip(a, b) if tuple(x) != tuple(y))
+        print("\nA companion's hair: %d pixels differ laid out with its layers' groups together; by point %s; "
+              "together %s" % (off, by_point, hair()))
+        assert off == 0 and together["pieces"] == by_point["pieces"], (off, by_point, together)
+        log = obs.log()
+        assert "3D effect" not in log and "Windows won't draw" not in log, log
+    finally:
+        try:
+            c.send("RemoveInput", {"inputName": "Owner"}, raw=True)
+        except Exception:
+            pass
         c.disconnect()
 
 

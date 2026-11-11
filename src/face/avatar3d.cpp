@@ -479,6 +479,11 @@ void Avatar3D::free_part(Part &part)
 		}
 	for (auto &from : part.laid_from)
 		from.clear();
+	for (auto &sort : part.merged) {
+		for (Part::Merged &m : sort)
+			gs_indexbuffer_destroy(m.ib);
+		sort.clear();
+	}
 	gs_vertexbuffer_destroy(part.hull.vb);
 	gs_indexbuffer_destroy(part.hull.ib);
 	part.hull = Part::Laid();
@@ -1087,13 +1092,15 @@ bool Avatar3D::load_strands(size_t i, const Rig::Part &p, bool lines, bool laid)
 }
 
 void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int> &groups, size_t layer, size_t count,
-			    const char *technique, bool lines, int sort, HairDrawn &drawn)
+			    const char *technique, bool lines, int sort, Avatar3D &whose)
 {
 	// Laid out as drawn (posed on the card): each sort's own points and
 	// pieces, made before the first time they're drawn; one that can't be
 	// made (no memory for it): by point, as before.
 	Part &part = parts_[i];
-	bool laid = hair_plan_.layout == 1 && p.gpu && part.skin && p.prim;
+	const HairPlan &plan = whose.hair_plan_;
+	HairDrawn &drawn = whose.hair_drawn_;
+	bool laid = plan.layout == 1 && p.gpu && part.skin && p.prim;
 	for (int k = 0; laid && k < 2; k++)
 		if (sort != 1 - k)
 			laid = lay_strands(part, *p.prim, k, lines);
@@ -1109,7 +1116,7 @@ void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int>
 		return;
 	// (A measure - HairPlan::measure 5: a stretch in two draws, its first
 	// half and its second.)
-	const bool halves = hair_plan_.measure == 5;
+	const bool halves = plan.measure == 5;
 	auto send = [&](uint32_t from, uint32_t pieces) {
 		const uint32_t first = halves && pieces > 1 ? pieces / 2 : pieces;
 		gs_draw(shape, from * corners, first * corners);
@@ -1120,6 +1127,19 @@ void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int>
 		}
 	};
 	if (laid) {
+		// (A layer's groups together - HairPlan::merge 1 - where all it
+		// draws here is of one sort: two sorts drawn in one go are a group's
+		// wide pieces and then its thin ones, a group at a time, from two
+		// sets of points - nothing one draw can do.)
+		int only = -1, sorts = 0;
+		for (int k = 0; k < 2; k++)
+			if (sort != 1 - k && !part.laid[k][lines ? 1 : 0].none && !part.laid_from[k].empty()) {
+				only = k;
+				sorts++;
+			}
+		if (plan.merge > 0 && sorts == 1 && !halves &&
+		    draw_merged(part, h, only, lines, groups, layer, count, technique, whose))
+			return;
 		const Part::Laid *loaded = nullptr;
 		while (gs_effect_loop(effect_, technique)) {
 			loaded = nullptr;
@@ -1170,13 +1190,93 @@ void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int>
 		}
 }
 
-void Avatar3D::draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t drawn_h, size_t count,
-			 HairDrawn &drawn)
+bool Avatar3D::draw_merged(Part &part, const Strands &h, int k, bool lines, const std::vector<int> &groups,
+			   size_t layer, size_t count, const char *technique, Avatar3D &whose)
+{
+	const Part::Laid &l = part.laid[k][lines ? 1 : 0];
+	const std::vector<uint32_t> &from = part.laid_from[k];
+	const size_t layers = (size_t)std::max(1, h.layers);
+	if (!l.vb || !l.ib || from.empty() || layer >= layers)
+		return false;
+	if (part.merged[k].size() != layers) {
+		for (Part::Merged &m : part.merged[k])
+			gs_indexbuffer_destroy(m.ib);
+		part.merged[k].assign(layers, Part::Merged());
+	}
+	Part::Merged &m = part.merged[k][layer];
+	if (m.asked != count || m.asked_lines != lines) {
+		m.asked = count;
+		m.asked_lines = lines;
+		m.steady = 0;
+	} else if (m.steady < 0xFFFFFFFFu) {
+		m.steady++;
+	}
+	if (m.age < 0xFFFFFFFFu)
+		m.age++;
+	const uint32_t each = lines ? 2 : 6;
+	std::vector<StrandMerge::Row> &rows = whose.rows_;
+	// (Made for these strands, in this form.)
+	const bool made = m.ib && m.made.made && m.lines == lines && m.made.count == count;
+	bool fits = made && m.made.draws(groups, rows);
+	// Made once what's asked has held still - and made again when its
+	// groups' order has come to take too many draws, no sooner than
+	// MERGE_REST frames after the last time (HairPlan::merge 2, tests:
+	// never again for that).
+	const bool again = fits && rows.size() > MERGE_ROWS && whose.hair_plan_.merge != 2 && m.age >= MERGE_REST;
+	if ((!made || again) && m.steady >= MERGE_STEADY && whose.merge_left_ > 0) {
+		const size_t room = strand_merge_room(h, from, layer);
+		// (None of this sort in this layer: nothing to draw.)
+		if (!room)
+			return true;
+		if (m.ib && (m.room != room || m.lines != lines)) {
+			gs_indexbuffer_destroy(m.ib);
+			m.ib = nullptr;
+			m.made = StrandMerge();
+		}
+		if (!m.ib && room * each <= 0xFFFFFFF0u) {
+			void *corners = bzalloc(sizeof(uint32_t) * room * each);
+			m.ib = gs_indexbuffer_create(GS_UNSIGNED_LONG, corners, room * each, GS_DYNAMIC);
+			m.room = room;
+			m.lines = lines;
+		}
+		const uint32_t *all = static_cast<const uint32_t *>(gs_indexbuffer_get_data(l.ib));
+		uint32_t *out = m.ib ? static_cast<uint32_t *>(gs_indexbuffer_get_data(m.ib)) : nullptr;
+		if (all && out) {
+			m.made = strand_merge(h, from, k, layer, count, groups, all, each, out);
+			gs_indexbuffer_flush(m.ib);
+			m.age = 0;
+			whose.merge_left_ -= (long long)(room * each * sizeof(uint32_t));
+			whose.merges_++;
+			fits = m.made.made && m.made.draws(groups, rows);
+		}
+	}
+	if (!fits)
+		return false;
+	gs_load_vertexbuffer(l.vb);
+	gs_load_indexbuffer(m.ib);
+	const gs_draw_mode shape = lines ? GS_LINES : GS_TRIS;
+	HairDrawn &drawn = whose.hair_drawn_;
+	while (gs_effect_loop(effect_, technique))
+		for (const StrandMerge::Row &row : rows) {
+			gs_draw(shape, row.from * each, row.pieces * each);
+			drawn.draws++;
+			drawn.pieces += row.pieces;
+			drawn.laid += row.pieces;
+			drawn.merged += row.pieces;
+			if (lines)
+				drawn.lines += row.pieces;
+		}
+	return true;
+}
+
+void Avatar3D::draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t drawn_h, size_t count, Avatar3D &whose)
 {
 	const Strands &h = p.prim->hair;
+	const HairPlan &plan = whose.hair_plan_;
+	HairDrawn &drawn = whose.hair_drawn_;
 	const size_t layers = (size_t)std::max(1, h.layers), core = (size_t)std::max(0, std::min(h.core, h.layers));
 	// (A measure - HairPlan::measure 4: no hull.)
-	if (!core || !count || hair_plan_.measure == 4)
+	if (!core || !count || plan.measure == 4)
 		return;
 	// A quarter of the strands drawn (the first of them), each as much
 	// wider.
@@ -1185,7 +1285,7 @@ void Avatar3D::draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t
 	// Laid out as drawn (posed on the card), made before the first time
 	// it's drawn; one that can't be made: by point, as before.
 	Part &part = parts_[i];
-	const bool laid = hair_plan_.layout == 1 && p.gpu && part.skin && p.prim && lay_hull(part, *p.prim);
+	const bool laid = plan.layout == 1 && p.gpu && part.skin && p.prim && lay_hull(part, *p.prim);
 	set_camera();
 	set_strand(v, drawn_h, upto, p.scale, nullptr);
 	if (!load_strands(i, p, false, laid))
@@ -1678,6 +1778,8 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 	const bool character = upload(rig);
 	turn_clock();
 	hair_drawn_ = HairDrawn();
+	hair_drawn_.merges = merges_;
+	merge_left_ = (long long)MERGE_BYTES;
 	hair_drawn_.ms = hair_took(took_);
 	hair_drawn_.depth_ms = hair_took(took_depth_);
 	// 0.9.0: the others beside it, each onto the graphics card too.
@@ -1841,6 +1943,12 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 					}
 				hair_drawn_.laid_bytes += dr.a->parts_[i].hull.bytes;
 				hair_drawn_.laid_ms += dr.a->parts_[i].hull.ms;
+				// (And a layer's stretches together: their corners again.)
+				for (const auto &sort : dr.a->parts_[i].merged)
+					for (const Part::Merged &m : sort)
+						if (m.ib)
+							hair_drawn_.laid_bytes +=
+								m.room * (m.lines ? 2 : 6) * sizeof(uint32_t);
 			}
 	}
 	hair_drawn_.share = budget;
@@ -1963,8 +2071,7 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 			for (Drawn &dr : all)
 				for (size_t i = 0; i < dr.hair.size(); i++)
 					if (dr.hair[i].count)
-						dr.a->draw_hull(i, (*dr.posed)[i], v, drawn_h, dr.hair[i].count,
-								hair_drawn_);
+						dr.a->draw_hull(i, (*dr.posed)[i], v, drawn_h, dr.hair[i].count, *this);
 			gs_blend_op(GS_BLEND_OP_ADD);
 			gs_blend_state_pop();
 			gs_enable_depth_test(false);
@@ -2230,7 +2337,7 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 									: hair_plan_.measure == 3 ? "StrandSkBare"
 												  : "StrandSk";
 						dr.a->draw_strands(part.i, p, part.order, layer, dr.hair[part.i].count,
-								   technique, lines, sort, hair_drawn_);
+								   technique, lines, sort, *this);
 					}
 				}
 			if (one_pixel)
@@ -2265,6 +2372,7 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 	if (skips)
 		card_picture_take();
 	stop_clock();
+	hair_drawn_.merges = merges_;
 
 	gs_blend_state_pop();
 	gs_enable_depth_test(false);

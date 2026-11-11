@@ -4287,6 +4287,221 @@ static void test_layout()
 	CHECK(none.points.empty() && none.corners.empty() && none.from.empty());
 }
 
+// What a draw a group sends of a layer (Avatar3D's draw_strands, laid out):
+// each group's stretch of that layer and sort - the first `count` strands'
+// pieces - in the groups' order, its corners as the layout has them.
+static std::vector<uint32_t> a_draw_a_group(const Strands &h, const StrandLayout &l, int sort, size_t layer,
+					    size_t count, const std::vector<int> &order, size_t each)
+{
+	std::vector<uint32_t> out;
+	const size_t layers = (size_t)std::max(1, h.layers);
+	for (int g : order) {
+		const size_t run = (size_t)g * layers + layer;
+		Strands::Stretch some[2];
+		h.pieces_of(run, count, some);
+		out.insert(out.end(), l.corners.begin() + (size_t)l.from[run] * each,
+			   l.corners.begin() + ((size_t)l.from[run] + some[sort].count) * each);
+	}
+	return out;
+}
+
+// What a merged stretch's rows send for the groups in `order` (`draws`:
+// how many rows; -1: it can't).
+static std::vector<uint32_t> rows_send(const StrandMerge &m, const std::vector<uint32_t> &corners,
+				       const std::vector<int> &order, size_t each, int &draws)
+{
+	std::vector<StrandMerge::Row> rows = {{7, 7}};
+	std::vector<uint32_t> out;
+	if (!m.draws(order, rows)) {
+		draws = rows.empty() ? -1 : -2;
+		return out;
+	}
+	draws = (int)rows.size();
+	for (const StrandMerge::Row &row : rows) {
+		if (!row.pieces || ((size_t)row.from + row.pieces) * each > corners.size()) {
+			draws = -3;
+			return out;
+		}
+		out.insert(out.end(), corners.begin() + (size_t)row.from * each,
+			   corners.begin() + ((size_t)row.from + row.pieces) * each);
+	}
+	return out;
+}
+
+// A coat like long_coat's, hung on `bones` bones in turn.
+static Groom coat_on(int strands, int bones)
+{
+	Groom g;
+	uint32_t seed = 4321;
+	for (int s = 0; s < strands; s++) {
+		const int points = 6 + s % 9;
+		std::vector<V3> p;
+		float y = 0;
+		for (int i = 0; i < points; i++) {
+			p.push_back({(float)(s % 24) + (i % 2 ? 0.05f : 0.0f), y, (float)(s / 24)});
+			y += 0.02f + 0.03f * chance(seed);
+			g.held((uint16_t)(s % bones), 1);
+		}
+		g.strand(p);
+	}
+	return g;
+}
+
+// Whether, for one sort of a part laid out as ribbons or lines, a layer's
+// merged stretch made for every order in `orders` and every count sends
+// just what a draw a group would - in the order it was made in with one
+// draw, and in every other of the orders with a draw for each row of
+// groups that still follow each other. `most`: the most rows any took.
+static bool merges_right(const Strands &h, int sort, bool lines, const std::vector<std::vector<int>> &orders,
+			 size_t &most)
+{
+	const size_t each = lines ? 2 : 6, layers = (size_t)std::max(1, h.layers);
+	const StrandLayout l = strand_layout(h, sort, lines);
+	if (l.from.size() != h.groups.size() * layers + 1)
+		return false;
+	size_t room_all = 0;
+	for (size_t layer = 0; layer < layers; layer++) {
+		const size_t room = strand_merge_room(h, l.from, layer);
+		room_all += room;
+		for (size_t count : {h.strands(), h.strands() / 3, (size_t)7, (size_t)0})
+			for (const std::vector<int> &made_in : orders) {
+				// (Room for the whole layer, and a mark after it: nothing
+				// written past what it holds.)
+				std::vector<uint32_t> out(room * each + 1, 0xABCDEF01u);
+				const StrandMerge m = strand_merge(h, l.from, sort, layer, count, made_in,
+								   l.corners.data(), each, out.data());
+				if (!m.made || m.count != count || m.order != made_in ||
+				    m.at.size() != made_in.size() + 1 || m.at.back() > room ||
+				    out[room * each] != 0xABCDEF01u)
+					return false;
+				const std::vector<uint32_t> want =
+					a_draw_a_group(h, l, sort, layer, count, made_in, each);
+				if (want.size() != (size_t)m.at.back() * each ||
+				    !std::equal(want.begin(), want.end(), out.begin()))
+					return false;
+				if (count >= h.strands() && made_in.size() == h.groups.size() && m.at.back() != room)
+					return false;
+				out.resize((size_t)m.at.back() * each);
+				for (const std::vector<int> &now : orders) {
+					int draws = 0;
+					const std::vector<uint32_t> got = rows_send(m, out, now, each, draws);
+					// (An order with a group it wasn't made with: it can't.)
+					bool all_in = true;
+					for (int g : now)
+						all_in = all_in &&
+							 std::find(made_in.begin(), made_in.end(), g) != made_in.end();
+					if (!all_in) {
+						if (draws != -1)
+							return false;
+						continue;
+					}
+					if (draws < 0 || got != a_draw_a_group(h, l, sort, layer, count, now, each))
+						return false;
+					if (now == made_in && draws != (want.empty() ? 0 : 1))
+						return false;
+					if ((size_t)draws > now.size())
+						return false;
+					most = std::max(most, (size_t)draws);
+				}
+			}
+	}
+	// (All the layers' room: every piece of the sort.)
+	return room_all == l.from.back();
+}
+
+// A layer's groups sent to the card in one draw (HairPlan::merge 1).
+static void test_merge()
+{
+	// A coat of 600 hairs on six bones, in 5 layers and one sort.
+	const Groom g = coat_on(600, 6);
+	Builder b = file_of({g}, {{2, 0, 0}, {6, 0, 0}, {10, 0, 0}, {14, 0, 0}, {18, 0, 0}, {22, 0, 0}});
+	const Model m = loaded(b, options_with(0));
+	const Primitive &h = part_of(m);
+	CHECK(h.hair.strands() == 600 && h.hair.groups.size() == 6 && h.hair.layers == 5 && h.hair.thin.empty());
+	if (h.hair.groups.size() != 6)
+		return;
+	const std::vector<int> as_made = {0, 1, 2, 3, 4, 5}, back = {5, 4, 3, 2, 1, 0}, mixed = {3, 0, 5, 1, 4, 2},
+			       swapped = {0, 1, 3, 2, 4, 5}, last_first = {5, 0, 1, 2, 3, 4};
+	for (int lines = 0; lines < 2; lines++) {
+		size_t most = 0;
+		CHECK(merges_right(h.hair, 0, lines != 0, {as_made, back, mixed, swapped, last_first}, most));
+		// (Turned right round, or mixed: a draw a group again, never more.)
+		CHECK(most == 6);
+	}
+	// Two groups that have changed places: the row before them, each of
+	// them, the row after - 4 draws, not 6; the last group gone to the
+	// front: 2.
+	{
+		const StrandLayout l = strand_layout(h.hair, 0, true);
+		for (size_t layer = 0; layer < 5; layer++) {
+			std::vector<uint32_t> out(strand_merge_room(h.hair, l.from, layer) * 2);
+			const StrandMerge made = strand_merge(h.hair, l.from, 0, layer, h.hair.strands(), as_made,
+							      l.corners.data(), 2, out.data());
+			std::vector<StrandMerge::Row> rows;
+			CHECK(made.draws(as_made, rows) && rows.size() == 1 && rows[0].from == 0 &&
+			      rows[0].pieces == made.at.back() && rows[0].pieces > 0);
+			CHECK(made.draws(swapped, rows) && rows.size() == 4);
+			CHECK(made.draws(last_first, rows) && rows.size() == 2);
+			CHECK(made.draws(back, rows) && rows.size() == 6);
+			// (Only some of its groups, in its order: the rows between the
+			// ones left out.)
+			CHECK(made.draws({0, 1, 4, 5}, rows) && rows.size() == 2);
+			CHECK(made.draws({2}, rows) && rows.size() == 1 && rows[0].from == made.at[2]);
+			CHECK(made.draws({}, rows) && rows.empty());
+			// A group it hasn't: it can't, and says so.
+			rows = {{1, 1}};
+			CHECK(!made.draws({0, 6}, rows) && rows.empty());
+			CHECK(!made.draws({-1}, rows) && rows.empty());
+		}
+		// Made with only some groups: those are all it can send.
+		std::vector<uint32_t> out(strand_merge_room(h.hair, l.from, 0) * 2);
+		const StrandMerge some =
+			strand_merge(h.hair, l.from, 0, 0, 600, {4, 1}, l.corners.data(), 2, out.data());
+		std::vector<StrandMerge::Row> rows;
+		CHECK(some.made && some.draws({4, 1}, rows) && rows.size() == 1 && some.draws({1, 4}, rows) &&
+		      rows.size() == 2);
+		CHECK(!some.draws({4, 1, 0}, rows) && rows.empty());
+		// A group named twice, or one it doesn't have, or a layer it
+		// doesn't have: not made.
+		CHECK(!strand_merge(h.hair, l.from, 0, 0, 600, {0, 1, 0}, l.corners.data(), 2, out.data()).made);
+		CHECK(!strand_merge(h.hair, l.from, 0, 0, 600, {0, 6}, l.corners.data(), 2, out.data()).made);
+		CHECK(!strand_merge(h.hair, l.from, 0, 5, 600, as_made, l.corners.data(), 2, out.data()).made);
+		CHECK(!strand_merge(h.hair, l.from, 0, 0, 600, as_made, nullptr, 2, out.data()).made);
+		CHECK(!strand_merge(h.hair, l.from, 0, 0, 600, as_made, l.corners.data(), 2, nullptr).made);
+		CHECK(!StrandMerge().draws(as_made, rows) && rows.empty());
+		CHECK(strand_merge_room(h.hair, l.from, 5) == 0 && strand_merge_room(Strands(), {}, 0) == 0);
+	}
+
+	// Two sorts (every fifth hair wide): each sort's layers on their own -
+	// the wide ones as ribbons, the thin ones as lines, as they're drawn.
+	{
+		Groom two = coat_on(600, 6);
+		for (size_t s = 0; s < 600; s++)
+			two.width.insert(two.width.end(), two.first[s + 1] - two.first[s],
+					 s % 5 == 0 ? 0.0005f : 0.0001f);
+		Builder file = file_of({two}, {{2, 0, 0}, {6, 0, 0}, {10, 0, 0}, {14, 0, 0}, {18, 0, 0}, {22, 0, 0}});
+		const Model n = loaded(file, options_with(0));
+		const Primitive &q = part_of(n);
+		CHECK(!q.hair.thin.empty() && q.hair.groups.size() == 6);
+		size_t most = 0;
+		CHECK(merges_right(q.hair, 0, false, {as_made, mixed, swapped}, most));
+		CHECK(merges_right(q.hair, 1, true, {as_made, mixed, swapped}, most));
+		CHECK(merges_right(q.hair, 1, false, {as_made, back}, most) &&
+		      merges_right(q.hair, 0, true, {back, mixed}, most));
+	}
+	// One layer, and a coat short of points: right too.
+	{
+		LoadOptions o = options_with(0);
+		o.strand_layers = 1;
+		const Model n = loaded(b, o);
+		size_t most = 0;
+		CHECK(part_of(n).hair.layers == 1 && merges_right(part_of(n).hair, 0, true, {as_made, mixed}, most));
+		const Model few = loaded(b, rated(g.pos.size() / 2));
+		CHECK(part_of(few).hair.strands() < 600 &&
+		      merges_right(part_of(few).hair, 0, false, {as_made, mixed}, most));
+	}
+}
+
 // A strand part's hull laid out as it's drawn (strand_hull): for any
 // number of strands drawn, each group's stretch holds exactly the pieces
 // the hull draws by point - its inner layers' pieces of the first
@@ -6042,6 +6257,7 @@ int main()
 	test_layers_and_pieces();
 	test_two_sorts();
 	test_layout();
+	test_merge();
 	test_hull_layout();
 	test_expressions();
 	test_expressions_by_strand();
