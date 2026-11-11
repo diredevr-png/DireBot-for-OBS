@@ -79,7 +79,9 @@ struct HairPlan {
 	// Hair that can't show - behind a solid part, or deep under other hair
 	// - left out before the card cuts it into pixels (posed on the card,
 	// Direct3D: the effect's strand_shown): 0 never, 1 where it can, 2
-	// only the hair that would be left out is drawn (a test's view of it).
+	// only the hair that would be left out is drawn (a test's view of it),
+	// 3 every piece is left out (a measure: the card's work on hair before
+	// any of it is cut into pixels).
 	int skip_hidden = 1;
 	// Hairs well under a pixel wide sent as lines (hair_form): 0 never, 1
 	// where they're that thin, 2 always (tests).
@@ -179,25 +181,33 @@ inline float hair_px(const Strands &h, float width, const HairShare &s, float sc
 //     until a pixel is a tenth smaller than that, so it doesn't flicker
 //     between the two at the edge. Nearer, it's ribbons as ever: nothing
 //     changes in a close-up.
+//   - A coat of many thin hairs and a few wide ones (an animal's: the
+//     wide ones standing for the deep coat) would never be lines by that,
+//     for what its wide hairs lose. It's in two sorts (Strands::thin), and
+//     by the same rule of its thin pieces alone (Strands::thin_pixel)
+//     those go as lines while its wide ones stay ribbons.
 //   - The budget draws fewer hairs, each wider - and a line can only be
 //     more solid. So under a budget it stays lines while that loses under
-//     a twentieth (Strands::line_pixel_most); with too few hairs for that
-//     it's ribbons again - at HAIR_LINE_COST of the budget's share, as a
-//     ribbon costs the card about twice a line: the same cost either side
-//     of the change, so the budget finds one answer and stays there. (But
-//     never under the budget's least share, HAIR_SHARE_LEAST: a coat is
-//     never thinned further than it was as ribbons alone.)
+//     a twentieth (Strands::line_pixel_most, thin_pixel_most); with too
+//     few hairs for that it's ribbons again - at as much less of the
+//     budget's share as the lines saved (a ribbon costs the card about
+//     twice a line, HAIR_LINE_COST): the same cost either side of the
+//     change, so the budget finds one answer and stays there. (But never
+//     under the budget's least share, HAIR_SHARE_LEAST: a coat is never
+//     thinned further than it was as ribbons alone.)
 constexpr float HAIR_LINE_STAYS = 1.1f, HAIR_LINE_COST = 0.5f, HAIR_SHARE_LEAST = 0.1f;
 
 struct HairForm {
 	HairShare share;
-	bool lines = false;
+	// All its pieces as lines; or (of a part in two sorts) its thin ones.
+	bool lines = false, thin = false;
 };
 
 // hair_share's answer and whether the part is sent as lines: `lines` the
-// plan's say (HairPlan::lines), `was_lines` whether it was last frame.
+// plan's say (HairPlan::lines), `was_lines` and `was_thin` what it was
+// last frame.
 inline HairForm hair_form(const Strands &h, size_t loaded, float scale, float distance, float pixel, float thinnest,
-			  float solid, float budget, int lines, bool was_lines)
+			  float solid, float budget, int lines, bool was_lines, bool was_thin = false)
 {
 	HairForm f;
 	f.share = hair_share(h, loaded, scale, distance, pixel, thinnest, solid, budget);
@@ -207,17 +217,24 @@ inline HairForm hair_form(const Strands &h, size_t loaded, float scale, float di
 		f.lines = true;
 		return f;
 	}
-	if (!(h.line_pixel > 0))
-		return f;
 	const HairShare all = budget < 1 ? hair_share(h, loaded, scale, distance, pixel, thinnest, solid, 1.0f)
 					 : f.share;
-	if (hair_px(h, h.line_pixel, all, scale, distance, pixel) > (was_lines ? HAIR_LINE_STAYS : 1.0f))
+	const bool whole = h.line_pixel > 0 && hair_px(h, h.line_pixel, all, scale, distance, pixel) <=
+						       (was_lines ? HAIR_LINE_STAYS : 1.0f);
+	const bool thin = !whole && !h.thin.empty() && h.thin_pixel > 0 &&
+			  hair_px(h, h.thin_pixel, all, scale, distance, pixel) <=
+				  (was_lines || was_thin ? HAIR_LINE_STAYS : 1.0f);
+	if (!whole && !thin)
 		return f;
-	if (!(budget < 1) || hair_px(h, h.line_pixel_most, f.share, scale, distance, pixel) <= 1.0f)
-		f.lines = true;
-	else
-		f.share = hair_share(h, loaded, scale, distance, pixel, thinnest, solid,
-				     std::max(budget * HAIR_LINE_COST, std::min(budget, HAIR_SHARE_LEAST)));
+	if (!(budget < 1) ||
+	    hair_px(h, whole ? h.line_pixel_most : h.thin_pixel_most, f.share, scale, distance, pixel) <= 1.0f) {
+		(whole ? f.lines : f.thin) = true;
+		return f;
+	}
+	const float cost = whole ? HAIR_LINE_COST
+				 : 1 - (1 - HAIR_LINE_COST) * std::min(1.0f, std::max(0.0f, h.thin_share));
+	f.share = hair_share(h, loaded, scale, distance, pixel, thinnest, solid,
+			     std::max(budget * cost, std::min(budget, HAIR_SHARE_LEAST)));
 	return f;
 }
 

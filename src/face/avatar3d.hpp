@@ -274,7 +274,7 @@ private:
 		// Its pieces as lines (hair.hpp's strand_corners), made the first
 		// time it's drawn that way; and whether it was last frame.
 		gs_indexbuffer_t *ib_lines = nullptr;
-		bool as_lines = false;
+		bool as_lines = false, thin_lines = false; // (all of them; its thin ones only)
 		bool skin = false;    // its points as made, with their bones (posed on the card)
 		bool was_morphed = false;
 		bool posed_here = false; // a card part's points last sent posed here
@@ -314,11 +314,13 @@ private:
 	// out before it's drawn (HairPlan::skip_hidden; 0: not).
 	void set_strand(const View3D &v, uint32_t drawn_h, float upto, float scale, gs_texture_t *depth,
 			bool lines = false, int skip = 0);
-	// A layer of a hair-strand part: the groups given (Strands::groups),
-	// in that order, each one's pieces in that layer of its first `count`
-	// strands - as ribbons or as lines; what it drew added to `drawn`.
+	// A hair-strand part's pieces drawn: for each of `groups`, in that
+	// order, the pieces in `layer` of its first `count` strands - as
+	// ribbons or as lines; `sort` 0 its wide pieces only, 1 its thin ones
+	// only (a part in two sorts: Strands::thin), anything else all of
+	// them; what it drew added to `drawn`.
 	void draw_strands(size_t i, const Rig::Part &p, const std::vector<int> &groups, size_t layer, size_t count,
-			  const char *technique, bool lines, HairDrawn &drawn);
+			  const char *technique, bool lines, int sort, HairDrawn &drawn);
 	// A hair-strand part's bones and spots' moves for the card, its points
 	// and pieces (as ribbons or as lines) loaded: whether it can be drawn.
 	bool load_strands(size_t i, const Rig::Part &p, bool lines = false);

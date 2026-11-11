@@ -710,6 +710,86 @@ static void test_lines()
 	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 3, 1, false);
 	CHECK(f.lines && f.share.count == 10000);
 
+	// A coat in two sorts - 8 in 10 of its pieces thin (those 0.0005
+	// wide), the rest so wide that as a whole it would lose a hundredth
+	// only once a pixel is 6 of those widths: never lines by that. Its
+	// thin pieces go as lines by the same rule of them alone - from 0.62
+	// away, staying so to 0.5625 - and the rest stay ribbons.
+	Strands two = coat;
+	two.line_pixel = 6 * width;
+	two.line_pixel_most = 5 * width;
+	two.thin = {0};
+	two.thin_share = 0.8f;
+	two.thin_pixel = 1.2375f * width;
+	two.thin_pixel_most = 1.1875f * width;
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 1, 1, false);
+	CHECK(f.thin && !f.lines && f.share.count == 10000 && f.share.upto == 1);
+	CHECK(hair_form(two, 10000, 1, 0.63f, pixel, 1, 0.4f, 1, 1, false).thin);
+	f = hair_form(two, 10000, 1, 0.61f, pixel, 1, 0.4f, 1, 1, false);
+	CHECK(!f.thin && !f.lines && f.share.count == 10000);
+	CHECK(hair_form(two, 10000, 1, 0.61f, pixel, 1, 0.4f, 1, 1, false, true).thin);
+	CHECK(hair_form(two, 10000, 1, 0.57f, pixel, 1, 0.4f, 1, 1, false, true).thin);
+	CHECK(!hair_form(two, 10000, 1, 0.55f, pixel, 1, 0.4f, 1, 1, false, true).thin);
+	// (All of it lines last frame, by a plan since changed: its thin ones
+	// stay.)
+	f = hair_form(two, 10000, 1, 0.61f, pixel, 1, 0.4f, 1, 1, true, false);
+	CHECK(f.thin && !f.lines);
+	// Far off, fewer and wider: its thin pieces lines all the way out,
+	// never all of it.
+	for (float away : {2.0f, 5.0f, 20.0f, 100.0f}) {
+		const HairShare s = hair_share(two, 10000, 1, away, pixel, 1, 0.4f, 1);
+		f = hair_form(two, 10000, 1, away, pixel, 1, 0.4f, 1, 1, false);
+		CHECK(f.thin && !f.lines && f.share.count == s.count && f.share.upto == s.upto);
+	}
+	// Told never: ribbons. Told always: all of it, wide ones too.
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 1, 0, false, true);
+	CHECK(!f.thin && !f.lines);
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 1, 2, false, true);
+	CHECK(f.lines && !f.thin);
+	// Where the whole coat is thin enough: all of it, as a coat in one
+	// sort.
+	{
+		Strands fine = two;
+		fine.line_pixel = 1.5f * width;
+		fine.line_pixel_most = 1.4f * width;
+		f = hair_form(fine, 10000, 1, 1, pixel, 1, 0.4f, 1, 1, false);
+		CHECK(f.lines && !f.thin && f.share.count == 10000);
+		// (Nearer than that - from 0.75 away - its thin ones alone.)
+		f = hair_form(fine, 10000, 1, 0.7f, pixel, 1, 0.4f, 1, 1, false);
+		CHECK(!f.lines && f.thin);
+	}
+	// Under a budget its thin pieces stay lines while that loses them
+	// under a twentieth (to 0.59 of the hairs).
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 0.8f, 1, false);
+	CHECK(f.thin && !f.lines && f.share.count == 8000);
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 0.6f, 1, false, true);
+	CHECK(f.thin && f.share.count == 6000);
+	// Fewer: ribbons - as much less of the budget's share as the lines
+	// saved: 8 in 10 of its pieces at half the cost, so 0.6 of it. Never
+	// under the least share.
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 0.5f, 1, false, true);
+	CHECK(!f.thin && !f.lines && f.share.count >= 3000 && f.share.count <= 3001 && near(f.share.upto, 0.3, 2e-4));
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 0.2f, 1, false);
+	CHECK(!f.thin && !f.lines && f.share.count >= 1200 && f.share.count <= 1201);
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 0.15f, 1, false);
+	CHECK(!f.thin && !f.lines && f.share.count == 1000);
+	// (A share of thin pieces that's no number: no more of the budget's
+	// share than there is.)
+	for (float v : {std::numeric_limits<float>::quiet_NaN(), -1.0f, 7.0f, std::numeric_limits<float>::infinity()}) {
+		Strands odd = two;
+		odd.thin_share = v;
+		f = hair_form(odd, 10000, 1, 1, pixel, 1, 0.4f, 0.5f, 1, false);
+		CHECK(!f.thin && f.share.count >= 2500 && f.share.count <= 5000);
+	}
+	// (In one sort - no list of where its thin pieces start: never by
+	// that, whatever its numbers say.)
+	{
+		Strands one = two;
+		one.thin.clear();
+		f = hair_form(one, 10000, 1, 1, pixel, 1, 0.4f, 1, 1, false, true);
+		CHECK(!f.thin && !f.lines);
+	}
+
 	// A coat whose widths were never measured (no hairs with any length):
 	// ribbons. None ready to draw: none, and not lines.
 	Strands unmeasured = coat;
@@ -3147,7 +3227,9 @@ static std::vector<float> piece_starts(const Primitive &p)
 }
 
 // What must hold of any part's pieces: every piece once, in the runs of
-// its strand's group; a run's pieces in strand order; a group's layers
+// its strand's group; a run's pieces in strand order - in two sorts (a
+// coat with a thin_width): its wide pieces first, then its thin ones, each
+// in strand order, most of its pieces thin and some not; a group's layers
 // from the root out, every hair's first piece in the first; and its reach
 // no nearer than any piece of its inner layers starts.
 static bool pieces_right(const Primitive &p)
@@ -3168,6 +3250,33 @@ static bool pieces_right(const Primitive &p)
 	std::sort(got.begin(), got.end());
 	if (got != want)
 		return false;
+	const bool sorts = !h.thin.empty();
+	if (sorts) {
+		if (h.thin.size() != groups * layers || !(h.thin_width > 0))
+			return false;
+		std::vector<uint32_t> strand_of(p.pos.size(), 0);
+		for (size_t s = 0; s < h.strands(); s++)
+			for (uint32_t i = h.first[s]; i < h.first[s + 1]; i++)
+				strand_of[i] = (uint32_t)s;
+		size_t thin = 0;
+		for (size_t r = 0; r + 1 < h.runs.size(); r++) {
+			if (h.thin[r] < h.runs[r] || h.thin[r] > h.runs[r + 1])
+				return false;
+			for (uint32_t k = h.runs[r]; k < h.runs[r + 1]; k++) {
+				const bool wide = h.piece_width(strand_of[h.pieces[k]], h.pieces[k]) > (double)h.thin_width;
+				if (wide != (k < h.thin[r]))
+					return false;
+				thin += wide ? 0 : 1;
+			}
+		}
+		if (thin == h.pieces.size() || (double)thin < (double)Strands::THIN_MOST * (double)h.pieces.size() ||
+		    !near(h.thin_share, (double)thin / (double)h.pieces.size(), 1e-6))
+			return false;
+		if (!(h.thin_pixel_most > 0) || !(h.thin_pixel_most <= h.thin_pixel) || !(h.thin_pixel <= h.line_pixel))
+			return false;
+	} else if (h.thin_width != 0 || h.thin_share != 0 || h.thin_pixel != 0 || h.thin_pixel_most != 0) {
+		return false;
+	}
 	const std::vector<int> group_of = groups_of_strands(p);
 	for (int g : group_of)
 		if (g < 0)
@@ -3179,8 +3288,8 @@ static bool pieces_right(const Primitive &p)
 			const uint32_t a = h.runs[g * layers + l], b = h.runs[g * layers + l + 1];
 			float nearest = 1e30f, furthest = -1;
 			for (uint32_t k = a; k < b; k++) {
-				// (In strand order, so in point order.)
-				if (k > a && h.pieces[k] <= h.pieces[k - 1])
+				// (In strand order, so in point order - each sort.)
+				if (k > a && !(sorts && k == h.thin[g * layers + l]) && h.pieces[k] <= h.pieces[k - 1])
 					return false;
 				nearest = std::min(nearest, from[h.pieces[k]]);
 				furthest = std::max(furthest, from[h.pieces[k]]);
@@ -3422,6 +3531,199 @@ static void test_layers_and_pieces()
 	// And of a coat cut short by its points allowed.
 	const Model few = loaded(b, allowed(1000));
 	CHECK(part_of(few).hair.strands() > 60 && part_of(few).hair.strands() < 120 && pieces_right(part_of(few)));
+}
+
+// --- Two sorts of pieces --------------------------------------------------------
+
+// Whether pieces_of gives, for each run, the wide and the thin pieces of
+// the first `count` strands - as counted one by one - and all the runs
+// together every piece of those strands.
+static bool stretches_right(const Primitive &h, size_t count)
+{
+	std::vector<uint32_t> strand_of(h.pos.size(), 0);
+	for (size_t s = 0; s < h.hair.strands(); s++)
+		for (uint32_t i = h.hair.first[s]; i < h.hair.first[s + 1]; i++)
+			strand_of[i] = (uint32_t)s;
+	size_t total = 0;
+	for (size_t r = 0; r + 1 < h.hair.runs.size(); r++) {
+		const uint32_t a = h.hair.runs[r], b = h.hair.runs[r + 1], middle = h.hair.thin.empty() ? b : h.hair.thin[r];
+		Strands::Stretch got[2];
+		h.hair.pieces_of(r, count, got);
+		uint32_t wide = 0, thin = 0;
+		for (uint32_t k = a; k < middle; k++)
+			wide += strand_of[h.hair.pieces[k]] < count ? 1 : 0;
+		for (uint32_t k = middle; k < b; k++)
+			thin += strand_of[h.hair.pieces[k]] < count ? 1 : 0;
+		if (got[0].from != a || got[0].count != wide || got[1].from != middle || got[1].count != thin ||
+		    h.hair.pieces_of(r, count) != wide + thin)
+			return false;
+		// (Those are each stretch's first: what's drawn is its start.)
+		for (const Strands::Stretch &one : got)
+			for (uint32_t k = one.from; k < one.from + one.count; k++)
+				if (strand_of[h.hair.pieces[k]] >= count)
+					return false;
+		total += wide + thin;
+	}
+	const size_t strands = std::min(count, h.hair.strands());
+	return total == h.hair.first[strands] - strands;
+}
+
+static void test_two_sorts()
+{
+	// The long coat of 400 hairs on two bones, every fifth hair 0.0005
+	// wide and the rest 0.0001: half its hairs' length is under 0.0001
+	// wide, so a piece is thin up to 0.00015 - four hairs in five.
+	Groom g = long_coat(400);
+	for (size_t s = 0; s < 400; s++)
+		g.width.insert(g.width.end(), g.first[s + 1] - g.first[s], s % 5 == 0 ? 0.0005f : 0.0001f);
+	Builder b = file_of({g}, {{5, 0, 0}, {15, 0, 0}});
+	const Model m = loaded(b, options_with(0));
+	const Primitive &h = part_of(m);
+	const size_t pieces = g.pos.size() - 400;
+	CHECK(h.hair.strands() == 400 && h.hair.pieces.size() == pieces && h.hair.runs.size() == 11);
+	size_t wide = 0;
+	for (size_t s = 0; s < h.hair.strands(); s++)
+		if (h.hair.width[h.hair.first[s]] > 0.0003f)
+			wide += h.hair.first[s + 1] - h.hair.first[s] - 1;
+	CHECK(wide > pieces / 6 && wide < pieces / 4);
+	CHECK(h.hair.thin_width == Strands::THIN_WIDTH * 0.0001f && h.hair.thin.size() == 10);
+	CHECK(near(h.hair.thin_share, 1.0 - (double)wide / (double)pieces, 1e-6));
+	// Every run: its wide pieces, then its thin ones, each by strand.
+	CHECK(pieces_right(h));
+	size_t before = 0;
+	for (size_t r = 0; r + 1 < h.hair.runs.size() && r < h.hair.thin.size(); r++)
+		before += h.hair.thin[r] - h.hair.runs[r];
+	CHECK(before == wide);
+	// As lines, its thin pieces alone (all one width: 0.99 and 0.95 of it
+	// over what a line covers) - the whole coat's hairs, only with a pixel
+	// several times bigger.
+	CHECK(near(h.hair.thin_pixel, 0.0001 * 0.99 / 0.8, 1e-10) && near(h.hair.thin_pixel_most, 0.0001 * 0.95 / 0.8, 1e-10));
+	CHECK(h.hair.line_pixel > 4 * h.hair.thin_pixel && h.hair.line_pixel_most > 4 * h.hair.thin_pixel_most);
+	// How many of each belong to the first so many strands.
+	bool counted = true;
+	for (size_t count : {0u, 1u, 2u, 3u, 5u, 6u, 16u, 50u, 199u, 200u, 201u, 399u, 400u, 401u, 100000u})
+		counted = counted && stretches_right(h, count);
+	CHECK(counted);
+	// (A run it hasn't: none of either.)
+	Strands::Stretch none[2];
+	h.hair.pieces_of(10, 400, none);
+	CHECK(none[0].count == 0 && none[1].count == 0);
+	none[0].count = none[1].count = 9;
+	Strands().pieces_of(0, 1, none);
+	CHECK(none[0].count == 0 && none[1].count == 0);
+	// The same coat with other numbers of layers.
+	for (int layers : {1, 2, 16}) {
+		LoadOptions o = options_with(0);
+		o.strand_layers = layers;
+		const Model n = loaded(b, o);
+		const Primitive &q = part_of(n);
+		CHECK(q.hair.thin.size() == 2 * (size_t)layers && pieces_right(q) && q.hair.thin_share == h.hair.thin_share);
+		CHECK(stretches_right(q, 0) && stretches_right(q, 77) && stretches_right(q, 400));
+	}
+
+	// One sort - a run all by strand, as ever - where:
+	// its hairs are all one width (or the file gives none);
+	{
+		Groom same = long_coat(400);
+		Builder none = file_of({same}, {{5, 0, 0}, {15, 0, 0}});
+		const Model plain = loaded(none, options_with(0));
+		CHECK(part_of(plain).hair.thin.empty() && part_of(plain).hair.thin_width == 0 && pieces_right(part_of(plain)));
+		same.width.assign(same.pos.size(), 0.0004f);
+		Builder one = file_of({same}, {{5, 0, 0}, {15, 0, 0}});
+		const Model even = loaded(one, options_with(0));
+		CHECK(part_of(even).hair.thin.empty() && pieces_right(part_of(even)) && stretches_right(part_of(even), 123));
+	}
+	// most of them are the wide ones (every fifth hair thin: none is wider
+	// than 1.5 times what half their length is under);
+	{
+		Groom most = long_coat(400);
+		for (size_t s = 0; s < 400; s++)
+			most.width.insert(most.width.end(), most.first[s + 1] - most.first[s], s % 5 == 0 ? 0.0001f : 0.0005f);
+		Builder wide_ones = file_of({most}, {{5, 0, 0}, {15, 0, 0}});
+		const Model n = loaded(wide_ones, options_with(0));
+		CHECK(part_of(n).hair.thin.empty() && part_of(n).hair.thin_share == 0 && pieces_right(part_of(n)));
+	}
+	// its thin hairs are most of its length but few of its pieces: 100
+	// hairs of one piece 3 long and 0.0001 wide, 50 of 8 short pieces
+	// 0.0005 wide - a fifth of its pieces thin.
+	{
+		Groom few;
+		for (int k = 0; k < 100; k++) {
+			few.straight({(float)k, 0, 0}, {(float)k, 3, 0}, 2);
+			few.width.insert(few.width.end(), 2, 0.0001f);
+		}
+		for (int k = 0; k < 50; k++) {
+			few.straight({(float)k, 0, 1}, {(float)k, 0.08f, 1}, 9);
+			few.width.insert(few.width.end(), 9, 0.0005f);
+		}
+		const Model n = loaded(few, options_with(0));
+		const Primitive &q = part_of(n);
+		CHECK(q.hair.pieces.size() == 500 && q.hair.thin.empty() && q.hair.thin_width == 0 && q.hair.thin_pixel == 0 &&
+		      pieces_right(q));
+		// (With 5 times as many of the thin: 500 of 900, two sorts.)
+		for (int k = 100; k < 500; k++) {
+			few.straight({(float)k, 0, 0}, {(float)k, 3, 0}, 2);
+			few.width.insert(few.width.end(), 2, 0.0001f);
+		}
+		const Model more = loaded(few, options_with(0));
+		const Primitive &r = part_of(more);
+		CHECK(r.hair.pieces.size() == 900 && !r.hair.thin.empty() && near(r.hair.thin_share, 500.0 / 900, 1e-6) &&
+		      pieces_right(r));
+	}
+
+	// Hairs that narrow from root to tip, 0.001 to 0.0001 over 9 pieces:
+	// the middle piece is 0.00055 wide, so each hair's first two pieces
+	// (0.00095, 0.00085) are the wide ones and its other 7 thin.
+	{
+		Groom taper;
+		for (int k = 0; k < 200; k++) {
+			taper.straight({(float)(k % 20), 0, (float)(k / 20)}, {(float)(k % 20), 0.9f, (float)(k / 20)}, 10);
+			for (int i = 0; i < 10; i++)
+				taper.width.push_back(0.001f - 0.0001f * (float)i);
+		}
+		const Model n = loaded(taper, options_with(0));
+		const Primitive &q = part_of(n);
+		CHECK(q.hair.pieces.size() == 1800 && !q.hair.thin.empty() && near(q.hair.thin_share, 7.0 / 9, 1e-6));
+		CHECK(near(q.hair.thin_width, 1.5 * 0.00055, 1e-9) && pieces_right(q));
+		bool roots = true;
+		for (size_t r = 0; r + 1 < q.hair.runs.size(); r++)
+			for (uint32_t k = q.hair.runs[r]; k < q.hair.runs[r + 1]; k++) {
+				const uint32_t piece = q.hair.pieces[k];
+				const bool first_two = q.hair.along[piece] < 0.2f;
+				roots = roots && first_two == (k < q.hair.thin[r]);
+			}
+		CHECK(roots);
+		for (size_t count : {0u, 1u, 99u, 200u, 1000u})
+			CHECK(stretches_right(q, count));
+	}
+
+	// Short of points, a coat's deep hair is kept thinner than the rest
+	// and each kept hair of it drawn as much wider: those are its wide
+	// pieces. 64 x 64 hairs that cover their skin twice over, and beside
+	// them 32 x 32 three times as long (six times over: rated a third),
+	// all 0.001 wide in the file, half its points allowed.
+	{
+		const float d = 0.01f;
+		const Groom coat = joined(patch(64, 64, d, d, 0.2f, 0.001f), patch(32, 32, d, d, 0.6f, 0.001f, {5, 0, 0}));
+		const Model n = loaded(coat, rated(5120, 2.0f, 4));
+		const Primitive &q = part_of(n);
+		size_t deep = 0, deep_wide = 0, wide_in_all = 0;
+		bool only_deep = true;
+		CHECK(q.hair.strands() == 2560 && q.hair.pieces.size() == 2560 && !q.hair.thin.empty() && pieces_right(q));
+		for (size_t r = 0; r + 1 < q.hair.runs.size() && r < q.hair.thin.size(); r++)
+			for (uint32_t k = q.hair.runs[r]; k < q.hair.runs[r + 1]; k++) {
+				const bool of_deep = q.pos[q.hair.pieces[k]].x > 2.5f, is_wide = k < q.hair.thin[r];
+				deep += of_deep ? 1 : 0;
+				deep_wide += of_deep && is_wide ? 1 : 0;
+				wide_in_all += is_wide ? 1 : 0;
+				only_deep = only_deep && (of_deep || !is_wide);
+			}
+		std::printf("unit_hair: a coat short of points, in two sorts: %zu of its %zu deep hairs' pieces wide, %zu wide "
+			    "in all of %zu (thin share %.4f, full %.4f)\n",
+			    deep_wide, deep, wide_in_all, q.hair.pieces.size(), q.hair.thin_share, q.hair.full);
+		CHECK(only_deep && deep > 150 && deep_wide * 10 >= deep * 8 && wide_in_all == deep_wide);
+		CHECK(stretches_right(q, 0) && stretches_right(q, 1000) && stretches_right(q, 2560));
+	}
 }
 
 // --- Expressions --------------------------------------------------------------
@@ -4849,6 +5151,7 @@ int main()
 	test_share_by_sample();
 	test_groups();
 	test_layers_and_pieces();
+	test_two_sorts();
 	test_expressions();
 	test_expressions_by_strand();
 	test_stand_in_hair();

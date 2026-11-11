@@ -1075,7 +1075,8 @@ void rate_strands(RawStrands &raw, float cover, float uneven)
 // root most (the smallest groups joined to the one nearest, past
 // MOST_STRAND_GROUPS), each group's pieces in `layers` layers of as many
 // pieces each by how far from their roots they start, and a layer's by
-// strand.
+// strand - in two sorts where it has a `thin_width`, its wide pieces
+// first (Strands::thin).
 void arrange_strands(Primitive &p, int layers)
 {
 	Strands &h = p.hair;
@@ -1083,6 +1084,8 @@ void arrange_strands(Primitive &p, int layers)
 	h.groups.clear();
 	h.pieces.clear();
 	h.runs.clear();
+	h.thin.clear();
+	h.thin_share = 0;
 	h.layers = std::max(1, std::min(16, layers));
 	h.core = 0;
 	if (!strands)
@@ -1214,11 +1217,19 @@ void arrange_strands(Primitive &p, int layers)
 	std::vector<double> ends(groups, 0.0);
 	std::vector<size_t> inner(groups, 0);
 	std::vector<uint32_t> count(groups * L + 1, 0);
+	// (In two sorts: how many of each run's pieces are wide.)
+	const bool sorts = h.thin_width > 0;
+	std::vector<uint32_t> wide(sorts ? groups * L : 0, 0);
+	size_t wide_in_all = 0;
 	for (size_t s = 0; s < strands; s++)
 		for (uint32_t i = h.first[s]; i + 1 < h.first[s + 1]; i++) {
 			const uint32_t g = group_of[s];
 			const size_t l = layer_of(g, from[i]);
 			count[g * L + l + 1]++;
+			if (sorts && h.piece_width(s, i) > (double)h.thin_width) {
+				wide[g * L + l]++;
+				wide_in_all++;
+			}
 			if (l < (size_t)h.core) {
 				ends[g] += (double)from[i] + (double)length(p.pos[i + 1] - p.pos[i]);
 				inner[g]++;
@@ -1233,9 +1244,25 @@ void arrange_strands(Primitive &p, int layers)
 	h.runs = count;
 	h.pieces.resize(count[groups * L]);
 	std::vector<uint32_t> fill(count.begin(), count.end() - 1);
+	// Two sorts only with enough thin pieces, and some wide.
+	const size_t in_all = h.pieces.size();
+	if (!sorts || !wide_in_all || (double)(in_all - wide_in_all) < (double)Strands::THIN_MOST * (double)in_all) {
+		h.thin_width = h.thin_pixel = h.thin_pixel_most = 0;
+		for (size_t s = 0; s < strands; s++)
+			for (uint32_t i = h.first[s]; i + 1 < h.first[s + 1]; i++)
+				h.pieces[fill[group_of[s] * L + layer_of(group_of[s], from[i])]++] = i;
+		return;
+	}
+	h.thin_share = (float)((double)(in_all - wide_in_all) / (double)in_all);
+	h.thin.resize(groups * L);
+	for (size_t r = 0; r < groups * L; r++)
+		h.thin[r] = count[r] + wide[r];
+	std::vector<uint32_t> fill_thin = h.thin;
 	for (size_t s = 0; s < strands; s++)
-		for (uint32_t i = h.first[s]; i + 1 < h.first[s + 1]; i++)
-			h.pieces[fill[group_of[s] * L + layer_of(group_of[s], from[i])]++] = i;
+		for (uint32_t i = h.first[s]; i + 1 < h.first[s + 1]; i++) {
+			const size_t r = group_of[s] * L + layer_of(group_of[s], from[i]);
+			h.pieces[(h.piece_width(s, i) > (double)h.thin_width ? fill : fill_thin)[r]++] = i;
+		}
 }
 
 // A strand part's kept strands made ready (Primitive::strands): the
@@ -1307,10 +1334,9 @@ Primitive finish_strands(const RawStrands &raw, int layers, std::vector<uint32_t
 	size_t at = 0;
 	double widest = 0;
 	for (size_t k = 0; k < kept; k++) {
-		const double wider = 1 / std::min(1.0, (double)h.full * (double)h.rate[k]);
 		for (uint32_t i = h.first[k]; i + 1 < h.first[k + 1]; i++, at++) {
 			const double piece = length(p.pos[i + 1] - p.pos[i]);
-			const double wide = 0.5 * ((double)h.width[i] + (double)h.width[i + 1]) * wider;
+			const double wide = h.piece_width(k, i);
 			width_sum += wide * piece;
 			length_sum += piece;
 			if (at % every == 0) {
@@ -1320,25 +1346,52 @@ Primitive finish_strands(const RawStrands &raw, int layers, std::vector<uint32_t
 		}
 	}
 	h.mean_width = length_sum > 0 ? (float)(width_sum / length_sum) : 0.0f;
-	auto lost_at = [&some](double pixel) {
+	// (Of the first `count` of them.)
+	auto lost_at = [&some](double pixel, size_t count) {
 		double lost = 0, all = 0;
-		for (const std::pair<float, float> &one : some) {
+		for (size_t k = 0; k < count; k++) {
+			const std::pair<float, float> &one = some[k];
 			all += (double)one.first * (double)one.second;
 			lost += std::max(0.0, (double)one.first - (double)Strands::LINE_COVERS * pixel) *
 				(double)one.second;
 		}
 		return all > 0 ? lost / all : 0.0;
 	};
-	auto pixel_losing = [&](double share) {
-		double under = 0, over = widest / (double)Strands::LINE_COVERS; // (at `over`, nothing's lost)
+	auto pixel_losing = [&](double share, size_t count, double widest_of) {
+		double under = 0, over = widest_of / (double)Strands::LINE_COVERS; // (at `over`, nothing's lost)
 		for (int step = 0; step < 40; step++) {
 			const double middle = 0.5 * (under + over);
-			(lost_at(middle) > share ? under : over) = middle;
+			(lost_at(middle, count) > share ? under : over) = middle;
 		}
 		return (float)over;
 	};
-	h.line_pixel = pixel_losing(0.01);
-	h.line_pixel_most = pixel_losing(0.05);
+	h.line_pixel = pixel_losing(0.01, some.size(), widest);
+	h.line_pixel_most = pixel_losing(0.05, some.size(), widest);
+	// In two sorts (Strands::thin): the thin pieces, no wider than
+	// THIN_WIDTH times the width half its hairs' length is under - where
+	// that's most of its pieces and not all (arrange_strands, which counts
+	// every one, has the last word).
+	h.thin_width = h.thin_pixel = h.thin_pixel_most = 0;
+	if (!some.empty() && length_sum > 0) {
+		std::sort(some.begin(), some.end());
+		double sampled = 0, half = 0;
+		for (const std::pair<float, float> &one : some)
+			sampled += one.second;
+		size_t middle = 0;
+		while (middle + 1 < some.size() && half + (double)some[middle].second < 0.5 * sampled)
+			half += some[middle++].second;
+		const float limit = Strands::THIN_WIDTH * some[middle].first;
+		const size_t thin = (size_t)(std::upper_bound(some.begin(), some.end(), limit,
+							       [](float w, const std::pair<float, float> &one) {
+								       return w < one.first;
+							       }) -
+					     some.begin());
+		if (thin < some.size() && (double)thin >= (double)Strands::THIN_MOST * (double)some.size() && limit > 0) {
+			h.thin_width = limit;
+			h.thin_pixel = pixel_losing(0.01, thin, some[thin - 1].first);
+			h.thin_pixel_most = pixel_losing(0.05, thin, some[thin - 1].first);
+		}
+	}
 	p.joints.shrink_to_fit();
 	p.weights.shrink_to_fit();
 	p.pos.shrink_to_fit();
@@ -3234,17 +3287,29 @@ int Strands::rate_step(float rate)
 	return (int)std::lround((r - 0.25f) / 0.75f * (float)(RATES - 1));
 }
 
+void Strands::pieces_of(size_t run, size_t count, Stretch out[2]) const
+{
+	out[0] = out[1] = Stretch();
+	if (run + 1 >= runs.size())
+		return;
+	const uint32_t a = runs[run], b = runs[run + 1], middle = run < thin.size() ? thin[run] : b;
+	// (A stretch's pieces are in strand order: those before the first
+	// point of strand `count`.)
+	auto under = [&](uint32_t from, uint32_t to) {
+		if (count >= strands())
+			return to - from;
+		return (uint32_t)(std::lower_bound(pieces.begin() + from, pieces.begin() + to, first[count]) -
+				  (pieces.begin() + from));
+	};
+	out[0] = {a, under(a, middle)};
+	out[1] = {middle, under(middle, b)};
+}
+
 uint32_t Strands::pieces_of(size_t run, size_t count) const
 {
-	if (run + 1 >= runs.size())
-		return 0;
-	const uint32_t a = runs[run], b = runs[run + 1];
-	if (count >= strands())
-		return b - a;
-	// (A run's pieces are in strand order: those before the first point
-	// of strand `count`.)
-	return (uint32_t)(std::lower_bound(pieces.begin() + a, pieces.begin() + b, first[count]) -
-			  (pieces.begin() + a));
+	Stretch both[2];
+	pieces_of(run, count, both);
+	return both[0].count + both[1].count;
 }
 
 bool load_model(const uint8_t *bytes, size_t size, const std::string &folder, Model &out, std::string *problem,

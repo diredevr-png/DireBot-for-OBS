@@ -149,6 +149,10 @@ float strand_shown(float3 pos, float along)
 {
 	if (strand_view.w < 0.5)
 		return 1.0;
+	// (3, a measure: every piece left out - the card's work on hair
+	// before any of it is cut into pixels.)
+	if (strand_view.w > 2.5)
+		return -1.0;
 	float shown = 1.0;
 	float4 c = mul(float4(pos, 1.0), ViewProj);
 	if (c.w > 0.0) {

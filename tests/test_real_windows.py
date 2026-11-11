@@ -721,14 +721,20 @@ def test_hidden_hair_is_left_out_on_the_card(obs):
     hairs hanging behind its body, never seen from the front - and none of
     the hair in plain sight, the tuft on its hand (but for a hair's first
     piece, where its root is inside the hand). Sent as lines ("hair_lines"
-    2) the same hairs are left out. Posed by the CPU nothing is left
-    out."""
+    2) the same hairs are left out - and of a coat of thin hairs with a
+    few wide ones among them, whose thin hairs alone go as lines. Posed by
+    the CPU nothing is left out."""
     figure = os.path.join(obs.home, "hidden.vrm")
     strands = hair_character(figure, crown=0, locks=0, tuft=200, behind=400)
     assert strands == 600
     # (The same with its tuft's hairs thin: a tenth of a pixel wide.)
     thin = os.path.join(obs.home, "hidden-thin.vrm")
     assert hair_character(thin, crown=0, locks=0, tuft=200, behind=400, width=0.0006) == strands
+    # (And a crown of thin hairs, every fifth one wide - with a few behind
+    # its body.)
+    among = os.path.join(obs.home, "hidden-among.vrm")
+    among_strands = hair_character(among, crown=600, locks=0, tuft=200, behind=100, width=0.0006, wide_every=5)
+    assert among_strands == 900
     c = obs.client()
 
     def st(name="Hidden"):
@@ -752,7 +758,7 @@ def test_hidden_hair_is_left_out_on_the_card(obs):
         return px[0] > 6 and px[2] > 6 and px[1] * 2 < min(px[0], px[2])
     try:
         c.send("CreateScene", {"sceneName": "Hidden scene"}, raw=True)
-        for name, model, lines in (("Hidden", figure, -1), ("Hidden thin", thin, 2)):
+        for name, model, lines in (("Hidden", figure, -1), ("Hidden thin", thin, 2), ("Hidden among", among, -1)):
             c.send("CreateInput", {"sceneName": "Hidden scene", "inputName": name,
                                    "inputKind": "direbot_face_avatar",
                                    "inputSettings": {"model": model, "width": 300, "height": 300,
@@ -761,10 +767,11 @@ def test_hidden_hair_is_left_out_on_the_card(obs):
                                                      "sway": 0, "eye_moves": False,
                                                      "hair_budget_ms": 0, "hair_lines": lines}}, raw=True)
         c.send("SetCurrentProgramScene", {"sceneName": "Hidden scene"}, raw=True)
-        for name in ("Hidden", "Hidden thin"):
+        for name in ("Hidden", "Hidden thin", "Hidden among"):
             assert wait_for(lambda: st(name)["shown"], 60, 0.2), obs.log()
             assert wait_for(lambda: st(name)["on_card"], 10, 0.1), (st(name), obs.log())
-            assert wait_for(lambda: hair(name)["drawn"] == strands, 10, 0.1), (hair(name), obs.log())
+            assert wait_for(lambda: hair(name)["drawn"] == (among_strands if name == "Hidden among" else strands),
+                            10, 0.1), (hair(name), obs.log())
         time.sleep(0.8)
 
         # Left out on the card: the picture has none of the hair behind its
@@ -830,6 +837,35 @@ def test_hidden_hair_is_left_out_on_the_card(obs):
         ink_ribbons = sum(px[0] for row in ribbons for px in row if faint(px))
         print("Thin hair on the card: %d of red as lines, %d as ribbons" % (ink_lines, ink_ribbons))
         assert ink_ribbons > 1000 and 0.85 * ink_ribbons < ink_lines < 1.15 * ink_ribbons, (ink_lines, ink_ribbons)
+
+        # Thin hairs with a few wide ones among them: the thin ones' pieces
+        # lines and the rest ribbons, each layer drawn in two goes - with
+        # the hidden ones left out of both, and as much hair in the picture
+        # as with none of it lines, its wide hairs as wide.
+        h = hair("Hidden among")
+        print("Thin hairs among wide ones on the card: %s" % h)
+        assert h["skips_hidden"] and h["pieces"] > among_strands, h
+        assert 0.6 * h["pieces"] < h["lines"] < 0.85 * h["pieces"], h
+        mixed = shot(c, "Hidden among")
+        assert pixels(mixed, white) == 0 and pixels(mixed, magenta) > 300, (pixels(mixed, white),
+                                                                            pixels(mixed, magenta))
+        change("Hidden among", hair_skip_hidden=0)
+        assert wait_for(lambda: not hair("Hidden among")["skips_hidden"], 10, 0.1), hair("Hidden among")
+        time.sleep(0.8)
+        assert unlike(shot(c, "Hidden among"), mixed) <= 8
+        change("Hidden among", hair_skip_hidden=-1, hair_lines=0)
+        assert wait_for(lambda: hair("Hidden among")["lines"] == 0 and hair("Hidden among")["skips_hidden"], 10,
+                        0.1), hair("Hidden among")
+        time.sleep(0.8)
+        ribbons = shot(c, "Hidden among")
+        ink_mixed = sum(px[0] for row in mixed for px in row if faint(px))
+        ink_ribbons = sum(px[0] for row in ribbons for px in row if faint(px))
+        print("Thin hairs among wide ones: %d of red with the thin as lines (%d solid pixels), %d all ribbons (%d)"
+              % (ink_mixed, pixels(mixed, magenta), ink_ribbons, pixels(ribbons, magenta)))
+        assert ink_ribbons > 1000 and 0.9 * ink_ribbons < ink_mixed < 1.1 * ink_ribbons, (ink_mixed, ink_ribbons)
+        assert 0.95 * pixels(ribbons, magenta) < pixels(mixed, magenta) < 1.05 * pixels(ribbons, magenta), \
+            (pixels(mixed, magenta), pixels(ribbons, magenta))
+        assert hair("Hidden among")["pieces"] == h["pieces"], hair("Hidden among")
 
         # Posed by the CPU: nothing's left out, the same picture.
         change(card_posing=False)

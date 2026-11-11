@@ -938,7 +938,7 @@ bool Avatar3D::load_strands(size_t i, const Rig::Part &p, bool lines)
 }
 
 void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int> &groups, size_t layer, size_t count,
-			    const char *technique, bool lines, HairDrawn &drawn)
+			    const char *technique, bool lines, int sort, HairDrawn &drawn)
 {
 	if (!load_strands(i, p, lines))
 		return;
@@ -952,15 +952,26 @@ void Avatar3D::draw_strands(size_t i, const Rig::Part &p, const std::vector<int>
 		return;
 	while (gs_effect_loop(effect_, technique))
 		for (int g : groups) {
-			const size_t run = (size_t)g * layers + layer;
-			const uint32_t pieces = h.pieces_of(run, count);
-			if (!pieces)
-				continue;
-			gs_draw(shape, h.runs[run] * corners, pieces * corners);
-			drawn.pieces += pieces;
-			if (lines)
-				drawn.lines += pieces;
-			drawn.draws++;
+			Strands::Stretch some[2];
+			h.pieces_of((size_t)g * layers + layer, count, some);
+			if (sort == 0)
+				some[1].count = 0;
+			else if (sort == 1)
+				some[0].count = 0;
+			else if (some[0].from + some[0].count == some[1].from) {
+				// (All of both: one stretch.)
+				some[0].count += some[1].count;
+				some[1].count = 0;
+			}
+			for (const Strands::Stretch &one : some) {
+				if (!one.count)
+					continue;
+				gs_draw(shape, one.from * corners, one.count * corners);
+				drawn.pieces += one.count;
+				if (lines)
+					drawn.lines += one.count;
+				drawn.draws++;
+			}
 		}
 }
 
@@ -986,10 +997,11 @@ void Avatar3D::draw_hull(size_t i, const Rig::Part &p, const View3D &v, uint32_t
 			// root, straight behind its own inner end, always shows.)
 			set_vec4(p_strand_lod, upto, 1.5f * h.groups[g].reach * p.scale, 0.0f, 0.0f);
 			for (size_t l = 0; l < core; l++) {
-				const size_t run = g * layers + l;
-				const uint32_t pieces = h.pieces_of(run, some);
-				if (pieces)
-					gs_draw(GS_TRIS, h.runs[run] * 6, pieces * 6);
+				Strands::Stretch both[2];
+				h.pieces_of(g * layers + l, some, both);
+				for (const Strands::Stretch &one : both)
+					if (one.count)
+						gs_draw(GS_TRIS, one.from * 6, one.count * 6);
 			}
 		}
 }
@@ -1525,7 +1537,7 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 				const Rig::Part &p = posed[i];
 				if (!part.strands || !part.vb || !part.ib || part.skin != p.gpu || p.hidden ||
 				    p.collapsed || !p.prim) {
-					part.as_lines = false;
+					part.as_lines = part.thin_lines = false;
 					continue;
 				}
 				const Strands &h = p.prim->hair;
@@ -1534,9 +1546,11 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 				// (As lines where its hairs are thin enough: hair.hpp.)
 				const HairForm form =
 					hair_form(h, loaded, p.scale, dr.distance[i], pixel, 1.0f, hair_plan_.solid,
-						  budget, dr.a->p_strand_view ? hair_plan_.lines : 0, part.as_lines);
+						  budget, dr.a->p_strand_view ? hair_plan_.lines : 0, part.as_lines,
+						  part.thin_lines);
 				dr.hair[i] = form.share;
 				part.as_lines = form.lines;
+				part.thin_lines = form.thin;
 				pieces += pieces_of(h, dr.hair[i].count);
 			}
 		}
@@ -1943,13 +1957,22 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 			for (size_t layer = 0; layer < layers; layer++)
 				for (const HairPart &part : parts) {
 					const Rig::Part &p = (*dr.posed)[part.i];
-					const bool lines = dr.a->parts_[part.i].as_lines;
+					const Part &form = dr.a->parts_[part.i];
 					dr.a->part_distance_ = part.distance;
-					dr.a->set_material(material_of(dr, part.i), v, false, false, false);
-					dr.a->set_strand(v, drawn_h, dr.hair[part.i].upto, p.scale, depth_map, lines,
-							 skips && p.gpu ? hair_plan_.skip_hidden : 0);
-					dr.a->draw_strands(part.i, p, part.order, layer, dr.hair[part.i].count,
-							   p.gpu ? "StrandSk" : "Strand", lines, hair_drawn_);
+					// (Its thin pieces alone as lines: its wide ones
+					// first, as ribbons - under them, as the deep coat
+					// they stand for is. Everything the effect reads is
+					// given again for the second: a technique's end
+					// empties it.)
+					for (int sort = form.thin_lines ? 0 : -1; sort < (form.thin_lines ? 2 : 0); sort++) {
+						const bool lines = form.as_lines || sort == 1;
+						dr.a->set_material(material_of(dr, part.i), v, false, false, false);
+						dr.a->set_strand(v, drawn_h, dr.hair[part.i].upto, p.scale, depth_map,
+								 lines, skips && p.gpu ? hair_plan_.skip_hidden : 0);
+						dr.a->draw_strands(part.i, p, part.order, layer, dr.hair[part.i].count,
+								   p.gpu ? "StrandSk" : "Strand", lines, sort,
+								   hair_drawn_);
+					}
 				}
 			gs_enable_depth_test(true);
 			if (clock && hair_timer == 1 && at >= last_hair) {

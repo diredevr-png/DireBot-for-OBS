@@ -211,9 +211,13 @@ LIFT = 0.15
 # How far the "Tilt" animation tips its neck over (degrees, towards the
 # picture's left).
 TILT = 30
+# How wide the few wide hairs of a coat of thin ones are (hair_character's
+# `wide_every`; metres).
+WIDE_HAIR = 0.006
 
 
-def hair_character(path, vrm=True, standin=False, behind=0, fan=0, width=0.006, crown=2400, locks=300, tuft=200):
+def hair_character(path, vrm=True, standin=False, behind=0, fan=0, width=0.006, crown=2400, locks=300, tuft=200,
+                   wide_every=0):
     """arms_character with real hair, magenta:
       - on top of its head `crown` strands standing out all round, drooping
         a little, hung on its head; its one expression ("lift": a VRM's
@@ -230,10 +234,15 @@ def hair_character(path, vrm=True, standin=False, behind=0, fan=0, width=0.006, 
       - `standin`: stand-in hair too - a yellow cap, an ordinary part
         marked {"direbot": {"hair_standin": true}} in its material's
         extras.
-    Every hair `width` wide (the file's units: metres). An animation of
-    its own, "Tilt", holds its neck tipped TILT degrees over. Returns how
-    many strands the file has."""
+    Every hair `width` wide (the file's units: metres) - but with
+    `wide_every`, every so-manyth hair of its crown, its locks and its tuft
+    WIDE_HAIR wide: a coat of thin hairs with a few wide ones among them.
+    An animation of its own, "Tilt", holds its neck tipped TILT degrees
+    over. Returns how many strands the file has."""
     arms_character(path, vrm=vrm)
+
+    def wide(i):
+        return WIDE_HAIR if wide_every and i % wide_every == 0 else width
     doc, blob = open_glb(path)
     names = {n.get("name"): i for i, n in enumerate(doc["nodes"])}
     bones = [names["head"], names["neck"], names["chest"], names["leftHand"]]
@@ -254,7 +263,7 @@ def hair_character(path, vrm=True, standin=False, behind=0, fan=0, width=0.006, 
             t = k / 5
             points.append((root[0] + d[0] * 0.13 * t, root[1] + d[1] * 0.13 * t - 0.05 * t * t,
                            root[2] + d[2] * 0.13 * t))
-        hair.add(points, width, MAGENTA, [[(HEAD, 1.0)]] * 6, move=(0, LIFT, 0))
+        hair.add(points, wide(i), MAGENTA, [[(HEAD, 1.0)]] * 6, move=(0, LIFT, 0))
     for side in (1, -1):
         for i in range(locks):
             a, b = (i * 0.61803) % 1, (i * 0.75488) % 1
@@ -269,14 +278,14 @@ def hair_character(path, vrm=True, standin=False, behind=0, fan=0, width=0.006, 
                 head = max(0.0, 1 - 2 * t)
                 chest = max(0.0, 2 * t - 1)
                 held.append([(HEAD, head), (NECK, 1 - head - chest), (CHEST, chest)])
-            hair.add(points, width, MAGENTA, held)
+            hair.add(points, wide(i), MAGENTA, held)
     hand = world_of(doc, names["leftHand"])
     for i in range(tuft):
         a, b = (i * 0.61803) % 1, (i * 0.75488) % 1
         root = (hand[0] + 0.02 + 0.06 * a, hand[1] + 0.015, -0.025 + 0.05 * b)
         points = [(root[0] + (a - 0.5) * 0.04 * t, root[1] + 0.1 * t, root[2] + 0.01 * t * t)
                   for t in (0, 0.5, 1)]
-        hair.add(points, width, MAGENTA, [[(HAND, 1.0)]] * 3)
+        hair.add(points, wide(i), MAGENTA, [[(HAND, 1.0)]] * 3)
     chest = world_of(doc, names["chest"])
     for i in range(behind):
         a, b = (i * 0.61803) % 1, (i * 0.75488) % 1
@@ -821,6 +830,55 @@ def test_thin_hairs_are_sent_as_lines(run):
         unlike = differing(rows["Wide always"], rows["Wide"])
         assert wide_ribbons > 3000 and wide_lines < 0.95 * wide_ribbons and unlike > 1000, (wide_ribbons, wide_lines,
                                                                                          unlike)
+        for name in s.names:
+            assert "problem" not in s.model(name), s.model(name)
+    finally:
+        s.close()
+
+
+def test_thin_hairs_among_wide_ones_are_lines(run):
+    """A coat of many thin hairs with a few wide ones among them (an
+    animal's) is never thin enough as a whole. Its thin hairs' pieces go to
+    the graphics card as lines all the same, and its wide ones stay
+    ribbons: FaceGetState counts the thin ones' pieces as lines, and the
+    picture has as much hair as with none of it lines ("hair_lines" 0) -
+    its wide hairs as wide as ever. Told always (2), the wide ones go thin
+    too."""
+    figure = os.path.join(run.home, "lines-among.vrm")
+    strands = hair_character(figure, width=0.0006, wide_every=5)
+    s = Stage(run, "Among")
+    try:
+        s.add("Among", figure)
+        s.add("Among never", figure, hair_lines=0)
+        s.add("Among always", figure, hair_lines=2)
+        s.shown()
+        assert wait_for(lambda: all(s.hair(name)["drawn"] > 0 for name in s.names), 10, 0.1)
+        time.sleep(0.5)
+        h = {name: s.hair(name) for name in s.names}
+        for name in s.names:
+            print(f"{name}: {h[name]}")
+        rows = {name: s.shot(name) for name in s.names}
+        # Four hairs in five are thin: their pieces lines, the rest ribbons.
+        pieces = h["Among"]["pieces"]
+        assert pieces > strands and h["Among"]["drawn"] == h["Among never"]["drawn"] == h["Among always"]["drawn"], h
+        assert h["Among never"]["pieces"] == pieces and h["Among always"]["pieces"] == pieces, h
+        assert 0.78 * pieces < h["Among"]["lines"] < 0.82 * pieces, h["Among"]
+        assert h["Among never"]["lines"] == 0 and h["Among always"]["lines"] == pieces, h
+        # As much hair in the picture, over as much of it - and its wide
+        # hairs (solid magenta) as before.
+        lines, ribbons = ink(rows["Among"]), ink(rows["Among never"])
+        over, over_ribbons = count(rows["Among"], faint_magenta), count(rows["Among never"], faint_magenta)
+        solid, solid_ribbons = count(rows["Among"], magenta), count(rows["Among never"], magenta)
+        print(f"thin hairs among wide ones, the thin as lines: {lines} of red over {over} pixels, {solid} of them "
+              f"solid; all ribbons {ribbons} over {over_ribbons}, {solid_ribbons} solid")
+        assert ribbons > 20000 and solid_ribbons > 1500, (ribbons, solid_ribbons)
+        assert 0.95 * ribbons < lines < 1.05 * ribbons, (lines, ribbons)
+        assert 0.9 * over_ribbons < over < 1.1 * over_ribbons, (over, over_ribbons)
+        assert 0.97 * solid_ribbons < solid < 1.03 * solid_ribbons, (solid, solid_ribbons)
+        # Told always: its wide hairs lines too - thin ones.
+        solid_always = count(rows["Among always"], magenta)
+        print(f"told always: {solid_always} solid pixels")
+        assert solid_always < 0.95 * solid_ribbons, (solid_always, solid_ribbons)
         for name in s.names:
             assert "problem" not in s.model(name), s.model(name)
     finally:

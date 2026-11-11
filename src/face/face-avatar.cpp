@@ -1095,6 +1095,12 @@ struct FaceAvatar {
 	// file is loaded - "hair_bend", in its file's units, and "hair_turn",
 	// degrees; under 0: the setting's. model.hpp's LoadOptions.)
 	std::atomic<float> hair_bend{-1.0f}, hair_turn{-1.0f};
+	// (And how many layers its pieces are drawn in - "hair_layers"; and
+	// how solid a hair thinner than a pixel is left, which says how many
+	// are drawn of a coat small on screen - "hair_solid", 0.05 to 1; 0 or
+	// under: the setting's. LoadOptions::strand_layers, HairPlan::solid.)
+	std::atomic<int> hair_layers{-1};
+	std::atomic<float> hair_solid{-1.0f};
 	// Whether characters can be posed on the card here (known for sure
 	// once the drawing's made): their hair is kept for how it's posed.
 #ifdef _WIN32
@@ -1109,6 +1115,8 @@ struct FaceAvatar {
 			lo.strand_bend = own;
 		if (const float own = hair_turn; own >= 0)
 			lo.strand_turn = own;
+		if (const int own = hair_layers; own > 0)
+			lo.strand_layers = own;
 		return lo;
 	}
 	// The character's file as last asked for (model_lock), and how its
@@ -3209,6 +3217,8 @@ struct FaceAvatar {
 			hair.skip_hidden = own;
 		if (const int own = hair_lines; own >= 0)
 			hair.lines = own;
+		if (const float own = hair_solid; own > 0)
+			hair.solid = std::min(1.0f, std::max(0.05f, own));
 		if (avatar3d) {
 			avatar3d->set_gpu_skin(card_posing);
 			rig->set_gpu_skin(avatar3d->gpu_skin());
@@ -5429,6 +5439,8 @@ struct FaceAvatar {
 		hair_lines = (int)obs_data_get_int(settings, "hair_lines");
 		hair_bend = (float)obs_data_get_double(settings, "hair_bend");
 		hair_turn = (float)obs_data_get_double(settings, "hair_turn");
+		hair_layers = (int)obs_data_get_int(settings, "hair_layers");
+		hair_solid = (float)obs_data_get_double(settings, "hair_solid");
 		const char *model_file = obs_data_get_string(settings, "model");
 		{
 			std::lock_guard<std::mutex> l(model_lock);
@@ -7153,6 +7165,8 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "hair_lines", -1);
 	obs_data_set_default_double(settings, "hair_bend", -1.0);
 	obs_data_set_default_double(settings, "hair_turn", -1.0);
+	obs_data_set_default_int(settings, "hair_layers", -1);
+	obs_data_set_default_double(settings, "hair_solid", -1.0);
 	obs_data_set_default_bool(settings, "auto_blink", false);
 	obs_data_set_default_string(settings, "model_place", "");
 	obs_data_set_default_string(settings, "model_setup", "");

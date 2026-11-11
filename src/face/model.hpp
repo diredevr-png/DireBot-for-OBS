@@ -38,6 +38,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -236,7 +237,34 @@ struct Strands {
 	// groups x layers runs of `pieces`, a group's layers back to back:
 	// run g * layers + l is pieces runs[g * layers + l] up to the next.
 	std::vector<uint32_t> runs;
-	// How many of a run's pieces belong to the first `count` strands.
+	// A coat whose hairs aren't all one width - a few wide ones among many
+	// thin - in two sorts, so its thin pieces can go to the card as lines
+	// while its wide ones stay ribbons (hair.hpp's hair_form): a piece is
+	// thin when it's no wider (as drawn at `full`) than `thin_width`,
+	// THIN_WIDTH times the width half its hairs' length is under. Then
+	// each run is its wide pieces first, runs[r] up to thin[r], and its
+	// thin ones after, each sort by strand. Only when at least THIN_MOST
+	// of its pieces are thin and some aren't: otherwise one sort
+	// (`thin` empty, thin_width 0), a run all by strand.
+	static constexpr float THIN_WIDTH = 1.5f, THIN_MOST = 0.5f;
+	float thin_width = 0;
+	std::vector<uint32_t> thin; // a run: where its thin pieces start
+	float thin_share = 0;       // how many of its pieces are thin (0 to 1)
+	// As line_pixel and line_pixel_most, of its thin pieces alone.
+	float thin_pixel = 0, thin_pixel_most = 0;
+	// A piece's width as drawn at `full`: the piece from point `i` of
+	// strand `s`.
+	double piece_width(size_t s, size_t i) const
+	{
+		return 0.5 * ((double)width[i] + (double)width[i + 1]) / std::min(1.0, (double)full * (double)rate[s]);
+	}
+	// A run's pieces that belong to the first `count` strands: a stretch
+	// of `pieces` - two in two sorts, its wide ones' and its thin ones'.
+	struct Stretch {
+		uint32_t from = 0, count = 0;
+	};
+	void pieces_of(size_t run, size_t count, Stretch out[2]) const;
+	// How many of them there are.
 	uint32_t pieces_of(size_t run, size_t count) const;
 
 	// Expressions (the mesh's morph targets) move hair with the skin it
