@@ -73,14 +73,21 @@ def put_in_add_on():
     return folder
 
 
+def take_out_add_on():
+    shutil.rmtree(os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"),
+                               "obs-studio", "plugins", MODULE), ignore_errors=True)
+
+
 class WindowsObs:
-    def __init__(self):
+    def __init__(self, add_on=True):
+        """`add_on` False: OBS on its own, the add-on taken out (for what
+        OBS itself leaves behind when it closes)."""
         self.ended = None       # its log, once it has closed
         self.home = os.path.join(os.environ["RUNNER_TEMP"] if "RUNNER_TEMP" in os.environ
                                  else os.environ["TEMP"], "direbot-obs-test")
         shutil.rmtree(self.home, ignore_errors=True)
         os.makedirs(self.home)
-        self.plugin = put_in_add_on()
+        self.plugin = put_in_add_on() if add_on else take_out_add_on()
         config = os.path.join(os.environ["APPDATA"], "obs-studio")
         shutil.rmtree(config, ignore_errors=True)      # a throwaway machine
         os.makedirs(config)
@@ -103,11 +110,32 @@ class WindowsObs:
             [os.path.join(bin64, "obs64.exe"), "--disable-updater",
              "--disable-shutdown-check", "--multi"],
             cwd=bin64, stdout=self.out, stderr=subprocess.STDOUT)
+        if not add_on:
+            # No link without the add-on: OBS's own WebSocket server and
+            # its window say it's up.
+            self.link = {"port": self.ws_port, "password": ""}
+            if not wait_for(lambda: self.answers() and self.mains(), 120, 0.25):
+                log = self.log()
+                self.kill()
+                raise AssertionError("OBS on its own never came up - its log:\n" + log)
+            return
         if not wait_for(lambda: os.path.exists(self.link_path), 120, 0.25):
             log = self.log()
             self.kill()
             raise AssertionError("the link never came on - OBS's log:\n" + log)
         self.link = json.load(open(self.link_path))
+
+    def answers(self):
+        """OBS's own WebSocket server takes a connection."""
+        try:
+            socket.create_connection(("127.0.0.1", self.ws_port), 0.5).close()
+            return True
+        except OSError:
+            return False
+
+    def mains(self):
+        """OBS's own window (its title starts "OBS "), once it's there."""
+        return [handle for handle, title in self.windows() if title.startswith("OBS ")]
 
     def log(self):
         if self.ended is not None:
@@ -155,9 +183,9 @@ class WindowsObs:
         if self.proc.poll() is None:
             user32 = ctypes.WinDLL("user32", use_last_error=True)
             user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-            seen = self.windows()
-            mains = [handle for handle, title in seen if title.startswith("OBS ")]
-            assert mains, ("OBS's own window isn't there", seen)
+            wait_for(self.mains, 30, 0.25)
+            mains = self.mains()
+            assert mains, ("OBS's own window isn't there", self.windows())
             for handle in mains:
                 user32.PostMessageW(handle, 0x0010, 0, 0)       # (WM_CLOSE)
             try:
@@ -843,73 +871,147 @@ def leaks(log):
     return int(found.group(1)) if found else None
 
 
+def hair_scene(o, c, name="Kept", **settings):
+    """A character with hair strands in a scene of its own, shown, posed on
+    the graphics card, the card's clock answering. Returns (its state, a
+    way to change its settings and wait for it)."""
+    figure = os.path.join(o.home, "hair-%s.vrm" % name.lower())
+    hair_character(figure, standin=True)
+
+    def st():
+        return vendor(c, "FaceGetState", {"source": name})["model"]
+
+    def change(**new):
+        c.send("SetInputSettings", {"inputName": name, "inputSettings": new}, raw=True)
+        time.sleep(0.5)
+        assert wait_for(lambda: not st()["loading"] and st()["shown"], 60, 0.1), (st(), o.log())
+        time.sleep(0.8)
+    scenes = [x["sceneName"] for x in c.send("GetSceneList", raw=True)["scenes"]]
+    if "Kept scene" not in scenes:
+        c.send("CreateScene", {"sceneName": "Kept scene"}, raw=True)
+    c.send("CreateInput", {"sceneName": "Kept scene", "inputName": name,
+                           "inputKind": "direbot_face_avatar",
+                           "inputSettings": dict({"model": figure, "width": 200, "height": 200,
+                                                  "size": 60, "framing": "whole", "style": "drawn",
+                                                  "mirror": False, "smoothing": 0, "breathing": 0,
+                                                  "sway": 0, "eye_moves": False}, **settings)}, raw=True)
+    c.send("SetCurrentProgramScene", {"sceneName": "Kept scene"}, raw=True)
+    assert wait_for(lambda: st()["shown"], 60, 0.2), o.log()
+    assert wait_for(lambda: st()["on_card"], 10, 0.1), (st(), o.log())
+    assert wait_for(lambda: st()["hair"]["drawn"] > 0, 10, 0.1), (st()["hair"], o.log())
+    if settings.get("hair_budget_ms", -1) != 0:
+        assert wait_for(lambda: st()["hair"]["ms"] >= 0, 20, 0.1), (st()["hair"], o.log())
+    return st, change
+
+
+def idle(o, c):
+    """The add-on loaded, nothing made."""
+    time.sleep(2)
+
+
+def hair_kept(o, c):
+    """One character with hair strands, the hair budget its own, its hair
+    detail changed to Light, to Today and back, the budget far too small
+    and its own again - and still in its scene when OBS closes, as a
+    streamer closes OBS."""
+    st, change = hair_scene(o, c)
+    assert st()["hair"]["budget_ms"] > 0, st()["hair"]
+    for detail in ("light", "today", "full"):
+        change(hair_detail=detail)
+        assert st()["hair"]["detail"] == detail, st()["hair"]
+    change(hair_budget_ms=0.001)
+    assert wait_for(lambda: st()["hair"]["share"] < 0.5, 20, 0.05), (st()["hair"], o.log())
+    change(hair_budget_ms=-1)
+    time.sleep(1.5)
+
+
+def hair_recorded(o, c):
+    """As a test of what hair costs goes: three characters with hair
+    strands at once (Full, Light, and Full with no budget), each shown in
+    turn while OBS records and a picture of it is saved - then all of it
+    taken away again before OBS closes."""
+    made = {"Full": {}, "Light": {"hair_detail": "light"}, "Unbudgeted": {"hair_budget_ms": 0}}
+    for name, settings in made.items():
+        hair_scene(o, c, name, **settings)
+    items = {name: c.send("GetSceneItemId", {"sceneName": "Kept scene", "sourceName": name},
+                          raw=True)["sceneItemId"] for name in made}
+    try:
+        c.send("SetRecordDirectory", {"recordDirectory": o.home}, raw=True)
+    except Exception as e:      # (an OBS whose WebSocket has no such request)
+        print("no SetRecordDirectory here: %s" % e)
+    recorded = 0
+    for shown in made:
+        for name, item in items.items():
+            c.send("SetSceneItemEnabled", {"sceneName": "Kept scene", "sceneItemId": item,
+                                           "sceneItemEnabled": name == shown}, raw=True)
+        c.send("StartRecord", raw=True)
+        assert wait_for(lambda: c.send("GetRecordStatus", raw=True)["outputActive"], 20, 0.2), o.log()
+        time.sleep(2)
+        c.send("SaveSourceScreenshot", {"sourceName": shown, "imageFormat": "png",
+                                        "imageFilePath": os.path.join(o.home, "kept-%s.png" % shown)},
+               raw=True)
+        c.send("StopRecord", raw=True)
+        assert wait_for(lambda: not c.send("GetRecordStatus", raw=True)["outputActive"], 30, 0.2), o.log()
+        recorded += 1
+    time.sleep(2)       # (the last file written out)
+    assert recorded == 3
+    for name in made:
+        c.send("RemoveInput", {"inputName": name}, raw=True)
+    others = [x["sceneName"] for x in c.send("GetSceneList", raw=True)["scenes"]
+              if x["sceneName"] != "Kept scene"]
+    assert others, "OBS's own first scene isn't there"
+    c.send("SetCurrentProgramScene", {"sceneName": others[0]}, raw=True)
+    c.send("RemoveScene", {"sceneName": "Kept scene"}, raw=True)
+    time.sleep(2)
+
+
 def test_closing_obs_leaves_nothing_behind(obs):
     """(After every test above: it closes their OBS.) Closed the way the X
-    on its window closes it, with all the tests above done in it - the
-    pictures, the phone, the tracker app, characters posed on the graphics
-    card, hair strands on it, gaming hands - OBS's log says nothing was
-    left behind."""
+    on its window closes it, OBS's log says how much was never given back.
+    With the add-on that's no more than OBS leaves on its own: after all
+    the tests above (the pictures, the phone, the tracker app, characters
+    posed on the graphics card, hair strands on it, gaming hands), with
+    the add-on doing nothing, with a character with hair strands still in
+    its scene, and after recording three of them and taking them away."""
+    left, said = {}, {}
     closed = obs.close()
     if not closed:
         seen = obs.windows()
-        obs.kill()      # (so the next test's OBS has the machine to itself)
-        raise AssertionError(("OBS didn't close", seen, obs.log()[-3000:]))
-    log = obs.log()
-    assert leaks(log) == 0, (leaks(log), log[-3000:])
+        obs.kill()      # (so the next OBS has the machine to itself)
+        said["after all the tests"] = "OBS didn't close: %s" % (seen,)
+    left["after all the tests"] = leaks(obs.log())
 
-
-def test_hair_on_the_card_leaves_nothing_behind():
-    """OBS started again, with one character with hair strands in its
-    scene: posed on the graphics card, the hair budget its own (the card's
-    clock read every frame), its hair detail changed to Light, to Today and
-    back, the budget far too small and its own again. Closed with the
-    character still in its scene, as a streamer closes OBS: nothing left
-    behind."""
-    o = WindowsObs()
-    try:
-        figure = os.path.join(o.home, "hair-kept.vrm")
-        strands = hair_character(figure, standin=True)
-        c = o.client()
-
-        def st():
-            return vendor(c, "FaceGetState", {"source": "Kept"})["model"]
-
-        def change(**settings):
-            c.send("SetInputSettings", {"inputName": "Kept", "inputSettings": settings}, raw=True)
-
-        def reloaded():
-            time.sleep(0.5)
-            assert wait_for(lambda: not st()["loading"] and st()["shown"], 60, 0.1), (st(), o.log())
-            time.sleep(0.8)
+    def session(name, add_on=True, doing=None):
+        o = None
         try:
-            c.send("CreateScene", {"sceneName": "Kept scene"}, raw=True)
-            c.send("CreateInput", {"sceneName": "Kept scene", "inputName": "Kept",
-                                   "inputKind": "direbot_face_avatar",
-                                   "inputSettings": {"model": figure, "width": 200, "height": 200,
-                                                     "size": 60, "framing": "whole", "style": "drawn",
-                                                     "mirror": False, "smoothing": 0, "breathing": 0,
-                                                     "sway": 0, "eye_moves": False}}, raw=True)
-            c.send("SetCurrentProgramScene", {"sceneName": "Kept scene"}, raw=True)
-            assert wait_for(lambda: st()["shown"], 60, 0.2), o.log()
-            assert wait_for(lambda: st()["on_card"], 10, 0.1), (st(), o.log())
-            assert wait_for(lambda: st()["hair"]["drawn"] > 0, 10, 0.1), (st()["hair"], o.log())
-            # Its own budget: the card's clock answers.
-            assert wait_for(lambda: st()["hair"]["ms"] >= 0, 20, 0.1), (st()["hair"], o.log())
-            assert st()["hair"]["budget_ms"] > 0 and st()["hair"]["strands"] == strands, st()["hair"]
-            for detail in ("light", "today", "full"):
-                change(hair_detail=detail)
-                reloaded()
-                assert st()["hair"]["detail"] == detail, st()["hair"]
-            change(hair_budget_ms=0.001)
-            assert wait_for(lambda: st()["hair"]["share"] < 0.5, 20, 0.05), (st()["hair"], o.log())
-            change(hair_budget_ms=-1)
-            time.sleep(1.5)
-            print("\nHair on the card, kept till OBS closes: %s" % st()["hair"])
+            o = WindowsObs(add_on=add_on)
+            if doing:
+                c = o.client()
+                try:
+                    doing(o, c)
+                finally:
+                    c.disconnect()
+            if not o.close():
+                said[name] = "OBS didn't close: %s" % (o.windows(),)
+            left[name] = leaks(o.log())
+            print("\n----- OBS's log, %s -----\n%s" % (name, o.log()))
+        except Exception as e:
+            said[name] = "%s: %s" % (type(e).__name__, e)
+            left.setdefault(name, None)
+            if o:
+                print("\n----- OBS's log, %s (failed) -----\n%s" % (name, o.log()))
         finally:
-            c.disconnect()
-        assert o.close(), ("OBS didn't close", o.windows(), o.log())
-        log = o.log()
-        print("\n----- OBS's log, closed with a hair character in its scene -----\n" + log)
-        assert leaks(log) == 0, (leaks(log), log[-3000:])
-    finally:
-        o.kill()
+            if o:
+                o.kill()
+
+    session("OBS on its own", add_on=False)
+    session("the add-on, nothing made", doing=idle)
+    session("hair kept till it closes", doing=hair_kept)
+    session("hair recorded, then taken away", doing=hair_recorded)
+    print("\nLeft behind when OBS closes (how many things were never given back):")
+    for name, n in left.items():
+        print("  %-34s %s%s" % (name, n, "   " + said[name][:300] if name in said else ""))
+    assert not said, said
+    own = left["OBS on its own"]
+    assert own is not None, left
+    assert all(n == own for n in left.values()), left
