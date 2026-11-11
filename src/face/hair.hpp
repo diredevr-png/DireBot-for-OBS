@@ -105,6 +105,20 @@ struct HairPlan {
 	// the hull costs. 5 each run's pieces go to the card in two draws, its
 	// first half and its second (the same picture): what a draw costs.
 	int measure = 0;
+	// The hair budget's rule (HairBudget::set_rule): 0 the one it's made
+	// with, 1 the one that uses the whole limit - and with it a part that
+	// is lines under a budget stays lines a little past where it would
+	// become them (hair_form's `stays`).
+	int budget_rule = 0;
+	// Under a budget (fewer hairs, each wider) a part stays lines while
+	// that loses under this much of what its hairs cover (hair_form's
+	// `loss`; HAIR_LINE_LOSS as ever) - and with too few hairs for that,
+	// it's ribbons at this much of the budget's share for each line it had
+	// (hair_form's `cost`; HAIR_LINE_COST as ever).
+	float line_loss = 0.05f, line_cost = 0.5f;
+	// For measuring only ("hair_share"): the hair budget's say held at
+	// this share of the hairs, whatever the clock says (0: not held).
+	float share = 0;
 };
 
 inline HairPlan hair_plan(HairDetail d)
@@ -214,7 +228,33 @@ inline float hair_px(const Strands &h, float width, const HairShare &s, float sc
 //     change, so the budget finds one answer and stays there. (But never
 //     under the budget's least share, HAIR_SHARE_LEAST: a coat is never
 //     thinned further than it was as ribbons alone.)
-constexpr float HAIR_LINE_STAYS = 1.1f, HAIR_LINE_COST = 0.5f, HAIR_SHARE_LEAST = 0.1f;
+//   - How much a budget's lines may lose, and what a ribbon costs against
+//     a line, are the plan's to say (HairPlan::line_loss, line_cost: a
+//     coat a little thinner with its hairs still hair-thin, or as thick
+//     as ever with fewer, wider hairs). With the budget's other rule
+//     (HairPlan::budget_rule) a part that's lines under a budget stays
+//     lines until a pixel is a tenth smaller, as above.
+constexpr float HAIR_LINE_STAYS = 1.1f, HAIR_LINE_COST = 0.5f, HAIR_LINE_LOSS = 0.05f, HAIR_SHARE_LEAST = 0.1f;
+
+// How wide a pixel has to be (in the part's file's units, its hairs as
+// drawn with all of them) for its hairs sent as lines - all of them
+// (`whole`), or its thin ones - to lose `loss` of what they cover:
+// Strands' line_pixel_most for a twentieth (and under), its line_pixel_at
+// for more, and a straight line between the ones it knows.
+inline float hair_line_pixel(const Strands &h, bool whole, float loss)
+{
+	const float *at = whole ? h.line_pixel_at : h.thin_pixel_at;
+	float under = HAIR_LINE_LOSS, pixel = whole ? h.line_pixel_most : h.thin_pixel_most;
+	if (!(loss > under))
+		return pixel;
+	for (int k = 0; k < Strands::LINE_LOSSES && at[k] > 0; k++) {
+		if (loss <= Strands::LINE_LOSS[k])
+			return pixel + (at[k] - pixel) * (loss - under) / (Strands::LINE_LOSS[k] - under);
+		under = Strands::LINE_LOSS[k];
+		pixel = at[k];
+	}
+	return pixel;
+}
 
 struct HairForm {
 	HairShare share;
@@ -224,9 +264,11 @@ struct HairForm {
 
 // hair_share's answer and whether the part is sent as lines: `lines` the
 // plan's say (HairPlan::lines), `was_lines` and `was_thin` what it was
-// last frame.
+// last frame; `loss`, `cost` and `stays` the plan's say for lines under a
+// budget (HairPlan::line_loss, line_cost, and its budget_rule 1).
 inline HairForm hair_form(const Strands &h, size_t loaded, float scale, float distance, float pixel, float thinnest,
-			  float solid, float budget, int lines, bool was_lines, bool was_thin = false)
+			  float solid, float budget, int lines, bool was_lines, bool was_thin = false,
+			  float loss = HAIR_LINE_LOSS, float cost = HAIR_LINE_COST, bool stays = false)
 {
 	HairForm f;
 	f.share = hair_share(h, loaded, scale, distance, pixel, thinnest, solid, budget);
@@ -245,15 +287,16 @@ inline HairForm hair_form(const Strands &h, size_t loaded, float scale, float di
 				  (was_lines || was_thin ? HAIR_LINE_STAYS : 1.0f);
 	if (!whole && !thin)
 		return f;
-	if (!(budget < 1) ||
-	    hair_px(h, whole ? h.line_pixel_most : h.thin_pixel_most, f.share, scale, distance, pixel) <= 1.0f) {
+	const bool was = stays && (was_lines || (!whole && was_thin));
+	if (!(budget < 1) || hair_px(h, hair_line_pixel(h, whole, loss), f.share, scale, distance, pixel) <=
+				     (was ? HAIR_LINE_STAYS : 1.0f)) {
 		(whole ? f.lines : f.thin) = true;
 		return f;
 	}
-	const float cost = whole ? HAIR_LINE_COST
-				 : 1 - (1 - HAIR_LINE_COST) * std::min(1.0f, std::max(0.0f, h.thin_share));
+	const float line = std::min(1.0f, std::max(0.1f, cost));
+	const float ribbons = whole ? line : 1 - (1 - line) * std::min(1.0f, std::max(0.0f, h.thin_share));
 	f.share = hair_share(h, loaded, scale, distance, pixel, thinnest, solid,
-			     std::max(budget * cost, std::min(budget, HAIR_SHARE_LEAST)));
+			     std::max(budget * ribbons, std::min(budget, HAIR_SHARE_LEAST)));
 	return f;
 }
 
@@ -438,11 +481,33 @@ inline StrandHull strand_hull(const Strands &h)
 // (measured) says so. A clock that stops answering (SILENT frames in a
 // row with no reading) is no clock: all the hairs are drawn, as with no
 // limit, until it answers again - never held at a share nothing measures.
+//
+// Its other rule (set_rule(1); it's made with the first). The first holds
+// anywhere from three quarters of the limit up to it, so as much as a
+// quarter of the limit goes unused; and where what hair costs jumps as
+// more of it is drawn (a part's hairs turn from ribbons into lines:
+// hair_form) it can go up over the jump and come back down for ever. This
+// one:
+//   - goes up while hair takes under CLIMB of the limit, aiming at AIM of
+//     it;
+//   - keeps the share it was over the limit at. Where it had just come up
+//     to that from a share it was under at, it goes back to that one, and
+//     halves the gap between the two until the gap is a few hundredths
+//     (GAP): a jump is found once, not crossed again and again;
+//   - with a share it was over at kept, holds as the first rule does
+//     (more only when well under, never to within GAP of that share), and
+//     tries past it after WAIT sets of readings with room to spare - four
+//     times as many after each try that ends over the limit;
+//   - forgets that share once hair takes a tenth less than it has where
+//     it's held (EASED: a game stopped, a character left).
 class HairBudget {
 public:
 	static constexpr float START = 0.25f, LEAST = HAIR_SHARE_LEAST;
 	static constexpr size_t READINGS = 6; // how many it waits for after a change
 	static constexpr size_t SILENT = 120; // frames with no reading before the clock counts as gone
+	// (The other rule's.)
+	static constexpr float CLIMB = 0.9f, AIM = 0.95f, GAP = 0.03f, EASED = 0.9f;
+	static constexpr uint32_t WAIT = 300, WAIT_MOST = 1u << 20;
 
 	// Milliseconds a frame (0 or less: no limit - all of them).
 	void set_limit(float ms)
@@ -458,7 +523,19 @@ public:
 		readings_.clear();
 		measured_ = -1;
 		unread_ = 0;
+		forget();
 	}
+	// Which rule: 0 the first, 1 the other.
+	void set_rule(int rule)
+	{
+		const int to = rule == 1 ? 1 : 0;
+		if (to == rule_)
+			return;
+		rule_ = to;
+		readings_.clear();
+		forget();
+	}
+	int rule() const { return rule_; }
 	float limit() const { return limit_; }
 	float share() const { return limit_ > 0 && !silent() ? share_ : 1.0f; }
 	// A frame whose clock was asked and never answered.
@@ -473,6 +550,11 @@ public:
 	// sees it: the second lowest of its last full set of readings (-1:
 	// none yet under this limit).
 	float measured() const { return measured_; }
+	// How many times its share has changed since its limit or its rule was
+	// set; and (the other rule) the share it was over the limit at, kept
+	// (0: none).
+	size_t changes() const { return changes_; }
+	float over() const { return over_; }
 
 	// A reading: hair took `ms` drawn at `share` of its hairs. Readings
 	// at another share than the one asked for now (drawn before the last
@@ -492,7 +574,10 @@ public:
 		const float took = sorted[1];
 		measured_ = took;
 		readings_.clear();
-		if (took > limit_) {
+		const float was = share_;
+		if (rule_ == 1) {
+			whole(took);
+		} else if (took > limit_) {
 			// Over: fewer at once (never less than half at a step: a
 			// reading can be wrong).
 			share_ = std::max(LEAST, share_ * std::max(0.5f, 0.9f * limit_ / took));
@@ -502,12 +587,102 @@ public:
 			const float room = took > 1e-4f ? 0.9f * limit_ / took : 1.25f;
 			share_ = std::min(1.0f, share_ * std::min(1.25f, std::max(1.02f, room)));
 		}
+		if (share_ != was)
+			changes_++;
 	}
 
 private:
+	// The other rule, for a set of readings: hair took `took`.
+	void whole(float took)
+	{
+		const float was = share_;
+		if (took > limit_) {
+			// Over. (On a try past a share it had been over at: the next
+			// try waits four times as long.)
+			if (tried_ > 0) {
+				wait_ = wait_ < WAIT_MOST / 4 ? wait_ * 4 : WAIT_MOST;
+				tried_ = 0;
+			}
+			over_ = share_;
+			held_ = 0;
+			// Back to the share it was last under at, where it has just
+			// come up from one (and the gap between the two is searched);
+			// else fewer by as much as it's over, as ever.
+			search_ = under_ > 0 && under_ < share_;
+			share_ = search_ ? under_ : std::max(LEAST, share_ * std::max(0.5f, 0.9f * limit_ / took));
+			under_ = 0;
+		} else {
+			under_ = share_;
+			if (over_ > 0 && (share_ >= over_ || (least_ >= 0 && took <= EASED * least_))) {
+				// Under where it was over, or it has eased here: what it
+				// kept is old.
+				over_ = tried_ = 0;
+				held_ = 0;
+				wait_ = WAIT;
+				search_ = false;
+			}
+			const bool room = took < CLIMB * limit_ && share_ < 1;
+			if (over_ > 0) {
+				float want = share_;
+				if (search_ && room && over_ > share_ * (1 + 2 * GAP)) {
+					want = std::sqrt(share_ * over_);
+				} else {
+					search_ = false;
+					if (took < 0.75f * limit_ && share_ < 1) {
+						const float more = took > 1e-4f ? 0.9f * limit_ / took : 1.25f;
+						want = std::max(
+							share_,
+							std::min(share_ * std::min(1.25f, std::max(1.02f, more)),
+								 over_ * (1 - GAP)));
+					}
+					if (want == share_ && room && ++held_ >= wait_) {
+						// A try past it: from the next set of readings.
+						tried_ = over_;
+						over_ = 0;
+						held_ = 0;
+					}
+				}
+				share_ = std::min(1.0f, want);
+			} else if (room) {
+				const float more = took > 1e-4f ? AIM * limit_ / took : 1.25f;
+				float want = share_ * std::min(1.25f, std::max(1.02f, more));
+				// (A try: first to where it was over, no further.)
+				if (tried_ > 0 && share_ < tried_)
+					want = std::min(want, tried_);
+				share_ = std::min(1.0f, want);
+			} else if (tried_ > 0) {
+				// The try has come to rest under the limit.
+				tried_ = 0;
+				wait_ = WAIT;
+			}
+		}
+		// (The least hair has taken at the share it's held at.)
+		if (share_ != was)
+			least_ = -1;
+		else if (least_ < 0 || took < least_)
+			least_ = took;
+	}
+	void forget()
+	{
+		over_ = under_ = tried_ = 0;
+		least_ = -1;
+		held_ = 0;
+		wait_ = WAIT;
+		search_ = false;
+		changes_ = 0;
+	}
+
 	float limit_ = 0, share_ = 1, measured_ = -1;
-	size_t unread_ = 0;
+	size_t unread_ = 0, changes_ = 0;
 	std::vector<float> readings_;
+	int rule_ = 0;
+	// (The other rule's: the share it was over at, the one it was last
+	// under at, the one a try is on its way past; the least hair took
+	// where it's held; sets of readings held with room, and how many
+	// before a try; searching the gap under `over_`.)
+	float over_ = 0, under_ = 0, tried_ = 0, least_ = -1;
+	uint32_t held_ = 0, wait_ = WAIT;
+	bool search_ = false;
 };
 
 } // namespace direbot::face

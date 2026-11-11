@@ -1248,6 +1248,7 @@ void arrange_strands(Primitive &p, int layers)
 	const size_t in_all = h.pieces.size();
 	if (!sorts || !wide_in_all || (double)(in_all - wide_in_all) < (double)Strands::THIN_MOST * (double)in_all) {
 		h.thin_width = h.thin_pixel = h.thin_pixel_most = 0;
+		std::fill(h.thin_pixel_at, h.thin_pixel_at + Strands::LINE_LOSSES, 0.0f);
 		for (size_t s = 0; s < strands; s++)
 			for (uint32_t i = h.first[s]; i + 1 < h.first[s + 1]; i++)
 				h.pieces[fill[group_of[s] * L + layer_of(group_of[s], from[i])]++] = i;
@@ -1367,11 +1368,14 @@ Primitive finish_strands(const RawStrands &raw, int layers, std::vector<uint32_t
 	};
 	h.line_pixel = pixel_losing(0.01, some.size(), widest);
 	h.line_pixel_most = pixel_losing(0.05, some.size(), widest);
+	for (int k = 0; k < Strands::LINE_LOSSES; k++)
+		h.line_pixel_at[k] = pixel_losing(Strands::LINE_LOSS[k], some.size(), widest);
 	// In two sorts (Strands::thin): the thin pieces, no wider than
 	// THIN_WIDTH times the width half its hairs' length is under - where
 	// that's most of its pieces and not all (arrange_strands, which counts
 	// every one, has the last word).
 	h.thin_width = h.thin_pixel = h.thin_pixel_most = 0;
+	std::fill(h.thin_pixel_at, h.thin_pixel_at + Strands::LINE_LOSSES, 0.0f);
 	if (!some.empty() && length_sum > 0) {
 		std::sort(some.begin(), some.end());
 		double sampled = 0, half = 0;
@@ -1390,6 +1394,8 @@ Primitive finish_strands(const RawStrands &raw, int layers, std::vector<uint32_t
 			h.thin_width = limit;
 			h.thin_pixel = pixel_losing(0.01, thin, some[thin - 1].first);
 			h.thin_pixel_most = pixel_losing(0.05, thin, some[thin - 1].first);
+			for (int k = 0; k < Strands::LINE_LOSSES; k++)
+				h.thin_pixel_at[k] = pixel_losing(Strands::LINE_LOSS[k], thin, some[thin - 1].first);
 		}
 	}
 	p.joints.shrink_to_fit();

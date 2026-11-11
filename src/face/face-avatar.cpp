@@ -1109,6 +1109,14 @@ struct FaceAvatar {
 	// of its corners read, its hull left out, or a run sent in two draws -
 	// "hair_measure": HairPlan::measure; under 0: not.)
 	std::atomic<int> hair_measure{-1};
+	// (And the hair budget's rule - "hair_budget_rule": 0 the first, 1 the
+	// one that uses the whole limit; how much of what they cover a budget's
+	// lines may lose - "hair_line_loss", 0.05 to 0.4; what a ribbon costs
+	// against a line - "hair_line_cost", 0.1 to 1; and, for measuring
+	// only, the budget's share held - "hair_share", up to 1. Under 0, or 0:
+	// the setting's. HairPlan::budget_rule, line_loss, line_cost, share.)
+	std::atomic<int> hair_budget_rule{-1};
+	std::atomic<float> hair_line_loss{-1.0f}, hair_line_cost{-1.0f}, hair_share{-1.0f};
 	// Whether characters can be posed on the card here (known for sure
 	// once the drawing's made): their hair is kept for how it's posed.
 #ifdef _WIN32
@@ -3231,6 +3239,14 @@ struct FaceAvatar {
 			hair.layout = own;
 		if (const int own = hair_measure; own >= 0)
 			hair.measure = own;
+		if (const int own = hair_budget_rule; own >= 0)
+			hair.budget_rule = own;
+		if (const float own = hair_line_loss; own > 0)
+			hair.line_loss = std::min(0.4f, std::max(0.05f, own));
+		if (const float own = hair_line_cost; own > 0)
+			hair.line_cost = std::min(1.0f, std::max(0.1f, own));
+		if (const float own = hair_share; own > 0)
+			hair.share = std::min(1.0f, own);
 		if (avatar3d) {
 			avatar3d->set_gpu_skin(card_posing);
 			rig->set_gpu_skin(avatar3d->gpu_skin());
@@ -5455,6 +5471,10 @@ struct FaceAvatar {
 		hair_solid = (float)obs_data_get_double(settings, "hair_solid");
 		hair_layout = (int)obs_data_get_int(settings, "hair_layout");
 		hair_measure = (int)obs_data_get_int(settings, "hair_measure");
+		hair_budget_rule = (int)obs_data_get_int(settings, "hair_budget_rule");
+		hair_line_loss = (float)obs_data_get_double(settings, "hair_line_loss");
+		hair_line_cost = (float)obs_data_get_double(settings, "hair_line_cost");
+		hair_share = (float)obs_data_get_double(settings, "hair_share");
 		const char *model_file = obs_data_get_string(settings, "model");
 		{
 			std::lock_guard<std::mutex> l(model_lock);
@@ -6724,6 +6744,9 @@ struct FaceAvatar {
 					{"hull_draws", st.hair.hull_draws},
 					{"depth_ms", r(st.hair.depth_ms, 1000)},
 					{"share", r(st.hair.share, 1000)},
+					{"share_changes", st.hair.share_changes},
+					{"form_changes", st.hair.form_changes},
+					{"over", r(st.hair.over, 1000)},
 					{"ms", r(st.hair.ms, 1000)},
 					{"budget_ms", r(st.hair_budget_ms, 1000)}}},
 				      {"animations", animations},
@@ -7189,6 +7212,10 @@ void get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "hair_solid", -1.0);
 	obs_data_set_default_int(settings, "hair_layout", -1);
 	obs_data_set_default_int(settings, "hair_measure", -1);
+	obs_data_set_default_int(settings, "hair_budget_rule", -1);
+	obs_data_set_default_double(settings, "hair_line_loss", -1.0);
+	obs_data_set_default_double(settings, "hair_line_cost", -1.0);
+	obs_data_set_default_double(settings, "hair_share", -1.0);
 	obs_data_set_default_bool(settings, "auto_blink", false);
 	obs_data_set_default_string(settings, "model_place", "");
 	obs_data_set_default_string(settings, "model_setup", "");

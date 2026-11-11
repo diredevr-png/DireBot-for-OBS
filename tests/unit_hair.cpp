@@ -417,6 +417,12 @@ static void test_plans()
 	// As made: nothing limited.
 	const HairPlan made;
 	CHECK(made.budget_ms == 0 && made.pieces == 0);
+	// Whatever the choice: the budget's first rule, a budget's lines as
+	// ever, and its share never held.
+	for (const HairPlan &plan : {full, light, today, made})
+		CHECK(plan.budget_rule == 0 && plan.line_loss == HAIR_LINE_LOSS && plan.line_cost == HAIR_LINE_COST &&
+		      plan.share == 0);
+	CHECK(HAIR_LINE_LOSS == 0.05f && HAIR_LINE_COST == 0.5f);
 
 	// How a file is loaded for each: the points kept (on the card, here),
 	// and how straight a run is left out.
@@ -813,6 +819,146 @@ static void test_lines()
 		}
 }
 
+// Under a budget, how much of what they cover a part's lines may lose, what
+// a ribbon costs against a line, and lines that stay lines: the plan's say
+// (HairPlan::line_loss, line_cost, budget_rule).
+static void test_lines_kept_lower()
+{
+	// The coat of test_lines: 10000 hairs all 0.0005 wide, half a pixel
+	// from 1 away. Hairs all one width lose a share L of what they cover
+	// once a pixel is (1 - L) / 0.8 of their width (the loader's numbers:
+	// test_what_a_point_keeps).
+	const float pixel = 0.001f, width = 0.0005f;
+	Strands coat = alike(10000, 10000, width);
+	coat.line_pixel = 1.2375f * width;
+	coat.line_pixel_most = 1.1875f * width;
+	CHECK(Strands::LINE_LOSSES == 5);
+	for (int k = 0; k < Strands::LINE_LOSSES; k++) {
+		CHECK(Strands::LINE_LOSS[k] > (k ? Strands::LINE_LOSS[k - 1] : HAIR_LINE_LOSS) &&
+		      Strands::LINE_LOSS[k] < 1);
+		coat.line_pixel_at[k] = (1 - Strands::LINE_LOSS[k]) / 0.8f * width;
+	}
+	// The pixel for a loss: a twentieth and under, line_pixel_most; the
+	// losses it knows, theirs; between two, between theirs; past the last,
+	// the last.
+	for (float loss : {-1.0f, 0.0f, 0.01f, 0.05f, std::numeric_limits<float>::quiet_NaN()})
+		CHECK(hair_line_pixel(coat, true, loss) == coat.line_pixel_most);
+	for (int k = 0; k < Strands::LINE_LOSSES; k++)
+		CHECK(near(hair_line_pixel(coat, true, Strands::LINE_LOSS[k]), coat.line_pixel_at[k], 1e-9));
+	CHECK(near(hair_line_pixel(coat, true, 0.075f), 0.925 / 0.8 * width, 1e-9));
+	CHECK(near(hair_line_pixel(coat, true, 0.25f), 0.75 / 0.8 * width, 1e-9));
+	CHECK(hair_line_pixel(coat, true, 0.9f) == coat.line_pixel_at[Strands::LINE_LOSSES - 1]);
+	CHECK(hair_line_pixel(coat, true, std::numeric_limits<float>::infinity()) ==
+	      coat.line_pixel_at[Strands::LINE_LOSSES - 1]);
+	// (Its thin pieces' own, of a coat in two sorts; a coat that knows
+	// none past a twentieth - or only the first few - goes by the last it
+	// knows.)
+	CHECK(hair_line_pixel(coat, false, 0.2f) == 0);
+	{
+		Strands two = coat;
+		two.thin_pixel_most = 0.5f * width;
+		two.thin_pixel_at[0] = 0.4f * width;
+		two.thin_pixel_at[1] = 0.3f * width;
+		CHECK(hair_line_pixel(two, false, 0.05f) == two.thin_pixel_most);
+		CHECK(near(hair_line_pixel(two, false, 0.1f), 0.4 * width, 1e-10));
+		CHECK(near(hair_line_pixel(two, false, 0.125f), 0.35 * width, 1e-10));
+		CHECK(near(hair_line_pixel(two, false, 0.4f), 0.3 * width, 1e-10));
+		Strands none = alike(10000, 10000, width);
+		none.line_pixel_most = 1.1875f * width;
+		CHECK(hair_line_pixel(none, true, 0.3f) == none.line_pixel_most);
+	}
+
+	// As ever (a twentieth): lines down to 0.59 of the hairs, then ribbons
+	// at half the budget's share. Told a fifth: lines down to half of them
+	// (each a pixel wide by then), where a pixel is their width over 0.8 x
+	// 0.8 - and ribbons under that.
+	HairForm f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.55f, 1, false);
+	CHECK(!f.lines && f.share.count == 2750);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.55f, 1, false, false, 0.2f);
+	CHECK(f.lines && f.share.count == 5500 && near(f.share.upto, 0.55, 1e-6));
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.51f, 1, false, false, 0.2f);
+	CHECK(f.lines && f.share.count == 5100);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.49f, 1, false, false, 0.2f);
+	CHECK(!f.lines && f.share.count == 2450);
+	// (Two fifths: down to 0.375 of them.)
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.38f, 1, false, false, 0.4f);
+	CHECK(f.lines && f.share.count == 3800);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.37f, 1, false, false, 0.4f);
+	CHECK(!f.lines && f.share.count == 1850);
+	// What a ribbon costs against a line: as ribbons, that much of the
+	// budget's share (as ever: half) - never under the least share, never
+	// more than the budget's.
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.4f, 1, false, false, 0.2f, 0.8f);
+	CHECK(!f.lines && f.share.count >= 3200 && f.share.count <= 3201 && near(f.share.upto, 0.32, 2e-4));
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.4f, 1, false, false, HAIR_LINE_LOSS, 1.0f);
+	CHECK(!f.lines && f.share.count == 4000);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.4f, 1, false, false, HAIR_LINE_LOSS, 7.0f);
+	CHECK(!f.lines && f.share.count == 4000);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.4f, 1, false, false, HAIR_LINE_LOSS, 0.0f);
+	CHECK(!f.lines && f.share.count == 1000);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.4f, 1, false, false, HAIR_LINE_LOSS,
+		      std::numeric_limits<float>::quiet_NaN());
+	CHECK(!f.lines && f.share.count >= 1000 && f.share.count <= 4000);
+	// Lines that stay: a part that was lines the frame before stays lines
+	// under a budget until a pixel is a tenth smaller (to 0.54 of its
+	// hairs as ever, 0.455 told a fifth) - only when told to, and never
+	// one that was ribbons.
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.55f, 1, true, false, HAIR_LINE_LOSS, HAIR_LINE_COST, true);
+	CHECK(f.lines && f.share.count == 5500);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.55f, 1, true, false, HAIR_LINE_LOSS, HAIR_LINE_COST, false);
+	CHECK(!f.lines && f.share.count == 2750);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.55f, 1, false, false, HAIR_LINE_LOSS, HAIR_LINE_COST, true);
+	CHECK(!f.lines && f.share.count == 2750);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.53f, 1, true, false, HAIR_LINE_LOSS, HAIR_LINE_COST, true);
+	CHECK(!f.lines && f.share.count == 2650);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.46f, 1, true, false, 0.2f, HAIR_LINE_COST, true);
+	CHECK(f.lines && f.share.count == 4600);
+	f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 0.45f, 1, true, false, 0.2f, HAIR_LINE_COST, true);
+	CHECK(!f.lines && f.share.count == 2250);
+
+	// A coat in two sorts (8 in 10 of its pieces thin): its thin ones
+	// alone, by their own numbers - told a fifth, lines down to half of
+	// them; ribbons under that at 0.6 of the budget's share as ever, or
+	// 0.84 where a ribbon costs a line and a quarter (0.8).
+	Strands two = coat;
+	two.line_pixel = 6 * width;
+	two.line_pixel_most = 5 * width;
+	for (int k = 0; k < Strands::LINE_LOSSES; k++) {
+		two.thin_pixel_at[k] = coat.line_pixel_at[k];
+		two.line_pixel_at[k] = 4 * width;
+	}
+	two.thin = {0};
+	two.thin_share = 0.8f;
+	two.thin_pixel = 1.2375f * width;
+	two.thin_pixel_most = 1.1875f * width;
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 0.55f, 1, false);
+	CHECK(!f.thin && !f.lines && f.share.count >= 3300 && f.share.count <= 3301);
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 0.55f, 1, false, false, 0.2f);
+	CHECK(f.thin && !f.lines && f.share.count == 5500);
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 0.45f, 1, false, false, 0.2f, 0.8f);
+	CHECK(!f.thin && !f.lines && f.share.count >= 3780 && f.share.count <= 3781);
+	// (Its thin ones that were lines stay, told to; so do they where all
+	// of it was lines by a plan since changed.)
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 0.46f, 1, false, true, 0.2f, HAIR_LINE_COST, true);
+	CHECK(f.thin && !f.lines && f.share.count == 4600);
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 0.46f, 1, true, false, 0.2f, HAIR_LINE_COST, true);
+	CHECK(f.thin && !f.lines && f.share.count == 4600);
+	f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 0.46f, 1, false, true, 0.2f, HAIR_LINE_COST, false);
+	CHECK(!f.thin && !f.lines);
+	// With all its hairs (no budget): nothing changes, whatever is told.
+	for (float loss : {0.05f, 0.2f, 0.4f})
+		for (float cost : {0.5f, 0.8f})
+			for (bool stays : {false, true}) {
+				f = hair_form(coat, 10000, 1, 1, pixel, 1, 0.4f, 1, 1, false, false, loss, cost, stays);
+				CHECK(f.lines && f.share.count == 10000);
+				f = hair_form(coat, 10000, 1, 0.61f, pixel, 1, 0.4f, 1, 1, false, false, loss, cost,
+					      stays);
+				CHECK(!f.lines && f.share.count == 10000);
+				f = hair_form(two, 10000, 1, 1, pixel, 1, 0.4f, 1, 1, false, false, loss, cost, stays);
+				CHECK(f.thin && !f.lines && f.share.count == 10000);
+			}
+}
+
 // --- The hair budget --------------------------------------------------------
 
 // As many readings as it waits for, all `ms`, at the share it asks for.
@@ -1080,6 +1226,392 @@ static void test_budget_settles()
 			if (cost * HairBudget::LEAST <= limit && cost >= limit)
 				CHECK(b.share() > HairBudget::LEAST && b.share() < 1 && near(b.measured(), took, 1e-5));
 		}
+}
+
+// The budget's other rule (HairBudget::set_rule(1)), against a made-up
+// graphics card: hair takes `fixed` whatever is drawn and `each` for all
+// its hairs as ribbons. From the share `lines_from` up (0: never) its
+// hairs are lines, each costing `line` of a ribbon; under it ribbons, at
+// `ribbons` of the budget's share (hair_form). Lines stay lines down to
+// lines_from / `stays`. `load` is everything else on the card (a game: all
+// of it takes that much longer).
+struct MadeUpCard {
+	float fixed = 0, each = 1, lines_from = 0, line = 1, ribbons = 1, stays = 1, load = 1;
+	bool lines = false, drawn = false;
+	int crossings = 0; // how many times its hairs changed between lines and ribbons
+	float took(float share)
+	{
+		const bool now = lines_from > 0 && share >= (lines ? lines_from / stays : lines_from);
+		if (drawn && now != lines)
+			crossings++;
+		lines = now;
+		drawn = true;
+		const float hairs = now ? line * share : std::max(ribbons * share, std::min(share, HairBudget::LEAST));
+		return load * (fixed + each * hairs);
+	}
+};
+
+// One set of readings off the card at the share the budget asks for (a
+// third of them six times as long, as a game's frame in between makes
+// them; `noise`: each as much longer as this says, 0 to 1 at a time).
+static float a_set(HairBudget &b, MadeUpCard &card, const std::function<float()> &noise = nullptr)
+{
+	const float share = b.share(), took = card.took(share);
+	for (size_t r = 0; r < HairBudget::READINGS; r++)
+		b.read(took * (r % 3 == 1 ? 6.0f : 1.0f) * (noise ? 1 + noise() : 1.0f), share);
+	return took;
+}
+
+static void test_budget_whole_limit()
+{
+	CHECK(HairBudget::CLIMB == 0.9f && HairBudget::AIM == 0.95f && HairBudget::GAP == 0.03f &&
+	      HairBudget::EASED == 0.9f && HairBudget::WAIT == 300);
+	// Made with the first rule; told another, the first.
+	{
+		HairBudget b;
+		CHECK(b.rule() == 0 && b.over() == 0 && b.changes() == 0);
+		b.set_rule(1);
+		CHECK(b.rule() == 1 && b.share() == 1);
+		b.set_rule(7);
+		CHECK(b.rule() == 0);
+		b.set_rule(-1);
+		CHECK(b.rule() == 0);
+	}
+	const float least = HairBudget::LEAST;
+
+	// What hair costs rises evenly with the hairs drawn (some of it fixed
+	// whatever is drawn): it ends where hair takes CLIMB of the limit or
+	// more and no more than the limit - or with all the hairs if those are
+	// under it, or the fewest if even those are over - in a few sets of
+	// readings, and once it's under the limit it never goes back over. The
+	// first rule, off the same card, ends anywhere from three quarters of
+	// the limit up: never with more hairs than this one.
+	for (float limit : {1.0f, 0.5f})
+		for (float fixed : {0.0f, 0.3f, 0.6f})
+			for (float each : {0.1f, 0.5f, 0.9f, 1.3f, 2.0f, 7.0f, 40.0f, 200.0f}) {
+				MadeUpCard card, same;
+				card.fixed = same.fixed = fixed * limit;
+				card.each = same.each = each;
+				HairBudget b, first;
+				b.set_rule(1);
+				b.set_limit(limit);
+				first.set_limit(limit);
+				CHECK(b.share() == HairBudget::START);
+				int last_change = 0;
+				bool under = false, back_over = false;
+				for (int step = 1; step <= 700; step++) {
+					const float share = b.share(), took = a_set(b, card);
+					a_set(first, same);
+					if (b.share() != share)
+						last_change = step;
+					back_over = back_over || (under && took > limit * 1.0001f);
+					under = under || took <= limit;
+				}
+				const float took = card.took(b.share());
+				CHECK(last_change <= 345 && !back_over);
+				if (b.share() == 1)
+					CHECK(took <= limit);
+				else if (b.share() == least)
+					CHECK(took >= HairBudget::CLIMB * limit * 0.9999f);
+				else
+					CHECK(took >= HairBudget::CLIMB * limit * 0.9999f && took <= limit * 1.0001f);
+				CHECK(b.share() >= first.share() * 0.9999f);
+				CHECK(b.changes() <= 12);
+				// (All of them, where all of them leave room under the
+				// limit.)
+				if (card.took(1) < HairBudget::CLIMB * limit)
+					CHECK(b.share() == 1);
+			}
+
+	// A jump: the hairs turn into lines from 0.7 of them up, and as lines
+	// they don't fit under the limit (1.09 there, against 0.7 as ribbons
+	// just under it). The first rule goes up over the jump and comes back
+	// down for ever (ribbons well under the limit, so more; lines over
+	// it, so fewer). The other finds the jump - back to the share it was
+	// under at, the gap halved until it's small - and holds under it;
+	// then tries past it, each try four times as long after the last.
+	{
+		MadeUpCard jump;
+		jump.fixed = 0.05f;
+		jump.each = 1.6f;
+		jump.lines_from = 0.7f;
+		jump.line = 0.93f;
+		jump.ribbons = 0.579f;
+		MadeUpCard same = jump;
+		HairBudget first, b;
+		first.set_limit(1);
+		b.set_rule(1);
+		b.set_limit(1);
+		for (int step = 0; step < 250; step++) {
+			a_set(first, same);
+			a_set(b, jump);
+		}
+		CHECK(same.crossings >= 200);
+		CHECK(jump.crossings >= 2 && jump.crossings <= 6 && !jump.lines);
+		CHECK(b.share() < 0.7f && b.share() >= 0.7f / (1 + 2 * HairBudget::GAP) / 1.001f);
+		CHECK(b.over() >= 0.7f && b.over() <= b.share() * (1 + 2 * HairBudget::GAP) * 1.001f);
+		CHECK(jump.took(b.share()) < 0.75f);
+		const size_t settled = b.changes();
+		const int found = jump.crossings;
+		CHECK(settled <= 12);
+		// (Held: nothing changes until the first try, WAIT sets on.)
+		for (int step = 250; step < 290; step++)
+			a_set(b, jump);
+		CHECK(b.changes() == settled && jump.crossings == found);
+		// Tries: over the jump and straight back, at about 300, 1500, 6300
+		// and 25500 sets of readings - four in 30000, not a hundred.
+		int tries_at[8] = {0}, tries = 0;
+		for (int step = 290; step < 30000; step++) {
+			const int before = jump.crossings;
+			const float share = b.share();
+			a_set(b, jump);
+			if (jump.crossings > before && jump.lines && tries < 8)
+				tries_at[tries++] = step;
+			// (A try goes to where it was over, no further.)
+			if (jump.lines)
+				CHECK(share <= 0.7f * (1 + 2 * HairBudget::GAP) * 1.001f);
+		}
+		CHECK(tries == 4);
+		CHECK(tries_at[0] >= 295 && tries_at[0] <= 330);
+		CHECK(tries_at[1] - tries_at[0] >= 1200 && tries_at[1] - tries_at[0] <= 1210);
+		CHECK(tries_at[2] - tries_at[1] >= 4800 && tries_at[2] - tries_at[1] <= 4810);
+		CHECK(tries_at[3] - tries_at[2] >= 19200 && tries_at[3] - tries_at[2] <= 19210);
+		CHECK(jump.crossings == found + 8 && !jump.lines && b.share() < 0.7f);
+		CHECK(b.changes() == settled + 8);
+	}
+	// The same jump where lines do fit under the limit (0.96 at the jump):
+	// over it once, and it holds there as lines.
+	{
+		MadeUpCard jump;
+		jump.fixed = 0.05f;
+		jump.each = 1.6f;
+		jump.lines_from = 0.7f;
+		jump.line = 0.8125f;
+		jump.ribbons = 0.579f;
+		HairBudget b;
+		b.set_rule(1);
+		b.set_limit(1);
+		for (int step = 0; step < 3000; step++)
+			a_set(b, jump);
+		const float took = jump.took(b.share());
+		CHECK(jump.lines && jump.crossings <= 3 && b.share() >= 0.7f);
+		CHECK(took >= 0.9f && took <= 1.0001f && b.changes() <= 10);
+	}
+	// (Lines that stay lines a little under the jump, as hair_form keeps
+	// them with this rule: wherever it ends, it holds - under the limit,
+	// few changes, and its four tries in 30000 sets of readings each over
+	// the jump and back.)
+	for (float line : {0.8125f, 0.87f, 0.93f})
+		for (float fixed : {0.05f, 0.2f, 0.39f}) {
+			MadeUpCard jump;
+			jump.fixed = fixed;
+			jump.each = 1.6f - fixed;
+			jump.lines_from = 0.63f;
+			jump.line = line;
+			jump.ribbons = 0.579f;
+			jump.stays = HAIR_LINE_STAYS;
+			HairBudget b;
+			b.set_rule(1);
+			b.set_limit(1);
+			for (int step = 0; step < 280; step++)
+				a_set(b, jump);
+			const size_t settled = b.changes();
+			const int found = jump.crossings;
+			for (int step = 280; step < 295; step++)
+				a_set(b, jump);
+			CHECK(b.changes() == settled && settled <= 12 && found <= 8);
+			CHECK(jump.took(b.share()) <= 1.0001f);
+			for (int step = 295; step < 30000; step++)
+				a_set(b, jump);
+			CHECK(jump.crossings <= found + 8 && b.changes() <= settled + 20);
+			CHECK(jump.took(b.share()) <= 1.0001f);
+		}
+
+	// A game starts (everything on the card takes 1.3 times as long): fewer
+	// hairs, under the limit again within a few sets of readings. It stops:
+	// hair takes a tenth less than it did where the budget holds, so what
+	// it kept is forgotten and the hairs come back - as many as before.
+	{
+		MadeUpCard card;
+		card.fixed = 0.39f;
+		card.each = 1.0f;
+		HairBudget b, first;
+		MadeUpCard same = card;
+		b.set_rule(1);
+		b.set_limit(1);
+		first.set_limit(1);
+		for (int step = 0; step < 100; step++) {
+			a_set(b, card);
+			a_set(first, same);
+		}
+		const float before = b.share(), first_before = first.share();
+		CHECK(card.took(before) >= 0.9f && card.took(before) <= 1.0f && b.over() == 0);
+		card.load = same.load = 1.3f;
+		int back_under = -1;
+		for (int step = 0; step < 200; step++) {
+			if (a_set(b, card) <= 1.0f && back_under < 0)
+				back_under = step;
+			a_set(first, same);
+		}
+		CHECK(back_under >= 1 && back_under <= 4);
+		CHECK(b.share() < before && b.over() > 0 && card.took(b.share()) <= 1.0f);
+		const float during = b.share();
+		card.load = same.load = 1.0f;
+		for (int step = 0; step < 40; step++) {
+			a_set(b, card);
+			a_set(first, same);
+		}
+		CHECK(b.over() == 0 && b.share() > during && b.share() >= before * 0.97f);
+		CHECK(card.took(b.share()) >= 0.9f && card.took(b.share()) <= 1.0001f);
+		// (The first rule ends, as before the game, anywhere from three
+		// quarters of the limit up.)
+		CHECK(same.took(first.share()) >= 0.75f && same.took(first.share()) <= 1.0001f && first_before < 1);
+		CHECK(b.changes() <= 16);
+	}
+
+	// What hair costs eases a little (a twentieth: not enough to forget
+	// by): the hairs it makes room for come at the next try.
+	{
+		MadeUpCard jump;
+		jump.fixed = 0.39f;
+		jump.each = 1.21f;
+		jump.lines_from = 0.63f;
+		jump.line = 1 / 1.21f;
+		jump.ribbons = 0.579f;
+		HairBudget b;
+		b.set_rule(1);
+		b.set_limit(1);
+		for (int step = 0; step < 400; step++)
+			a_set(b, jump);
+		// (Lines at the jump take 1.02: ribbons under it, one try gone.)
+		CHECK(!jump.lines && b.share() < 0.63f && b.over() >= 0.63f);
+		jump.load = 0.94f;
+		for (int step = 400; step < 1450; step++)
+			a_set(b, jump);
+		CHECK(!jump.lines);
+		for (int step = 1450; step < 1600; step++)
+			a_set(b, jump);
+		CHECK(jump.lines && b.share() >= 0.63f && b.over() == 0);
+		CHECK(jump.took(b.share()) >= 0.9f && jump.took(b.share()) <= 1.0001f);
+		// (And costs as before again: back under the jump, and the next
+		// try no later than the first was - the wait starts over once a
+		// try holds.)
+		jump.load = 1.0f;
+		const int before = jump.crossings;
+		for (int step = 1600; step < 1700; step++)
+			a_set(b, jump);
+		CHECK(!jump.lines && jump.crossings == before + 1);
+		for (int step = 1700; step < 2050; step++)
+			a_set(b, jump);
+		CHECK(!jump.lines && jump.crossings == before + 3);
+	}
+
+	// Readings that jump about (each up to a tenth longer, one in five
+	// half as long again - and a game's frames in between, as ever): it
+	// stays between the fewest and all, changes now and then and not all
+	// the time, and what the hairs it asks for take by themselves is over
+	// the limit for a few sets of readings at most.
+	for (float lines_from : {0.0f, 0.63f}) {
+		MadeUpCard card;
+		card.fixed = 0.29f;
+		card.each = 1.21f;
+		card.lines_from = lines_from;
+		card.line = 1 / 1.21f;
+		card.ribbons = lines_from > 0 ? 0.579f : 1 / 1.21f;
+		card.stays = HAIR_LINE_STAYS;
+		uint32_t seed = 12345;
+		auto noise = [&seed]() {
+			seed = seed * 1664525u + 1013904223u;
+			const float a = (float)(seed >> 8) / 16777216.0f;
+			seed = seed * 1664525u + 1013904223u;
+			const bool spike = (seed >> 8) % 5 == 0;
+			return a * 0.1f + (spike ? 0.5f : 0.0f);
+		};
+		HairBudget b;
+		b.set_rule(1);
+		b.set_limit(1);
+		int over = 0;
+		double shares = 0;
+		for (int step = 0; step < 6000; step++) {
+			const float took = a_set(b, card, noise);
+			CHECK(b.share() >= least && b.share() <= 1);
+			if (step >= 100) {
+				over += took > 1.0f;
+				shares += b.share();
+			}
+		}
+		CHECK(b.changes() <= 200 && card.crossings <= 80);
+		CHECK(over <= 120);
+		CHECK(shares / 5900 >= 0.3 && shares / 5900 <= 0.75);
+	}
+
+	// Even the fewest hairs over the limit: the fewest, and it stays there.
+	{
+		MadeUpCard slow;
+		slow.each = 40;
+		HairBudget b;
+		b.set_rule(1);
+		b.set_limit(1);
+		for (int step = 0; step < 50; step++)
+			a_set(b, slow);
+		const size_t changes = b.changes();
+		CHECK(b.share() == least && changes <= 3);
+		for (int step = 0; step < 2000; step++)
+			a_set(b, slow);
+		CHECK(b.share() == least && b.changes() == changes);
+		// Another limit, or the first rule again: what it kept is gone,
+		// and its changes are counted from there.
+		CHECK(b.over() == least);
+		b.set_limit(2);
+		CHECK(b.over() == 0 && b.changes() == 0 && b.share() == least);
+		for (int step = 0; step < 5; step++)
+			a_set(b, slow);
+		CHECK(b.over() == least && b.share() == least);
+		b.set_rule(0);
+		CHECK(b.over() == 0 && b.changes() == 0 && b.rule() == 0);
+		// No limit: all of them, whichever rule.
+		b.set_rule(1);
+		b.set_limit(0);
+		CHECK(b.share() == 1);
+		a_set(b, slow);
+		CHECK(b.share() == 1 && b.changes() == 0 && b.measured() == -1);
+	}
+	// A clock that stops answering is no clock with this rule either: all
+	// the hairs, until it answers again.
+	{
+		MadeUpCard card;
+		card.each = 2;
+		HairBudget b;
+		b.set_rule(1);
+		b.set_limit(1);
+		for (int step = 0; step < 30; step++)
+			a_set(b, card);
+		const float held = b.share();
+		CHECK(held < 1 && held > least);
+		for (size_t k = 0; k < HairBudget::SILENT; k++)
+			b.unread();
+		CHECK(b.silent() && b.share() == 1);
+		b.read(1.0f, 1.0f);
+		CHECK(!b.silent() && b.share() == held);
+	}
+	// Readings that aren't numbers, or are for another share than it asks
+	// for: left out.
+	{
+		HairBudget b;
+		b.set_rule(1);
+		b.set_limit(1);
+		for (int k = 0; k < 50; k++) {
+			b.read(std::numeric_limits<float>::quiet_NaN(), b.share());
+			b.read(-1.0f, b.share());
+			b.read(std::numeric_limits<float>::infinity(), b.share());
+			b.read(0.2f, 0.9f);
+		}
+		CHECK(b.share() == HairBudget::START && b.changes() == 0 && b.measured() == -1);
+		// (Nothing at all on the card's clock: more, a quarter at a time.)
+		for (size_t r = 0; r < HairBudget::READINGS; r++)
+			b.read(0.0f, b.share());
+		CHECK(near(b.share(), 0.3125, 1e-6) && b.changes() == 1);
+	}
 }
 
 // --- A file's lines and line strips -----------------------------------------
@@ -1463,6 +1995,9 @@ static void test_what_a_point_keeps()
 		const Strands &h = part_of(loaded(two)).hair;
 		CHECK(near(h.line_pixel, (0.005 - 0.00016 / 3) / 0.8, 1e-8));
 		CHECK(near(h.line_pixel_most, (0.005 - 0.0008 / 3) / 0.8, 1e-8));
+		// (And more of it: each of Strands::LINE_LOSS.)
+		for (int k = 0; k < Strands::LINE_LOSSES; k++)
+			CHECK(near(h.line_pixel_at[k], (0.005 - Strands::LINE_LOSS[k] * 0.016 / 3) / 0.8, 1e-8));
 		// (Hairs all one width: 0.99 and 0.95 of it, over what a line
 		// covers.)
 		Groom same;
@@ -1471,6 +2006,11 @@ static void test_what_a_point_keeps()
 		same.width = std::vector<float>(6, 0.002f);
 		const Strands &one = part_of(loaded(same)).hair;
 		CHECK(near(one.line_pixel, 0.002 * 0.99 / 0.8, 1e-8) && near(one.line_pixel_most, 0.002 * 0.95 / 0.8, 1e-8));
+		for (int k = 0; k < Strands::LINE_LOSSES; k++)
+			CHECK(near(one.line_pixel_at[k], 0.002 * (1 - Strands::LINE_LOSS[k]) / 0.8, 1e-8));
+		// (In one sort: none for its thin pieces alone.)
+		for (int k = 0; k < Strands::LINE_LOSSES; k++)
+			CHECK(one.thin_pixel_at[k] == 0 && h.thin_pixel_at[k] == 0);
 	}
 }
 
@@ -3274,9 +3814,21 @@ static bool pieces_right(const Primitive &p)
 			return false;
 		if (!(h.thin_pixel_most > 0) || !(h.thin_pixel_most <= h.thin_pixel) || !(h.thin_pixel <= h.line_pixel))
 			return false;
-	} else if (h.thin_width != 0 || h.thin_share != 0 || h.thin_pixel != 0 || h.thin_pixel_most != 0) {
+		// (The pixels its thin pieces lose more at: each smaller than the
+		// one before.)
+		for (int k = 0; k < Strands::LINE_LOSSES; k++)
+			if (!(h.thin_pixel_at[k] > 0) ||
+			    !(h.thin_pixel_at[k] <= (k ? h.thin_pixel_at[k - 1] : h.thin_pixel_most)))
+				return false;
+	} else if (h.thin_width != 0 || h.thin_share != 0 || h.thin_pixel != 0 || h.thin_pixel_most != 0 ||
+		   std::any_of(h.thin_pixel_at, h.thin_pixel_at + Strands::LINE_LOSSES,
+			       [](float v) { return v != 0; })) {
 		return false;
 	}
+	for (int k = 0; k < Strands::LINE_LOSSES; k++)
+		if (!(h.line_pixel_at[k] <= (k ? h.line_pixel_at[k - 1] : h.line_pixel_most)) ||
+		    (h.line_pixel_most > 0 && !(h.line_pixel_at[k] > 0)))
+			return false;
 	const std::vector<int> group_of = groups_of_strands(p);
 	for (int g : group_of)
 		if (g < 0)
@@ -3926,6 +4478,8 @@ static void test_two_sorts()
 	// over what a line covers) - the whole coat's hairs, only with a pixel
 	// several times bigger.
 	CHECK(near(h.hair.thin_pixel, 0.0001 * 0.99 / 0.8, 1e-10) && near(h.hair.thin_pixel_most, 0.0001 * 0.95 / 0.8, 1e-10));
+	for (int k = 0; k < Strands::LINE_LOSSES; k++)
+		CHECK(near(h.hair.thin_pixel_at[k], 0.0001 * (1 - Strands::LINE_LOSS[k]) / 0.8, 1e-10));
 	CHECK(h.hair.line_pixel > 4 * h.hair.thin_pixel && h.hair.line_pixel_most > 4 * h.hair.thin_pixel_most);
 	// How many of each belong to the first so many strands.
 	bool counted = true;
@@ -5460,8 +6014,10 @@ int main()
 	test_plans();
 	test_share_on_screen();
 	test_lines();
+	test_lines_kept_lower();
 	test_budget();
 	test_budget_settles();
+	test_budget_whole_limit();
 	test_lines_and_strips();
 	test_hairs_of_two_points();
 	test_wild_numbers();

@@ -197,6 +197,11 @@ struct Strands {
 	// times that width.
 	static constexpr float LINE_COVERS = 0.8f;
 	float line_pixel = 0, line_pixel_most = 0;
+	// And for them to lose more of it, each of LINE_LOSSES (hair.hpp's
+	// hair_line_pixel: how thin a budget may leave a coat drawn as lines).
+	static constexpr int LINE_LOSSES = 5;
+	static constexpr float LINE_LOSS[LINE_LOSSES] = {0.1f, 0.15f, 0.2f, 0.3f, 0.4f};
+	float line_pixel_at[LINE_LOSSES] = {0, 0, 0, 0, 0};
 	size_t strands() const { return first.empty() ? 0 : first.size() - 1; }
 	// How many of its strands (the first of them) lie wholly in its first
 	// `points` points.
@@ -251,8 +256,10 @@ struct Strands {
 	float thin_width = 0;
 	std::vector<uint32_t> thin; // a run: where its thin pieces start
 	float thin_share = 0;       // how many of its pieces are thin (0 to 1)
-	// As line_pixel and line_pixel_most, of its thin pieces alone.
+	// As line_pixel, line_pixel_most and line_pixel_at, of its thin pieces
+	// alone.
 	float thin_pixel = 0, thin_pixel_most = 0;
+	float thin_pixel_at[LINE_LOSSES] = {0, 0, 0, 0, 0};
 	// A piece's width as drawn at `full`: the piece from point `i` of
 	// strand `s`.
 	double piece_width(size_t s, size_t i) const

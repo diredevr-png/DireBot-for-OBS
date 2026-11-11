@@ -1034,6 +1034,33 @@ def test_hair_laid_out_as_drawn_on_the_card(obs):
         # memory than one.)
         assert hair("Laid among")["laid_mb"] > after["laid_mb"], (hair("Laid among"), after)
 
+        # The hair budget's share held ("hair_share", for measuring): only
+        # that share of its strands is drawn, each as much wider - the start
+        # of every run, and of its hull's - by point and laid out the same
+        # to the pixel, as ribbons and with its thin hairs as lines. And a
+        # budget's lines kept with fewer hairs ("hair_line_loss": how much
+        # of what they cover they may lose, up to 0.4 instead of a
+        # twentieth): never fewer lines, never fewer hairs, than as ever.
+        for share in (0.6, 0.3):
+            before, after = both("Laid", "its share held at %s, ribbons" % share, least=1000, hair_share=share)
+            assert after["share"] == share and after["lines"] == 0, after
+            assert abs(after["drawn"] - share * strands) <= 0.03 * strands, (share, after)
+            assert 0 < after["hull_pieces"] < after["pieces"], after
+        change("Laid", hair_share=-1)
+        kept = {}
+        for loss in (-1, 0.4):
+            for share in (0.7, 0.4):
+                before, after = both("Laid among", "its share held at %s, a budget's lines losing %s" % (share, loss),
+                                     least=1000, hair_lines=-1, hair_share=share, hair_line_loss=loss)
+                assert after["share"] == share and 16 <= after["drawn"] <= share * strands * 1.03, (share, after)
+                kept[(loss, share)] = after
+        for share in (0.7, 0.4):
+            assert kept[(0.4, share)]["lines"] >= kept[(-1, share)]["lines"], (share, kept)
+            assert kept[(0.4, share)]["drawn"] >= kept[(-1, share)]["drawn"], (share, kept)
+        change("Laid among", hair_share=-1, hair_line_loss=-1)
+        assert wait_for(lambda: hair("Laid among")["share"] == 1 and hair("Laid among")["drawn"] == strands, 10, 0.1), \
+            hair("Laid among")
+
         # For measuring only (numbers the settings window doesn't show), by
         # point and laid out: the hidden-hair test made with nothing left
         # out ("hair_skip_hidden" 4) is the picture with every hair sent, to

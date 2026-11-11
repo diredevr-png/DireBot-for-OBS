@@ -254,6 +254,12 @@ public:
 		// themselves (-1: not known).
 		float share = 1, ms = -1, depth_ms = -1;
 		bool skips = false;
+		// How many times the hair budget has changed its share since its
+		// limit or rule was set, and how many times a part's hairs have
+		// changed between lines and ribbons since this was made; and (the
+		// budget's other rule) the share it was over the limit at, kept.
+		size_t share_changes = 0, form_changes = 0;
+		float over = 0;
 	};
 	const HairDrawn &hair_drawn() const { return hair_drawn_; }
 	// The solid parts' distances from the camera, as last drawn (hairs
@@ -288,6 +294,7 @@ private:
 		// time it's drawn that way; and whether it was last frame.
 		gs_indexbuffer_t *ib_lines = nullptr;
 		bool as_lines = false, thin_lines = false; // (all of them; its thin ones only)
+		bool formed = false;                       // (it was drawn the frame before)
 		bool skin = false;    // its points as made, with their bones (posed on the card)
 		bool boned = false;   // a strand part: its points have bones of their own
 		// A strand part posed on the card, laid out as it's drawn
@@ -419,6 +426,7 @@ private:
 	// The last readings (hair_took: their middle one), and of each the
 	// picture of the solid parts' distances alone.
 	std::vector<float> took_, took_depth_;
+	size_t form_changes_ = 0;
 	void turn_clock();
 	HairClock *start_clock(float share);
 	void clocks_lost();

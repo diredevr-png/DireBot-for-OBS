@@ -448,6 +448,7 @@ Avatar3D::~Avatar3D()
 void Avatar3D::set_hair(const HairPlan &plan)
 {
 	hair_plan_ = plan;
+	budget_.set_rule(plan.budget_rule);
 	budget_.set_limit(plan.budget_ms);
 }
 
@@ -1746,7 +1747,9 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 	// screen asks for (hair.hpp's hair_share), the hair budget's share of
 	// that, and no more pieces in all than the plan allows.
 	const uint32_t drawn_h = v.h * k;
-	const float budget = clocks_work_ ? budget_.share() : 1.0f;
+	// (Or the share the plan holds it at, measuring.)
+	const float asked = clocks_work_ ? budget_.share() : 1.0f;
+	const float budget = hair_plan_.share > 0 ? std::min(1.0f, hair_plan_.share) : asked;
 	// (Hair to draw; and any of it posed on the graphics card.)
 	bool any_hair = false, any_card_hair = false;
 	{
@@ -1765,18 +1768,24 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 				const Rig::Part &p = posed[i];
 				if (!part.strands || !part.vb || !part.ib || part.skin != p.gpu || p.hidden ||
 				    p.collapsed || !p.prim) {
-					part.as_lines = part.thin_lines = false;
+					part.as_lines = part.thin_lines = part.formed = false;
 					continue;
 				}
 				const Strands &h = p.prim->hair;
 				// (Posed here: those the rig posed, the first of them.)
 				const size_t loaded = p.gpu ? h.strands() : h.strands_in(p.pos.size());
 				// (As lines where its hairs are thin enough: hair.hpp.)
-				const HairForm form =
-					hair_form(h, loaded, p.scale, dr.distance[i], pixel, 1.0f, hair_plan_.solid,
-						  budget, dr.a->p_strand_view ? hair_plan_.lines : 0, part.as_lines,
-						  part.thin_lines);
+				const HairForm form = hair_form(h, loaded, p.scale, dr.distance[i], pixel, 1.0f,
+								hair_plan_.solid, budget,
+								dr.a->p_strand_view ? hair_plan_.lines : 0,
+								part.as_lines, part.thin_lines, hair_plan_.line_loss,
+								hair_plan_.line_cost, hair_plan_.budget_rule == 1);
 				dr.hair[i] = form.share;
+				// (How often a part drawn the frame before changes between
+				// lines and ribbons: counted.)
+				if (part.formed && (part.as_lines != form.lines || part.thin_lines != form.thin))
+					form_changes_++;
+				part.formed = true;
 				part.as_lines = form.lines;
 				part.thin_lines = form.thin;
 				pieces += pieces_of(h, dr.hair[i].count);
@@ -1835,6 +1844,9 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 			}
 	}
 	hair_drawn_.share = budget;
+	hair_drawn_.share_changes = budget_.changes();
+	hair_drawn_.form_changes = form_changes_;
+	hair_drawn_.over = budget_.over();
 
 	static const Material plain;
 	auto material_of = [&](const Drawn &dr, size_t i) -> const Material & {
