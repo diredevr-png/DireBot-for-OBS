@@ -384,7 +384,12 @@ has been quiet a second). Each part as you pick:
 Unity is left-handed (x its right, y up, z its front): a place
 (x, y, z) is ours (-x, y, z) and a turn (x, y, z, w) ours (x, -y, -z, w).
 `vmc_mirror` swaps its left and right (for an app that doesn't mirror
-you). A move on cue still takes the bones it moves; bones the app doesn't
+you). A move on cue still takes the bones it moves (after 0.10.0, not
+released yet: and so does the idle a move that stays plays, as it shows -
+riding a mount, its hands stay on their holds and its hips on the mount,
+the app's body easing back in as it gets off; your head from a camera is
+turned against the app's chest only as far as its chest is the app's,
+not a move's); bones the app doesn't
 send stay as they were (your camera's arms, if they follow you, or
 hanging by its sides), and each part eases in and out over a quarter of a
 second as the app starts and stops sending. `FaceSet` with the face from

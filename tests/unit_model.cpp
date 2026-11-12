@@ -4279,6 +4279,170 @@ static void test_a_ride_lands_smoothly()
 	}
 }
 
+// After 0.10.0: another tracker app's body (VMC) leaves what a move that
+// stays has to it while it stays - the idle it rides in is a move's, as
+// the move that got it there is - so its hands stay where the ride puts
+// them. Its own idle (not a move's) is the app's as before; fading back
+// to it, the app's body eases back in. Your head from a camera is turned
+// against the app's chest only as far as its chest is the app's.
+static void test_a_ride_holds_against_the_app()
+{
+	const float PI = 3.14159265f;
+	const float D = PI / 180;
+	Figure body = make_body();
+	Builder &b = body.p.b;
+	{
+		// (Feet on the floor: its hips a metre up.)
+		std::vector<V3> pos;
+		std::vector<uint16_t> ix;
+		cube(pos, ix, {0, 0.05f, 0}, 0.05f);
+		const int a_pos = b.vec3s(pos), a_ix = b.indices(ix);
+		const json prim = {{"attributes", {{"POSITION", a_pos}}}, {"indices", a_ix}};
+		b.doc["meshes"].push_back({{"primitives", json::array({prim})}});
+		const int feet = b.node({{"name", "feet"}, {"mesh", (int)b.doc["meshes"].size() - 1}});
+		b.doc["scenes"][0]["nodes"].push_back(feet);
+	}
+	json &bones = b.doc["extensions"]["VRMC_vrm"]["humanoid"]["humanBones"];
+	const int arm = bones["leftUpperArm"]["node"].get<int>(), lower = bones["leftLowerArm"]["node"].get<int>();
+	const int t1 = b.floats({0, 1}, 1, "SCALAR");
+	const Quat reach = axis_angle({0, 1, 0}, -80 * D); // out in front
+	// "Ride": up a metre (on a mount), its left arm reaching forward to a
+	// hold, its chest straight. "Idle": its head alone.
+	b.doc["animations"] = json::array(
+		{{{"name", "Ride"},
+		  {"samplers",
+		   {{{"input", t1}, {"output", b.floats({0, 2, 0, 0, 2, 0}, 3, "VEC3")}},
+		    {{"input", t1},
+		     {"output",
+		      b.floats({reach.x, reach.y, reach.z, reach.w, reach.x, reach.y, reach.z, reach.w}, 4, "VEC4")}},
+		    {{"input", t1}, {"output", b.floats({0, 0, 0, 1, 0, 0, 0, 1}, 4, "VEC4")}}}},
+		  {"channels",
+		   {{{"sampler", 0}, {"target", {{"node", body.p.hips}, {"path", "translation"}}}},
+		    {{"sampler", 1}, {"target", {{"node", arm}, {"path", "rotation"}}}},
+		    {{"sampler", 2}, {"target", {{"node", body.chest}, {"path", "rotation"}}}}}}},
+		 {{"name", "Idle"},
+		  {"samplers", {{{"input", t1}, {"output", b.floats({0, 0, 0, 1, 0, 0, 0, 1}, 4, "VEC4")}}}},
+		  {"channels", {{{"sampler", 0}, {"target", {{"node", body.p.head}, {"path", "rotation"}}}}}}}});
+	auto m = std::make_shared<Model>();
+	CHECK(load(b.glb(), *m));
+	if (m->animations.size() != 2)
+		return;
+	RigOptions o;
+	o.springs = false;
+	auto arm_way = [&](const Rig &r) {
+		return way_of(r, arm, lower);
+	};
+	auto hips_at = [&](const Rig &r) {
+		return move_of(r.world()[body.p.hips]);
+	};
+	auto nose = [&](const Rig &r) {
+		return direction(r.world()[body.p.head], {0, 0, 1});
+	};
+	auto apart = [D](V3 a, V3 c) {
+		return std::acos(std::max(-1.0f, std::min(1.0f, dot(a, c)))) / D;
+	};
+	// Riding, nothing from the app: where the ride has it.
+	RigOptions riding = o;
+	riding.animation = 0;
+	Rig plain(m, riding);
+	plain.pose(still());
+	const V3 on_hold = arm_way(plain), up_there = hips_at(plain);
+	CHECK(near(up_there.y, 2, 1e-4));
+	// The app: its left arm up 60, its hips across and down, its chest
+	// twisted 30 (and your head from a camera, straight on).
+	const Quat up60 = axis_angle({0, 0, 1}, 60 * D), twist = axis_angle({0, 1, 0}, 30 * D);
+	Drive d = still();
+	d.tracked.bones = {{"leftUpperArm", up60, 1}, {"chest", twist, 1}};
+	d.tracked.hips = {0.1f, -0.2f, 0};
+	d.tracked.hips_amount = 1;
+	d.tracked.torso = 1;
+	d.tracked.chest = twist;
+	const V3 apps_arm = rotate(twist * up60, {1, 0, 0});
+	// (How far the app moves its hips, standing.)
+	RigOptions idling = o;
+	idling.animation = 1;
+	Rig stands(m, idling);
+	stands.pose(still());
+	const V3 standing = hips_at(stands);
+	stands.pose(d);
+	const V3 apps_step = hips_at(stands) - standing;
+	CHECK(near3(apps_step, {0.1f, -0.2f, 0}, 2e-3f));
+
+	// The ride as its own idle (not a move's): the app's, as before.
+	Rig own(m, riding);
+	own.pose(d);
+	CHECK(near3(arm_way(own), apps_arm, 2e-3f));
+	CHECK(near3(hips_at(own), up_there + apps_step, 2e-3f));
+	CHECK(near3(nose(own), {0, 0, 1}, 2e-3f)); // (turned back against the app's chest)
+
+	// The ride a move's (a move that stays): its arm on its hold, its
+	// hips up there, its chest straight, its head straight on - nothing
+	// of the app's on what it moves.
+	Rig rig(m, o);
+	rig.set_animation(0, 0, 0, true);
+	rig.pose(d);
+	CHECK(rig.animation() == 0);
+	CHECK(apart(arm_way(rig), on_hold) < 0.05f);
+	CHECK(near3(hips_at(rig), up_there, 1e-4f));
+	CHECK(near3(direction(rig.world()[body.chest], {0, 0, 1}), {0, 0, 1}, 2e-3f));
+	CHECK(near3(nose(rig), {0, 0, 1}, 2e-3f));
+	// (Your head turned 20 to its left: 20 to its left, as without the app.)
+	d.head = axis_angle({0, 1, 0}, 20 * D);
+	rig.pose(d);
+	CHECK(near3(nose(rig), {std::sin(20 * D), 0, std::cos(20 * D)}, 2e-3f));
+	d.head = Quat{};
+	// Asked again as its own idle (the same one, no longer a move's): the
+	// app's again.
+	rig.set_animation(0);
+	rig.pose(d);
+	CHECK(near3(arm_way(rig), apps_arm, 2e-3f));
+	rig.set_animation(0, 0, 0, true);
+	rig.pose(d);
+	CHECK(apart(arm_way(rig), on_hold) < 0.05f);
+
+	// Its stay over: back to its own idle over a second, the app's body
+	// easing back in, a little a frame (no jump), all of it at the end.
+	rig.set_animation(1, 1.0f);
+	float most_turn = 0, most_step = 0;
+	V3 last = arm_way(rig), last_hips = hips_at(rig);
+	bool between = false;
+	for (int f = 1; f <= 70; f++) {
+		rig.pose(d);
+		const V3 w = arm_way(rig), h = hips_at(rig);
+		most_turn = std::max(most_turn, apart(w, last));
+		most_step = std::max(most_step, length(h - last_hips));
+		if (f == 30)
+			between = apart(w, on_hold) > 10 && apart(w, apps_arm) > 10;
+		last = w;
+		last_hips = h;
+	}
+	CHECK(between);
+	CHECK(most_turn < 6.0f);
+	CHECK(most_step < 0.035f);
+	CHECK(!rig.animation_fading());
+	CHECK(near3(arm_way(rig), apps_arm, 2e-3f));
+	CHECK(near3(hips_at(rig), standing + apps_step, 2e-3f));
+
+	// A move on cue holding its chest: your head turned against the app's
+	// chest no more (its chest is the move's), straight on.
+	Rig cue(m, o);
+	Motion straight;
+	const std::vector<uint8_t> f = make_motion({{"chest", Quat{}}}, {0, 1, 0});
+	CHECK(load_motion(f.data(), f.size(), "", straight));
+	MoveNow mv;
+	mv.motion = std::make_shared<const Motion>(straight);
+	mv.time = 1;
+	mv.amount = 1;
+	d.body = {mv};
+	cue.pose(d);
+	CHECK(near3(nose(cue), {0, 0, 1}, 2e-3f));
+	// (Without it: the app's chest twisted, your head still straight on.)
+	d.body.clear();
+	cue.pose(d);
+	CHECK(near3(nose(cue), {0, 0, 1}, 2e-3f));
+	CHECK(near3(direction(cue.world()[body.chest], {0, 0, 1}), rotate(twist, {0, 0, 1}), 2e-3f));
+}
+
 static void test_faces_on_cue()
 {
 	Person p = make_person(false);
@@ -5619,6 +5783,7 @@ int main()
 	test_a_move_holds_its_body();
 	test_cross_fades_let_go();
 	test_a_ride_lands_smoothly();
+	test_a_ride_holds_against_the_app();
 	test_link_chain();
 	test_spots_on_a_vrm();
 	test_spots_on_two_characters();

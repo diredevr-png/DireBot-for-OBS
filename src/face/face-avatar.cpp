@@ -2813,7 +2813,9 @@ struct FaceAvatar {
 		} else {
 			start = 0;
 		}
-		rig->set_animation(to, stay_fade, start);
+		// (Its idle a move's: another tracker app's bones leave what it
+		// moves to it, as they do the move's - after 0.10.0.)
+		rig->set_animation(to, stay_fade, start, stay_target >= 0);
 		stay_idle_now = stay_target;
 		stay_due = false;
 		std::lock_guard<std::mutex> l(state_lock);
@@ -2990,7 +2992,7 @@ struct FaceAvatar {
 			stands_for = ro.animation;
 			framed_for = -1;
 			if (stay_idle_now >= 0)
-				rig->set_animation(stay_idle_now);
+				rig->set_animation(stay_idle_now, 0, 0, true);
 			spots3d = face_spots(model_now, ro.facing, *look3d.setup);
 			// Your eyes and mouth are cut the shape of its spots.
 			const float eye = (spots3d.spot[0].h / std::max(1e-6f, spots3d.spot[0].w) +

@@ -234,8 +234,11 @@ public:
 	// Another of its own animations (or -1 none), from its start: no need
 	// to start again. 0.9.0: cross-faded from the one before over `fade`
 	// seconds (0: straight there), the new one from `start` seconds into
-	// it - so a move that ends where an idle starts lands on it.
-	void set_animation(int which, float fade = 0, float start = 0);
+	// it - so a move that ends where an idle starts lands on it. After
+	// 0.10.0: `holds`, it's a move's (the idle a move that stays plays):
+	// another tracker app's bones leave what it moves to it, as they do a
+	// move on cue's.
+	void set_animation(int which, float fade = 0, float start = 0, bool holds = false);
 	int animation() const { return options_.animation; }
 	// Seconds into its animation now, and whether one is still fading out.
 	float animation_time() const { return anim_time_; }
@@ -483,6 +486,14 @@ private:
 	// cross-fades to another): what the rig itself does to it (arms down,
 	// fingers relaxed, a breath's shrug) is that much less.
 	std::vector<float> anim_turns_;
+	// After 0.10.0: how much a move's animation (set_animation's `holds`)
+	// has each node it turns or moves (0 to 1, as it fades in or out):
+	// another tracker app's bones that much less, as for a move on cue.
+	std::vector<float> anim_holds_;
+	bool holds_ = false, fade_from_holds_ = false;
+	// How much of its body (hips to chest) is another tracker app's, as
+	// posed (TrackedBody::torso, less where a move has it).
+	float app_torso_ = 0;
 	float torso_held_ = 0; // its body held still (torso_held)
 	// 0.9.0: the animation it's fading from (-1: none), how far into it,
 	// and how far into the fade (seconds, of `fade_length_`). After
@@ -496,7 +507,7 @@ private:
 	// for one whose bones are all shrunk away (Part::hidden).
 	std::vector<std::vector<uint16_t>> part_joints_;
 	void apply_animation(int which, float t, float amount, const std::vector<uint8_t> *shared = nullptr,
-			     float shared_amount = 1);
+			     float shared_amount = 1, bool holds = false);
 	// How much a body move holds each node this frame (0 to 1): what the
 	// rig itself does to it (arms down, fingers relaxed) is that much less.
 	std::vector<float> moved_;

@@ -483,6 +483,7 @@ Rig::Rig(std::shared_ptr<const Model> model, const RigOptions &options) : model_
 	world_ = rest_world_;
 	held_.assign(n, 0);
 	anim_turns_.assign(n, 0);
+	anim_holds_.assign(n, 0);
 	if (options_.animation >= (int)m.animations.size())
 		options_.animation = -1;
 	head_ = m.bone("head");
@@ -1869,8 +1870,14 @@ float Rig::hips_height(int hips) const
 void Rig::drive_tracked(const Drive &d)
 {
 	const TrackedBody &t = d.tracked;
+	app_torso_ = clamp01(t.torso);
 	if ((t.bones.empty() && !(t.hips_amount > 0)) || !model_->is_vrm())
 		return;
+	// How much a move has a node: one on cue, or (after 0.10.0) the idle
+	// a move that stays plays (set_animation's `holds`), as it shows.
+	auto has = [&](int node) {
+		return 1 - (1 - moved_[node]) * (1 - (node < (int)anim_holds_.size() ? anim_holds_[node] : 0.0f));
+	};
 	std::map<std::string, std::pair<Quat, float>> turn;
 	for (const TrackedBone &b : t.bones) {
 		const float a = clamp01(b.amount);
@@ -1882,10 +1889,16 @@ void Rig::drive_tracked(const Drive &d)
 	for (auto &kv : turn) {
 		auto it = bones1_.find(kv.first);
 		if (it != bones1_.end())
-			kv.second.second *= 1 - moved_[it->second];
+			kv.second.second *= 1 - has(it->second);
 	}
 	auto hips = bones1_.find("hips");
-	const float a = hips != bones1_.end() ? clamp01(t.hips_amount) * (1 - moved_[hips->second]) : 0.0f;
+	const float a = hips != bones1_.end() ? clamp01(t.hips_amount) * (1 - has(hips->second)) : 0.0f;
+	// Its body the app's only as far as no move has it (your head turned
+	// against the app's chest no more than its chest is the app's).
+	float most = hips != bones1_.end() ? has(hips->second) : 0.0f;
+	for (int n : torso_)
+		most = std::max(most, has(n));
+	app_torso_ *= 1 - most;
 	pose_humanoid(turn);
 	if (a > 0 && std::isfinite(t.hips.x + t.hips.y + t.hips.z)) {
 		const Quat F = options_.facing;
@@ -1900,16 +1913,20 @@ void Rig::drive_tracked(const Drive &d)
 	}
 }
 
-void Rig::set_animation(int which, float fade, float start)
+void Rig::set_animation(int which, float fade, float start, bool holds)
 {
 	if (which < 0 || which >= (int)model_->animations.size())
 		which = -1;
-	if (which == options_.animation)
+	if (which == options_.animation) {
+		holds_ = holds && which >= 0;
 		return;
+	}
 	// 0.9.0: the one before fades out from where it is (a fade already
 	// going on is taken over from where it's got to: the newest two).
 	const bool fades = std::isfinite(fade) && fade > 1e-3f && options_.animation >= 0;
 	fade_from_ = fades ? options_.animation : -1;
+	fade_from_holds_ = fades && holds_;
+	holds_ = holds && which >= 0;
 	fade_from_time_ = anim_time_;
 	fade_t_ = 0;
 	fade_length_ = fades ? std::min(fade, 10.0f) : 0;
@@ -1933,8 +1950,12 @@ void Rig::set_animation(int which, float fade, float start)
 // One of its own animations at `t` seconds over what its nodes have now, as
 // much as `amount` (1: just as it has them) - a channel `shared` has too
 // (another animation's: key_bit by node) as much as `shared_amount`.
-void Rig::apply_animation(int which, float t, float amount, const std::vector<uint8_t> *shared, float shared_amount)
+void Rig::apply_animation(int which, float t, float amount, const std::vector<uint8_t> *shared, float shared_amount,
+			  bool holds)
 {
+	// (A move's has what it turns or moves as much as it shows - eased
+	// as its pose is: over the one before where they share a node.)
+	const float hold = holds ? 1.0f : 0.0f;
 	const Animation &a = model_->animations[which];
 	float v[4];
 	for (const AnimChannel &c : a.channels) {
@@ -1952,6 +1973,7 @@ void Rig::apply_animation(int which, float t, float amount, const std::vector<ui
 		if (c.path == AnimChannel::Move) {
 			const V3 to{v[0], v[1], v[2]};
 			t_[c.node] = k >= 1 ? to : t_[c.node] + (to - t_[c.node]) * k;
+			anim_holds_[c.node] += (hold - anim_holds_[c.node]) * k;
 		} else if (c.path == AnimChannel::Size) {
 			const V3 to{v[0], v[1], v[2]};
 			if (size_switched(c))
@@ -1962,6 +1984,7 @@ void Rig::apply_animation(int which, float t, float amount, const std::vector<ui
 			const Quat to{v[0], v[1], v[2], v[3]};
 			r_[c.node] = k >= 1 ? to : normalized(slerp(r_[c.node], normalized(to), k));
 			anim_turns_[c.node] = 1 - (1 - anim_turns_[c.node]) * (1 - k);
+			anim_holds_[c.node] += (hold - anim_holds_[c.node]) * k;
 		}
 	}
 }
@@ -1973,6 +1996,7 @@ void Rig::animate(float dt)
 {
 	const Model &m = *model_;
 	anim_turns_.assign(m.nodes.size(), 0);
+	anim_holds_.assign(m.nodes.size(), 0);
 	const float step = std::max(0.0f, std::min(dt, 1.0f));
 	const int now = options_.animation >= 0 && options_.animation < (int)m.animations.size() ? options_.animation
 												 : -1;
@@ -1997,7 +2021,8 @@ void Rig::animate(float dt)
 			// the new one over it below. Where the new one doesn't (or
 			// it's none), the old one easing back to how they rest as it
 			// fades - not held as it was, then let go of at the end.
-			apply_animation(fade_from_, fade_from_time_, 1 - into, now >= 0 ? &fade_keys_ : nullptr, 1.0f);
+			apply_animation(fade_from_, fade_from_time_, 1 - into, now >= 0 ? &fade_keys_ : nullptr, 1.0f,
+					fade_from_holds_);
 			if (m.animations[fade_from_].hold_torso)
 				held = 1 - into;
 		}
@@ -2005,7 +2030,7 @@ void Rig::animate(float dt)
 		fade_from_ = -1;
 	}
 	if (now >= 0) {
-		apply_animation(now, anim_time_, fade_from_ >= 0 ? into : 1.0f);
+		apply_animation(now, anim_time_, fade_from_ >= 0 ? into : 1.0f, nullptr, 1, holds_);
 		if (m.animations[now].hold_torso)
 			held += fade_from_ >= 0 ? into : 1.0f;
 	}
@@ -2081,7 +2106,7 @@ void Rig::drive_head(const Drive &d)
 	// Your head's turn - from a camera, against the world: with another
 	// tracker app's body on it, against its chest (as much as it's the
 	// app's).
-	const float app_body = clamp01(d.tracked.torso);
+	const float app_body = clamp01(app_torso_);
 	Quat head = d.head;
 	if (app_body > 0)
 		head = slerp(Quat{}, conj(normalized(d.tracked.chest)), app_body) * head;
