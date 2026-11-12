@@ -4090,6 +4090,195 @@ static void test_a_move_holds_its_body()
 	}
 }
 
+// After 0.10.0: an idle cross-faded to another (a move that stays: riding
+// in and out) lets go of what only the old one moves as it fades - its
+// hips back down, its arm back by its side, smoothly - instead of holding
+// it as it was and letting go all at once at the end. What only the new
+// one moves comes in from how it stands (its arm down by its side, not
+// out in the T it was made in). Outside a cross-fade: as before.
+static void test_cross_fades_let_go()
+{
+	const float PI = 3.14159265f;
+	const float D = PI / 180;
+	Figure body = make_body();
+	Builder &b = body.p.b;
+	json &bones = b.doc["extensions"]["VRMC_vrm"]["humanoid"]["humanBones"];
+	const int arm = bones["leftUpperArm"]["node"].get<int>();
+	const int t1 = b.floats({0, 1}, 1, "SCALAR");
+	const Quat reach = axis_angle({0, 1, 0}, -80 * D); // out in front
+	// "Up": its hips a metre higher (on a mount), its left arm reaching
+	// forward. "Nod": its head alone.
+	b.doc["animations"] = json::array(
+		{{{"name", "Up"},
+		  {"samplers",
+		   {{{"input", t1}, {"output", b.floats({0, 2, 0, 0, 2, 0}, 3, "VEC3")}},
+		    {{"input", t1},
+		     {"output",
+		      b.floats({reach.x, reach.y, reach.z, reach.w, reach.x, reach.y, reach.z, reach.w}, 4, "VEC4")}}}},
+		  {"channels",
+		   {{{"sampler", 0}, {"target", {{"node", body.p.hips}, {"path", "translation"}}}},
+		    {{"sampler", 1}, {"target", {{"node", arm}, {"path", "rotation"}}}}}}},
+		 {{"name", "Nod"},
+		  {"samplers", {{{"input", t1}, {"output", b.floats({0, 0, 0, 1, 0, 0, 0, 1}, 4, "VEC4")}}}},
+		  {"channels", {{{"sampler", 0}, {"target", {{"node", body.p.head}, {"path", "rotation"}}}}}}}});
+	auto m = std::make_shared<Model>();
+	CHECK(load(b.glb(), *m));
+	RigOptions o;
+	o.springs = false;
+	const int lower = bones["leftLowerArm"]["node"].get<int>();
+	auto arm_way = [&](const Rig &r) {
+		return normalized(move_of(r.world()[lower]) - move_of(r.world()[arm]));
+	};
+	auto hips_y = [&](const Rig &r) {
+		return move_of(r.world()[body.p.hips]).y;
+	};
+	auto apart = [](V3 a, V3 c) {
+		return std::acos(std::max(-1.0f, std::min(1.0f, dot(a, c)))) / 3.14159265f * 180;
+	};
+	// How it stands in each.
+	RigOptions on_up = o, on_nod = o;
+	on_up.animation = 0;
+	on_nod.animation = 1;
+	Rig up(m, on_up), nod(m, on_nod);
+	up.pose(still());
+	nod.pose(still());
+	const V3 reaching = arm_way(up), down = arm_way(nod);
+	CHECK(near(hips_y(up), 2, 1e-5) && near(hips_y(nod), 1, 1e-5));
+	CHECK(apart(reaching, down) > 60); // (the arm down by its side, not out in a T)
+	const V3 t_pose{1, 0, 0};
+	CHECK(apart(down, t_pose) > 60);
+
+	for (int way = 0; way < 2; way++) {
+		// Over a second, frame by frame: "Up" to "Nod", then back.
+		RigOptions from = o;
+		from.animation = way ? 1 : 0;
+		Rig rig(m, from);
+		Drive d = still();
+		rig.pose(d);
+		rig.set_animation(way ? 0 : 1, 1.0f);
+		float last_y = hips_y(rig), most_y = 0, most_turn = 0, most_out = 0;
+		V3 last_way = arm_way(rig);
+		for (int f = 1; f <= 70; f++) {
+			rig.pose(d);
+			const float y = hips_y(rig);
+			const V3 w = arm_way(rig);
+			most_y = std::max(most_y, std::fabs(y - last_y));
+			most_turn = std::max(most_turn, apart(w, last_way));
+			// Never far off the way from where it starts to where it ends
+			// (0.9.0: out towards the T it was made in, then down at once).
+			most_out = std::max(most_out, apart(w, down) + apart(w, reaching) - apart(down, reaching));
+			last_y = y;
+			last_way = w;
+			if (f == 30) {
+				// Half way (smoothly: half of it).
+				CHECK(near(y, 1.5, 0.02));
+				CHECK(near(apart(w, down), apart(reaching, down) / 2, 3));
+			}
+		}
+		// A smooth fade: the most a frame is about 1.5 times the average
+		// (a metre over 60 frames), no jump as it ends; there at the end.
+		CHECK(most_y < 0.03f);
+		CHECK(most_turn < 3.5f);
+		CHECK(most_out < 10.0f); // (a bow of a few degrees: two turns eased together)
+		CHECK(!rig.animation_fading());
+		CHECK(near(hips_y(rig), way ? 2 : 1, 1e-5));
+		CHECK(apart(arm_way(rig), way ? reaching : down) < 0.01f);
+	}
+	// Not fading: just as before (all of it, at once).
+	Rig at_once(m, on_up);
+	at_once.pose(still());
+	at_once.set_animation(1);
+	at_once.pose(still());
+	CHECK(near(hips_y(at_once), 1, 1e-5) && apart(arm_way(at_once), down) < 0.01f);
+}
+
+// After 0.10.0: a move that stays as DireBot plays it - React easing the
+// move in and out, its idle swapped in under it (stay_swap) - lands on its
+// idle without the one before showing through. Riding up: its hips never
+// dip back towards standing as the move eases out (0.9.0: a quarter of the
+// way, halfway through). Riding off: never back up towards the mount, and
+// no jump at the end (0.9.0: all the way back up, then down at once).
+static void test_a_ride_lands_smoothly()
+{
+	Figure body = make_body();
+	Builder &b = body.p.b;
+	// "idle": its head alone (it stands). "come": its hips up a metre in
+	// its first second, then still for two. "ride": up there, over and
+	// over. "go": down again in its first second, then still for two.
+	auto hips = [&](std::vector<float> ys, std::vector<float> ts) {
+		std::vector<float> v;
+		for (float y : ys)
+			v.insert(v.end(), {0, y, 0});
+		return json{{"input", b.floats(ts, 1, "SCALAR")}, {"output", b.floats(v, 3, "VEC3")}};
+	};
+	auto clip = [&](const char *name, json sampler, int node, const char *path) {
+		return json{{"name", name},
+			    {"samplers", {sampler}},
+			    {"channels", {{{"sampler", 0}, {"target", {{"node", node}, {"path", path}}}}}}};
+	};
+	b.doc["animations"] = json::array({clip("idle",
+						{{"input", b.floats({0, 1}, 1, "SCALAR")},
+						 {"output", b.floats({0, 0, 0, 1, 0, 0, 0, 1}, 4, "VEC4")}},
+						body.p.head, "rotation"),
+					   clip("come", hips({1, 2, 2}, {0, 1, 3}), body.p.hips, "translation"),
+					   clip("ride", hips({2, 2}, {0, 1}), body.p.hips, "translation"),
+					   clip("go", hips({2, 1, 1}, {0, 1, 3}), body.p.hips, "translation")});
+	auto m = std::make_shared<Model>();
+	CHECK(load(b.glb(), *m));
+	if (m->animations.size() != 4)
+		return;
+	const float L = 3, FRAME = 1.0f / 60;
+	const StaySwap swap = stay_swap(L, 0.5f);
+	const ReactView view;
+	for (int going = 0; going < 2; going++) {
+		RigOptions o;
+		o.springs = false;
+		o.animation = going ? 2 : 0;
+		Rig rig(m, o);
+		React r;
+		const int move = going ? 3 : 1, to = going ? 0 : 2;
+		r.play(move, L);
+		bool swapped = false;
+		float worst = 0, last = 0, most_step = 0;
+		for (int f = 0; f * FRAME < L + 0.5f; f++) {
+			Drive d = still();
+			d.dt = FRAME;
+			float u = -1;
+			for (const BodyMove &bm : r.step(FRAME, view).body)
+				if (bm.move == move) {
+					MoveNow mv;
+					mv.animation = move;
+					mv.time = u = bm.time;
+					mv.amount = bm.amount;
+					d.body = {mv};
+				}
+			// (As face-avatar's step_stay and apply_stay: landing on the
+			// idle's start as the move ends.)
+			if (!swapped && (u >= swap.at || u < 0)) {
+				const float length = m->animations[to].length;
+				rig.set_animation(to, u >= 0 ? swap.fade : 0.5f,
+						  length > 0 ? std::fmod(std::max(0.0f, u) - L + 10 * length, length)
+							     : 0);
+				swapped = true;
+			}
+			rig.pose(d);
+			const float y = move_of(rig.world()[body.p.hips]).y;
+			// Where its moves have it: up (or down) after the first second.
+			if (f * FRAME > 1.05f)
+				worst = std::max(worst, std::fabs(y - (going ? 1.0f : 2.0f)));
+			if (f)
+				most_step = std::max(most_step, std::fabs(y - last));
+			last = y;
+		}
+		std::printf(
+			"unit_model: riding %s: its hips at most %.4f m off where its moves have them, at most %.4f m a frame\n",
+			going ? "off" : "up", worst, most_step);
+		CHECK(swapped && worst < 0.001f);
+		CHECK(most_step < 0.03f); // (its moves' own: a metre in a second, eased)
+		CHECK(rig.animation() == to && !rig.animation_fading());
+	}
+}
+
 static void test_faces_on_cue()
 {
 	Person p = make_person(false);
@@ -5428,6 +5617,8 @@ int main()
 	test_a_size_switch();
 	test_shapes_a_move_plays();
 	test_a_move_holds_its_body();
+	test_cross_fades_let_go();
+	test_a_ride_lands_smoothly();
 	test_link_chain();
 	test_spots_on_a_vrm();
 	test_spots_on_two_characters();

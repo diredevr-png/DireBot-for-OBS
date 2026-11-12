@@ -89,10 +89,20 @@ bool builtin_arms(BuiltIn b);
 // How long it lasts (seconds).
 float builtin_length(BuiltIn b);
 // How long a move `length` seconds long eases in, and out at its end
-// (0.9.0: a move that ends in a new idle swaps it in as it starts easing
-// out, so it lands on it).
+// (0.9.0: a move that ends in a new idle has it swapped in under it, so
+// it lands on it: stay_swap).
 float move_ease_in(float length);
 float move_ease_out(float length);
+// After 0.10.0: a move that stays (a ride), `length` seconds long: its
+// idle is cross-faded in under it while the move shows whole - from `at`
+// seconds into it over `fade` (at most `most`), done as the move begins to
+// ease out - so the idle before it never shows through as the move eases
+// out over the new one. (0.9.0 cross-faded it in as the move eased out:
+// halfway, a quarter of the old idle showed.)
+struct StaySwap {
+	float at = 0, fade = 0;
+};
+StaySwap stay_swap(float length, float most);
 
 // What happens where a thing hits, besides the flash (0.9.0).
 enum class Effect { None, Splat, Feathers, Pieces };

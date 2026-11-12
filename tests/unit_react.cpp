@@ -1455,6 +1455,48 @@ static void test_effects()
 	}
 }
 
+// After 0.10.0: a move that stays (a ride) has its idle cross-faded in
+// under it while the move shows whole - done as the move begins to ease
+// out, so the idle before it never shows through the move easing out over
+// the new one. A short move: as long as it shows whole; none: at once.
+static void test_stay_swap()
+{
+	const ReactView view;
+	for (float L : {4.0f, 2.0f, 1.0f, 0.5f}) {
+		const StaySwap s = stay_swap(L, 0.5f);
+		CHECK(s.fade > 0 && s.fade <= 0.5f + 1e-6f);
+		CHECK(std::fabs(s.at + s.fade - (L - move_ease_out(L))) < 1e-5f);
+		CHECK(s.at >= move_ease_in(L) - 1e-5f);
+		// The move as React plays it shows whole all the while.
+		React r;
+		r.play(7, L);
+		float least = 1;
+		bool seen = false;
+		for (int f = 0; f * FRAME < L + 0.2f; f++)
+			for (const BodyMove &m : r.step(FRAME, view).body)
+				if (m.move == 7 && m.time >= s.at && m.time <= s.at + s.fade) {
+					least = std::min(least, m.amount);
+					seen = true;
+				}
+		CHECK(seen && least > 0.999f);
+	}
+	// A 4 s ride: in from 3.05 s over half a second (0.9.0: from 3.55 s
+	// over 0.45 s, as the move eased out).
+	const StaySwap ride = stay_swap(4, 0.5f);
+	CHECK(std::fabs(ride.at - 3.05f) < 1e-5f && std::fabs(ride.fade - 0.5f) < 1e-6f);
+	// Asked for less: less.
+	CHECK(std::fabs(stay_swap(4, 0.2f).fade - 0.2f) < 1e-6f && std::fabs(stay_swap(4, 0.2f).at - 3.35f) < 1e-5f);
+	// No time to: swapped at once as it begins to ease out. Odd numbers:
+	// at its start, at once.
+	CHECK(stay_swap(4, 0).fade == 0 && std::fabs(stay_swap(4, 0).at - 3.55f) < 1e-5f);
+	for (float odd :
+	     {0.0f, -3.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()}) {
+		const StaySwap s = stay_swap(odd, 0.5f);
+		CHECK(std::isfinite(s.at) && std::isfinite(s.fade) && s.fade >= 0 && s.at >= 0);
+	}
+	CHECK(stay_swap(4, std::numeric_limits<float>::quiet_NaN()).fade == 0);
+}
+
 int main()
 {
 	test_names();
@@ -1465,6 +1507,7 @@ int main()
 	test_sticks_and_bonks();
 	test_all_at_once();
 	test_effects();
+	test_stay_swap();
 	std::printf("unit_react: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;
 }

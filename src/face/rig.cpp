@@ -47,6 +47,13 @@ constexpr float PULLED_DRAG = 0.02f;
 // How far your eyes turn at their most (degrees), for a full look.
 constexpr float EYE_SIDEWAYS = 30, EYE_UPDOWN = 25;
 
+// What an animation's channel moves of its node (where it is, its turn,
+// size or shapes), as a bit (Rig::fade_keys_).
+uint8_t key_bit(AnimChannel::Path p)
+{
+	return (uint8_t)(1u << (unsigned)p);
+}
+
 float clamp01(float v)
 {
 	return std::min(1.0f, std::max(0.0f, v));
@@ -915,8 +922,10 @@ void Rig::curl_fingers(const Drive &d)
 {
 	const float c = clamp01(options_.fingers);
 	for (const Finger &f : fingers_) {
-		// One its own animation turns stays as the animation has it.
-		if (anim_turns_[f.node])
+		// One its own animation turns stays as the animation has it (as
+		// much as it does: part-way while it cross-fades).
+		const float loose = 1 - anim_turns_[f.node];
+		if (!(loose > 0))
 			continue;
 		// Relaxed (or as curled as asked)...
 		float angle = c > 0 ? std::max(0.0f, f.most * c - f.has) : 0.0f;
@@ -927,7 +936,7 @@ void Rig::curl_fingers(const Drive &d)
 			if (k > 0)
 				angle += (t.bend[f.digit][f.joint] - f.has - angle) * k;
 		}
-		angle *= 1 - moved_[f.node];
+		angle *= (1 - moved_[f.node]) * loose;
 		if (std::fabs(angle) > 1e-4f)
 			turn_in_rest(f.node, axis_angle(f.axis, angle));
 	}
@@ -1048,10 +1057,12 @@ void Rig::drive_arms(const Drive &d)
 		const ArmRest &ar = arm_rest_[side];
 		const ArmTarget &t = d.arms.side[side];
 		const int up = arm_bone_[side][0], hd = arm_bone_[side][2];
-		if (!ar.ok || !(t.weight > 0) || anim_turns_[up])
+		if (!ar.ok || !(t.weight > 0) || !(anim_turns_[up] < 1))
 			continue;
-		// (Less of it as its hand is on a keyboard, mouse or pad.)
-		const float amount = clamp01(t.weight) * (1 - moved_[up]) * (1 - clamp01(d.desk[side].weight));
+		// (Less of it as its hand is on a keyboard, mouse or pad, or its
+		// animation turns its arm.)
+		const float amount = clamp01(t.weight) * (1 - moved_[up]) * (1 - clamp01(d.desk[side].weight)) *
+				     (1 - anim_turns_[up]);
 		if (!(amount > 0))
 			continue;
 		V3 du = normalized(t.upper, ar.upper), df = normalized(t.fore, ar.fore);
@@ -1063,10 +1074,11 @@ void Rig::drive_arms(const Drive &d)
 		const int sh = shoulder_[side];
 		Quat lift{};
 		V3 shoulder_at = ar.shoulder;
-		if (ar.lifts && !anim_turns_[sh]) {
+		if (ar.lifts && anim_turns_[sh] < 1) {
 			constexpr float SHOULDER_SHARE = 1.0f / 3, SHOULDER_MOST = 25 * RAD;
 			const float above = std::asin(std::max(-1.0f, std::min(1.0f, du.y)));
-			const float angle = std::min(SHOULDER_MOST, std::max(0.0f, above) * SHOULDER_SHARE) * amount;
+			const float angle = std::min(SHOULDER_MOST, std::max(0.0f, above) * SHOULDER_SHARE) * amount *
+					    (1 - anim_turns_[sh]);
 			if (angle > 1e-4f) {
 				lift = axis_angle(ar.lift_axis, angle);
 				shoulder_at = ar.root + rotate(lift, ar.shoulder - ar.root);
@@ -1215,9 +1227,9 @@ void Rig::drive_desk(const Drive &d)
 		const DeskHand &t = d.desk[side];
 		const ArmRest &ar = arm_rest_[side];
 		const int up = arm_bone_[side][0], lo = arm_bone_[side][1], hd = arm_bone_[side][2];
-		if (!(t.weight > 0) || !ar.ok || up < 0 || lo < 0 || anim_turns_[up])
+		if (!(t.weight > 0) || !ar.ok || up < 0 || lo < 0 || !(anim_turns_[up] < 1))
 			continue;
-		const float amount = clamp01(t.weight) * (1 - cue_moved_[up]);
+		const float amount = clamp01(t.weight) * (1 - cue_moved_[up]) * (1 - anim_turns_[up]);
 		if (!(amount > 0) || !std::isfinite(t.wrist.x + t.wrist.y + t.wrist.z))
 			continue;
 		// Its shoulder as it is now (the facing model's way): where its
@@ -1292,9 +1304,9 @@ void Rig::drive_desk(const Drive &d)
 	// its own axis (find_fingers), as much as its hand's there.
 	for (const Finger &f : fingers_) {
 		const DeskHand &t = d.desk[f.side];
-		if (!(t.weight > 0) || anim_turns_[f.node])
+		if (!(t.weight > 0) || !(anim_turns_[f.node] < 1))
 			continue;
-		const float k = clamp01(t.weight) * (1 - cue_moved_[f.node]);
+		const float k = clamp01(t.weight) * (1 - cue_moved_[f.node]) * (1 - anim_turns_[f.node]);
 		const float bend = bends[f.side][f.digit][f.joint];
 		if (!(k > 0) || !std::isfinite(bend))
 			continue;
@@ -1326,7 +1338,7 @@ void Rig::reach_digit(const DeskHand &t, int side, int digit, float bend[3], flo
 		if (g.side == side && g.digit == digit && g.joint < 3)
 			f[g.joint] = &g;
 	int n = 0;
-	while (n < 3 && f[n] && !anim_turns_[f[n]->node] && (n == 0 || m.nodes[f[n]->node].parent == f[n - 1]->node))
+	while (n < 3 && f[n] && anim_turns_[f[n]->node] < 1 && (n == 0 || m.nodes[f[n]->node].parent == f[n - 1]->node))
 		n++;
 	if (n == 0 || m.nodes[f[0]->node].parent < 0)
 		return;
@@ -1901,6 +1913,15 @@ void Rig::set_animation(int which, float fade, float start)
 	fade_from_time_ = anim_time_;
 	fade_t_ = 0;
 	fade_length_ = fades ? std::min(fade, 10.0f) : 0;
+	// (What the new one moves of each node: what only the old one moves
+	// eases back to how it rests as it fades - not held, then let go of.)
+	if (fades) {
+		fade_keys_.assign(model_->nodes.size(), 0);
+		if (which >= 0)
+			for (const AnimChannel &c : model_->animations[which].channels)
+				if (c.node >= 0 && c.node < (int)fade_keys_.size())
+					fade_keys_[c.node] |= key_bit(c.path);
+	}
 	options_.animation = which;
 	anim_time_ = 0;
 	if (which >= 0 && std::isfinite(start) && start > 0) {
@@ -1910,14 +1931,18 @@ void Rig::set_animation(int which, float fade, float start)
 }
 
 // One of its own animations at `t` seconds over what its nodes have now, as
-// much as `amount` (1: just as it has them).
-void Rig::apply_animation(int which, float t, float amount)
+// much as `amount` (1: just as it has them) - a channel `shared` has too
+// (another animation's: key_bit by node) as much as `shared_amount`.
+void Rig::apply_animation(int which, float t, float amount, const std::vector<uint8_t> *shared, float shared_amount)
 {
 	const Animation &a = model_->animations[which];
-	const float k = clamp01(amount);
 	float v[4];
 	for (const AnimChannel &c : a.channels) {
 		if (c.node < 0 || c.node >= (int)r_.size())
+			continue;
+		const bool both = shared && c.node < (int)shared->size() && ((*shared)[c.node] & key_bit(c.path));
+		const float k = clamp01(both ? shared_amount : amount);
+		if (!(k > 0))
 			continue;
 		if (c.path == AnimChannel::Shapes) {
 			play_shapes(c, t, k);
@@ -1936,7 +1961,7 @@ void Rig::apply_animation(int which, float t, float amount)
 		} else {
 			const Quat to{v[0], v[1], v[2], v[3]};
 			r_[c.node] = k >= 1 ? to : normalized(slerp(r_[c.node], normalized(to), k));
-			anim_turns_[c.node] = 1;
+			anim_turns_[c.node] = 1 - (1 - anim_turns_[c.node]) * (1 - k);
 		}
 	}
 }
@@ -1968,9 +1993,11 @@ void Rig::animate(float dt)
 		} else {
 			const float u = clamp01(fade_t_ / std::max(1e-4f, fade_length_));
 			into = u * u * (3 - 2 * u);
-			// The old one as it has them, then the new one over it - or, the
-			// new one none, the old one easing back to how it rests.
-			apply_animation(fade_from_, fade_from_time_, now >= 0 ? 1.0f : 1 - into);
+			// The old one as it has them where the new one moves them too,
+			// the new one over it below. Where the new one doesn't (or
+			// it's none), the old one easing back to how they rest as it
+			// fades - not held as it was, then let go of at the end.
+			apply_animation(fade_from_, fade_from_time_, 1 - into, now >= 0 ? &fade_keys_ : nullptr, 1.0f);
 			if (m.animations[fade_from_].hold_torso)
 				held = 1 - into;
 		}
@@ -2074,12 +2101,13 @@ void Rig::drive_head(const Drive &d)
 	const int chest_top = head_ >= 0 && !torso_.empty() ? torso_.back() : -1;
 	for (int side = 0; side < 2 && breath > 0; side++) {
 		const int sh = shoulder_[side], arm = upper_arm_[side];
-		if (arm < 0 || anim_turns_[arm])
+		if (arm < 0 || !(anim_turns_[arm] < 1))
 			continue;
-		// (Less of it as a move holds the arm.)
-		const float k = 1 - moved_[arm];
-		if (sh >= 0 && !anim_turns_[sh] && model_->nodes[arm].parent == sh) {
-			const Quat shrug = own(axis_angle({0, 0, 1}, (side ? -3.0f : 3.0f) * RAD * breath * k));
+		// (Less of it as a move holds the arm, or its animation turns it.)
+		const float k = (1 - moved_[arm]) * (1 - anim_turns_[arm]);
+		if (sh >= 0 && anim_turns_[sh] < 1 && model_->nodes[arm].parent == sh) {
+			const Quat shrug = own(axis_angle({0, 0, 1}, (side ? -3.0f : 3.0f) * RAD * breath * k *
+									     (1 - anim_turns_[sh])));
 			turn_in_rest(sh, shrug);
 			turn_in_rest(arm, conj(shrug));
 		}
@@ -2090,10 +2118,11 @@ void Rig::drive_head(const Drive &d)
 			turn_in_rest(arm, slerp(Quat{}, conj(lean), k));
 	}
 	// (Arms its animation turns are where it has them, down or not; a move
-	// holding them, as much as it does.)
+	// holding them, as much as it does - and its animation, cross-fading,
+	// as much as it does.)
 	for (const Arm &a : arms_)
-		if (!anim_turns_[a.node])
-			turn_in_rest(a.node, slerp(Quat{}, a.turn, 1 - moved_[a.node]));
+		if (anim_turns_[a.node] < 1)
+			turn_in_rest(a.node, slerp(Quat{}, a.turn, (1 - moved_[a.node]) * (1 - anim_turns_[a.node])));
 	if (head_ < 0)
 		return;
 	// Its body: some of your head's turn, its own slow sway, and a breath

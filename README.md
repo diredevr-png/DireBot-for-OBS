@@ -607,6 +607,16 @@ lets go as it fades) and for a VRM animation file's. A move that isn't
 marked never lets go of one that is: a wave while it rides keeps it held.
 Not marked, its body follows, sways and breathes as before.
 
+**Smoother into and out of a move that stays (after 0.10.0, not released
+yet).** Its idle now cross-fades in under its move while the move still
+plays in full, and is all there before the move eases out, so riding up
+onto a mount lands on the mount instead of dipping back towards standing
+(0.9.0: a quarter of the way, halfway through), and riding off lands on
+the ground instead of sliding back up and dropping at the end. Any
+cross-fade between two of a character's own animations now eases what
+only the old one moves back to how the character rests (its arms down by
+its side), instead of holding it to the end and letting go at once.
+
 **Glowing parts: fire, sparks and smoke (0.9.0).** A see-through part
 (glTF's `BLEND`) whose material has `"extras": {"direbot": {"glow":
 {"soft": 1.5, "ragged": 0}}}` is drawn as a soft glowing gas - a

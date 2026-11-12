@@ -478,17 +478,25 @@ private:
 	bool auto_chain_ = false;
 	bool settled_ = true;
 	float spring_time_ = 0;
-	float anim_time_ = 0;          // seconds into its animation
-	std::vector<char> anim_turns_; // a node its animation turns
-	float torso_held_ = 0;         // its body held still (torso_held)
+	float anim_time_ = 0; // seconds into its animation
+	// How much its animation turns each node (0 to 1: part-way while one
+	// cross-fades to another): what the rig itself does to it (arms down,
+	// fingers relaxed, a breath's shrug) is that much less.
+	std::vector<float> anim_turns_;
+	float torso_held_ = 0; // its body held still (torso_held)
 	// 0.9.0: the animation it's fading from (-1: none), how far into it,
-	// and how far into the fade (seconds, of `fade_length_`).
+	// and how far into the fade (seconds, of `fade_length_`). After
+	// 0.10.0: what the one it's fading to moves of each node (fade_keys_:
+	// a bit for each of its channels' paths, rig.cpp's key_bit) - what only
+	// the old one moves eases back to how it rests as the old one fades.
 	int fade_from_ = -1;
 	float fade_from_time_ = 0, fade_t_ = 0, fade_length_ = 0;
+	std::vector<uint8_t> fade_keys_;
 	// Each part's joints (its skin's numbers) that move any of its points,
 	// for one whose bones are all shrunk away (Part::hidden).
 	std::vector<std::vector<uint16_t>> part_joints_;
-	void apply_animation(int which, float t, float amount);
+	void apply_animation(int which, float t, float amount, const std::vector<uint8_t> *shared = nullptr,
+			     float shared_amount = 1);
 	// How much a body move holds each node this frame (0 to 1): what the
 	// rig itself does to it (arms down, fingers relaxed) is that much less.
 	std::vector<float> moved_;

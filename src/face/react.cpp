@@ -187,6 +187,16 @@ float move_ease_out(float length)
 	return std::max(1e-4f, std::min(0.45f, length * 0.45f));
 }
 
+StaySwap stay_swap(float length, float most)
+{
+	StaySwap s;
+	const float L = std::isfinite(length) ? std::max(0.0f, length) : 0.0f;
+	const float whole = L - move_ease_in(L) - move_ease_out(L);
+	s.fade = std::max(0.0f, std::min(std::isfinite(most) ? most : 0.0f, whole));
+	s.at = std::max(0.0f, L - move_ease_out(L) - s.fade);
+	return s;
+}
+
 const char *builtin_name(BuiltIn b)
 {
 	switch (b) {

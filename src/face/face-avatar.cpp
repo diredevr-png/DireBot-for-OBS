@@ -149,8 +149,10 @@ constexpr float TURN_PAD = 0.08f, FLAT_MOST = 2048;
 constexpr float WORN_HOLD = 1.0f, WORN_FADE = 0.5f;
 // 0.9.0: a move that stays (a ride...) that can't land exactly where its
 // idle starts (none, or cut short): its idle cross-fades in over this
-// long (seconds). And the camera views a companion and a move that stay
-// glide to, as view_shown has them (the chosen one's number, or -1).
+// long (seconds) - and, after 0.10.0, one that can: at most this long,
+// under the move while it shows whole (react.hpp's stay_swap). And the
+// camera views a companion and a move that stay glide to, as view_shown
+// has them (the chosen one's number, or -1).
 constexpr float STAY_FADE = 0.5f;
 constexpr int VIEW_COMPANION = -2, VIEW_STAY = -3;
 
@@ -2788,8 +2790,9 @@ struct FaceAvatar {
 		st.pat = companion_pat >= 0 ? m.nodes[companion_pat].name : "";
 	}
 
-	// 0.9.0: a move that stays, its idle swapped in where its move begins
-	// to ease out - timed so its loop starts as the move ends - or its own
+	// 0.9.0: a move that stays, its idle swapped in under its move (after
+	// 0.10.0: cross-faded in while the move shows whole, done as it begins
+	// to ease out) - timed so its loop starts as the move ends - or its own
 	// back as the move back ends (graphics thread, pictures_lock held, the
 	// rig there).
 	void apply_stay()
@@ -4743,9 +4746,10 @@ struct FaceAvatar {
 	}
 
 	// 0.9.0: a move that stays, on from where it was: its move's time as
-	// React plays it, and its idle (or its own back) due where the move
-	// begins to ease out - at once if the move's gone (cut short by
-	// another, stopped) or there's none (graphics thread).
+	// React plays it, and its idle (or its own back) due under the move
+	// (stay_swap: cross-faded in while the move shows whole) - at once if
+	// the move's gone (cut short by another, stopped) or there's none
+	// (graphics thread).
 	void step_stay(float dt)
 	{
 		if (stay_due)
@@ -4760,8 +4764,10 @@ struct FaceAvatar {
 				t = bm.time;
 				amount = bm.amount;
 			}
-		const float ease = move_ease_out(stay_job.length);
-		const float from = stay_job.length - ease;
+		// (Its idle cross-faded in under it while the move shows whole,
+		// done as the move begins to ease out.)
+		const StaySwap swap = stay_swap(stay_job.length, STAY_FADE);
+		const float from = swap.at;
 		// Cut short by another move (easing out before its time): its idle
 		// comes in under that one now.
 		const bool cut = found && t > move_ease_in(stay_job.length) && amount < stay_amount - 1e-4f;
@@ -4777,9 +4783,9 @@ struct FaceAvatar {
 		// Landing on its idle's start as the move ends - unless the move
 		// isn't there to cover it: a cross-fade then.
 		stay_aligned = found;
-		stay_ease = ease;
+		stay_ease = stay_job.length - from;
 		stay_offset = found ? t - from : 0;
-		stay_fade = found ? ease : STAY_FADE;
+		stay_fade = found ? swap.fade : STAY_FADE;
 	}
 
 	void tick(float dt)
