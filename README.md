@@ -96,10 +96,11 @@ the character shows its own drawn eyes and mouth. Optional pictures for
 turned left and turned right, and outfit layers in front of or behind the
 character. Or a **3D character** instead of the pictures: a `.glb`/`.gltf`
 (Blender and most 3D tools) or `.vrm` (VRoid Studio, VRM 0.x and 1.0),
-read by our own code (`src/face/model.cpp`) and drawn with OBS's own
-graphics: lit glossy, as a cartoon (VRM's MToon, with its outlines) or
-flat, see-through round it. It turns and nods with you (a VRM's neck and
-head bones, or the whole of it round its head), makes your 52 expressions
+read by our own code (`src/face/model.cpp`; files up to 1 GB, 0.10.2:
+512 MB before) and drawn with OBS's own graphics: lit glossy, as a
+cartoon (VRM's MToon, with its outlines) or flat, see-through round it.
+It turns and nods with you (a VRM's neck and head bones, or the whole of
+it round its head), makes your 52 expressions
 (parts named as Apple's ARKit names them, or VRM's expressions worked out
 from yours), looks where you look, and its swinging parts swing: VRM's
 spring bones, or any bones that hang free (a chain of links, a doll's

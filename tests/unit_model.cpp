@@ -314,6 +314,96 @@ static void test_files_named_in_other_letters()
 	std::filesystem::remove_all(folder, ec);
 }
 
+// 0.10.2: a file up to 1 GB opens (a character riding its mount, with its
+// hair strands and moves, runs to about 700 MB; 512 MB was the most
+// before), its numbers read even from past the first 512 MB of it, and the
+// same as from the same file in memory. One over 1 GB is refused with
+// words before a byte of it is read. (Both files are sparse: no disk.)
+static void test_big_files()
+{
+	std::error_code ec;
+	const auto folder = std::filesystem::temp_directory_path() / ("direbot-big-" + std::to_string(std::random_device{}()));
+	std::filesystem::create_directories(folder, ec);
+	CHECK(!ec);
+	const std::string big = folder.u8string() + "/riding.glb", huge = folder.u8string() + "/huge.glb";
+	// A cube whose numbers sit after 600 MB of nothing in its file's data.
+	const size_t gap = (size_t)600 << 20;
+	Builder b;
+	std::vector<V3> pos;
+	std::vector<uint16_t> ix;
+	cube(pos, ix, {0, 1, 0});
+	b.doc["meshes"].push_back(
+		{{"primitives", {{{"attributes", {{"POSITION", b.vec3s(pos)}}}, {"indices", b.indices(ix)}}}}});
+	b.node({{"mesh", 0}, {"name", "far in"}});
+	const std::vector<uint8_t> small = b.glb();
+	Model near_m;
+	std::string why;
+	CHECK(load(small, near_m, &why));
+	json doc = b.doc;
+	for (json &v : doc["bufferViews"])
+		v["byteOffset"] = v["byteOffset"].get<size_t>() + gap;
+	doc["buffers"] = json::array({{{"byteLength", gap + b.bin.size()}}});
+	doc["scenes"] = json::array({{{"nodes", {0}}}});
+	std::string text = doc.dump();
+	while (text.size() % 4)
+		text.push_back(' ');
+	std::vector<uint8_t> data = b.bin;
+	while (data.size() % 4)
+		data.push_back(0);
+	{
+		std::ofstream f(utf8_path(big), std::ios::binary | std::ios::trunc);
+		auto put = [&f](uint32_t v) {
+			for (int i = 0; i < 4; i++)
+				f.put((char)(uint8_t)(v >> (8 * i)));
+		};
+		f.write("glTF", 4);
+		put(2);
+		put((uint32_t)(28 + text.size() + gap + data.size()));
+		put((uint32_t)text.size());
+		put(0x4E4F534A);
+		f.write(text.data(), (std::streamsize)text.size());
+		put((uint32_t)(gap + data.size()));
+		put(0x004E4942);
+		f.seekp((std::streamoff)gap, std::ios::cur);
+		f.write(reinterpret_cast<const char *>(data.data()), (std::streamsize)data.size());
+		CHECK((bool)f);
+	}
+	CHECK(std::filesystem::file_size(big, ec) > (size_t)512 << 20);
+	{
+		Model m;
+		CHECK(load_model(big, m, &why));
+		CHECK(m.points == near_m.points && m.points == 8);
+		const bool one = m.meshes.size() == 1 && near_m.meshes.size() == 1 && m.meshes[0].parts.size() == 1 &&
+				 near_m.meshes[0].parts.size() == 1;
+		CHECK(one);
+		if (one) {
+			const Primitive &far_p = m.meshes[0].parts[0], &near_p = near_m.meshes[0].parts[0];
+			bool same = far_p.pos.size() == near_p.pos.size() && far_p.pos.size() == 8;
+			for (size_t i = 0; same && i < far_p.pos.size(); i++)
+				same = near3(far_p.pos[i], near_p.pos[i], 0);
+			CHECK(same);
+			CHECK(far_p.index == near_p.index && far_p.index.size() == 36);
+		}
+		CHECK(near3(m.low, {-0.5f, 0.5f, -0.5f}, 1e-6f) && near3(m.high, {0.5f, 1.5f, 0.5f}, 1e-6f));
+	}
+	{
+		std::ofstream f(utf8_path(huge), std::ios::binary | std::ios::trunc);
+		f.write(reinterpret_cast<const char *>(small.data()), (std::streamsize)small.size());
+		f.seekp((std::streamoff)((size_t)1 << 30) - (std::streamoff)small.size(), std::ios::cur);
+		f.put(0);
+		CHECK((bool)f);
+	}
+	CHECK(std::filesystem::file_size(huge, ec) == ((size_t)1 << 30) + 1);
+	Model refused;
+	why.clear();
+	CHECK(!load_model(huge, refused, &why));
+	CHECK(why.find("over 1 GB") != std::string::npos);
+	Motion mo;
+	why.clear();
+	CHECK(!load_motion(huge, mo, &why) && why.find("over 1 GB") != std::string::npos);
+	std::filesystem::remove_all(folder, ec);
+}
+
 // Broken and hostile files fail with words, never a crash.
 static void test_broken()
 {
@@ -5769,6 +5859,7 @@ int main()
 	test_write_and_read();
 	test_storage();
 	test_files_named_in_other_letters();
+	test_big_files();
 	test_broken();
 	test_vrm1_reading();
 	test_vrm0_reading();

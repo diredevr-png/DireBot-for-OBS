@@ -38,8 +38,11 @@ namespace {
 
 using json = nlohmann::json;
 
-// The most a file may hold, so a hostile one can't use up the PC.
-constexpr size_t MOST_FILE = 512u << 20;
+// The most a file may hold, so a hostile one can't use up the PC. (A
+// character riding a mount, with strand hair, moves and its mount in it,
+// runs to about 700 MB; 0.10.2 took this up from 512 MB.)
+constexpr size_t MOST_FILE = (size_t)1 << 30;
+const char *const CANT_OPEN = "DireBot can't open the file (or it's over 1 GB)";
 constexpr size_t MOST_POINTS = 4'000'000;
 constexpr size_t MOST_INDEX = 24'000'000;
 // Hair strands: the most points a file's strands may have, all its strand
@@ -2936,10 +2939,12 @@ uint32_t u32(const uint8_t *p)
 	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
-// A .glb's description and data, or a .gltf's description.
-void open_file(const uint8_t *bytes, size_t size, json &doc, std::vector<uint8_t> &bin, bool &glb)
+// A .glb's description, and where in it its data is (`bin_at`, `bin_len`;
+// none: both 0), or a .gltf's description.
+void open_file(const uint8_t *bytes, size_t size, json &doc, size_t &bin_at, size_t &bin_len, bool &glb)
 {
 	glb = false;
+	bin_at = bin_len = 0;
 	if (size >= 12 && std::memcmp(bytes, "glTF", 4) == 0) {
 		glb = true;
 		const uint32_t version = u32(bytes + 4), total = u32(bytes + 8);
@@ -2956,8 +2961,9 @@ void open_file(const uint8_t *bytes, size_t size, json &doc, std::vector<uint8_t
 			if (type == 0x4E4F534A && !have_json) {
 				doc = json::parse(bytes + at, bytes + at + len, nullptr, false);
 				have_json = true;
-			} else if (type == 0x004E4942 && bin.empty()) {
-				bin.assign(bytes + at, bytes + at + len);
+			} else if (type == 0x004E4942 && !bin_len) {
+				bin_at = at;
+				bin_len = len;
 			}
 			at += (len + 3) & ~3u;
 		}
@@ -2966,6 +2972,20 @@ void open_file(const uint8_t *bytes, size_t size, json &doc, std::vector<uint8_t
 	} else {
 		doc = json::parse(bytes, bytes + size, nullptr, false);
 	}
+}
+
+// A .glb's data, out of the file's bytes: copied, or - when the file's
+// bytes are `owned` (read from disk) - the bytes themselves, moved down
+// over its description, so a file that may be a gigabyte is never held
+// twice while it's read.
+std::vector<uint8_t> take_bin(const uint8_t *bytes, size_t at, size_t len, std::vector<uint8_t> *owned)
+{
+	if (!owned)
+		return std::vector<uint8_t>(bytes + at, bytes + at + len);
+	if (len && at)
+		std::memmove(owned->data(), owned->data() + at, len);
+	owned->resize(len);
+	return std::move(*owned);
 }
 
 // The VRM humanoid's bones, each with the one it hangs from (VRM 1.0).
@@ -3168,20 +3188,22 @@ const char *humanoid_parent(const std::string &bone)
 	return nullptr;
 }
 
-bool load_motion(const uint8_t *bytes, size_t size, const std::string &folder, Motion &out, std::string *problem)
+// (`owned`: the file's bytes, read from disk, theirs to take.)
+static bool read_motion(const uint8_t *bytes, size_t size, std::vector<uint8_t> *owned, const std::string &folder,
+			Motion &out, std::string *problem)
 {
 	out = Motion();
 	try {
 		json doc;
-		std::vector<uint8_t> bin;
+		size_t bin_at = 0, bin_len = 0;
 		bool glb = false;
-		open_file(bytes, size, doc, bin, glb);
+		open_file(bytes, size, doc, bin_at, bin_len, glb);
 		if (doc.is_discarded() || !doc.is_object())
 			fail("it isn't a VRM animation (.vrma) file");
 		Reader rd(doc);
 		rd.folder = folder;
 		rd.glb = glb;
-		rd.bin = std::move(bin);
+		rd.bin = take_bin(bytes, bin_at, bin_len, owned);
 		load_motion_json(rd, doc, out);
 		return true;
 	} catch (const Fail &f) {
@@ -3198,17 +3220,22 @@ bool load_motion(const uint8_t *bytes, size_t size, const std::string &folder, M
 	return false;
 }
 
+bool load_motion(const uint8_t *bytes, size_t size, const std::string &folder, Motion &out, std::string *problem)
+{
+	return read_motion(bytes, size, nullptr, folder, out, problem);
+}
+
 bool load_motion(const std::string &path, Motion &out, std::string *problem)
 {
 	std::vector<uint8_t> bytes;
 	if (!read_file(path, bytes)) {
 		if (problem)
-			*problem = "DireBot can't open the file (or it's over 512 MB)";
+			*problem = CANT_OPEN;
 		return false;
 	}
 	const size_t slash = path.find_last_of("/\\");
 	const std::string folder = slash == std::string::npos ? "." : path.substr(0, slash);
-	return load_motion(bytes.data(), bytes.size(), folder, out, problem);
+	return read_motion(bytes.data(), bytes.size(), &bytes, folder, out, problem);
 }
 
 std::vector<bool> skin_materials(const Model &m, const std::string &names)
@@ -3434,21 +3461,22 @@ uint32_t Strands::pieces_of(size_t run, size_t count) const
 	return both[0].count + both[1].count;
 }
 
-bool load_model(const uint8_t *bytes, size_t size, const std::string &folder, Model &out, std::string *problem,
-		const LoadOptions &options)
+// (`owned`: the file's bytes, read from disk, theirs to take.)
+static bool read_model(const uint8_t *bytes, size_t size, std::vector<uint8_t> *owned, const std::string &folder,
+		       Model &out, std::string *problem, const LoadOptions &options)
 {
 	out = Model();
 	try {
 		json doc;
-		std::vector<uint8_t> bin;
+		size_t bin_at = 0, bin_len = 0;
 		bool glb = false;
-		open_file(bytes, size, doc, bin, glb);
+		open_file(bytes, size, doc, bin_at, bin_len, glb);
 		if (doc.is_discarded() || !doc.is_object())
 			fail("it isn't a 3D model DireBot can read (.glb, .gltf or .vrm)");
 		Reader rd(doc);
 		rd.folder = folder;
 		rd.glb = glb;
-		rd.bin = std::move(bin);
+		rd.bin = take_bin(bytes, bin_at, bin_len, owned);
 		load_json(rd, doc, out, options);
 		return true;
 	} catch (const Fail &f) {
@@ -3465,17 +3493,23 @@ bool load_model(const uint8_t *bytes, size_t size, const std::string &folder, Mo
 	return false;
 }
 
+bool load_model(const uint8_t *bytes, size_t size, const std::string &folder, Model &out, std::string *problem,
+		const LoadOptions &options)
+{
+	return read_model(bytes, size, nullptr, folder, out, problem, options);
+}
+
 bool load_model(const std::string &path, Model &out, std::string *problem, const LoadOptions &options)
 {
 	std::vector<uint8_t> bytes;
 	if (!read_file(path, bytes)) {
 		if (problem)
-			*problem = "DireBot can't open the file (or it's over 512 MB)";
+			*problem = CANT_OPEN;
 		return false;
 	}
 	const size_t slash = path.find_last_of("/\\");
 	const std::string folder = slash == std::string::npos ? "." : path.substr(0, slash);
-	return load_model(bytes.data(), bytes.size(), folder, out, problem, options);
+	return read_model(bytes.data(), bytes.size(), &bytes, folder, out, problem, options);
 }
 
 void sample(const AnimChannel &c, float t, float *out)

@@ -887,6 +887,87 @@ def test_3d_characters(run):
         c.disconnect()
 
 
+def spread_glb(path, out, gap):
+    """`path`'s .glb again as `out`, its data after `gap` bytes of nothing
+    (a sparse file: no disk), so the file is that much bigger and its
+    numbers are read from past them."""
+    with open(path, "rb") as f:
+        f.seek(12)
+        n, _ = struct.unpack("<II", f.read(8))
+        doc = json.loads(f.read(n))
+        m, _ = struct.unpack("<II", f.read(8))
+        blob = f.read(m)
+    for v in doc["bufferViews"]:
+        v["byteOffset"] = v.get("byteOffset", 0) + gap
+    doc["buffers"][0]["byteLength"] += gap
+    text = json.dumps(doc).encode()
+    text += b" " * (-len(text) % 4)
+    with open(out, "wb") as f:
+        f.write(struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(text) + 8 + gap + len(blob)))
+        f.write(struct.pack("<II", len(text), 0x4E4F534A) + text)
+        f.write(struct.pack("<II", gap + len(blob), 0x004E4942))
+        f.seek(gap, 1)
+        f.write(blob)
+
+
+def test_3d_characters_up_to_1_gb(run):
+    """0.10.2: a character's file up to 1 GB opens (one riding its mount,
+    with its hair strands and moves, runs to about 700 MB; 512 MB was the
+    most before) and shows as the same file small does; one over 1 GB
+    says so in plain words and draws nothing."""
+    ball = os.path.join(run.home, "ball.glb")
+    ball_character(ball)
+    big = os.path.join(run.home, "ball-big.glb")
+    spread_glb(ball, big, 600 << 20)
+    huge = os.path.join(run.home, "ball-huge.glb")
+    with open(huge, "wb") as f:
+        with open(ball, "rb") as small:
+            f.write(small.read())
+        f.truncate((1 << 30) + 1)
+    assert os.path.getsize(big) > 512 << 20 and os.path.getsize(huge) == (1 << 30) + 1
+    common = {"width": 200, "height": 200, "size": 100, "mirror": False, **STILL}
+    avatars = {"3D small": ball, "3D big": big, "3D huge": huge}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "Big files"})
+        for name, path in avatars.items():
+            send(c, "CreateInput", {"sceneName": "Big files", "inputName": name,
+                                    "inputKind": "direbot_face_avatar",
+                                    "inputSettings": {**common, "model": path}})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Big files"})
+
+        def st(name):
+            return vendor(c, "FaceGetState", {"source": name})["model"]
+        for name in ("3D small", "3D big"):
+            assert wait_for(lambda: st(name)["shown"], 60, 0.2), st(name)
+        for name in ("3D small", "3D big"):
+            assert wait_for(lambda: st(name)["cards"] == 3, 10, 0.1), st(name)
+        small_m, big_m = st("3D small"), st("3D big")
+        assert big_m["loaded"] and "problem" not in big_m, big_m
+        for key in ("points", "triangles", "cards"):
+            assert big_m[key] == small_m[key], (key, big_m[key], small_m[key])
+        assert wait_for(lambda: st("3D huge").get("problem"), 30, 0.1), st("3D huge")
+        h = st("3D huge")
+        assert "over 1 GB" in h["problem"] and not h["loaded"] and not h["shown"], h
+        # Drawn as the small one is: an orange ball, see-through round it.
+        time.sleep(0.5)
+        for name in ("3D small", "3D big"):
+            rows = screenshot(c, name)
+            mid = rows[120][100]
+            assert mid[0] > 150 and mid[0] > mid[1] > mid[2], (name, mid)
+            assert rows[3][3] == (0, 0, 0), (name, rows[3][3])
+        for name in avatars:
+            send(c, "RemoveInput", {"inputName": name})
+        send(c, "RemoveScene", {"sceneName": "Big files"})
+    finally:
+        c.disconnect()
+        for path in (big, huge):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 def hull_character(path, two_sided=False, mirrored=False):
     """An orange ball in a dark shell a little bigger, the shell turned
     inside out (its triangles' fronts in): a hand-made outline, an
