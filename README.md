@@ -384,8 +384,8 @@ has been quiet a second). Each part as you pick:
 Unity is left-handed (x its right, y up, z its front): a place
 (x, y, z) is ours (-x, y, z) and a turn (x, y, z, w) ours (x, -y, -z, w).
 `vmc_mirror` swaps its left and right (for an app that doesn't mirror
-you). A move on cue still takes the bones it moves (after 0.10.0, not
-released yet: and so does the idle a move that stays plays, as it shows -
+you). A move on cue still takes the bones it moves (0.10.1: and so
+does the idle a move that stays plays, as it shows -
 riding a mount, its hands stay on their holds and its hips on the mount,
 the app's body easing back in as it gets off; your head from a camera is
 turned against the app's chest only as far as its chest is the app's,
@@ -595,8 +595,8 @@ strands in the mesh follow (their own targets, as with expressions).
 Not marked, such tracks aren't read, as before: a face's shapes are
 moved by your face.
 
-**A body held still while a move plays (after 0.10.0, not released
-yet).** A 3D character's spine and chest take some of your head's turn
+**A body held still while a move plays (0.10.1).** A 3D character's
+spine and chest take some of your head's turn
 (`body_follow`), its own slow sway and each breath's lean and rise - on
 top of whatever a move does with them, so a hand the move puts on
 something (holding on as it rides a mount, a hand on a sword's hilt)
@@ -612,8 +612,8 @@ lets go as it fades) and for a VRM animation file's. A move that isn't
 marked never lets go of one that is: a wave while it rides keeps it held.
 Not marked, its body follows, sways and breathes as before.
 
-**Smoother into and out of a move that stays (after 0.10.0, not released
-yet).** Its idle now cross-fades in under its move while the move still
+**Smoother into and out of a move that stays (0.10.1).** Its idle now
+cross-fades in under its move while the move still
 plays in full, and is all there before the move eases out, so riding up
 onto a mount lands on the mount instead of dipping back towards standing
 (0.9.0: a quarter of the way, halfway through), and riding off lands on

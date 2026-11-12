@@ -9,7 +9,7 @@ settings folder and C:\\ProgramData\\obs-studio\\plugins):
 
     set CI=true
     set DIREBOT_OBS_ROOT=C:\\obs-33.0.1          (OBS's Windows zip, unpacked)
-    set DIREBOT_OBS_ZIP=release\\direbot-for-obs-0.10.0-windows-x64.zip
+    set DIREBOT_OBS_ZIP=release\\direbot-for-obs-0.10.1-windows-x64.zip
     set DIREBOT_OBS_LAYOUT=new                    (new: OBS 33+, legacy: bin\\64bit)
     set DIREBOT_OBS_EXPECT=33.0.1
     python -m pytest tests/test_real_windows.py
