@@ -1819,15 +1819,25 @@ void Rig::play_moves(const Drive &d)
 		const float a = clamp01(mv.amount);
 		if (!(a > 0) || !std::isfinite(mv.time))
 			continue;
+		bool holds = false;
 		if (mv.motion) {
-			if (plays_motions())
+			if (plays_motions()) {
 				play_motion(*mv.motion, mv.time, a);
+				holds = mv.motion->hold_torso;
+			}
 		} else if (mv.animation >= 0) {
-			if (mv.animation < (int)model_->animations.size())
+			if (mv.animation < (int)model_->animations.size()) {
 				play_own(mv.animation, mv.time, a);
+				holds = model_->animations[mv.animation].hold_torso;
+			}
 		} else if (builtin_arms(mv.builtin)) {
 			play_builtin(mv.builtin, mv.time, a);
 		}
+		// One that holds its body still, as much as it shows - over what
+		// holds it already (its idle, another move). One that doesn't
+		// leaves that as it is: a wave while it rides keeps it held.
+		if (holds)
+			torso_held_ = 1 - (1 - torso_held_) * (1 - a);
 	}
 }
 
@@ -1944,6 +1954,10 @@ void Rig::animate(float dt)
 	if (now >= 0 && m.animations[now].length > 0)
 		anim_time_ = std::fmod(anim_time_ + step, m.animations[now].length);
 	float into = 1;
+	// Its body held still as much as an animation that holds it shows:
+	// the old one's share of it as it fades out, the new one's as it
+	// fades in.
+	float held = 0;
 	if (fade_from_ >= 0 && fade_from_ < (int)m.animations.size()) {
 		fade_t_ += step;
 		const float length = m.animations[fade_from_].length;
@@ -1957,12 +1971,18 @@ void Rig::animate(float dt)
 			// The old one as it has them, then the new one over it - or, the
 			// new one none, the old one easing back to how it rests.
 			apply_animation(fade_from_, fade_from_time_, now >= 0 ? 1.0f : 1 - into);
+			if (m.animations[fade_from_].hold_torso)
+				held = 1 - into;
 		}
 	} else {
 		fade_from_ = -1;
 	}
-	if (now >= 0)
+	if (now >= 0) {
 		apply_animation(now, anim_time_, fade_from_ >= 0 ? into : 1.0f);
+		if (m.animations[now].hold_torso)
+			held += fade_from_ >= 0 ? into : 1.0f;
+	}
+	torso_held_ = clamp01(held);
 }
 
 // A node's place in the world from its parent's (or the root), and all
@@ -2044,7 +2064,13 @@ void Rig::drive_head(const Drive &d)
 	// did, not swung out or forward: they're turned back by as much. Not
 	// a side its animation moves.
 	const float breath = clamp01(d.breath);
-	const Quat lean = own(axis_angle({1, 0, 0}, -2.0f * RAD * breath));
+	// (Its body held still by a move - Animation::hold_torso, as much as
+	// it shows: none of your head's turn, its sway or its breath's lean
+	// and rise on its spine and chest, so what its hands hold stays put.
+	// Its shoulders' shrug is the arms' as ever: none on an arm a move
+	// holds.)
+	const float unheld = 1 - clamp01(torso_held_);
+	const Quat lean = own(axis_angle({1, 0, 0}, -2.0f * RAD * breath * unheld));
 	const int chest_top = head_ >= 0 && !torso_.empty() ? torso_.back() : -1;
 	for (int side = 0; side < 2 && breath > 0; side++) {
 		const int sh = shoulder_[side], arm = upper_arm_[side];
@@ -2075,8 +2101,8 @@ void Rig::drive_head(const Drive &d)
 	// take the rest, so the head still turns just as yours.
 	Quat torso;
 	if (!torso_.empty()) {
-		// (Less of both as its body is another tracker app's.)
-		const float ours = 1 - app_body;
+		// (Less of both as its body is another tracker app's, or held.)
+		const float ours = (1 - app_body) * unheld;
 		const Quat follow = slerp(Quat{}, R, clamp01(d.body_follow) * 0.4f * ours);
 		const Quat sway = own(axis_angle({0, 1, 0}, d.body_yaw * RAD * ours) *
 				      axis_angle({0, 0, 1}, d.body_roll * RAD * ours));
@@ -2101,7 +2127,8 @@ void Rig::drive_head(const Drive &d)
 		// person), in its parent's own terms.
 		const int top = torso_.back(), under = model_->nodes[top].parent;
 		if (under >= 0)
-			t_[top] = t_[top] + direction(inverse(rest_world_[under]), {0, 0.004f * height_ * breath, 0});
+			t_[top] = t_[top] +
+				  direction(inverse(rest_world_[under]), {0, 0.004f * height_ * breath * unheld, 0});
 	}
 	const Quat rest_of = conj(torso) * R;
 	if (neck_ >= 0 && neck_ != head_) {

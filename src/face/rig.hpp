@@ -23,8 +23,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //     like a long thin one - the whole of it turns round its head.
 //   - Its body (a VRM's spine and chest): some of your head's turn and
 //     its own slow sway, its chest and shoulders rising with each breath
-//     (alive.hpp); a character with no head bone grows a touch with each
-//     breath instead. Its fingers rest relaxed (or as curled as asked).
+//     (alive.hpp) - held still instead while a move whose file asks for
+//     it plays (Animation::hold_torso); a character with no head bone
+//     grows a touch with each breath instead. Its fingers rest relaxed
+//     (or as curled as asked).
 //   - Your 52 expressions (through your face's tuning, alive.hpp): parts
 //     named as Apple's ARKit names them ("jawOpen", "eyeBlinkLeft"...)
 //     follow yours as they are; VRM's
@@ -319,6 +321,12 @@ public:
 	// bones, sleeves...).
 	int following_bones() const { return (int)model_->constraints.size(); }
 	bool has_body() const { return !torso_.empty(); }
+	// How much its body (spine to chest) was held still last frame, 0 to 1:
+	// by its own animations that ask for it (Animation::hold_torso) - the
+	// one it plays over and over and those on cue - as much as they show.
+	// Held, your head's turn, its own sway and its breath leave its body
+	// alone; its neck and head take all of your head's turn.
+	float torso_held() const { return torso_held_; }
 	bool auto_chain() const { return auto_chain_; }
 	int upright_parts() const { return (int)upright_.size(); }
 	// What your eyes and mouth ride on: the model -> the world as its head
@@ -472,6 +480,7 @@ private:
 	float spring_time_ = 0;
 	float anim_time_ = 0;          // seconds into its animation
 	std::vector<char> anim_turns_; // a node its animation turns
+	float torso_held_ = 0;         // its body held still (torso_held)
 	// 0.9.0: the animation it's fading from (-1: none), how far into it,
 	// and how far into the fade (seconds, of `fade_length_`).
 	int fade_from_ = -1;

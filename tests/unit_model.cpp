@@ -2838,7 +2838,7 @@ struct MotionBones {
 };
 static std::vector<uint8_t> make_motion(const std::map<std::string, Quat> &turns, V3 hips_at = {0, 1, 0},
 					float happy = -1, bool with_ext = true, bool with_hips = true,
-					MotionBones *out = nullptr)
+					MotionBones *out = nullptr, const json &extras = json())
 {
 	Builder b;
 	struct B {
@@ -2915,6 +2915,8 @@ static std::vector<uint8_t> make_motion(const std::map<std::string, Quat> &turns
 		channels.push_back({{"sampler", samplers.size() - 1}, {"target", {{"node", face}, {"path", "translation"}}}});
 	}
 	b.doc["animations"] = json::array({{{"name", "Test move"}, {"samplers", samplers}, {"channels", channels}}});
+	if (!extras.is_null())
+		b.doc["animations"][0]["extras"] = extras;
 	if (with_ext)
 		b.doc["extensions"]["VRMC_vrm_animation"] = {
 			{"specVersion", "1.0"},
@@ -3833,6 +3835,259 @@ static void test_shapes_a_move_plays()
 	d.body = {mv};
 	prig.pose(d);
 	CHECK(strengths(prig, 0.2f, 0, 0, 0.4f));
+}
+
+// After 0.10.0: a move whose file asks for it ("extras": {"direbot":
+// {"hold_torso": true}} on its animation, or 1 as Blender may write a
+// ticked box) holds its body still while it plays, as much as it shows:
+// your head's turn, its own sway and its breath leave its spine and chest
+// alone - a rider's hands stay on what they hold - and its neck and head
+// take all of your head's turn. Its own idle (a ride that stays) and moves
+// on cue alike; a VRM animation file's too. Not marked (0, or not in
+// DireBot's own extras): as ever.
+static void test_a_move_holds_its_body()
+{
+	const float PI = 3.14159265f;
+	const float D = PI / 180;
+	Figure body = make_body();
+	Builder &b = body.p.b;
+	json &bones = b.doc["extensions"]["VRMC_vrm"]["humanoid"]["humanBones"];
+	const int arm[2] = {bones["leftUpperArm"]["node"].get<int>(), bones["rightUpperArm"]["node"].get<int>()};
+	// Each move: its body as it rests, both arms forward and down (holding
+	// on), over a second.
+	const int t2 = b.floats({0, 1}, 1, "SCALAR");
+	auto held_still = [&](Quat q) {
+		return b.floats({q.x, q.y, q.z, q.w, q.x, q.y, q.z, q.w}, 4, "VEC4");
+	};
+	const Quat reach[2] = {axis_angle({0, 1, 0}, -50 * D) * axis_angle({0, 0, 1}, -30 * D),
+			       axis_angle({0, 1, 0}, 50 * D) * axis_angle({0, 0, 1}, 30 * D)};
+	const json samplers = {{{"input", t2}, {"output", held_still(Quat{})}},
+			       {{"input", t2}, {"output", held_still(reach[0])}},
+			       {{"input", t2}, {"output", held_still(reach[1])}}};
+	const json channels = {{{"sampler", 0}, {"target", {{"node", body.spine}, {"path", "rotation"}}}},
+			       {{"sampler", 0}, {"target", {{"node", body.chest}, {"path", "rotation"}}}},
+			       {{"sampler", 1}, {"target", {{"node", arm[0]}, {"path", "rotation"}}}},
+			       {{"sampler", 2}, {"target", {{"node", arm[1]}, {"path", "rotation"}}}}};
+	const struct {
+		const char *name;
+		json extras;
+	} kinds[] = {{"Ride", {{"direbot", {{"hold_torso", true}}}}},
+		     {"Ride, ticked", {{"direbot", {{"hold_torso", 1}}}}},
+		     {"Plain", json()},
+		     {"Ride, unticked", {{"direbot", {{"hold_torso", 0}}}}},
+		     {"Not ours", {{"hold_torso", true}}},
+		     {"Words", {{"direbot", {{"hold_torso", "yes"}}}}}};
+	json animations = json::array();
+	for (const auto &k : kinds) {
+		json a = {{"name", k.name}, {"samplers", samplers}, {"channels", channels}};
+		if (!k.extras.is_null())
+			a["extras"] = k.extras;
+		animations.push_back(a);
+	}
+	b.doc["animations"] = animations;
+	auto m = std::make_shared<Model>();
+	CHECK(load(b.glb(), *m));
+	CHECK(m->animations.size() == 6);
+	if (m->animations.size() != 6)
+		return;
+	CHECK(m->animations[0].hold_torso && m->animations[1].hold_torso);
+	for (int i = 2; i < 6; i++)
+		CHECK(!m->animations[i].hold_torso);
+
+	RigOptions o;
+	o.springs = false;
+	Rig rig(m, o);
+	CHECK(rig.has_body() && rig.torso_held() == 0);
+	auto at = [](const Rig &r, int node) {
+		return move_of(r.world()[node]);
+	};
+	auto yaw_of = [&](const Rig &r, int node) {
+		const V3 f = direction(r.world()[node], {0, 0, 1});
+		return std::atan2(f.x, f.z) / D;
+	};
+	auto front = [](const Rig &r, int node) {
+		return normalized(direction(r.world()[node], {0, 0, 1}));
+	};
+	auto move = [](int which, float amount) {
+		MoveNow mv;
+		mv.animation = which;
+		mv.time = 0.5f;
+		mv.amount = amount;
+		return mv;
+	};
+	// Your head turned 30 degrees, its body following all it can (12 of
+	// them), swaying (2 more, and a lean to the side) and breathing in.
+	const Quat turn = axis_angle({0, 1, 0}, 30 * D);
+	auto tracked = [&](std::vector<MoveNow> moves) {
+		Drive d = still();
+		d.head = turn;
+		d.body_follow = 1;
+		d.body_yaw = 2;
+		d.body_roll = 0.8f;
+		d.breath = 1;
+		d.body = moves;
+		return d;
+	};
+	auto untracked = [&](std::vector<MoveNow> moves) {
+		Drive d = still();
+		d.body = moves;
+		return d;
+	};
+
+	// Marked, all of it: its hands just where the move has them, its body
+	// facing straight ahead (not following, swaying or leaning back), its
+	// head turned just as yours, its neck its share (40%) of all of it.
+	for (int which : {0, 1}) {
+		rig.pose(untracked({move(which, 1)}));
+		const V3 hand[2] = {at(rig, body.hand[0]), at(rig, body.hand[1])};
+		const V3 chest = at(rig, body.chest), neck = at(rig, body.p.neck), head = at(rig, body.p.head);
+		CHECK(rig.torso_held() == 1);
+		rig.pose(tracked({move(which, 1)}));
+		CHECK(rig.torso_held() == 1);
+		CHECK(near3(at(rig, body.hand[0]), hand[0], 1e-5f) && near3(at(rig, body.hand[1]), hand[1], 1e-5f));
+		CHECK(near3(at(rig, body.chest), chest, 1e-6f) && near3(at(rig, body.p.neck), neck, 1e-6f));
+		CHECK(near3(at(rig, body.p.head), head, 1e-6f)); // (no breath's rise)
+		CHECK(near3(front(rig, body.spine), {0, 0, 1}, 1e-5f) &&
+		      near3(front(rig, body.chest), {0, 0, 1}, 1e-5f));
+		CHECK(near3(front(rig, body.p.head), rotate(turn, {0, 0, 1}), 1e-4f));
+		CHECK(near(yaw_of(rig, body.p.neck), 12, 0.01));
+	}
+	// Not marked (or no move at all): its body follows, sways and breathes
+	// as ever, its hands carried off what they hold.
+	for (int which : {-1, 2, 3, 4, 5}) {
+		const std::vector<MoveNow> moves = which >= 0 ? std::vector<MoveNow>{move(which, 1)}
+							      : std::vector<MoveNow>{};
+		rig.pose(untracked(moves));
+		const V3 hand = at(rig, body.hand[0]), head = at(rig, body.p.head);
+		rig.pose(tracked(moves));
+		CHECK(rig.torso_held() == 0);
+		CHECK(near(yaw_of(rig, body.chest), 14, 0.1));
+		CHECK(length(at(rig, body.hand[0]) - hand) > 0.05f);
+		CHECK(length(at(rig, body.p.head) - head) > 0.002f); // (its chest leaning and rising)
+		CHECK(near3(front(rig, body.p.head), rotate(turn, {0, 0, 1}), 0.05f));
+	}
+	// Easing in or out: held as much as it shows - its body half as
+	// turned. Not playing: not held.
+	rig.pose(tracked({move(0, 0.5f)}));
+	CHECK(near(rig.torso_held(), 0.5, 1e-6));
+	CHECK(near(yaw_of(rig, body.chest), 7, 0.1));
+	rig.pose(tracked({move(0, 0.1f)}));
+	CHECK(near(rig.torso_held(), 0.1, 1e-6));
+	CHECK(near(yaw_of(rig, body.chest), 12.6, 0.1));
+	rig.pose(tracked({move(0, 0)}));
+	CHECK(rig.torso_held() == 0);
+	CHECK(near(yaw_of(rig, body.chest), 14, 0.1));
+	// Two marked over each other, half each: held three quarters. One not
+	// marked over a marked one doesn't let go of it.
+	rig.pose(tracked({move(0, 0.5f), move(1, 0.5f)}));
+	CHECK(near(rig.torso_held(), 0.75, 1e-6));
+	rig.pose(tracked({move(0, 0.5f), move(2, 1)}));
+	CHECK(near(rig.torso_held(), 0.5, 1e-6));
+	rig.pose(tracked({move(2, 1), move(0, 0.5f)}));
+	CHECK(near(rig.torso_held(), 0.5, 1e-6));
+	// Odd numbers: as before.
+	MoveNow odd = move(0, 1);
+	odd.time = std::numeric_limits<float>::quiet_NaN();
+	rig.pose(tracked({odd}));
+	CHECK(rig.torso_held() == 0);
+	odd = move(9, 1);
+	rig.pose(tracked({odd}));
+	CHECK(rig.torso_held() == 0);
+
+	// Its own idle marked (a ride that stays): held all the time it plays.
+	// A wave on cue (not marked) over it: still held, the hand it doesn't
+	// wave staying where the ride has it.
+	RigOptions oi = o;
+	oi.animation = 0;
+	Rig idle(m, oi);
+	idle.pose(untracked({}));
+	const V3 ride_hand = at(idle, body.hand[0]);
+	idle.pose(tracked({}));
+	CHECK(idle.torso_held() == 1);
+	CHECK(near3(at(idle, body.hand[0]), ride_hand, 1e-5f) && near3(front(idle, body.chest), {0, 0, 1}, 1e-5f));
+	MoveNow wave;
+	wave.builtin = BuiltIn::Wave;
+	wave.time = 0.3f;
+	wave.amount = 1;
+	idle.pose(tracked({wave}));
+	CHECK(idle.torso_held() == 1);
+	CHECK(near3(at(idle, body.hand[0]), ride_hand, 1e-5f) && near3(front(idle, body.chest), {0, 0, 1}, 1e-5f));
+	// Faded over a second to one that isn't marked: let go as it fades
+	// (smoothly: half way, half held), then not at all.
+	Drive step = tracked({});
+	step.dt = 0.5f;
+	idle.set_animation(2, 1);
+	idle.pose(step);
+	CHECK(near(idle.torso_held(), 0.5, 1e-6));
+	step.dt = 0.25f;
+	idle.pose(step);
+	CHECK(near(idle.torso_held(), 1 - 0.84375, 1e-5));
+	step.dt = 0.5f;
+	idle.pose(step);
+	CHECK(idle.torso_held() == 0 && near(yaw_of(idle, body.chest), 14, 0.1));
+	// ...and back to a marked one: held as it comes in.
+	idle.set_animation(1, 1);
+	idle.pose(step);
+	CHECK(near(idle.torso_held(), 0.5, 1e-6));
+	idle.pose(step);
+	CHECK(idle.torso_held() == 1);
+	// From one marked to another: held all the way through.
+	idle.set_animation(0, 1);
+	step.dt = 0.25f;
+	for (int i = 0; i < 5; i++) {
+		idle.pose(step);
+		CHECK(near(idle.torso_held(), 1, 1e-6));
+	}
+	// To none (back as it rests): let go as it fades out.
+	idle.set_animation(-1, 1);
+	step.dt = 0.5f;
+	idle.pose(step);
+	CHECK(near(idle.torso_held(), 0.5, 1e-6));
+	idle.pose(step);
+	CHECK(idle.torso_held() == 0);
+	// Straight to a marked one (no fade): held at once.
+	idle.set_animation(1);
+	idle.pose(step);
+	CHECK(idle.torso_held() == 1);
+
+	// A VRM animation file (.vrma) marked the same way.
+	const Quat up60 = axis_angle({0, 0, 1}, 60 * D);
+	for (int marked = 0; marked < 2; marked++) {
+		const json extras = marked ? json{{"direbot", {{"hold_torso", true}}}} : json();
+		const std::vector<uint8_t> file =
+			make_motion({{"leftUpperArm", up60}}, {0, 1, 0}, -1, true, true, nullptr, extras);
+		auto mo = std::make_shared<Motion>();
+		std::string why;
+		CHECK(load_motion(file.data(), file.size(), "", *mo, &why));
+		CHECK(mo->hold_torso == (marked == 1));
+		MoveNow mv;
+		mv.motion = mo;
+		mv.time = 1;
+		mv.amount = 1;
+		rig.pose(tracked({mv}));
+		CHECK(rig.torso_held() == (marked ? 1.0f : 0.0f));
+		CHECK(near(yaw_of(rig, body.chest), marked ? 0 : 14, 0.1));
+	}
+
+	// A character with no body bones: nothing to hold, nothing breaks.
+	{
+		Person p = make_person(false);
+		p.b.doc["animations"] = json::array(
+			{{{"name", "Ride"},
+			  {"extras", {{"direbot", {{"hold_torso", true}}}}},
+			  {"samplers",
+			   {{{"input", p.b.floats({0, 1}, 1, "SCALAR")},
+			     {"output", p.b.floats({0, 0, 0, 1, 0, 0, 0, 1}, 4, "VEC4")}}}},
+			  {"channels", {{{"sampler", 0}, {"target", {{"node", p.head}, {"path", "rotation"}}}}}}}});
+		auto mp = std::make_shared<Model>();
+		CHECK(load(p.b.glb(), *mp));
+		RigOptions op = o;
+		op.animation = 0;
+		Rig bodiless(mp, op);
+		bodiless.pose(tracked({}));
+		CHECK(!bodiless.has_body() && bodiless.torso_held() == 1);
+		CHECK(near3(front(bodiless, p.head), rotate(turn, {0, 0, 1}), 1e-4f));
+	}
 }
 
 static void test_faces_on_cue()
@@ -5172,6 +5427,7 @@ int main()
 	test_own_animation();
 	test_a_size_switch();
 	test_shapes_a_move_plays();
+	test_a_move_holds_its_body();
 	test_link_chain();
 	test_spots_on_a_vrm();
 	test_spots_on_two_characters();

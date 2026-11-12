@@ -440,6 +440,12 @@ struct Animation {
 	std::string name; // as the file has it, or "Animation 1", "Animation 2"...
 	std::vector<AnimChannel> channels;
 	float length = 0; // seconds: its last key
+	// Its body held still while it plays (the file says so: "extras":
+	// {"direbot": {"hold_torso": true}} on the animation): your head's
+	// turn, its own sway and its breath leave its spine and chest alone,
+	// as much as it shows - a rider's hands stay on what they hold. Its
+	// neck and head still turn as yours (rig.cpp's drive_head).
+	bool hold_torso = false;
 };
 struct ModelMeta {
 	std::string title, author, licence;
@@ -581,6 +587,9 @@ struct Motion {
 	// Its expressions ("happy", "aa", "blink"... or the file's own): each
 	// one's strength over time (the channel's first number).
 	std::vector<std::pair<std::string, AnimChannel>> expressions;
+	// Its body held still while it plays (Animation::hold_torso: its
+	// animation's extras say so).
+	bool hold_torso = false;
 };
 // Loads a .vrma. False, with why in plain words, if it can't.
 bool load_motion(const std::string &path, Motion &out, std::string *problem = nullptr);

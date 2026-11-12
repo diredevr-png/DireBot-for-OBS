@@ -148,8 +148,10 @@ When it can't see you it holds your last look for a second, then eases
 into a gentle idle - looking about, blinking by itself - and is back with
 you as soon as it sees you; `auto_blink` makes it blink by itself while it
 sees you too. A VRM's chest and shoulders rise with each breath and its
-body takes some of your head's turn (`body_follow` 0-100); a 3D character
-with no bones grows a touch with each breath, and a 2D one rises.
+body takes some of your head's turn (`body_follow` 0-100) - except while
+a move that holds it still plays (see "A body held still while a move
+plays" below); a 3D character with no bones grows a touch with each
+breath, and a 2D one rises.
 
 **The mouth from your mic, lights you choose, and camera views (0.6.0).**
 Its mouth moves from your mic as well as your camera (`mouth_from`:
@@ -587,6 +589,23 @@ with nothing playing it the shapes are as the file has them. Hair
 strands in the mesh follow (their own targets, as with expressions).
 Not marked, such tracks aren't read, as before: a face's shapes are
 moved by your face.
+
+**A body held still while a move plays (after 0.10.0, not released
+yet).** A 3D character's spine and chest take some of your head's turn
+(`body_follow`), its own slow sway and each breath's lean and rise - on
+top of whatever a move does with them, so a hand the move puts on
+something (holding on as it rides a mount, a hand on a sword's hilt)
+drifts off it as you turn your head. A move can ask for its body to be
+held still: its animation marked `"extras": {"direbot": {"hold_torso":
+true}}` (or `1`, as Blender may write a ticked box). While it plays - as
+much as it shows, so it eases in and out with the move - your head's
+turn, the sway and the breath leave its spine and chest alone, its neck
+and head take all of your head's turn, and its hands stay where the move
+puts them. It works for a character's own animations (on cue, or the idle
+a move that stays plays over and over: fading to one that isn't marked
+lets go as it fades) and for a VRM animation file's. A move that isn't
+marked never lets go of one that is: a wave while it rides keeps it held.
+Not marked, its body follows, sways and breathes as before.
 
 **Glowing parts: fire, sparks and smoke (0.9.0).** A see-through part
 (glTF's `BLEND`) whose material has `"extras": {"direbot": {"glow":

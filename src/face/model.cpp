@@ -110,6 +110,14 @@ std::string text(const json &j, const char *key)
 	const json &v = field(j, key);
 	return v.is_string() ? v.get<std::string>() : std::string();
 }
+// One of DireBot's own marks on a part of a file ("extras": {"direbot":
+// {"switch": true}}): true, or a number that isn't 0 - Blender writes a
+// ticked box either way.
+bool marked(const json &j, const char *key)
+{
+	const json &v = field(field(field(j, "extras"), "direbot"), key);
+	return v.is_boolean() ? v.get<bool>() : v.is_number() && v.get<double>() != 0;
+}
 // Up to `n` numbers from a list into `out` (the rest kept).
 void numbers(const json &j, const char *key, float *out, int n)
 {
@@ -2212,12 +2220,8 @@ void read_nodes(const json &doc, Model &m)
 		const json &n = nodes[i];
 		Node &node = m.nodes[i];
 		node.name = text(n, "name");
-		// (A switch: true, or a number that isn't 0 - Blender writes a
-		// ticked box either way.)
-		const json &sw = field(field(field(n, "extras"), "direbot"), "switch");
-		node.size_switch = sw.is_boolean() ? sw.get<bool>() : sw.is_number() && sw.get<double>() != 0;
-		const json &sh = field(field(field(n, "extras"), "direbot"), "shapes");
-		node.plays_shapes = sh.is_boolean() ? sh.get<bool>() : sh.is_number() && sh.get<double>() != 0;
+		node.size_switch = marked(n, "switch");
+		node.plays_shapes = marked(n, "shapes");
 		node.mesh = index_of(n, "mesh");
 		node.skin = index_of(n, "skin");
 		if (node.mesh >= (int)list(doc, "meshes").size())
@@ -2770,6 +2774,7 @@ void read_animations(Reader &rd, const json &doc, Model &m)
 		anim.name = text(aj, "name");
 		if (anim.name.empty())
 			anim.name = "Animation " + std::to_string(ai + 1);
+		anim.hold_torso = marked(aj, "hold_torso");
 		for (const json &cj : list(aj, "channels")) {
 			AnimChannel c;
 			if (!read_channel(rd, aj, cj, m, c, numbers))
@@ -3098,6 +3103,7 @@ void load_motion_json(Reader &rd, const json &doc, Motion &out)
 	for (size_t ai = 0; ai < animations.size() && out.tracks.empty(); ai++) {
 		const json &aj = animations[ai];
 		out.name = text(aj, "name");
+		out.hold_torso = marked(aj, "hold_torso");
 		for (const json &cj : list(aj, "channels")) {
 			AnimChannel c;
 			if (!read_channel(rd, aj, cj, m, c, numbers))
