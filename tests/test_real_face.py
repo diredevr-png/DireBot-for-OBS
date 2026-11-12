@@ -915,6 +915,9 @@ def test_3d_characters_up_to_1_gb(run):
     with its hair strands and moves, runs to about 700 MB; 512 MB was the
     most before) and shows as the same file small does; one over 1 GB
     says so in plain words and draws nothing."""
+    face_png = os.path.join(run.home, "camera.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
     ball = os.path.join(run.home, "ball.glb")
     ball_character(ball)
     big = os.path.join(run.home, "ball-big.glb")
@@ -925,11 +928,16 @@ def test_3d_characters_up_to_1_gb(run):
             f.write(small.read())
         f.truncate((1 << 30) + 1)
     assert os.path.getsize(big) > 512 << 20 and os.path.getsize(huge) == (1 << 30) + 1
-    common = {"width": 200, "height": 200, "size": 100, "mirror": False, **STILL}
+    size = 300
+    common = {"source": "Big camera", "width": size, "height": size, "size": 100,
+              "mirror": False, "smoothing": 100, "follow_move": 0, "follow_grow": 0,
+              "follow_tilt": 0, "bend": 100, **STILL}
     avatars = {"3D small": ball, "3D big": big, "3D huge": huge}
     c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
     try:
         send(c, "CreateScene", {"sceneName": "Big files"})
+        send(c, "CreateInput", {"sceneName": "Big files", "inputName": "Big camera",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
         for name, path in avatars.items():
             send(c, "CreateInput", {"sceneName": "Big files", "inputName": name,
                                     "inputKind": "direbot_face_avatar",
@@ -953,10 +961,10 @@ def test_3d_characters_up_to_1_gb(run):
         time.sleep(0.5)
         for name in ("3D small", "3D big"):
             rows = screenshot(c, name)
-            mid = rows[120][100]
+            mid = rows[size // 2 + 30][size // 2]
             assert mid[0] > 150 and mid[0] > mid[1] > mid[2], (name, mid)
-            assert rows[3][3] == (0, 0, 0), (name, rows[3][3])
-        for name in avatars:
+            assert rows[5][5] == (0, 0, 0), (name, rows[5][5])
+        for name in [*avatars, "Big camera"]:
             send(c, "RemoveInput", {"inputName": name})
         send(c, "RemoveScene", {"sceneName": "Big files"})
     finally:
