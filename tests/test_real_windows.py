@@ -107,11 +107,18 @@ class WindowsObs:
         self.link_path = os.path.join(config, "plugin_config", MODULE, "link.json")
         self.logs = os.path.join(config, "logs")
         bin64 = os.path.join(ROOT, "bin", "64bit")
+        # No internet for this OBS (as on Linux): its services list update
+        # and its "what's new" then fail at once. What OBS itself leaves
+        # behind when it closes then doesn't depend on obsproject.com - OBS
+        # 31.1.1 leaves one thing behind each time it does get a new list.
+        nowhere = "http://127.0.0.1:9"
+        env = dict(os.environ, http_proxy=nowhere, https_proxy=nowhere,
+                   HTTP_PROXY=nowhere, HTTPS_PROXY=nowhere, no_proxy="")
         self.out = open(os.path.join(self.home, "obs-out.log"), "w")
         self.proc = subprocess.Popen(
             [os.path.join(bin64, "obs64.exe"), "--disable-updater",
              "--disable-shutdown-check", "--multi"],
-            cwd=bin64, stdout=self.out, stderr=subprocess.STDOUT)
+            cwd=bin64, env=env, stdout=self.out, stderr=subprocess.STDOUT)
         if not add_on:
             # No link without the add-on: OBS's own WebSocket server and
             # its window say it's up.
@@ -1751,6 +1758,12 @@ def leaks(log):
     return int(found.group(1)) if found else None
 
 
+def went_online(log):
+    """Whether OBS got its services list from the internet after all (then
+    what it leaves behind is partly OBS's own doing)."""
+    return "[rtmp-services plugin] Successfully updated" in log
+
+
 def hair_scene(o, c, name="Kept", **settings):
     """A character with hair strands in a scene of its own, shown, posed on
     the graphics card, the card's clock answering. Returns (its state, a
@@ -1860,6 +1873,8 @@ def test_closing_obs_leaves_nothing_behind(obs):
         obs.kill()      # (so the next OBS has the machine to itself)
         said["after all the tests"] = "OBS didn't close: %s" % (seen,)
     left["after all the tests"] = leaks(obs.log())
+    if went_online(obs.log()):
+        said["after all the tests"] = "OBS went online, though kept offline"
 
     def session(name, add_on=True, doing=None):
         o = None
@@ -1874,6 +1889,8 @@ def test_closing_obs_leaves_nothing_behind(obs):
             if not o.close():
                 said[name] = "OBS didn't close: %s" % (o.windows(),)
             left[name] = leaks(o.log())
+            if went_online(o.log()):
+                said[name] = "OBS went online, though kept offline"
             print("\n----- OBS's log, %s -----\n%s" % (name, o.log()))
         except Exception as e:
             said[name] = "%s: %s" % (type(e).__name__, e)
