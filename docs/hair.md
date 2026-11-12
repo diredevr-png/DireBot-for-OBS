@@ -1,6 +1,6 @@
 # Hair, strand by strand: how it's drawn, what it costs, and how that was found
 
-This is the working record of the strand hair in **DireBot Face Avatar** (after 0.9.0, not released yet): what the
+This is the working record of the strand hair in **DireBot Face Avatar** (0.10.0): what the
 code does now, the numbers it was built on, what was tried and dropped and why, and how to measure it again. Read it
 before changing anything in `src/face/hair.hpp`, the strand parts of `src/face/model.cpp` and
 `src/face/avatar3d.cpp`, or the strand techniques of `data/effects/direbot-face-3d*.effect`.
