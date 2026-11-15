@@ -527,6 +527,16 @@ static void test_page_paths_and_spots()
 	CHECK(!obs::page_spot(0.5, 1.01, 1920, 1080, x, y));
 	CHECK(!obs::page_spot(0.5, 0.5, 0, 1080, x, y));
 	CHECK(!obs::page_spot(std::nan(""), 0.5, 1920, 1080, x, y));
+	// The player's size on the stream, against the smallest its site
+	// allows (Twitch's 400 x 300): no minimum, always; else drawn x part.
+	CHECK(obs::player_big_enough(0, 0, 0, 0, 0, 0));
+	CHECK(obs::player_big_enough(1920, 1080, 0.5, 0.5, 400, 300));
+	CHECK(obs::player_big_enough(800, 600, 0.5, 0.5, 400, 300));
+	CHECK(obs::player_big_enough(799.6, 599.6, 0.5, 0.5, 400, 300)); // OBS's rounding
+	CHECK(!obs::player_big_enough(798, 600, 0.5, 0.5, 400, 300));
+	CHECK(!obs::player_big_enough(1920, 1080, 0.2, 0.5, 400, 300));
+	CHECK(!obs::player_big_enough(1920, 1080, 0.5, 0.25, 400, 300));
+	CHECK(!obs::player_big_enough(std::nan(""), 1080, 0.5, 0.5, 400, 300));
 }
 
 static void test_places_words()

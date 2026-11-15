@@ -91,4 +91,14 @@ bool page_spot(double x, double y, uint32_t width, uint32_t height, int &px, int
 	return true;
 }
 
+bool player_big_enough(double drawn_w, double drawn_h, double w, double h, double min_w, double min_h)
+{
+	if (!(min_w > 0) && !(min_h > 0))
+		return true;
+	if (!std::isfinite(drawn_w) || !std::isfinite(drawn_h) || !std::isfinite(w) || !std::isfinite(h))
+		return false;
+	// Half a pixel's grace: a scale of 0.99999 from OBS's maths is 1.
+	return drawn_w * w + 0.5 >= min_w && drawn_h * h + 0.5 >= min_h;
+}
+
 } // namespace direbot::obs

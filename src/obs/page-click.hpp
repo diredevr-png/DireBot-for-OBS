@@ -28,7 +28,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //
 // Only DireBot's own pages on this PC are ever clicked, never anyone
 // else's; nothing about a source's address is ever reported (it can hold
-// a login key).
+// a login key). And only a page on the stream now (in the program's
+// scene, shown): Twitch lets a player start only where it can be seen -
+// and, given the player's size, only one drawn at least as big as its
+// site allows (Twitch's: 400 x 300).
 
 #pragma once
 
@@ -45,8 +48,12 @@ using link::json;
 const std::vector<std::string> &page_click_requests();
 bool page_click_handles(const std::string &type);
 
-// {"port": DireBot's port, "path": "/overlay", "x": 0-1, "y": 0-1}
-//   -> {"ok": true, "clicked": how many sources} or {"ok": false, "error"}.
+// {"port": DireBot's port, "path": "/overlay", "x": 0-1, "y": 0-1,
+//  and optionally "w", "h": the player's size as parts of the page, with
+//  "min_w", "min_h": the smallest it may be drawn on the stream, pixels}
+//   -> {"ok": true, "clicked": how many sources, "hidden": how many weren't
+//       on the stream, "small": how many showed the player too small}
+//   or {"ok": false, "error"}.
 json page_click(const std::string &type, const json &data);
 
 } // namespace direbot::obs

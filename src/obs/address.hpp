@@ -38,4 +38,10 @@ std::string address_path(const std::string &url);
 // on the page (or a page with no size).
 bool page_spot(double x, double y, uint32_t width, uint32_t height, int &px, int &py);
 
+// 0.11.0: whether a player taking up `w` x `h` of a page (parts of it,
+// 0-1) is at least `min_w` x `min_h` pixels where the page is drawn
+// `drawn_w` x `drawn_h` pixels on OBS's canvas. Twitch's clip player may
+// only be started at 400 x 300 or more. No minimum asked (0): true.
+bool player_big_enough(double drawn_w, double drawn_h, double w, double h, double min_w, double min_h);
+
 } // namespace direbot::obs

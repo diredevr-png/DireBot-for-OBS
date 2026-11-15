@@ -33,7 +33,10 @@ player waits on its play button until it's clicked, whatever it's told.
 DireBot's clip queue asks the add-on for that one click (`ClickPage`): it
 clicks DireBot's own page in your browser source, where the player is,
 the way OBS's Interact window does. Only DireBot's own pages on this PC
-(DireBot's port, the page it names) are ever clicked.
+(DireBot's port, the page it names) are ever clicked - and only while
+they're on your stream (in the scene that's on, not hidden), with the
+player drawn at least as big as Twitch allows (400 × 300): Twitch's
+player may only be started where it can be seen.
 
 **Multistream.** The add-on sends your stream to YouTube, Kick, TikTok
 or any other site at the same time as your main stream. **Tools →
@@ -783,7 +786,7 @@ The add-on's own requests go through `CallVendorRequest` with
 | `FaceArms` `{source, do}` | Your hands and arms (0.8.0): `do` `calibrate` (hold a hand up by your ear, open, palm to the camera; follow `hands_and_arms.calibrating` in `FaceGetState` - it's saved in `arms_calibration` when it's done), `stop`, or `forget`. `ok`, or `error` in words (not on, your hands not followed, not a 3D VRM in its own spot, the body models not ready, or the avatar not shown) |
 | (vendor event) `FaceSign` | 0.9.0: a sign it watches for was held its time: `source`, `id` (the rule's), `what`, `side` (the hand that made it: `left`, `right`, `both`; a wink's eye; "" for the other face moves) |
 | `FaceModelFront` `{source, width?, close?}` | its 3D character straight from the front as it's made: `width`, `height`, `rgba` (base64, plain colour), `box` (`left`, `top`, `width`, `height` in the model), `region` (`x`, `y`, `w`, `h`: the part of the box drawn, as shares of it), `spots` (as in `FaceGetState`) - its front picture, which spots and outfit places are shares of. `close`: just the part round its face, for its eyes and mouth up close (`spots` are still shares of the whole box) |
-| `ClickPage` `{port, path, x, y}` | 0.11.0: one click on each browser source showing DireBot's page `path` (e.g. `/overlay`, without `?`) at `http://localhost:<port>` (or 127.x, [::1]), at `x`, `y` (0-1 across and down the page), as OBS's Interact window clicks: `ok`, `clicked` (how many sources), or `ok` false and `error` in words. Never says anything about a source's address |
+| `ClickPage` `{port, path, x, y, w?, h?, min_w?, min_h?}` | 0.11.0: one click on each browser source showing DireBot's page `path` (e.g. `/overlay`, without `?`) at `http://localhost:<port>` (or 127.x, [::1]), at `x`, `y` (0-1 across and down the page), as OBS's Interact window clicks - only a source on the stream now (`obs_source_active`), and with `w`, `h` (the player's size, parts of the page) and `min_w`, `min_h` (pixels), only where the player is drawn at least that big in the program's scene (scenes and groups inside it included): `ok`, `clicked` (how many sources), `hidden` (how many weren't on the stream), `small` (how many showed it too small), or `ok` false and `error` in words. Never says anything about a source's address |
 | `GetUsage` | `measuring` (first 3 seconds), `fps`, `fps_now`, `frame_ms`, `frame_budget_ms`, `frames`, `frames_lagged`, `encoded`, `encoded_skipped`, `cpu`, `memory_mb`, `stream_frames`, `stream_dropped`, and `sources`: per input and filter `name`, `uuid`, `kind`, `type`, `active`, `showing`, `measured`, `tick_ms`, `render_ms`, `gpu_ms` (+ `_max_ms`), `fps_in`/`fps_shown` for cameras and media, `parent`/`enabled` for filters (and `own_ms`/`own_gpu_ms`: a filter's time takes in what it draws on, so this is its own part), and `hints` (browser size/fps/"shut down when hidden", whether it shows a page on this PC and its port, a short fingerprint of a camera to spot the same one added twice) |
 
 ## Building

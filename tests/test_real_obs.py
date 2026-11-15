@@ -407,7 +407,9 @@ CLICK_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"></head>
   style="position:absolute;left:0;top:0;width:50%%;height:100%%;border:0"></iframe>
 <script>
 function tell(what){ var r = new XMLHttpRequest();
-  r.open('GET', what + (what.indexOf('?') < 0 ? '?' : '&') + 'page=' + location.pathname, true); r.send(); }
+  var copy = (location.search.match(/[?&]copy=([a-z]+)/) || [])[1] || '';
+  r.open('GET', what + (what.indexOf('?') < 0 ? '?' : '&') + 'page=' + location.pathname +
+         '&copy=' + copy, true); r.send(); }
 document.addEventListener('mousedown', function(e){ tell('/clicked?x=' + e.clientX + '&y=' + e.clientY); });
 var told = false;
 setInterval(function(){
@@ -461,10 +463,11 @@ class ClickPages:
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-    def said(self, path, page=None):
+    def said(self, path, page=None, copy=None):
         with self.lock:
             return [q for p, q in self.heard
-                    if p == path and (page is None or q.get("page") == page)]
+                    if p == path and (page is None or q.get("page") == page)
+                    and (copy is None or q.get("copy", "") == copy)]
 
     def close(self):
         self.server.shutdown()
@@ -478,7 +481,7 @@ def check_page_clicks(c, scene, browser_or_skip):
     page. `browser_or_skip(why)`: what to do when this OBS has no browser
     (skip on Linux; on Windows OBS always has one, so fail)."""
     pages = ClickPages()
-    made = []
+    made, made_scene = [], []
     try:
         for name, url in (("Clip page", "http://127.0.0.1:%d/overlay?layout=Chatting" % pages.port),
                           ("Another page", "http://127.0.0.1:%d/elsewhere" % pages.port),
@@ -500,7 +503,7 @@ def check_page_clicks(c, scene, browser_or_skip):
 
         # The right half: the page itself, at that spot.
         answer = vendor(c, "ClickPage", {"port": pages.port, "path": "/overlay", "x": 0.75, "y": 0.5})
-        assert answer == {"ok": True, "clicked": 1}, answer
+        assert answer == {"ok": True, "clicked": 1, "hidden": 0, "small": 0}, answer
         assert wait_for(lambda: pages.said("/clicked", "/overlay"), 10), pages.heard
         spot = pages.said("/clicked", "/overlay")[0]
         assert abs(int(spot["x"]) - 300) <= 1 and abs(int(spot["y"]) - 150) <= 1, spot
@@ -509,7 +512,7 @@ def check_page_clicks(c, scene, browser_or_skip):
         # The left half: the frame from another site gets the click, and
         # the page sees the focus go into it.
         answer = vendor(c, "ClickPage", {"port": pages.port, "path": "/overlay", "x": 0.25, "y": 0.5})
-        assert answer == {"ok": True, "clicked": 1}, answer
+        assert answer == {"ok": True, "clicked": 1, "hidden": 0, "small": 0}, answer
         assert wait_for(lambda: pages.said("/inner-clicked"), 10), pages.heard
         spot = pages.said("/inner-clicked")[0]
         assert abs(int(spot["x"]) - 100) <= 1 and abs(int(spot["y"]) - 150) <= 1, spot
@@ -522,24 +525,71 @@ def check_page_clicks(c, scene, browser_or_skip):
         assert not pages.said("/clicked", "/elsewhere") and not pages.said("/focus", "/elsewhere")
         assert len(pages.said("/inner-clicked")) == 1, pages.heard
         answer = vendor(c, "ClickPage", {"port": pages.port, "path": "/nowhere", "x": 0.5, "y": 0.5})
-        assert answer == {"ok": True, "clicked": 0}, answer
+        assert answer == {"ok": True, "clicked": 0, "hidden": 0, "small": 0}, answer
+
+        # The same page in a scene that isn't on the stream: never clicked
+        # (Twitch lets its player start only where it can be seen).
+        c.send("CreateScene", {"sceneName": "Not on stream"}, raw=True)
+        made_scene.append("Not on stream")
+        c.send("SetCurrentProgramScene", {"sceneName": scene}, raw=True)
+        c.send("CreateInput", {"sceneName": "Not on stream", "inputName": "Clip page off stream",
+                               "inputKind": "browser_source",
+                               "inputSettings": {"url": "http://127.0.0.1:%d/overlay?copy=off" % pages.port,
+                                                 "width": 400, "height": 300},
+                               "sceneItemEnabled": True}, raw=True)
+        made.append("Clip page off stream")
+        assert wait_for(lambda: pages.said("/loaded", "/overlay", copy="off"), 45, 0.2), pages.heard
+        answer = vendor(c, "ClickPage", {"port": pages.port, "path": "/overlay", "x": 0.75, "y": 0.5})
+        assert answer == {"ok": True, "clicked": 1, "hidden": 1, "small": 0}, answer
+        assert wait_for(lambda: len(pages.said("/clicked", "/overlay", copy="")) == 2, 10), pages.heard
+        # Hidden in the scene that is on the stream (its eye off): not clicked either.
+        item = c.send("GetSceneItemId", {"sceneName": scene, "sourceName": "Clip page"}, raw=True)["sceneItemId"]
+        c.send("SetSceneItemEnabled", {"sceneName": scene, "sceneItemId": item, "sceneItemEnabled": False}, raw=True)
+        time.sleep(0.5)
+        answer = vendor(c, "ClickPage", {"port": pages.port, "path": "/overlay", "x": 0.75, "y": 0.5})
+        assert answer == {"ok": True, "clicked": 0, "hidden": 2, "small": 0}, answer
+        c.send("SetSceneItemEnabled", {"sceneName": scene, "sceneItemId": item, "sceneItemEnabled": True}, raw=True)
+        time.sleep(0.5)
+
+        # With the player's size: a player half the page across (200 x 300
+        # here at its own size) is smaller than Twitch's 400 x 300 - not
+        # clicked; the page drawn twice as big, it's 400 x 600 - clicked.
+        sized = {"port": pages.port, "path": "/overlay", "x": 0.75, "y": 0.5,
+                 "w": 0.5, "h": 1.0, "min_w": 400, "min_h": 300}
+        answer = vendor(c, "ClickPage", sized)
+        assert answer == {"ok": True, "clicked": 0, "hidden": 1, "small": 1}, answer
+        c.send("SetSceneItemTransform", {"sceneName": scene, "sceneItemId": item,
+                                         "sceneItemTransform": {"scaleX": 2.0, "scaleY": 2.0}}, raw=True)
+        time.sleep(0.5)
+        answer = vendor(c, "ClickPage", sized)
+        assert answer == {"ok": True, "clicked": 1, "hidden": 1, "small": 0}, answer
+        assert wait_for(lambda: len(pages.said("/clicked", "/overlay", copy="")) == 3, 10), pages.heard
+        assert not pages.said("/clicked", "/overlay", copy="off"), pages.heard
 
         # Not a spot on a page, not a path, not a port: refused.
         for bad in ({"port": pages.port, "path": "/overlay", "x": 1.5, "y": 0.5},
                     {"port": pages.port, "path": "/overlay", "x": 0.5, "y": -0.1},
                     {"port": pages.port, "path": "overlay", "x": 0.5, "y": 0.5},
                     {"port": pages.port, "path": "/overlay?layout=Chatting", "x": 0.5, "y": 0.5},
+                    {"port": pages.port, "path": "/overlay", "x": 0.5, "y": 0.5, "w": 1.5, "h": 1},
+                    {"port": pages.port, "path": "/overlay", "x": 0.5, "y": 0.5, "min_w": 400, "min_h": 300},
+                    {"port": pages.port, "path": "/overlay", "x": 0.5, "y": 0.5, "w": "half", "h": 1},
                     {"port": 0, "path": "/overlay", "x": 0.5, "y": 0.5},
                     {"port": "8080", "path": "/overlay", "x": 0.5, "y": 0.5},
                     {"path": "/overlay", "x": 0.5, "y": 0.5}, {}):
             answer = vendor(c, "ClickPage", bad)
             assert answer["ok"] is False and answer["error"], (bad, answer)
         time.sleep(0.5)
-        assert len(pages.said("/clicked", "/overlay")) == 1 and len(pages.said("/inner-clicked")) == 1
+        assert len(pages.said("/clicked", "/overlay")) == 3 and len(pages.said("/inner-clicked")) == 1
     finally:
         for name in made:
             try:
                 c.send("RemoveInput", {"inputName": name}, raw=True)
+            except Exception:
+                pass
+        for name in made_scene:
+            try:
+                c.send("RemoveScene", {"sceneName": name}, raw=True)
             except Exception:
                 pass
         pages.close()

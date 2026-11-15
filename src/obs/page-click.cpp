@@ -19,9 +19,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "page-click.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include <obs.h>
+#include <graphics/matrix4.h>
 
 #include "address.hpp"
 
@@ -73,6 +76,104 @@ json refused(const char *why)
 	return {{"ok", false}, {"error", why}};
 }
 
+// How big a source is drawn on the stream: the program's scene, and the
+// scenes and groups inside it, looked through for it. The biggest it's
+// drawn at, as a scale of its own size (0 when it isn't in there).
+struct Look {
+	obs_source_t *target = nullptr;
+	double sx = 0, sy = 0;
+};
+
+constexpr int DEEPEST = 6;
+
+void look_in(obs_scene_t *scene, double sx, double sy, Look &look, int depth);
+
+struct LookHere {
+	Look *look;
+	double sx, sy;
+	int depth;
+};
+
+bool look_item(obs_scene_t *, obs_sceneitem_t *item, void *param)
+{
+	auto *here = static_cast<LookHere *>(param);
+	if (!obs_sceneitem_visible(item))
+		return true;
+	obs_source_t *source = obs_sceneitem_get_source(item);
+	if (!source)
+		return true;
+	// Each pixel of the item's own picture, as big as it's drawn (bounds,
+	// crop and rotation included), in the scene around it.
+	struct matrix4 m;
+	obs_sceneitem_get_draw_transform(item, &m);
+	const double sx = std::hypot((double)m.x.x, (double)m.x.y) * here->sx;
+	const double sy = std::hypot((double)m.y.x, (double)m.y.y) * here->sy;
+	if (source == here->look->target) {
+		if (sx * sy > here->look->sx * here->look->sy) {
+			here->look->sx = sx;
+			here->look->sy = sy;
+		}
+		return true;
+	}
+	if (here->depth >= DEEPEST)
+		return true;
+	obs_scene_t *inner = obs_sceneitem_is_group(item) ? obs_sceneitem_group_get_scene(item)
+							  : obs_scene_from_source(source);
+	if (inner)
+		look_in(inner, sx, sy, *here->look, here->depth + 1);
+	return true;
+}
+
+void look_in(obs_scene_t *scene, double sx, double sy, Look &look, int depth)
+{
+	LookHere here{&look, sx, sy, depth};
+	obs_scene_enum_items(scene, look_item, &here);
+}
+
+// The scene on the stream now (the one a transition is going to).
+obs_source_t *program_scene()
+{
+	obs_source_t *out = obs_get_output_source(0);
+	if (!out)
+		return nullptr;
+	if (obs_source_get_type(out) == OBS_SOURCE_TYPE_TRANSITION) {
+		obs_source_t *active = obs_transition_get_active_source(out);
+		obs_source_release(out);
+		return active;
+	}
+	return out;
+}
+
+// How big the source is drawn on the stream: (width, height) in pixels of
+// OBS's canvas. Shown some other way than in the program's scenes (a
+// downstream keyer): taken as its own size.
+void drawn_size(obs_source_t *source, double &w, double &h)
+{
+	Look look;
+	look.target = source;
+	obs_source_t *program = program_scene();
+	if (program) {
+		obs_scene_t *scene = obs_scene_from_source(program);
+		if (scene)
+			look_in(scene, 1.0, 1.0, look, 0);
+		obs_source_release(program);
+	}
+	if (look.sx <= 0 || look.sy <= 0)
+		look.sx = look.sy = 1.0;
+	w = look.sx * obs_source_get_width(source);
+	h = look.sy * obs_source_get_height(source);
+}
+
+bool part(const json &data, const char *key, double &out)
+{
+	if (!data.contains(key))
+		return true;
+	if (!data[key].is_number())
+		return false;
+	out = data[key].get<double>();
+	return std::isfinite(out);
+}
+
 } // namespace
 
 const std::vector<std::string> &page_click_requests()
@@ -105,10 +206,36 @@ json page_click(const std::string &type, const json &data)
 		return refused("That isn't a page's path.");
 	if (!(x >= 0 && x <= 1 && y >= 0 && y <= 1))
 		return refused("The spot has to be on the page (0 to 1 across and down).");
+	// The player's size (parts of the page) and the smallest it may be
+	// started at, in pixels on the stream: optional, both or neither.
+	double w = 0, h = 0, min_w = 0, min_h = 0;
+	if (!part(data, "w", w) || !part(data, "h", h) || !part(data, "min_w", min_w) || !part(data, "min_h", min_h))
+		return refused("w, h, min_w and min_h are numbers.");
+	if (w < 0 || w > 1 || h < 0 || h > 1 || min_w < 0 || min_h < 0 || min_w > 10000 || min_h > 10000)
+		return refused("The player's size has to be part of the page (0 to 1), its smallest 0 to 10000.");
+	const bool sized = min_w > 0 || min_h > 0;
+	if (sized && (w <= 0 || h <= 0))
+		return refused("A smallest size needs the player's size (w and h).");
 
 	obs_enum_sources(each, &want);
-	int clicked = 0;
+	int clicked = 0, hidden = 0, small = 0;
 	for (obs_source_t *source : want.found) {
+		// Only a page on the stream now: a player nobody can see is never
+		// started (nor one drawn smaller than its site allows).
+		if (!obs_source_active(source)) {
+			hidden++;
+			obs_source_release(source);
+			continue;
+		}
+		if (sized) {
+			double dw = 0, dh = 0;
+			drawn_size(source, dw, dh);
+			if (!player_big_enough(dw, dh, w, h, min_w, min_h)) {
+				small++;
+				obs_source_release(source);
+				continue;
+			}
+		}
 		int px = 0, py = 0;
 		if (page_spot(x, y, obs_source_get_width(source), obs_source_get_height(source), px, py)) {
 			// As OBS's Interact window does it: the page gets the focus,
@@ -125,7 +252,7 @@ json page_click(const std::string &type, const json &data)
 		}
 		obs_source_release(source);
 	}
-	return {{"ok", true}, {"clicked", clicked}};
+	return {{"ok", true}, {"clicked", clicked}, {"hidden", hidden}, {"small", small}};
 }
 
 } // namespace direbot::obs
