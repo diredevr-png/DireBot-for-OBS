@@ -903,6 +903,16 @@ requests and a line in `features`.
 
 GPL-2.0-or-later, like OBS. See LICENSE.
 
+The zip carries the licence (`data/LICENSE.txt`) and every outside part's
+credit and licence text (`data/THIRD-PARTY-NOTICES.txt`, made from
+DireBot's own licence list). Besides those below:
+
+`deps/nlohmann` is Niels Lohmann's JSON for Modern C++ 3.11.3, unchanged,
+under the MIT licence (`deps/nlohmann/LICENSE.MIT`): it reads and writes
+JSON. `deps/obs-websocket/obs-websocket-api.h` is obs-websocket's own
+header for add-ons (Stephane Lepin and Kyle Manning, GPL-2.0-or-later),
+unchanged.
+
 The mouth from your mic is our own code; its first steps (bringing the
 sound down to a lower rate and looking at it 10 ms at a time) follow
 uLipSync's (Hecomi, MIT licence) as a recipe, with no code copied. Its
