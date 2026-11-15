@@ -4,6 +4,9 @@ An OBS add-on that connects OBS to [DireBot](https://github.com/diredevr-png/Dir
 by itself, shows what's slowing OBS down, streams to more than one site at
 once, and makes a tall (9:16) picture for TikTok, Shorts and Reels.
 
+DireBot for OBS is made by DireDevR. It isn't made, endorsed or supported
+by the OBS Project.
+
 ## What it does
 
 **DireBot Link.** When OBS opens, DireBot finds it and connects without a
@@ -902,6 +905,9 @@ requests and a line in `features`.
 ## Licence
 
 GPL-2.0-or-later, like OBS. See LICENSE.
+
+DireBot for OBS is made by DireDevR. It isn't made, endorsed or supported
+by the OBS Project; "OBS" and "OBS Studio" are the OBS Project's names.
 
 The zip carries the licence (`data/LICENSE.txt`) and every outside part's
 credit and licence text (`data/THIRD-PARTY-NOTICES.txt`, made from
