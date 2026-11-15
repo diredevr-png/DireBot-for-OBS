@@ -20,13 +20,16 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "page-click.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <memory>
 
 #include <obs.h>
 #include <graphics/matrix4.h>
 
 #include "address.hpp"
+#include "ui-call.hpp"
 
 namespace direbot::obs {
 
@@ -174,6 +177,47 @@ bool part(const json &data, const char *key, double &out)
 	return std::isfinite(out);
 }
 
+// The clicks themselves, on OBS's UI thread.
+json click_pages(Wanted &want, double x, double y, double w, double h, double min_w, double min_h, bool sized)
+{
+	obs_enum_sources(each, &want);
+	int clicked = 0, hidden = 0, small = 0;
+	for (obs_source_t *source : want.found) {
+		// Only a page on the stream now: a player nobody can see is never
+		// started (nor one drawn smaller than its site allows).
+		if (!obs_source_active(source)) {
+			hidden++;
+			obs_source_release(source);
+			continue;
+		}
+		if (sized) {
+			double dw = 0, dh = 0;
+			drawn_size(source, dw, dh);
+			if (!player_big_enough(dw, dh, w, h, min_w, min_h)) {
+				small++;
+				obs_source_release(source);
+				continue;
+			}
+		}
+		int px = 0, py = 0;
+		if (page_spot(x, y, obs_source_get_width(source), obs_source_get_height(source), px, py)) {
+			// As OBS's Interact window does it: the page gets the focus,
+			// the mouse moves there, and the button goes down and up.
+			struct obs_mouse_event e = {};
+			e.modifiers = 0;
+			e.x = px;
+			e.y = py;
+			obs_source_send_focus(source, true);
+			obs_source_send_mouse_move(source, &e, false);
+			obs_source_send_mouse_click(source, &e, MOUSE_LEFT, false, 1);
+			obs_source_send_mouse_click(source, &e, MOUSE_LEFT, true, 1);
+			clicked++;
+		}
+		obs_source_release(source);
+	}
+	return {{"ok", true}, {"clicked", clicked}, {"hidden", hidden}, {"small", small}};
+}
+
 } // namespace
 
 const std::vector<std::string> &page_click_requests()
@@ -217,42 +261,13 @@ json page_click(const std::string &type, const json &data)
 	if (sized && (w <= 0 || h <= 0))
 		return refused("A smallest size needs the player's size (w and h).");
 
-	obs_enum_sources(each, &want);
-	int clicked = 0, hidden = 0, small = 0;
-	for (obs_source_t *source : want.found) {
-		// Only a page on the stream now: a player nobody can see is never
-		// started (nor one drawn smaller than its site allows).
-		if (!obs_source_active(source)) {
-			hidden++;
-			obs_source_release(source);
-			continue;
-		}
-		if (sized) {
-			double dw = 0, dh = 0;
-			drawn_size(source, dw, dh);
-			if (!player_big_enough(dw, dh, w, h, min_w, min_h)) {
-				small++;
-				obs_source_release(source);
-				continue;
-			}
-		}
-		int px = 0, py = 0;
-		if (page_spot(x, y, obs_source_get_width(source), obs_source_get_height(source), px, py)) {
-			// As OBS's Interact window does it: the page gets the focus,
-			// the mouse moves there, and the button goes down and up.
-			struct obs_mouse_event e = {};
-			e.modifiers = 0;
-			e.x = px;
-			e.y = py;
-			obs_source_send_focus(source, true);
-			obs_source_send_mouse_move(source, &e, false);
-			obs_source_send_mouse_click(source, &e, MOUSE_LEFT, false, 1);
-			obs_source_send_mouse_click(source, &e, MOUSE_LEFT, true, 1);
-			clicked++;
-		}
-		obs_source_release(source);
-	}
-	return {{"ok", true}, {"clicked", clicked}, {"hidden", hidden}, {"small", small}};
+	// On OBS's UI thread, as its Interact window does. (Sent straight
+	// from obs-websocket's thread, in the real-OBS test on Linux, the
+	// click never reached the page and OBS went away.)
+	static const std::shared_ptr<std::atomic<bool>> alive = std::make_shared<std::atomic<bool>>(true);
+	return ui_call(alive, [want, x, y, w, h, min_w, min_h, sized]() mutable -> json {
+		return click_pages(want, x, y, w, h, min_w, min_h, sized);
+	});
 }
 
 } // namespace direbot::obs
