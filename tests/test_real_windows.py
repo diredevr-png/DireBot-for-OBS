@@ -37,7 +37,7 @@ from test_real_face import (PretendPhone, PretendVmcApp, arms_character, camera_
 from test_real_hair import (LIFT, MAGENTA, WIDE_HAIR, Strands, add_strands, hair_character,  # noqa: E402
                             hair_over_body, magenta, open_glb, per_metre, save_glb, settles, top_of, white,
                             world_of, yellow)
-from test_real_obs import VERSION, free_port, vendor, wait_for  # noqa: E402
+from test_real_obs import VERSION, check_page_clicks, free_port, vendor, wait_for  # noqa: E402
 
 ROOT = os.environ.get("DIREBOT_OBS_ROOT", "")
 ZIP = os.environ.get("DIREBOT_OBS_ZIP", "")
@@ -230,6 +230,22 @@ def test_obs_loads_the_add_on(obs):
     try:
         info = vendor(c, "GetInfo")
         assert info["plugin"] == VERSION and info["link"] is True
+    finally:
+        c.disconnect()
+
+
+def test_a_click_on_direbots_own_page(obs):
+    """0.11.0: DireBot's clip queue has the add-on click Twitch's play
+    button - in OBS for Windows, as on Devon's PC (OBS's browser is always
+    there, so a page that never loads is a failure here, not a skip)."""
+    c = obs.client()
+    try:
+        assert vendor(c, "GetInfo")["features"]["page_click"] is True
+        scene = c.send("GetSceneList", raw=True)["currentProgramSceneName"]
+
+        def fail(why):
+            raise AssertionError(why + " - OBS's log:\n" + obs.log())
+        check_page_clicks(c, scene, fail)
     finally:
         c.disconnect()
 

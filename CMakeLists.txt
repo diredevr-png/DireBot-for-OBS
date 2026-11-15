@@ -49,6 +49,7 @@ target_sources(
     src/obs/usage.cpp
     src/obs/link-file.cpp
     src/obs/address.cpp
+    src/obs/page-click.cpp
     src/obs/keystore.cpp
     src/obs/settings-window.cpp
     src/obs/recording.cpp

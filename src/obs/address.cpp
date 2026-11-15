@@ -20,6 +20,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 
 namespace direbot::obs {
 
@@ -65,6 +66,29 @@ bool local_address(const std::string &url, int &port)
 	if (!here)
 		port = 0;
 	return here;
+}
+
+std::string address_path(const std::string &url)
+{
+	const size_t scheme = url.find("://");
+	if (scheme == std::string::npos)
+		return "";
+	const size_t start = url.find_first_of("/?#", scheme + 3);
+	if (start == std::string::npos || url[start] != '/')
+		return "/";
+	const size_t end = url.find_first_of("?#", start);
+	return url.substr(start, end == std::string::npos ? std::string::npos : end - start);
+}
+
+bool page_spot(double x, double y, uint32_t width, uint32_t height, int &px, int &py)
+{
+	px = py = 0;
+	if (!width || !height || !std::isfinite(x) || !std::isfinite(y) || x < 0 || x > 1 || y < 0 || y > 1)
+		return false;
+	// The last pixel at most: 1.0 is the page's far edge, still on it.
+	px = std::min((int)width - 1, (int)std::floor(x * width));
+	py = std::min((int)height - 1, (int)std::floor(y * height));
+	return true;
 }
 
 } // namespace direbot::obs

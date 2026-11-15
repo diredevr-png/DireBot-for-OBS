@@ -68,6 +68,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 // rest relaxed. FaceGetState also says how lit your camera is and where
 // your face is in it, for DireBot's camera check.
 //
+// 0.11.0: a click on DireBot's own page (obs/page-click.hpp) - DireBot's
+// clip queue has Twitch's clip player clicked, since inside OBS it waits
+// on its play button whatever it's told.
+//
 // Later parts plug in beside these: each gets its own folder under src/,
 // its own vendor requests, and a line in features().
 
@@ -93,6 +97,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "multistream/multistream.hpp"
 #include "obs/link-file.hpp"
 #include "obs/meters.hpp"
+#include "obs/page-click.hpp"
 #include "obs/usage.hpp"
 #include "obs/websocket.hpp"
 #include "record/record.hpp"
@@ -158,6 +163,8 @@ public:
 			for (const std::string &r : record::CleanRecordings::requests())
 				requests.push_back(r);
 			for (const std::string &r : face::requests())
+				requests.push_back(r);
+			for (const std::string &r : obs::page_click_requests())
 				requests.push_back(r);
 			ws_.connect([this](const std::string &type, const json &data,
 					   bool &found) { return vendor_request(type, data, found); },
@@ -308,6 +315,8 @@ private:
 			return record_.request(type, data);
 		if (face::handles(type))
 			return face::request(type, data);
+		if (obs::page_click_handles(type))
+			return obs::page_click(type, data);
 		json answer;
 		if (multistream_.request(type, data, answer))
 			return answer;
@@ -324,7 +333,8 @@ private:
 			{"link_port", server_.port()},
 			{"features",
 			 {{"link", true}, {"meters", true}, {"usage", true}, {"vertical", true}, {"multistream", true},
-			  {"follow_cam", true}, {"record", true}, {"moves", true}, {"blur", true}, {"face_avatar", true}}}};
+			  {"follow_cam", true}, {"record", true}, {"moves", true}, {"blur", true}, {"face_avatar", true},
+			  {"page_click", true}}}};
 	}
 
 	// One small thread for everything that runs on a clock: opening the

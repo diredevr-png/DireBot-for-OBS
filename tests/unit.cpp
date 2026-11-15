@@ -13,6 +13,7 @@
 #include "../src/obs/keystore.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -505,6 +506,29 @@ static void test_addresses()
 	CHECK(obs::local_address("http://127.0.0.1:/x", port) && port == 0);
 }
 
+// 0.11.0: which of DireBot's pages a browser source shows, and where a
+// click lands on it.
+static void test_page_paths_and_spots()
+{
+	CHECK(obs::address_path("http://localhost:8080/overlay") == "/overlay");
+	CHECK(obs::address_path("http://localhost:8080/overlay?layout=Chatting") == "/overlay");
+	CHECK(obs::address_path("http://127.0.0.1:8080/layer/clipqueue#x") == "/layer/clipqueue");
+	CHECK(obs::address_path("http://localhost:8080") == "/");
+	CHECK(obs::address_path("http://localhost:8080?x=/overlay") == "/");
+	CHECK(obs::address_path("http://user:pw@localhost:8080/overlay/") == "/overlay/");
+	CHECK(obs::address_path("localhost:8080/overlay").empty());
+	CHECK(obs::address_path("").empty());
+	int x = -1, y = -1;
+	CHECK(obs::page_spot(0.5, 0.5, 1920, 1080, x, y) && x == 960 && y == 540);
+	CHECK(obs::page_spot(0, 0, 1920, 1080, x, y) && x == 0 && y == 0);
+	CHECK(obs::page_spot(1, 1, 1920, 1080, x, y) && x == 1919 && y == 1079);
+	CHECK(obs::page_spot(0.25, 0.75, 400, 300, x, y) && x == 100 && y == 225);
+	CHECK(!obs::page_spot(-0.01, 0.5, 1920, 1080, x, y));
+	CHECK(!obs::page_spot(0.5, 1.01, 1920, 1080, x, y));
+	CHECK(!obs::page_spot(0.5, 0.5, 0, 1080, x, y));
+	CHECK(!obs::page_spot(std::nan(""), 0.5, 1920, 1080, x, y));
+}
+
 static void test_places_words()
 {
 	using namespace multistream;
@@ -749,6 +773,7 @@ int main()
 	test_frames();
 	test_protocol();
 	test_addresses();
+	test_page_paths_and_spots();
 	test_places_words();
 	test_places_tidy();
 	test_places_file();

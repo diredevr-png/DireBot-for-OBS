@@ -12,6 +12,7 @@ Skipped unless OBS, Xvfb and the test build are there (Linux):
         python3 -m pytest tests/test_real_obs.py
 """
 
+import http.server
 import json
 import math
 import os
@@ -22,7 +23,9 @@ import socket
 import struct
 import subprocess
 import tempfile
+import threading
 import time
+import urllib.parse
 import wave
 
 import pytest
@@ -298,7 +301,8 @@ def test_the_plugins_own_requests_over_the_link_and_obs_websocket(obs):
                                     "usage": True, "vertical": True,
                                     "multistream": True, "follow_cam": True,
                                     "record": True, "moves": True,
-                                    "blur": True, "face_avatar": True}
+                                    "blur": True, "face_avatar": True,
+                                    "page_click": True}
         usage = vendor(c, "GetUsage")
         assert usage["fps"] > 0 and usage["frame_budget_ms"] > 0
         assert usage["memory_mb"] > 10
@@ -391,6 +395,162 @@ def test_a_browser_overlays_address_is_never_reported(obs):
         if e.code == 605:     # this OBS was built without its browser
             pytest.skip("no browser source in this OBS")
         raise
+    finally:
+        c.disconnect()
+
+
+# ---- 0.11.0: a click on one of DireBot's own pages -------------------------
+
+CLICK_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="margin:0;width:100vw;height:100vh;background:#123">
+<iframe id="f" src="http://localhost:%(port)d/inner"
+  style="position:absolute;left:0;top:0;width:50%%;height:100%%;border:0"></iframe>
+<script>
+function tell(what){ var r = new XMLHttpRequest();
+  r.open('GET', what + (what.indexOf('?') < 0 ? '?' : '&') + 'page=' + location.pathname, true); r.send(); }
+document.addEventListener('mousedown', function(e){ tell('/clicked?x=' + e.clientX + '&y=' + e.clientY); });
+var told = false;
+setInterval(function(){
+  if (!told && document.activeElement === document.getElementById('f')){ told = true; tell('/focus'); }
+}, 100);
+window.onload = function(){ tell('/loaded?w=' + innerWidth + '&h=' + innerHeight); };
+</script></body></html>"""
+
+INNER_PAGE = """<!DOCTYPE html><html><body style="margin:0;background:#321">
+<script>
+document.addEventListener('mousedown', function(e){
+  var r = new XMLHttpRequest(); r.open('GET', '/inner-clicked?x=' + e.clientX + '&y=' + e.clientY, true); r.send(); });
+</script></body></html>"""
+
+
+class ClickPages:
+    """A pretend DireBot on this machine: /overlay and /elsewhere are pages
+    that say when they're loaded and clicked (and where), and when the
+    focus goes into the frame on their left half - a page from another
+    site (localhost, not 127.0.0.1), as Twitch's player is in DireBot's
+    clip queue; the frame says when it's clicked itself."""
+
+    def __init__(self):
+        self.heard = []
+        self.lock = threading.Lock()
+        pages = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                url = urllib.parse.urlsplit(self.path)
+                query = dict(urllib.parse.parse_qsl(url.query))
+                if url.path in ("/overlay", "/elsewhere"):
+                    body = (CLICK_PAGE % {"port": pages.port}).encode()
+                elif url.path == "/inner":
+                    body = INNER_PAGE.encode()
+                else:
+                    with pages.lock:
+                        pages.heard.append((url.path, query))
+                    body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def said(self, path, page=None):
+        with self.lock:
+            return [q for p, q in self.heard
+                    if p == path and (page is None or q.get("page") == page)]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def check_page_clicks(c, scene, browser_or_skip):
+    """ClickPage clicks DireBot's own page (this PC, DireBot's port, the
+    same path) where it's told - into a frame from another site too, which
+    takes the focus - and nothing else; it refuses what isn't a spot on a
+    page. `browser_or_skip(why)`: what to do when this OBS has no browser
+    (skip on Linux; on Windows OBS always has one, so fail)."""
+    pages = ClickPages()
+    made = []
+    try:
+        for name, url in (("Clip page", "http://127.0.0.1:%d/overlay?layout=Chatting" % pages.port),
+                          ("Another page", "http://127.0.0.1:%d/elsewhere" % pages.port),
+                          ("Another port", "http://127.0.0.1:%d/overlay" % free_port())):
+            try:
+                c.send("CreateInput", {"sceneName": scene, "inputName": name,
+                                       "inputKind": "browser_source",
+                                       "inputSettings": {"url": url, "width": 400, "height": 300},
+                                       "sceneItemEnabled": True}, raw=True)
+            except obsws.error.OBSSDKRequestError as e:
+                if e.code == 605:     # this OBS was built without its browser
+                    return browser_or_skip("no browser source in this OBS")
+                raise
+            made.append(name)
+        if not wait_for(lambda: pages.said("/loaded", "/overlay") and pages.said("/loaded", "/elsewhere"), 45, 0.2):
+            return browser_or_skip("the browser source never loaded a page here")
+        loaded = pages.said("/loaded", "/overlay")[0]
+        assert (loaded["w"], loaded["h"]) == ("400", "300"), loaded
+
+        # The right half: the page itself, at that spot.
+        answer = vendor(c, "ClickPage", {"port": pages.port, "path": "/overlay", "x": 0.75, "y": 0.5})
+        assert answer == {"ok": True, "clicked": 1}, answer
+        assert wait_for(lambda: pages.said("/clicked", "/overlay"), 10), pages.heard
+        spot = pages.said("/clicked", "/overlay")[0]
+        assert abs(int(spot["x"]) - 300) <= 1 and abs(int(spot["y"]) - 150) <= 1, spot
+        assert not pages.said("/focus", "/overlay")
+
+        # The left half: the frame from another site gets the click, and
+        # the page sees the focus go into it.
+        answer = vendor(c, "ClickPage", {"port": pages.port, "path": "/overlay", "x": 0.25, "y": 0.5})
+        assert answer == {"ok": True, "clicked": 1}, answer
+        assert wait_for(lambda: pages.said("/inner-clicked"), 10), pages.heard
+        spot = pages.said("/inner-clicked")[0]
+        assert abs(int(spot["x"]) - 100) <= 1 and abs(int(spot["y"]) - 150) <= 1, spot
+        assert wait_for(lambda: pages.said("/focus", "/overlay"), 5), pages.heard
+        assert len(pages.said("/clicked", "/overlay")) == 1     # the frame's, not the page's
+
+        # Another page of the same pretend DireBot, or the same path at
+        # another port: never clicked.
+        time.sleep(1)
+        assert not pages.said("/clicked", "/elsewhere") and not pages.said("/focus", "/elsewhere")
+        assert len(pages.said("/inner-clicked")) == 1, pages.heard
+        answer = vendor(c, "ClickPage", {"port": pages.port, "path": "/nowhere", "x": 0.5, "y": 0.5})
+        assert answer == {"ok": True, "clicked": 0}, answer
+
+        # Not a spot on a page, not a path, not a port: refused.
+        for bad in ({"port": pages.port, "path": "/overlay", "x": 1.5, "y": 0.5},
+                    {"port": pages.port, "path": "/overlay", "x": 0.5, "y": -0.1},
+                    {"port": pages.port, "path": "overlay", "x": 0.5, "y": 0.5},
+                    {"port": pages.port, "path": "/overlay?layout=Chatting", "x": 0.5, "y": 0.5},
+                    {"port": 0, "path": "/overlay", "x": 0.5, "y": 0.5},
+                    {"port": "8080", "path": "/overlay", "x": 0.5, "y": 0.5},
+                    {"path": "/overlay", "x": 0.5, "y": 0.5}, {}):
+            answer = vendor(c, "ClickPage", bad)
+            assert answer["ok"] is False and answer["error"], (bad, answer)
+        time.sleep(0.5)
+        assert len(pages.said("/clicked", "/overlay")) == 1 and len(pages.said("/inner-clicked")) == 1
+    finally:
+        for name in made:
+            try:
+                c.send("RemoveInput", {"inputName": name}, raw=True)
+            except Exception:
+                pass
+        pages.close()
+
+
+def test_a_click_on_direbots_own_page(obs):
+    c = obs.client()
+    try:
+        info = vendor(c, "GetInfo")
+        assert info["features"]["page_click"] is True
+        check_page_clicks(c, "Scene", pytest.skip)
     finally:
         c.disconnect()
 
