@@ -43,6 +43,11 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //     bounces off), pieces (a snowball crushed against it, bursting into
 //     chunks and a puff of powder, some snow left on its face a moment),
 //     or a squish (a rubber duck squashed flat and wobbling back).
+//     And (0.12.0) 3D pieces thrown off it as it hits - a tomato's pulp
+//     tumbling away the way it was going, its juice in drops thrown out
+//     all round along its face and stretched by their speed, the sheet of
+//     juice spreading out as it bursts - and what's left on its face wet
+//     and glossy, lit as the character is.
 //   - A headpat: a hand coming in from a side, over the top of its head,
 //     palm down, and patting it - lifted from the wrist and let fall, a
 //     couple of times a second - its head dipping and squishing with each
@@ -111,6 +116,33 @@ enum class Effect { None, Splat, Feathers, Pieces };
 const char *effect_name(Effect e);
 Effect effect_named(const std::string &name);
 
+// 3D pieces thrown off as it hits (0.12.0), each one of the caller's 3D
+// things, and how they move:
+//   - Chunk: big pieces flying on the way it was going and out from it,
+//     a little towards you, tumbling and falling (a tomato's pulp);
+//   - Drop: small drops thrown out all round along its face, fast,
+//     stretched by their speed (its own x, its front, the way it goes),
+//     and falling;
+//   - Crown: the sheet of juice thrown out along its face as it bursts,
+//     made lying flat with its open side up (y, as a glTF file stands
+//     it): spreading open in a blink (its "open" shape: 0 just burst, 1
+//     spread out) and settling flat into what's left on its face.
+enum class PieceWay { Chunk, Drop, Crown };
+// As DireBot names them ("chunk", "drop", "crown"), and back (false if
+// it isn't one).
+const char *piece_way_name(PieceWay w);
+bool piece_way_named(const std::string &name, PieceWay &way);
+// Pieces of one 3D thing: how many (at random, `least` to `most`), and
+// how big (heads across, its longest side, give or take a fifth) for a
+// thing as big as made (0.45 heads across: bigger things, bigger pieces).
+struct PieceLook {
+	int thing = -1;
+	PieceWay way = PieceWay::Chunk;
+	int least = 1, most = 1;
+	float size = 0.1f;
+};
+constexpr int MOST_PIECE_LOOKS = 8;
+
 // An effect and its pictures (the caller's numbers, -1 none): what's left
 // on its face (a splat; the snow a snowball leaves), the drips running
 // down from it, what's thrown off it (juice, feathers, snow - one of them
@@ -125,6 +157,12 @@ struct HitLook {
 	float seconds = 4;
 	// Squashed much flatter as it hits, and wobbling back (a rubber duck).
 	bool squishy = false;
+	// 0.12.0: its 3D pieces; a splat's quick mist (`puff`); and what's left
+	// on its face wet and glossy - the splat's and the drips' height maps
+	// (pictures: light is high), and how glossy (0 not at all, up to 1.5).
+	std::vector<PieceLook> pieces;
+	int mark_bump = -1, drip_bump = -1;
+	float shine = 1;
 };
 constexpr float MOST_MARK = 15;
 // At most this many left on its face at once (one more and the oldest
@@ -158,6 +196,9 @@ struct Throw {
 	// What it does as it hits (0.9.0). A splat or pieces never stick:
 	// it's broken.
 	HitLook look;
+	// A 3D thing (0.12.0): broken, it's squashed flat against its face
+	// (wider every way, thin towards you) rather than as a picture is.
+	bool three_d = false;
 };
 // The longest a thing stays stuck to it, and at most this many stuck at
 // once (one more and the one stuck longest falls away).
@@ -197,8 +238,9 @@ struct FaceNow {
 struct Flying {
 	int picture = -1;
 	float x = 0, y = 0, size = 0, angle = 0, opacity = 1;
-	// Squashed a moment as it hits: its width and height times these.
-	float squash_x = 1, squash_y = 1;
+	// Squashed a moment as it hits: its width and height times these
+	// (and a 3D one's depth towards you, 0.12.0).
+	float squash_x = 1, squash_y = 1, squash_z = 1;
 	bool hit = false;
 	// A 3D one turns `angle` about this way (as the picture shows it: x
 	// right, y up, z out of the picture towards you).
@@ -240,6 +282,10 @@ struct Mark {
 	float x = 0, y = 0, size = 0, angle = 0, opacity = 1;
 	bool from_top = false;
 	float length = 0;
+	// 0.12.0: wet and glossy - its height map (HitLook's number, -1: flat
+	// as before) and how glossy.
+	int bump = -1;
+	float shine = 1;
 };
 
 // A bit thrown off it as it hits (0.9.0): a drop of juice, a feather, a
@@ -249,6 +295,20 @@ struct Bit {
 	int picture = -1;
 	float x = 0, y = 0, size = 0, angle = 0, opacity = 1;
 };
+
+// A 3D piece thrown off it as it hits (0.12.0): its 3D thing (PieceLook's
+// number), its middle at (x, y) heads and `z` heads towards you, `size`
+// heads across (its longest side), turned `turn` (as the world has it: x
+// right, y up, z towards you), sized `shape` along its own x, y and z
+// first (a drop stretched by its speed, a crown settling flat), its
+// "open" shape (0 to 1) and how much it shows.
+struct Piece3D {
+	int thing = -1;
+	float x = 0, y = 0, z = 0, size = 0, open = 1, opacity = 1;
+	Quat turn;
+	V3 shape{1, 1, 1};
+};
+constexpr int MOST_PIECES = 200;
 
 struct ReactOut {
 	std::vector<FaceNow> faces;
@@ -278,6 +338,8 @@ struct ReactOut {
 	// (0.9.0).
 	std::vector<Mark> marks;
 	std::vector<Bit> bits;
+	// The 3D pieces in the air (0.12.0).
+	std::vector<Piece3D> pieces;
 	// Hits this frame (for FaceGetState's count, and the hit's sound).
 	int hits = 0;
 	// Anything on at all (when nothing is, nothing needs drawing).
@@ -328,6 +390,8 @@ public:
 	// How many are left on its face, and bits in the air (0.9.0).
 	int marks() const { return (int)marks_.size(); }
 	int bits() const { return (int)bits_.size(); }
+	// ...and 3D pieces (0.12.0).
+	int pieces() const { return (int)pieces_.size(); }
 	void pat(const Pat &p);
 	// Everything eased off (quickly) and nothing waiting.
 	void stop();
@@ -394,9 +458,11 @@ private:
 		float fade_at = -1, fade_time = 0.8f;
 		float roll = 0; // its face's tilt as it was left
 		int id = 0;     // a splat's number; a drip's, its splat's
+		int bump = -1;  // wet: its height map (0.12.0)
+		float shine = 1;
 	};
-	// A bit thrown off it: how it moves.
-	enum class BitKind { Drop, Feather, Chunk, Puff };
+	// A bit thrown off it: how it moves (a mist: a splat's, quick).
+	enum class BitKind { Drop, Feather, Chunk, Puff, Mist };
 	struct BitItem {
 		BitKind kind = BitKind::Drop;
 		int picture = -1;
@@ -405,6 +471,18 @@ private:
 		// A feather's sway: how far, how fast, where in it.
 		float sway = 0, sway_w = 0, sway_at = 0, sway_x = 0;
 		float fade_at = -1;
+	};
+	// A 3D piece thrown off it (0.12.0): where (heads; z towards you) and
+	// how fast, how big as it is whole, its tumble (about `axis`, as the
+	// world has it), how long it lasts, and (stopped) when it started to
+	// shrink away.
+	struct PieceItem {
+		int thing = -1;
+		PieceWay way = PieceWay::Chunk;
+		float x = 0, y = 0, z = 0, vx = 0, vy = 0, vz = 0, size = 0;
+		V3 axis{0, 0, 1};
+		float angle = 0, spin = 0;
+		float at = 0, life = 1, fade_at = -1;
 	};
 	struct Spring {
 		float value = 0, speed = 0;
@@ -416,8 +494,10 @@ private:
 	void hit(Item &it, ReactOut &out);
 	// Off it now (stuck), falling away.
 	void unstick(Item &it);
-	// What it does as it hits (its HitLook), from where it touches.
-	void effect(const Item &it, float x, float y);
+	// What it does as it hits (its HitLook), from where it touches, the
+	// way it was going (unit, as the picture shows it).
+	void effect(const Item &it, float x, float y, float ux, float uy);
+	void step_pieces(float dt, const ReactView &view, ReactOut &out);
 	void step_effects(float dt, const ReactView &view, ReactOut &out);
 	void add_mark(const MarkItem &m);
 
@@ -465,6 +545,7 @@ private:
 	std::vector<Flash> flashes_;
 	std::vector<MarkItem> marks_;
 	std::vector<BitItem> bits_;
+	std::vector<PieceItem> pieces_;
 	float roll_now_ = 0; // ReactView::roll this step
 	int mark_ids_ = 0;
 };

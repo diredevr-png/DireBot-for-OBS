@@ -101,6 +101,19 @@ constexpr float BIT_GRAVITY = 8.5f, FEATHER_FALL = 0.55f, FEATHER_DRAG = 3.2f;
 // A squishy thing (a rubber duck): how flat it squashes, and its wobble
 // back (how fast it settles, seconds; how fast it wobbles).
 constexpr float SQUISH_FLAT = 0.6f, SQUISH_SETTLE = 0.12f, SQUISH_WOBBLE = 30.0f;
+// 0.12.0's 3D pieces: they shrink away over the last part of their life
+// (a share of it; stopped, over STOP_SHRINK seconds), rather than fade. A
+// crown spreads open in CROWN_OPEN seconds and to its size in CROWN_GROW,
+// settles flat from CROWN_SETTLE and is gone at CROWN_LIFE, fading over
+// its last CROWN_FADE (the splat under it takes over). A splat's mist
+// lasts about MIST_LIFE seconds.
+constexpr float PIECE_SHRINK = 0.3f, STOP_SHRINK = 0.2f;
+constexpr float CROWN_OPEN = 0.07f, CROWN_GROW = 0.08f, CROWN_SETTLE = 0.12f, CROWN_LIFE = 0.34f,
+		CROWN_FADE = 0.12f;
+// ...longer on the way the thing was going (times this), and showing this
+// much (a thin sheet).
+constexpr float CROWN_LONG = 1.25f, CROWN_SHOWS = 0.9f;
+constexpr float MIST_LIFE = 0.23f;
 
 float clamp01(float v)
 {
@@ -145,6 +158,31 @@ const char *effect_name(Effect e)
 	default:
 		return "";
 	}
+}
+
+const char *piece_way_name(PieceWay w)
+{
+	switch (w) {
+	case PieceWay::Drop:
+		return "drop";
+	case PieceWay::Crown:
+		return "crown";
+	default:
+		return "chunk";
+	}
+}
+
+bool piece_way_named(const std::string &name, PieceWay &way)
+{
+	std::string n;
+	for (char c : name)
+		n += (char)std::tolower((unsigned char)c);
+	for (PieceWay w : {PieceWay::Chunk, PieceWay::Drop, PieceWay::Crown})
+		if (n == piece_way_name(w)) {
+			way = w;
+			return true;
+		}
+	return false;
 }
 
 Effect effect_named(const std::string &name)
@@ -486,6 +524,9 @@ void React::stop()
 	for (BitItem &b : bits_)
 		if (b.fade_at < 0)
 			b.fade_at = b.at;
+	for (PieceItem &p : pieces_)
+		if (p.fade_at < 0)
+			p.fade_at = p.at;
 }
 
 void React::launch(Item &it, const ReactView &view)
@@ -608,7 +649,7 @@ void React::hit(Item &it, ReactOut &out)
 	}
 	it.x = it.x1;
 	it.y = it.y1;
-	effect(it, it.x1, it.touch_y);
+	effect(it, it.x1, it.touch_y, ux, uy);
 	if (t.look.effect == Effect::Splat || t.look.effect == Effect::Pieces) {
 		// Broken against it: no bouncing off.
 		it.broke = true;
@@ -673,10 +714,10 @@ void React::add_mark(const MarkItem &m)
 	}
 }
 
-void React::effect(const Item &it, float x, float y)
+void React::effect(const Item &it, float x, float y, float ux, float uy)
 {
 	const HitLook &look = it.t.look;
-	if (look.effect == Effect::None)
+	if (look.effect == Effect::None && look.pieces.empty())
 		return;
 	// As big as it was made (0.45 heads across): bigger or smaller things
 	// splash bigger or smaller.
@@ -699,6 +740,8 @@ void React::effect(const Item &it, float x, float y)
 		m.grow = 0;
 		m.roll = roll_now_;
 		m.id = ++mark_ids_;
+		m.bump = look.mark_bump;
+		m.shine = look.shine;
 		if (m.picture >= 0)
 			add_mark(m);
 		// Drips running down from its lower part.
@@ -718,7 +761,23 @@ void React::effect(const Item &it, float x, float y)
 			d.run_time = random(1.3f, 2.6f);
 			d.roll = roll_now_;
 			d.id = m.id;
+			d.bump = look.drip_bump;
+			d.shine = look.shine;
 			marks_.push_back(d);
+		}
+		// A quick mist where it burst (0.12.0), gone almost at once.
+		if (look.puff >= 0) {
+			BitItem b;
+			b.kind = BitKind::Mist;
+			b.picture = look.puff;
+			b.x = x;
+			b.y = y;
+			b.vx = random(-0.15f, 0.15f);
+			b.vy = -random(0.0f, 0.2f);
+			b.size = it.size0 * random(1.3f, 1.6f);
+			b.angle = random(-PI_F, PI_F);
+			b.life = MIST_LIFE * random(0.85f, 1.15f);
+			add_bit(b);
 		}
 		// Juice thrown off it, out and up from where it burst.
 		const int drops = look.bits.empty() ? 0 : 8 + (int)(random01() * 4);
@@ -803,6 +862,117 @@ void React::effect(const Item &it, float x, float y)
 			add_bit(b);
 		}
 	}
+	// Its 3D pieces (0.12.0).
+	const float way = std::atan2(uy, ux);
+	for (const PieceLook &pl : look.pieces) {
+		if (pl.thing < 0 || !finite(pl.size) || !(pl.size > 0))
+			continue;
+		const int lo = std::max(0, std::min(pl.least, pl.most)), hi = std::max(lo, pl.most);
+		const int n = std::min(hi, lo + (int)(random01() * (hi - lo + 1)));
+		for (int i = 0; i < n && (int)pieces_.size() < MOST_PIECES; i++) {
+			PieceItem p;
+			p.thing = pl.thing;
+			p.way = pl.way;
+			p.size = pl.size * k * random(0.8f, 1.2f);
+			if (pl.way == PieceWay::Chunk) {
+				// On the way it was going (within about 55 degrees of
+				// it) and out, kicked up, a little towards you; tumbling.
+				const float a = way + random(-0.95f, 0.95f), v = random(1.0f, 2.2f) * rk;
+				p.x = x + 0.08f * k * std::cos(a);
+				p.y = y + 0.08f * k * std::sin(a);
+				p.vx = v * std::cos(a);
+				p.vy = v * std::sin(a) - random(0.6f, 1.4f);
+				p.vz = random(0.2f, 1.0f);
+				p.axis = normalized(V3{random(-1, 1), random(-1, 1), random(-1, 1)}, {0, 0, 1});
+				p.angle = random(-PI_F, PI_F);
+				p.spin = random(5.0f, 11.0f) * (random01() < 0.5f ? -1 : 1);
+				p.life = random(0.8f, 1.15f);
+			} else if (pl.way == PieceWay::Drop) {
+				// All round along its face, more of them on the way it
+				// was going; a little towards you.
+				const float a = random01() < 0.4f ? way + random(-0.8f, 0.8f) : random(-PI_F, PI_F);
+				const float v = random(1.6f, 3.6f) * rk;
+				p.x = x + 0.1f * k * std::cos(a);
+				p.y = y + 0.1f * k * std::sin(a);
+				p.vx = v * std::cos(a);
+				p.vy = v * std::sin(a) - random(0.3f, 1.0f);
+				p.vz = random(0.1f, 1.4f);
+				p.life = random(0.45f, 0.8f);
+			} else {
+				// Spreading out along its face where it burst, a little on
+				// the way it was going and longer that way (its own x
+				// turned to it, about).
+				p.x = x + 0.06f * k * ux;
+				p.y = y + 0.06f * k * uy;
+				p.z = 0.02f;
+				p.angle = -way + random(-0.3f, 0.3f);
+				p.life = CROWN_LIFE;
+			}
+			pieces_.push_back(p);
+		}
+	}
+}
+
+void React::step_pieces(float dt, const ReactView &view, ReactOut &out)
+{
+	for (PieceItem &p : pieces_) {
+		p.at += dt;
+		if (p.way == PieceWay::Crown)
+			continue;
+		p.vy += BIT_GRAVITY * dt;
+		p.x += p.vx * dt;
+		p.y += p.vy * dt;
+		p.z += p.vz * dt;
+		p.angle += p.spin * dt;
+	}
+	pieces_.erase(std::remove_if(pieces_.begin(), pieces_.end(),
+				     [&](const PieceItem &p) {
+					     return p.at >= p.life ||
+						    (p.fade_at >= 0 && p.at - p.fade_at >= STOP_SHRINK) ||
+						    p.y - p.size > view.bottom + 0.5f;
+				     }),
+		      pieces_.end());
+	for (const PieceItem &p : pieces_) {
+		Piece3D o;
+		o.thing = p.thing;
+		o.x = p.x;
+		o.y = p.y;
+		o.z = p.z;
+		o.size = p.size;
+		// Shrinking away at the end (stopped: now, quickly).
+		float left = 1 - smooth((p.at - p.life * (1 - PIECE_SHRINK)) / (p.life * PIECE_SHRINK));
+		if (p.fade_at >= 0)
+			left *= 1 - smooth((p.at - p.fade_at) / STOP_SHRINK);
+		if (p.way == PieceWay::Chunk) {
+			o.turn = axis_angle(p.axis, p.angle);
+			o.size *= left;
+		} else if (p.way == PieceWay::Drop) {
+			// Its front the way it goes (the world's y is up), stretched
+			// by its speed and thinner for it.
+			const V3 go{p.vx, -p.vy, p.vz};
+			o.turn = turn_between({1, 0, 0}, normalized(go, {1, 0, 0}));
+			const float s = 1 + std::min(1.4f, 0.22f * length(go));
+			o.shape = {s, 1 / std::sqrt(s), 1 / std::sqrt(s)};
+			o.size *= left;
+		} else {
+			// Open in a blink, to its size a moment later (fast, then
+			// slowing), then settling flat into the splat as it fades.
+			const float u = p.at;
+			o.open = 1 - std::pow(1 - clamp01(u / CROWN_OPEN), 3.0f);
+			const float settle = smooth((u - CROWN_SETTLE) / (p.life - CROWN_SETTLE));
+			o.size *= (0.55f + 0.45f * (1 - sq(1 - clamp01(u / CROWN_GROW)))) * (1 - 0.1f * settle);
+			o.shape = {CROWN_LONG, 1 - 0.85f * settle, 1};
+			// (A thin sheet: a little see-through.)
+			o.opacity = CROWN_SHOWS * (1 - smooth((u - (p.life - CROWN_FADE)) / CROWN_FADE));
+			if (p.fade_at >= 0)
+				o.opacity *= 1 - smooth((p.at - p.fade_at) / STOP_SHRINK);
+			// Lying flat on its face, its open side towards you, its own x
+			// turned `angle` (the world's way round: y up).
+			o.turn = axis_angle({0, 0, 1}, p.angle) * axis_angle({1, 0, 0}, PI_F / 2);
+		}
+		if (o.size > 1e-4f && o.opacity > 0.001f)
+			out.pieces.push_back(o);
+	}
 }
 
 void React::step_effects(float dt, const ReactView &view, ReactOut &out)
@@ -825,6 +995,7 @@ void React::step_effects(float dt, const ReactView &view, ReactOut &out)
 			b.sway_x = b.sway * grows * std::sin(ph);
 			break;
 		}
+		case BitKind::Mist:
 		case BitKind::Puff: {
 			const float drag = std::exp(-2.0f * dt);
 			b.vx *= drag;
@@ -880,6 +1051,13 @@ void React::step_effects(float dt, const ReactView &view, ReactOut &out)
 			fade = 0.85f * (1 - smooth(u));
 			break;
 		}
+		case BitKind::Mist: {
+			// Out fast and stopped almost at once, thinning away.
+			const float u = b.at / b.life;
+			o.size = b.size * (0.6f + 0.6f * (1 - sq(1 - clamp01(u * 1.6f))));
+			fade = 0.75f * smooth(b.at / 0.02f) * (1 - smooth(u));
+			break;
+		}
 		}
 		if (b.fade_at >= 0)
 			fade *= 1 - smooth((b.at - b.fade_at) / 0.3f);
@@ -887,6 +1065,9 @@ void React::step_effects(float dt, const ReactView &view, ReactOut &out)
 		if (o.opacity > 0.001f)
 			out.bits.push_back(o);
 	}
+
+	// The 3D pieces (0.12.0).
+	step_pieces(dt, view, out);
 
 	// What's left on its face.
 	for (MarkItem &m : marks_)
@@ -1011,11 +1192,17 @@ ReactOut React::step(float dt, const ReactView &view)
 			f.squash_x = 1.06f + 0.29f * e;
 			f.squash_y = 0.95f - 0.25f * e;
 		} else if (it.broke) {
-			// Crushed flat against it, then gone (what it left takes over).
+			// Crushed flat against it, then gone (what it left takes over):
+			// a 3D one wider every way and thin towards you.
 			const float u = clamp01((it.at - it.hit_at) / CRUSH);
 			f.opacity = 1 - smooth(u);
-			f.squash_x = 1.3f + 0.35f * u;
-			f.squash_y = 0.6f - 0.25f * u;
+			if (it.t.three_d) {
+				f.squash_x = f.squash_y = 1.25f + 0.4f * u;
+				f.squash_z = 0.45f - 0.3f * u;
+			} else {
+				f.squash_x = 1.3f + 0.35f * u;
+				f.squash_y = 0.6f - 0.25f * u;
+			}
 		} else if (it.hit) {
 			const float tt = it.at - it.hit_at;
 			f.opacity = 1 - smooth((tt - (it.dropped ? 0.0f : 0.25f)) / (it.dropped ? 0.3f : FALL_TIME - 0.25f));
@@ -1310,6 +1497,8 @@ ReactOut React::step(float dt, const ReactView &view)
 			o.y = m.y;
 			o.size = m.size;
 			o.angle = m.angle;
+			o.bump = m.bump;
+			o.shine = m.shine;
 			float fade = 1;
 			const float end = m.at - m.stay;
 			if (end > 0) {
@@ -1350,7 +1539,7 @@ ReactOut React::step(float dt, const ReactView &view)
 		yaw_ = pitch_ = roll_ = dx_ = dy_ = Spring();
 	out.busy = settling || !faces_.empty() || !acts_.empty() || !flying_.empty() || !waiting_.empty() || patting_ ||
 		   !flashes_.empty() || ouch_ >= 0 || out.hits > 0 || after_ >= 0 || squish_ != 0 ||
-		   squish_speed_ != 0 || !marks_.empty() || !bits_.empty();
+		   squish_speed_ != 0 || !marks_.empty() || !bits_.empty() || !pieces_.empty();
 	return out;
 }
 

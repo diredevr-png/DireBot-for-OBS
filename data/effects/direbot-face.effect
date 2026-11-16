@@ -2,6 +2,8 @@
 //   Picture  the character's pictures (straight colour), cut to `clip`
 //   Stain    a picture premultiplied (something left on its face: the
 //            blend keeps it to where the character is drawn)
+//   WetStain the same, wet and glossy (0.12.0): its bumps (`bump_map`)
+//            lit by the character's key light, a highlight on them
 //   Cutout   one of your eyes or your mouth, from the camera: along its
 //            soft outline (`mask_map`), its skin taking the character's
 //            colour
@@ -62,6 +64,13 @@ uniform float ring_on;
 // The character's light on the card (each colour, 1: the studio's), so
 // your eyes and mouth sit in its light.
 uniform float3 card_light;
+// WetStain: its height map (light is high); which way its key light is
+// (towards it, in the picture's own ways: x across, y down, z towards
+// you); and how glossy, how steep its bumps, and how far apart (0 to 1)
+// two points of the height map are read, across and down.
+uniform texture2d bump_map;
+uniform float3 wet_light;
+uniform float4 wet_look;
 
 sampler_state textureSampler {
 	Filter    = Linear;
@@ -102,6 +111,25 @@ float4 PSStain(VertData v_in) : TARGET
 	float4 c = image.Sample(textureSampler, v_in.uv);
 	float a = c.a * opacity;
 	return float4(c.rgb * a, a);
+}
+
+// ---- WetStain ----
+
+float4 PSWetStain(VertData v_in) : TARGET
+{
+	float4 c = image.Sample(textureSampler, v_in.uv);
+	float2 step = wet_look.zw;
+	float hl = bump_map.Sample(textureSampler, v_in.uv - float2(step.x, 0.0)).r;
+	float hr = bump_map.Sample(textureSampler, v_in.uv + float2(step.x, 0.0)).r;
+	float hu = bump_map.Sample(textureSampler, v_in.uv - float2(0.0, step.y)).r;
+	float hd = bump_map.Sample(textureSampler, v_in.uv + float2(0.0, step.y)).r;
+	float3 n = normalize(float3((hl - hr) * wet_look.y, (hu - hd) * wet_look.y, 1.0));
+	float3 l = normalize(wet_light);
+	float3 h = normalize(l + float3(0.0, 0.0, 1.0));
+	float lit = 0.8 + 0.3 * dot(n, l);
+	float gloss = pow(saturate(dot(n, h)), 60.0) * wet_look.x;
+	float a = c.a * opacity;
+	return float4((c.rgb * lit + float3(gloss, gloss, gloss)) * a, a);
 }
 
 // ---- Colour (avatar2d.cpp's lab_of and rgb_of) ----
@@ -347,6 +375,15 @@ technique Stain
 	{
 		vertex_shader = VSDefault(v_in);
 		pixel_shader  = PSStain(v_in);
+	}
+}
+
+technique WetStain
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSWetStain(v_in);
 	}
 }
 

@@ -60,6 +60,13 @@ static bool finite_out(const ReactOut &o)
 	for (const Bit &b : o.bits)
 		good = good && ok(b.x) && ok(b.y) && ok(b.size) && ok(b.angle) && ok(b.opacity) && b.size > 0 &&
 		       b.opacity > 0 && b.opacity <= 1;
+	for (const Flying &f : o.flying)
+		good = good && ok(f.squash_z) && f.squash_z > 0;
+	for (const Piece3D &p : o.pieces)
+		good = good && ok(p.x) && ok(p.y) && ok(p.z) && ok(p.size) && ok(p.open) && ok(p.opacity) &&
+		       ok(p.turn.x) && ok(p.turn.y) && ok(p.turn.z) && ok(p.turn.w) && ok(p.shape.x) &&
+		       ok(p.shape.y) && ok(p.shape.z) && p.size > 0 && p.opacity > 0 && p.opacity <= 1 &&
+		       p.open >= 0 && p.open <= 1 && p.shape.x > 0 && p.shape.y > 0 && p.shape.z > 0;
 	return good;
 }
 
@@ -1455,6 +1462,235 @@ static void test_effects()
 	}
 }
 
+// 0.12.0: 3D pieces thrown off as it hits - a tomato's pulp tumbling away
+// the way it was going, its juice in drops thrown out all round and
+// stretched by their speed, the sheet of juice spreading open in a blink
+// and settling flat - each shrinking away (stopped: at once), never too
+// many; a quick mist; what's left on its face wet; a broken 3D thing
+// squashed flat against its face.
+static void test_pieces()
+{
+	PieceWay w = PieceWay::Chunk;
+	CHECK(piece_way_named("DROP", w) && w == PieceWay::Drop);
+	CHECK(piece_way_named("crown", w) && w == PieceWay::Crown);
+	CHECK(!piece_way_named("blob", w) && w == PieceWay::Crown && !piece_way_named("", w));
+	for (PieceWay v : {PieceWay::Chunk, PieceWay::Drop, PieceWay::Crown})
+		CHECK(piece_way_named(piece_way_name(v), w) && w == v);
+	// (Room below for all of it to fall and shrink away in sight.)
+	ReactView view;
+	view.bottom = 6;
+	auto tomato = []() {
+		Throw t;
+		t.picture = 0;
+		t.side = 1; // from the picture's right: going left
+		t.three_d = true;
+		t.look.effect = Effect::Splat;
+		t.look.mark = 5;
+		t.look.drip = 6;
+		t.look.puff = 8;
+		t.look.mark_bump = 9;
+		t.look.drip_bump = 10;
+		t.look.shine = 0.7f;
+		t.look.seconds = 1;
+		PieceLook crown, chunk, drop;
+		crown.thing = 0;
+		crown.way = PieceWay::Crown;
+		crown.size = 0.5f;
+		chunk.thing = 1;
+		chunk.least = 3;
+		chunk.most = 5;
+		chunk.size = 0.13f;
+		drop.thing = 2;
+		drop.way = PieceWay::Drop;
+		drop.least = 18;
+		drop.most = 26;
+		drop.size = 0.05f;
+		t.look.pieces = {crown, chunk, drop};
+		return t;
+	};
+	auto step_to_hit = [&](React &r) {
+		ReactOut o;
+		for (int i = 0; i < 200 && !o.hits; i++)
+			o = r.step(FRAME, view);
+		return o;
+	};
+	auto of = [](const ReactOut &o, int thing) {
+		std::vector<Piece3D> got;
+		for (const Piece3D &p : o.pieces)
+			if (p.thing == thing)
+				got.push_back(p);
+		return got;
+	};
+	for (uint32_t seed : {1u, 2u, 3u, 4u, 5u}) {
+		React r(seed);
+		CHECK(r.throw_at(tomato()) > 0);
+		ReactOut o = step_to_hit(r);
+		CHECK(o.hits == 1 && finite_out(o));
+		const std::vector<Piece3D> crowns = of(o, 0), chunks = of(o, 1), drops = of(o, 2);
+		CHECK(crowns.size() == 1);
+		CHECK(chunks.size() >= 3 && chunks.size() <= 5);
+		CHECK(drops.size() >= 18 && drops.size() <= 26);
+		CHECK((int)o.pieces.size() == r.pieces());
+		// The crown where it burst (a little on the way it was going),
+		// lying flat with its open side towards you, just burst; a little
+		// see-through; longer the way it was going.
+		CHECK(o.marks.size() >= 1);
+		const Mark splat = o.marks[0];
+		const Piece3D &c0 = crowns[0];
+		CHECK(std::fabs(c0.x - splat.x) < 0.1f && std::fabs(c0.y - splat.y) < 0.1f && c0.z > 0);
+		CHECK(c0.open < 0.65f && c0.opacity <= 0.9f + 1e-6f && c0.shape.x > 1.1f);
+		const V3 up = rotate(c0.turn, {0, 1, 0});
+		CHECK(up.z > 0.99f);
+		// Its long way (its own x) along the way it was going (leftwards,
+		// and down as it came down on its arc).
+		CHECK(rotate(c0.turn, {1, 0, 0}).x < -0.2f);
+		// What's left on its face is wet, its drips too; the mist.
+		CHECK(splat.bump == 9 && std::fabs(splat.shine - 0.7f) < 1e-6f);
+		int mists = 0;
+		for (const Bit &b : o.bits)
+			mists += b.picture == 8;
+		CHECK(mists == 1);
+		// The tomato itself squashed flat against its face: wider every
+		// way, thin towards you.
+		CHECK(o.flying.size() == 1 && o.flying[0].squash_z < 0.5f &&
+		      std::fabs(o.flying[0].squash_x - o.flying[0].squash_y) < 1e-6f && o.flying[0].squash_x > 1.2f);
+		// On: the crown opens in a blink and grows, then settles flat and
+		// is gone in about a third of a second.
+		float open_at_70ms = 0, biggest = c0.size, flattest = 1;
+		float crown_gone = -1, mist_gone = -1, t = 0;
+		// The chunks: the way it was going (left) at first, towards you,
+		// and falling; shrinking away at the end. The drops: stretched,
+		// their fronts the way they go.
+		float chunk_vx = 0, first_x = 0;
+		for (const Piece3D &p : chunks)
+			first_x += p.x / chunks.size();
+		bool drops_point = true, drops_stretched = true, towards_you = true, fine = true;
+		std::vector<Piece3D> last = o.pieces;
+		std::vector<float> chunk_y;
+		bool drips_wet = false;
+		float chunk_small = 1;
+		while (t < 1.4f) {
+			ReactOut q = r.step(FRAME, view);
+			t += FRAME;
+			fine = fine && finite_out(q);
+			const std::vector<Piece3D> cr = of(q, 0), ch = of(q, 1), dr = of(q, 2);
+			if (!cr.empty()) {
+				if (t <= 0.07f + 1e-4f)
+					open_at_70ms = cr[0].open;
+				biggest = std::max(biggest, cr[0].size);
+				flattest = std::min(flattest, cr[0].shape.y);
+			} else if (crown_gone < 0) {
+				crown_gone = t;
+			}
+			bool mist = false;
+			for (const Bit &b : q.bits)
+				mist = mist || b.picture == 8;
+			if (!mist && mist_gone < 0)
+				mist_gone = t;
+			for (const Mark &m : q.marks)
+				drips_wet = drips_wet || (m.from_top && m.bump == 10);
+			if (t < 0.1f && !ch.empty()) {
+				float x = 0;
+				for (const Piece3D &p : ch)
+					x += p.x / ch.size();
+				chunk_vx = (x - first_x) / t;
+				for (const Piece3D &p : ch)
+					towards_you = towards_you && p.z > 0;
+			}
+			if (!ch.empty()) {
+				float y = 0;
+				for (const Piece3D &p : ch)
+					y += p.y / ch.size();
+				chunk_y.push_back(y);
+				for (const Piece3D &p : ch)
+					chunk_small = std::min(chunk_small, p.size / 0.13f);
+			}
+			// Each drop's front the way it went since the frame before.
+			std::vector<Piece3D> lastd;
+			for (const Piece3D &p : last)
+				if (p.thing == 2)
+					lastd.push_back(p);
+			if (t < 0.3f && lastd.size() == dr.size())
+				for (size_t i = 0; i < dr.size(); i++) {
+					const V3 went{dr[i].x - lastd[i].x, -(dr[i].y - lastd[i].y), dr[i].z - lastd[i].z};
+					if (length(went) > 1e-4f)
+						drops_point = drops_point &&
+							      dot(rotate(dr[i].turn, {1, 0, 0}), normalized(went)) > 0.95f;
+					drops_stretched = drops_stretched && dr[i].shape.x > 1.05f && dr[i].shape.y < 1 &&
+							  std::fabs(dr[i].shape.y - dr[i].shape.z) < 1e-5f;
+				}
+			last = q.pieces;
+		}
+		CHECK(fine);
+		CHECK(open_at_70ms > 0.99f && biggest > c0.size * 1.3f && flattest < 0.3f);
+		CHECK(crown_gone > 0.3f && crown_gone < 0.4f);
+		CHECK(mist_gone > 0.15f && mist_gone < 0.32f);
+		CHECK(drips_wet);
+		CHECK(chunk_vx < -0.3f && towards_you);
+		CHECK(chunk_y.size() > 30 && chunk_y[30] > chunk_y[5]);
+		CHECK(chunk_small < 0.5f);
+		CHECK(drops_point && drops_stretched);
+		// All gone, and all still.
+		run(r, 3.0f, view, [](const ReactOut &) {});
+		ReactOut now = r.step(FRAME, view);
+		CHECK(now.pieces.empty() && r.pieces() == 0 && !now.busy);
+	}
+	{
+		// Stopped: its pieces shrink away at once.
+		React r(9);
+		r.throw_at(tomato());
+		ReactOut o = step_to_hit(r);
+		CHECK(!o.pieces.empty());
+		r.stop();
+		run(r, 0.25f, view, [](const ReactOut &) {});
+		CHECK(r.step(FRAME, view).pieces.empty());
+	}
+	{
+		// Never too many: a barrage keeps under MOST_PIECES.
+		React r(10);
+		for (int i = 0; i < MOST_WAITING; i++)
+			r.throw_at(tomato());
+		int most = 0;
+		run(r, 3.0f, view, [&](const ReactOut &q) { most = std::max(most, (int)q.pieces.size()); });
+		CHECK(most > 60 && most <= MOST_PIECES);
+	}
+	{
+		// Pieces of a thing that only hits (no effect): thrown all the
+		// same, and it bounces off as before; odd numbers are safe (none,
+		// no thing, least past most).
+		React r(11);
+		Throw t;
+		t.picture = 0;
+		t.three_d = true;
+		PieceLook a, b, c;
+		a.thing = 3;
+		a.least = a.most = 2;
+		b.thing = -1;
+		b.least = b.most = 5;
+		c.thing = 4;
+		c.least = 9;
+		c.most = 2;
+		c.size = std::numeric_limits<float>::quiet_NaN();
+		t.look.pieces = {a, b, c};
+		r.throw_at(t);
+		ReactOut o = step_to_hit(r);
+		CHECK(of(o, 3).size() == 2 && of(o, -1).empty());
+		CHECK(of(o, 4).empty() && finite_out(o));
+		CHECK(o.flying.size() == 1 && o.flying[0].squash_z == 1);
+		run(r, 0.3f, view, [](const ReactOut &) {});
+		CHECK(r.flying() == 1);
+		// A picture broken against it: as before (squashed as a picture).
+		React r2(12);
+		Throw p = tomato();
+		p.three_d = false;
+		p.look.pieces.clear();
+		r2.throw_at(p);
+		o = step_to_hit(r2);
+		CHECK(o.flying.size() == 1 && o.flying[0].squash_z == 1 && o.flying[0].squash_y < 0.7f);
+		CHECK(o.pieces.empty());
+	}
+}
+
 // After 0.10.0: a move that stays (a ride) has its idle cross-faded in
 // under it while the move shows whole - done as the move begins to ease
 // out, so the idle before it never shows through the move easing out over
@@ -1507,6 +1743,7 @@ int main()
 	test_sticks_and_bonks();
 	test_all_at_once();
 	test_effects();
+	test_pieces();
 	test_stay_swap();
 	std::printf("unit_react: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;

@@ -133,6 +133,9 @@ constexpr float HAND_HEAD = 0.22f, HAND_OVER = 0.0f, HAND_BACK = 0.05f, HAND_REA
 constexpr float HAND_3D_TALL = 0.8f;
 // 3D things over the character: drawn nearly straight on (a narrow view).
 constexpr float OVERLAY_FOV = 0.35f;
+// How steep a wet splat's bumps are (0.12.0): its height map's change
+// between two points read, times this.
+constexpr float WET_STEEP = 9.0f;
 // How much bigger than its spot an eye or the mouth is drawn: room round
 // it for its soft edge.
 constexpr float PIECE_ROOM = 1.25f;
@@ -1390,7 +1393,8 @@ struct FaceAvatar {
 		    *p_body_map = nullptr, *p_body_place = nullptr, *p_inside = nullptr, *p_depth_map = nullptr,
 		    *p_char_px = nullptr, *p_pivot = nullptr, *p_turn_k = nullptr, *p_cell = nullptr, *p_pad = nullptr,
 		    *p_flip = nullptr, *p_body_origin = nullptr, *p_body_across = nullptr, *p_body_down = nullptr,
-		    *p_ring = nullptr, *p_ring_on = nullptr, *p_card_light = nullptr;
+		    *p_ring = nullptr, *p_ring_on = nullptr, *p_card_light = nullptr, *p_bump_map = nullptr,
+		    *p_wet_light = nullptr, *p_wet_look = nullptr;
 	EffectCheck check;
 	bool drawing = false, drawn = false, have_out = false;
 	std::vector<uint8_t> mask_bytes;
@@ -1617,6 +1621,8 @@ struct FaceAvatar {
 	// thing's number): its pictures by number in effect_pics.
 	std::vector<HitLook> throw_looks;
 	std::vector<PicturePtr> effect_pics;
+	// ...and their 3D pieces' files (0.12.0, PieceLook's numbers).
+	std::vector<std::string> piece_files;
 	std::string hand3d_file;
 	// A picture of the hand: where it touches the head and where its wrist
 	// is (shares of its width and height, as it comes from the left), and
@@ -1665,6 +1671,7 @@ struct FaceAvatar {
 		bool arms = false, motions = false, three_d = false, busy = false, placed = false;
 		int hits = 0, flying = 0;
 		int marks = 0, bits = 0; // 0.9.0: left on its face, bits in the air
+		int pieces = 0;          // 0.12.0: 3D pieces in the air
 		float head_px = 0;
 		Hand hand; // the headpat's hand now
 		float squint = 0, squish = 0;
@@ -1762,6 +1769,9 @@ struct FaceAvatar {
 			p_ring = param("ring");
 			p_ring_on = param("ring_on");
 			p_card_light = param("card_light");
+			p_bump_map = param("bump_map");
+			p_wet_light = param("wet_light");
+			p_wet_look = param("wet_look");
 			check.load(effect, "2D", face_2d_needs());
 			const float zero = 0;
 			const uint8_t *zero_data = reinterpret_cast<const uint8_t *>(&zero);
@@ -2542,6 +2552,7 @@ struct FaceAvatar {
 			const bool wanted =
 				it->first == hand3d_file ||
 				std::find(throw_files.begin(), throw_files.end(), it->first) != throw_files.end() ||
+				std::find(piece_files.begin(), piece_files.end(), it->first) != piece_files.end() ||
 				std::find(std::begin(game_files), std::end(game_files), it->first) != std::end(game_files);
 			if (wanted) {
 				++it;
@@ -2567,6 +2578,15 @@ struct FaceAvatar {
 		if (i < 0 || i >= DESK_PROPS || game_files[i].empty())
 			return nullptr;
 		auto it = props3d.find(game_files[i]);
+		return it == props3d.end() ? nullptr : it->second.get();
+	}
+
+	// 3D piece `n` (react.hpp's PieceLook::thing), if it's loaded.
+	Prop3D *piece_3d(int n)
+	{
+		if (n < 0 || n >= (int)piece_files.size())
+			return nullptr;
+		auto it = props3d.find(piece_files[n]);
 		return it == props3d.end() ? nullptr : it->second.get();
 	}
 
@@ -2846,12 +2866,35 @@ struct FaceAvatar {
 			M4 squash;
 			squash.m[0] = fl.squash_x;
 			squash.m[5] = fl.squash_y;
+			squash.m[10] = fl.squash_z;
 			PropAt p;
 			p.prop = prop;
 			// Turned clockwise as the picture shows it: about its way.
 			p.place = moved(world_of(fl.x, fl.y)) * squash * matrix_of(axis_angle(fl.axis, -fl.angle)) *
 				  scaled(fl.size / across) * moved((lo + hi) * -0.5f);
 			p.opacity = fl.opacity;
+			with.push_back(p);
+		}
+		// 3D pieces thrown off as things hit (0.12.0): sized by their
+		// longest side, stretched along their own ways, turned, at their
+		// distance towards you; their "open" shape as react.hpp says.
+		for (const Piece3D &pc : r.pieces) {
+			Prop3D *prop = piece_3d(pc.thing);
+			if (!prop || !(pc.opacity > 0.001f) || !(pc.size > 0))
+				continue;
+			const V3 lo = prop->low(), hi = prop->high();
+			const float across = std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 1e-6f});
+			PropAt p;
+			p.prop = prop;
+			p.place = moved(world_of(pc.x, pc.y) + V3{0, 0, pc.z}) * matrix_of(pc.turn) *
+				  matrix_of(V3{0, 0, 0}, Quat(), pc.shape) * scaled(pc.size / across) *
+				  moved((lo + hi) * -0.5f);
+			p.opacity = pc.opacity;
+			const int open = prop->shape("open");
+			if (open >= 0) {
+				p.shapes.assign((size_t)open + 1, 0);
+				p.shapes[open] = pc.open;
+			}
 			with.push_back(p);
 		}
 		Prop3D *hand = hand_too && r.hand.shown ? hand_3d() : nullptr;
@@ -4290,10 +4333,28 @@ struct FaceAvatar {
 		vec4_set(&m.t, cx + co * ox - si * oy, cy + si * ox + co * oy, 0, 1);
 		gs_effect_set_texture(p_image, pic->texture());
 		gs_effect_set_float(p_opacity, std::min(1.0f, mk.opacity));
+		// Wet and glossy (0.12.0): its bumps lit by the character's key
+		// light (the world's y is up; the picture's down), turned as it is.
+		const PicturePtr &bump = effect_picture(mk.bump);
+		const bool wet = loaded(bump) && mk.shine > 0.001f;
+		if (wet) {
+			const V3 key = normalized(look3d.lights.key_dir, {0, 0, 1});
+			const float lx = key.x, ly = -key.y;
+			vec3 light;
+			vec3_set(&light, co * lx + si * ly, -si * lx + co * ly, key.z);
+			vec4 look;
+			// (Two of the height map's points apart: smoother.)
+			vec4_set(&look, mk.shine, WET_STEEP, 2.0f / std::max(1.0f, (float)bump->width()),
+				 2.0f / std::max(1.0f, (float)bump->height()));
+			gs_effect_set_texture(p_bump_map, bump->texture());
+			gs_effect_set_vec3(p_wet_light, &light);
+			gs_effect_set_vec4(p_wet_look, &look);
+		}
+		const char *how = wet ? "WetStain" : "Stain";
 		gs_matrix_push();
 		gs_matrix_mul(&m);
-		check("Stain");
-		while (gs_effect_loop(effect, "Stain"))
+		check(how);
+		while (gs_effect_loop(effect, how))
 			gs_draw_quadf(pic->texture(), 0, 1, 1);
 		gs_matrix_pop();
 	}
@@ -4950,6 +5011,7 @@ struct FaceAvatar {
 		react_state.squish = react_now.squish;
 		react_state.marks = (int)react_now.marks.size();
 		react_state.bits = (int)react_now.bits.size();
+		react_state.pieces = (int)react_now.pieces.size();
 		react_state.stuck = 0;
 		for (const Flying &f : react_now.flying)
 			react_state.stuck += f.stuck;
@@ -5134,7 +5196,7 @@ struct FaceAvatar {
 			old_motions = motions;
 		}
 		const json throws = json::parse(obs_data_get_string(settings, "react_items"), nullptr, false);
-		std::vector<std::string> next_files, wanted_3d;
+		std::vector<std::string> next_files, wanted_3d, next_pieces;
 		if (throws.is_array())
 			for (const json &row : throws) {
 				if (next_throws.size() >= MOST_THROW_PICTURES)
@@ -5181,6 +5243,48 @@ struct FaceAvatar {
 					look.seconds = secs.is_number() ? clampf(secs.get<float>(), 0.5f, MOST_MARK)
 									: 4.0f;
 					look.squishy = hit.value("squishy", false);
+					// 0.12.0: wet and glossy ("mark_bump", "drip_bump": height
+					// maps; "shine", 0 to 1.5), and 3D pieces: [{"file": a
+					// .glb, "way": "chunk" | "drop" | "crown", "count": n or
+					// [least, most], "size": heads across}].
+					look.mark_bump = number(hit.value("mark_bump", json()));
+					look.drip_bump = number(hit.value("drip_bump", json()));
+					const json shine = hit.value("shine", json());
+					look.shine = shine.is_number() ? clampf(shine.get<float>(), 0, 1.5f) : 1.0f;
+					const json pieces = hit.value("pieces", json());
+					if (pieces.is_array())
+						for (const json &pc : pieces) {
+							if (look.pieces.size() >= (size_t)MOST_PIECE_LOOKS)
+								break;
+							const std::string f = pc.is_object() && pc.contains("file") &&
+											      pc["file"].is_string()
+										      ? pc["file"].get<std::string>()
+										      : "";
+							PieceLook pl;
+							if (f.empty() || !is_3d_file(f) ||
+							    !piece_way_named(pc.value("way", std::string("chunk")), pl.way))
+								continue;
+							auto at = std::find(next_pieces.begin(), next_pieces.end(), f);
+							pl.thing = (int)(at - next_pieces.begin());
+							if (at == next_pieces.end()) {
+								if (next_pieces.size() >= MOST_EFFECT_PICTURES)
+									continue;
+								next_pieces.push_back(f);
+								if (std::find(wanted_3d.begin(), wanted_3d.end(), f) == wanted_3d.end())
+									wanted_3d.push_back(f);
+							}
+							const json count = pc.value("count", json(1));
+							if (count.is_number()) {
+								pl.least = pl.most = (int)std::lround(clampf(count.get<float>(), 0, 60));
+							} else if (count.is_array() && count.size() == 2 && count[0].is_number() &&
+								   count[1].is_number()) {
+								pl.least = (int)std::lround(clampf(count[0].get<float>(), 0, 60));
+								pl.most = (int)std::lround(clampf(count[1].get<float>(), 0, 60));
+							}
+							const json size = pc.value("size", json());
+							pl.size = size.is_number() ? clampf(size.get<float>(), 0.005f, 3) : 0.1f;
+							look.pieces.push_back(pl);
+						}
 				}
 				next_looks.push_back(look);
 				// A 3D thing: loaded on its own thread (prop_loader).
@@ -5312,6 +5416,7 @@ struct FaceAvatar {
 			throw_files.swap(next_files);
 			throw_looks.swap(next_looks);
 			effect_pics.swap(next_effects);
+			piece_files.swap(next_pieces);
 			hand3d_file = hand3d_now;
 			std::copy(std::begin(game_files_now), std::end(game_files_now), std::begin(game_files));
 			hand_skin = skin_tint;
@@ -5883,6 +5988,8 @@ struct FaceAvatar {
 				// What it does as it hits, as DireBot made it (not an emote).
 				if (file.empty() && t.picture >= 0 && t.picture < (int)throw_looks.size())
 					t.look = throw_looks[t.picture];
+				t.three_d = file.empty() && t.picture >= 0 && t.picture < (int)throw_files.size() &&
+					    is_3d_file(throw_files[t.picture]);
 			}
 			t.side = num("side", 0);
 			t.strength = num("strength", 1);
@@ -6330,15 +6437,31 @@ struct FaceAvatar {
 				// What it does as it hits (0.9.0), and whether all its
 				// pictures for that are loaded.
 				json hit;
-				if (i < throw_looks.size() && throw_looks[i].effect != Effect::None) {
+				if (i < throw_looks.size() &&
+				    (throw_looks[i].effect != Effect::None || !throw_looks[i].pieces.empty())) {
 					const HitLook &look = throw_looks[i];
 					bool all = true;
-					for (int n : {look.mark, look.drip, look.puff})
+					for (int n : {look.mark, look.drip, look.puff, look.mark_bump, look.drip_bump})
 						all = all && (n < 0 ||
 							      (n < (int)effect_pics.size() && loaded(effect_pics[n])));
 					for (int n : look.bits)
 						all = all && n < (int)effect_pics.size() && loaded(effect_pics[n]);
 					hit = {{"effect", effect_name(look.effect)}, {"loaded", all}};
+					// 0.12.0: its 3D pieces, loaded (or why not).
+					if (!look.pieces.empty()) {
+						json pieces = json::array();
+						for (const PieceLook &pl : look.pieces) {
+							const std::string &f = pl.thing < (int)piece_files.size()
+										       ? piece_files[pl.thing]
+										       : std::string();
+							json row = {{"way", piece_way_name(pl.way)}, {"loaded", props_ready.count(f) > 0}};
+							auto why = prop_problems.find(f);
+							if (why != prop_problems.end())
+								row["problem"] = why->second;
+							pieces.push_back(row);
+						}
+						hit["pieces"] = pieces;
+					}
 				}
 				if (!is_3d_file(file)) {
 					json row = {{"loaded", loaded(throw_pics[i])}};
@@ -6660,6 +6783,7 @@ struct FaceAvatar {
 					   {"stuck", rs.stuck},
 					   {"marks", rs.marks},
 					   {"bits", rs.bits},
+					   {"pieces", rs.pieces},
 					   {"patting", rs.hand.shown},
 					   {"squint", std::round(rs.squint * 1000) / 1000},
 					   {"squish", std::round(rs.squish * 1000) / 1000},
