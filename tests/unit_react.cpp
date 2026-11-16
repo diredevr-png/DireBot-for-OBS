@@ -2159,6 +2159,38 @@ static void test_whole_point_wobble_rise()
 			else
 				CHECK(most > 0.2f && shown_at > 0.04f);
 		}
+		// A soft one that bursts into pieces (a snowball): squashed whole
+		// a moment, then gone at once - never fading slowly as a big
+		// see-through ghost of itself; one that splats (a tomato) is
+		// crushed flat and fades over CRUSH.
+		for (Effect e : {Effect::Pieces, Effect::Splat}) {
+			React r(23);
+			Throw t;
+			t.picture = 0;
+			t.three_d = true;
+			t.look.effect = e;
+			r.throw_at(t);
+			ReactOut o = step_to_hit(r);
+			float at = 0, solid_till = -1, ghost = 0, gone_at = -1, widest = 0;
+			auto look = [&](const ReactOut &q) {
+				for (const Flying &f : q.flying) {
+					if (f.opacity > 0.95f)
+						solid_till = at;
+					if (f.opacity > 0.1f && f.opacity < 0.9f)
+						ghost += FRAME;
+					widest = std::max(widest, f.squash_x);
+				}
+				if (q.flying.empty() && gone_at < 0)
+					gone_at = at;
+				at += FRAME;
+			};
+			look(o);
+			run(r, 0.3f, view, look);
+			if (e == Effect::Pieces)
+				CHECK(solid_till >= 0.015f && ghost <= 0.03f && widest < 1.5f && gone_at <= 0.1f);
+			else
+				CHECK(ghost > 0.03f && widest > 1.5f);
+		}
 	}
 	{
 		// What a thing that stays whole leaves lies nearly level (a fish's

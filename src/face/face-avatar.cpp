@@ -94,13 +94,15 @@ constexpr uint32_t LOOK_SIZE = 960;
 constexpr int SHOTS = 4;
 // Outfit layers at most.
 constexpr size_t MOST_LAYERS = 12;
-// What it does on cue: at most this many things to throw and VRM
-// animation files, and the numbers its VRM animation files' moves go by
+// What it does on cue: at most this many things to throw (0.12.0: 40 -
+// DireBot's own twenty 3D ones and twenty of yours) and VRM animation
+// files, and the numbers its VRM animation files' moves go by
 // (React::play's; under it, its own animations' numbers).
-constexpr size_t MOST_THROW_PICTURES = 24, MOST_MOTIONS = 32;
+constexpr size_t MOST_THROW_PICTURES = 40, MOST_MOTIONS = 32;
 // The most pictures for what things do as they hit (0.9.0: splats,
-// drips, juice, feathers, snow...), all of them together.
-constexpr size_t MOST_EFFECT_PICTURES = 64;
+// drips, juice, feathers, snow...), all of them together - and the most
+// 3D pieces (0.12.0: twenty things' chunks, drops and crowns).
+constexpr size_t MOST_EFFECT_PICTURES = 128;
 // The throws filter (0.9.0): how much of a hit's knock-back jolts the
 // camera (a person's head isn't a character's), and how long it stays
 // awake after something's asked of it (seconds).

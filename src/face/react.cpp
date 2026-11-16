@@ -1489,6 +1489,14 @@ ReactOut React::step(float dt, const ReactView &view)
 				// (A hard one - a handful of coins - isn't crushed: it
 				// flies apart at once, its pieces taking over.)
 				f.opacity = 1 - smooth(u * 3);
+			} else if (it.t.three_d && it.t.look.effect == Effect::Pieces) {
+				// (One that bursts into pieces - a snowball - squashes a
+				// moment, whole, then falls apart at once: its chunks,
+				// puff and what it left take over. Faded slowly, a big
+				// see-through ghost of it hung round the head.)
+				f.opacity = 1 - smooth((u - 0.3f) / 0.25f);
+				f.squash_x = f.squash_y = 1.2f + 0.25f * u;
+				f.squash_z = 0.55f - 0.2f * u;
 			} else if (it.t.three_d) {
 				f.squash_x = f.squash_y = 1.25f + 0.4f * u;
 				f.squash_z = 0.45f - 0.3f * u;
