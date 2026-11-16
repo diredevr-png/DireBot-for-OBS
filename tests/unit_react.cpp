@@ -1474,7 +1474,7 @@ static void test_pieces()
 	CHECK(piece_way_named("DROP", w) && w == PieceWay::Drop);
 	CHECK(piece_way_named("crown", w) && w == PieceWay::Crown);
 	CHECK(!piece_way_named("blob", w) && w == PieceWay::Crown && !piece_way_named("", w));
-	for (PieceWay v : {PieceWay::Chunk, PieceWay::Drop, PieceWay::Crown})
+	for (PieceWay v : {PieceWay::Chunk, PieceWay::Drop, PieceWay::Crown, PieceWay::Flutter})
 		CHECK(piece_way_named(piece_way_name(v), w) && w == v);
 	// (Room below for all of it to fall and shrink away in sight.)
 	ReactView view;
@@ -1634,6 +1634,57 @@ static void test_pieces()
 		run(r, 3.0f, view, [](const ReactOut &) {});
 		ReactOut now = r.step(FRAME, view);
 		CHECK(now.pieces.empty() && r.pieces() == 0 && !now.busy);
+	}
+	{
+		// Fluttering (a pillow's feathers): out all round, slowed at once,
+		// then drifting down slowly for a few seconds, swaying, turning.
+		React r(13);
+		Throw t;
+		t.picture = 0;
+		t.side = -1;
+		PieceLook f;
+		f.thing = 7;
+		f.way = PieceWay::Flutter;
+		f.least = f.most = 14;
+		f.size = 0.12f;
+		t.look.pieces = {f};
+		r.throw_at(t);
+		ReactOut o = step_to_hit(r);
+		CHECK(of(o, 7).size() == 14);
+		float y0 = 0;
+		for (const Piece3D &p : o.pieces)
+			y0 += p.y / o.pieces.size();
+		std::vector<float> ys;
+		std::vector<V3> ups;
+		float last = 0;
+		int frames = 0;
+		bool fine = true, slow = true;
+		std::vector<float> xs_first;
+		run(r, 2.5f, view, [&](const ReactOut &q) {
+			fine = fine && finite_out(q);
+			frames++;
+			if (q.pieces.empty())
+				return;
+			float y = 0;
+			for (const Piece3D &p : q.pieces)
+				y += p.y / q.pieces.size();
+			if (frames > 60 && !ys.empty())
+				slow = slow && (y - ys.back()) * 60 < 0.75f;
+			ys.push_back(y);
+			if (frames % 10 == 0)
+				ups.push_back(rotate(q.pieces[0].turn, {0, 1, 0}));
+			last = y;
+		});
+		CHECK(fine && slow);
+		// Still in the air after 2.5 s, well below where it burst.
+		CHECK(r.pieces() == 14 && last > y0 + 0.4f && last < y0 + 2.0f);
+		// Turning over as it goes (the way its top faces changes).
+		float least = 1;
+		for (size_t i = 1; i < ups.size(); i++)
+			least = std::min(least, dot(ups[i], ups[0]));
+		CHECK(least < 0.3f);
+		run(r, 2.0f, view, [](const ReactOut &) {});
+		CHECK(r.pieces() == 0);
 	}
 	{
 		// Stopped: its pieces shrink away at once.

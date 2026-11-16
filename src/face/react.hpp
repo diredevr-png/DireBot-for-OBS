@@ -126,9 +126,12 @@ Effect effect_named(const std::string &name);
 //   - Crown: the sheet of juice thrown out along its face as it bursts,
 //     made lying flat with its open side up (y, as a glTF file stands
 //     it): spreading open in a blink (its "open" shape: 0 just burst, 1
-//     spread out) and settling flat into what's left on its face.
-enum class PieceWay { Chunk, Drop, Crown };
-// As DireBot names them ("chunk", "drop", "crown"), and back (false if
+//     spread out) and settling flat into what's left on its face;
+//   - Flutter: light things burst out all round (feathers, confetti,
+//     glitter), slowed by the air at once, then drifting down for a few
+//     seconds, swaying, rocking and turning over.
+enum class PieceWay { Chunk, Drop, Crown, Flutter };
+// As DireBot names them ("chunk", "drop", "crown", "flutter"), and back (false if
 // it isn't one).
 const char *piece_way_name(PieceWay w);
 bool piece_way_named(const std::string &name, PieceWay &way);
@@ -483,6 +486,8 @@ private:
 		V3 axis{0, 0, 1};
 		float angle = 0, spin = 0;
 		float at = 0, life = 1, fade_at = -1;
+		// Fluttering: its sway (how far, how fast, where in it).
+		float sway = 0, sway_w = 0, sway_at = 0;
 	};
 	struct Spring {
 		float value = 0, speed = 0;

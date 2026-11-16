@@ -114,6 +114,9 @@ constexpr float CROWN_OPEN = 0.07f, CROWN_GROW = 0.08f, CROWN_SETTLE = 0.12f, CR
 // much (a thin sheet).
 constexpr float CROWN_LONG = 1.25f, CROWN_SHOWS = 0.9f;
 constexpr float MIST_LIFE = 0.23f;
+// Fluttering pieces: slowed by the air (how quickly), falling no faster
+// than FLUTTER_FALL heads a second, rocking up to FLUTTER_ROCK radians.
+constexpr float FLUTTER_DRAG = 3.4f, FLUTTER_FALL = 0.5f, FLUTTER_ROCK = 0.6f;
 
 float clamp01(float v)
 {
@@ -167,6 +170,8 @@ const char *piece_way_name(PieceWay w)
 		return "drop";
 	case PieceWay::Crown:
 		return "crown";
+	case PieceWay::Flutter:
+		return "flutter";
 	default:
 		return "chunk";
 	}
@@ -177,7 +182,7 @@ bool piece_way_named(const std::string &name, PieceWay &way)
 	std::string n;
 	for (char c : name)
 		n += (char)std::tolower((unsigned char)c);
-	for (PieceWay w : {PieceWay::Chunk, PieceWay::Drop, PieceWay::Crown})
+	for (PieceWay w : {PieceWay::Chunk, PieceWay::Drop, PieceWay::Crown, PieceWay::Flutter})
 		if (n == piece_way_name(w)) {
 			way = w;
 			return true;
@@ -898,6 +903,22 @@ void React::effect(const Item &it, float x, float y, float ux, float uy)
 				p.vy = v * std::sin(a) - random(0.3f, 1.0f);
 				p.vz = random(0.1f, 1.4f);
 				p.life = random(0.45f, 0.8f);
+			} else if (pl.way == PieceWay::Flutter) {
+				// Burst out all round and up, a little towards you; turning
+				// over about a way of its own, and swaying as it drifts.
+				const float a = random(-PI_F, PI_F), v = random(0.8f, 2.4f) * rk;
+				p.x = x + 0.12f * k * std::cos(a);
+				p.y = y + 0.1f * k * std::sin(a);
+				p.vx = v * std::cos(a);
+				p.vy = v * std::sin(a) - random(0.6f, 1.6f);
+				p.vz = random(-0.2f, 1.0f);
+				p.axis = normalized(V3{random(-1, 1), random(-1, 1), random(-0.3f, 0.3f)}, {1, 0, 0});
+				p.angle = random(-PI_F, PI_F);
+				p.spin = random(2.5f, 6.0f) * (random01() < 0.5f ? -1 : 1);
+				p.sway = random(0.06f, 0.14f) * k;
+				p.sway_w = random(2.6f, 4.4f);
+				p.sway_at = random(0, 2 * PI_F);
+				p.life = random(2.6f, 4.0f);
 			} else {
 				// Spreading out along its face where it burst, a little on
 				// the way it was going and longer that way (its own x
@@ -919,6 +940,18 @@ void React::step_pieces(float dt, const ReactView &view, ReactOut &out)
 		p.at += dt;
 		if (p.way == PieceWay::Crown)
 			continue;
+		if (p.way == PieceWay::Flutter) {
+			// The air slows it at once; then it drifts down.
+			const float drag = std::exp(-FLUTTER_DRAG * dt);
+			p.vx *= drag;
+			p.vz *= drag;
+			p.vy = FLUTTER_FALL + (p.vy - FLUTTER_FALL) * drag;
+			p.x += p.vx * dt;
+			p.y += p.vy * dt;
+			p.z += p.vz * dt;
+			p.angle += p.spin * dt;
+			continue;
+		}
 		p.vy += BIT_GRAVITY * dt;
 		p.x += p.vx * dt;
 		p.y += p.vy * dt;
@@ -945,6 +978,12 @@ void React::step_pieces(float dt, const ReactView &view, ReactOut &out)
 			left *= 1 - smooth((p.at - p.fade_at) / STOP_SHRINK);
 		if (p.way == PieceWay::Chunk) {
 			o.turn = axis_angle(p.axis, p.angle);
+			o.size *= left;
+		} else if (p.way == PieceWay::Flutter) {
+			// Swaying side to side and rocking with it, more as it slows.
+			const float ph = p.sway_w * p.at + p.sway_at, grows = smooth(p.at / 0.5f);
+			o.x += p.sway * grows * std::sin(ph);
+			o.turn = axis_angle({0, 0, 1}, FLUTTER_ROCK * grows * std::cos(ph)) * axis_angle(p.axis, p.angle);
 			o.size *= left;
 		} else if (p.way == PieceWay::Drop) {
 			// Its front the way it goes (the world's y is up), stretched
