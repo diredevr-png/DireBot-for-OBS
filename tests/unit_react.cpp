@@ -1402,6 +1402,63 @@ static void test_effects()
 		CHECK(!r.step(FRAME, view).busy);
 	}
 	{
+		// A glitter bomb: its cloud of glitter dust hangs (puff_seconds),
+		// and the glitter left on its face glints (its height map and
+		// shine); a snowball's puff is still gone in well under a second.
+		React r(16);
+		Throw t;
+		t.picture = 0;
+		t.look.effect = Effect::Pieces;
+		t.look.mark = 3;
+		t.look.mark_bump = 4;
+		t.look.shine = 1.4f;
+		t.look.puff = 13;
+		t.look.puff_seconds = 1.8f;
+		t.look.seconds = 4;
+		r.throw_at(t);
+		ReactOut o = step_to_hit(r);
+		CHECK(o.marks.size() == 1 && o.marks[0].bump == 4 && std::fabs(o.marks[0].shine - 1.4f) < 1e-4f);
+		int puffs = 0;
+		for (const Bit &b : o.bits)
+			puffs += b.picture == 13;
+		CHECK(puffs == 2);
+		run(r, 1.2f, view, [](const ReactOut &) {});
+		puffs = 0;
+		for (const Bit &b : r.step(FRAME, view).bits)
+			puffs += b.picture == 13 && b.opacity > 0.05f;
+		CHECK(puffs == 2);
+		run(r, 0.9f, view, [](const ReactOut &) {});
+		puffs = 0;
+		for (const Bit &b : r.step(FRAME, view).bits)
+			puffs += b.picture == 13;
+		CHECK(puffs == 0);
+		// Never longer than MOST_PUFF, whatever it's set to.
+		React r2(17);
+		t.look.puff_seconds = 1000;
+		r2.throw_at(t);
+		step_to_hit(r2);
+		run(r2, MOST_PUFF * 1.1f + 0.05f, view, [](const ReactOut &) {});
+		puffs = 0;
+		for (const Bit &b : r2.step(FRAME, view).bits)
+			puffs += b.picture == 13;
+		CHECK(puffs == 0);
+		// A snowball (no puff_seconds): gone by 0.7 s; its snow flat.
+		React r3(18);
+		Throw s;
+		s.picture = 0;
+		s.look.effect = Effect::Pieces;
+		s.look.mark = 3;
+		s.look.puff = 13;
+		r3.throw_at(s);
+		o = step_to_hit(r3);
+		CHECK(o.marks.size() == 1 && o.marks[0].bump == -1);
+		run(r3, 0.7f, view, [](const ReactOut &) {});
+		puffs = 0;
+		for (const Bit &b : r3.step(FRAME, view).bits)
+			puffs += b.picture == 13;
+		CHECK(puffs == 0);
+	}
+	{
 		// A squishy one: squashed flat as it hits, wobbling back (taller
 		// than it is a moment), settling.
 		React r(7);

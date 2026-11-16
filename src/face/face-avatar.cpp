@@ -5271,6 +5271,12 @@ struct FaceAvatar {
 					// ...and it is hard ("hard": a pinecone, not squashing).
 					const json hard = hit.value("hard", json());
 					look.hard = hard.is_boolean() && hard.get<bool>();
+					// ...and how long its puff hangs ("puff_seconds": a
+					// glitter bomb's cloud; 0 or none, a quick puff).
+					const json puff_secs = hit.value("puff_seconds", json());
+					look.puff_seconds = puff_secs.is_number() && std::isfinite(puff_secs.get<float>())
+								    ? clampf(puff_secs.get<float>(), 0, MOST_PUFF)
+								    : 0.0f;
 					const json pieces = hit.value("pieces", json());
 					if (pieces.is_array())
 						for (const json &pc : pieces) {

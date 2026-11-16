@@ -188,7 +188,12 @@ struct HitLook {
 	// 0.12.0: it is hard (a pinecone): it doesn't squash as it hits, nor
 	// while it's stuck.
 	bool hard = false;
+	// 0.12.0: how long its puff hangs in the air (seconds, up to
+	// MOST_PUFF; 0: a snowball's quick puff of powder, about 0.6) - a
+	// glitter bomb's cloud of glitter dust lingers.
+	float puff_seconds = 0;
 };
+constexpr float MOST_PUFF = 4;
 constexpr float MOST_MARK = 15;
 // At most this many left on its face at once (one more and the oldest
 // fades now), and this many bits in the air.

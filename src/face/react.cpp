@@ -930,6 +930,9 @@ void React::effect(const Item &it, float x, float y, float ux, float uy)
 			m.grow = 0;
 			m.roll = roll_now_;
 			m.id = ++mark_ids_;
+			// (Glitter left on it glints: its height map and shine.)
+			m.bump = look.mark_bump;
+			m.shine = look.shine;
 			add_mark(m);
 		}
 		const int n = look.bits.empty() ? 0 : 9 + (int)(random01() * 4);
@@ -959,7 +962,8 @@ void React::effect(const Item &it, float x, float y, float ux, float uy)
 			b.size = it.size0 * random(1.0f, 1.25f);
 			b.angle = random(-PI_F, PI_F);
 			b.spin = random(-0.8f, 0.8f);
-			b.life = random(0.5f, 0.65f);
+			b.life = look.puff_seconds > 0 ? std::min(look.puff_seconds, MOST_PUFF) * random(0.9f, 1.1f)
+						       : random(0.5f, 0.65f);
 			add_bit(b);
 		}
 	}
