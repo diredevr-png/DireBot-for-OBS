@@ -2258,8 +2258,9 @@ static void test_whole_point_wobble_rise()
 	}
 	{
 		// A stink: puffs rising one after another over a second or so -
-		// none yet as it hits, growing as they rise, thinning away; stopped,
-		// those still to come never come.
+		// the first at once as it hits, growing as they rise, thinning
+		// away, all nearly upright (a wavy line stands up as drawn);
+		// stopped, those still to come never come.
 		React r(11);
 		Throw t;
 		t.picture = 0;
@@ -2275,19 +2276,25 @@ static void test_whole_point_wobble_rise()
 		ReactOut o = step_to_hit(r);
 		const float hit_y = o.flying[0].y;
 		CHECK(o.pieces.size() <= 2 && finite_out(o));
-		int most = 0;
-		float highest = 1e9f, biggest = 0;
+		int most = 0, early = 0;
+		float highest = 1e9f, biggest = 0, tilt = 0, t_in = 0;
 		bool thin = false;
 		run(r, 1.0f, view, [&](const ReactOut &q) {
 			CHECK(finite_out(q));
+			t_in += FRAME;
 			most = std::max(most, (int)q.pieces.size());
 			for (const Piece3D &p : q.pieces) {
 				highest = std::min(highest, p.y);
 				biggest = std::max(biggest, p.size);
 				thin = thin || p.opacity < 0.5f;
+				if (t_in < 0.35f && p.opacity > 0.5f)
+					early++;
+				// (Its turn about the way you look: how far from upright.)
+				tilt = std::max(tilt, std::fabs(2 * std::atan2(p.turn.z, p.turn.w)));
 			}
 		});
 		CHECK(most >= 5 && highest < hit_y - 0.15f && biggest > 0.2f && thin);
+		CHECK(early > 0 && tilt < 0.3f + 0.3f * 1.0f + 0.01f);
 		r.stop();
 		run(r, 0.25f, view, [](const ReactOut &) {});
 		run(r, 2.0f, view, [&](const ReactOut &q) { CHECK(q.pieces.empty()); });

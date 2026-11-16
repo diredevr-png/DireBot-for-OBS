@@ -148,6 +148,9 @@ constexpr float WOBBLE_W = 26.0f, WOBBLE_HIT_W = 17.0f, WOBBLE_SETTLE = 0.7f;
 // Rising puffs (a stink): one after another over this long (seconds),
 // each rising this fast (heads a second), lasting about RISE_LIFE.
 constexpr float RISE_OVER = 1.3f, RISE_UP = 0.32f, RISE_LIFE = 1.8f;
+// ...leaving turned up to RISE_TILT (radians) either way, turning up to
+// RISE_TURN radians a second.
+constexpr float RISE_TILT = 0.3f, RISE_TURN = 0.3f;
 constexpr float MIST_LIFE = 0.23f;
 // Fluttering pieces: slowed by the air (how quickly), falling no faster
 // than FLUTTER_FALL heads a second, rocking up to FLUTTER_ROCK radians.
@@ -1097,13 +1100,16 @@ void React::effect(const Item &it, float x, float y, float ux, float uy)
 				p.z = random(0.08f, 0.3f);
 				p.vx = random(-0.08f, 0.08f);
 				p.vy = -RISE_UP * random(0.8f, 1.25f) * rk;
+				// (Nearly upright - a wavy line of stink stands up as
+				// drawn - turning only a little.)
 				p.axis = {0, 0, 1};
-				p.angle = random(-PI_F, PI_F);
-				p.spin = random(-0.8f, 0.8f);
+				p.angle = random(-RISE_TILT, RISE_TILT);
+				p.spin = random(-RISE_TURN, RISE_TURN);
 				p.sway = random(0.04f, 0.09f) * k;
 				p.sway_w = random(2.2f, 3.6f);
 				p.sway_at = random(0, 2 * PI_F);
-				p.at = -random(0, RISE_OVER);
+				// The first at once, as it lands.
+				p.at = i == 0 ? 0.0f : -random(0, RISE_OVER);
 				p.life = RISE_LIFE * random(0.85f, 1.15f);
 			} else {
 				// Spreading out along its face where it burst, a little on
