@@ -1381,6 +1381,10 @@ ReactOut React::step(float dt, const ReactView &view)
 			const float e = std::max(0.0f, 1 - (it.at - it.hit_at) / 0.14f);
 			f.opacity = 1;
 			stuck_squash(it.t, e, f.squash_x, f.squash_y, f.squash_z);
+			// (On top of its head - an ice cream like a hat - squashed
+			// down onto it: its bottom stays where it sits.)
+			if (it.t.above)
+				f.y += 0.5f * it.size * clampf(finite(it.t.tall) ? it.t.tall : 1, 0.05f, 4) * (1 - f.squash_y);
 		} else if (it.broke) {
 			// Crushed flat against it, then gone (what it left takes over):
 			// a 3D one wider every way and thin towards you.

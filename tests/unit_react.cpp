@@ -1928,7 +1928,7 @@ static void test_whole_point_wobble_rise()
 			t.three_d = true;
 			t.above = true;
 			t.side = side;
-			t.stick = 0.5f;
+			t.stick = 1.2f;
 			t.look.effect = Effect::Splat;
 			t.look.mark = 1;
 			t.look.whole = true;
@@ -1943,13 +1943,27 @@ static void test_whole_point_wobble_rise()
 			}
 			CHECK(o.flying.size() == 1 && o.flying[0].stuck);
 			const float sat_x = o.flying[0].x;
+			// (Squashed down onto its head: its bottom stays where it sits
+			// as it springs back.)
+			// (Its head kept still here, so only the squash would move it.)
+			ReactView still = view;
+			still.still_head = true;
+			float bottom = 1e9f;
+			run(r, 0.2f, still, [&](const ReactOut &q) {
+				if (q.flying.size() == 1 && q.flying[0].stuck) {
+					const float b = q.flying[0].y + 0.5f * q.flying[0].size * q.flying[0].squash_y;
+					if (bottom > 1e8f)
+						bottom = b;
+					CHECK(std::fabs(b - bottom) < 0.004f);
+				}
+			});
 			run(r, 0.3f, view, [&](const ReactOut &q) {
 				if (q.flying.size() == 1 && q.flying[0].stuck)
 					CHECK(std::fabs(q.flying[0].angle) < 0.1f);
 			});
 			float went = 0, toppled = 0;
 			bool round_z = true;
-			run(r, 0.6f, view, [&](const ReactOut &q) {
+			run(r, 1.4f, view, [&](const ReactOut &q) {
 				for (const Flying &f : q.flying)
 					if (!f.stuck) {
 						round_z = round_z && std::fabs(f.axis.z) > 0.999f;
