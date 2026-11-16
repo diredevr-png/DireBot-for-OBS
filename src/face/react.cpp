@@ -180,7 +180,9 @@ float envelope(float u, float length)
 // a little flat.
 void stuck_squash(const Throw &t, float e, float &sx, float &sy, float &sz)
 {
-	if (t.look.squishy) {
+	if (t.look.hard) {
+		sx = sy = sz = 1;
+	} else if (t.look.squishy) {
 		sx = 1.16f + 0.19f * e;
 		sy = 0.84f - 0.14f * e;
 		sz = 0.62f - 0.12f * e;
@@ -1413,7 +1415,7 @@ ReactOut React::step(float dt, const ReactView &view)
 				const float e = std::exp(-tt / SQUISH_SETTLE) * std::cos(tt * SQUISH_WOBBLE);
 				f.squash_x = 1 + SQUISH_FLAT * e;
 				f.squash_y = 1 - SQUISH_FLAT * 0.8f * e;
-			} else if (!it.dropped) {
+			} else if (!it.dropped && !it.t.look.hard) {
 				// Squashed flat against its face a moment, then springing back.
 				const float e = std::max(0.0f, 1 - tt / 0.14f);
 				f.squash_x = 1 + 0.35f * e;

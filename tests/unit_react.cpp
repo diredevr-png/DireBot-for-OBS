@@ -1975,6 +1975,33 @@ static void test_whole_point_wobble_rise()
 		}
 	}
 	{
+		// A hard thing (a pinecone) doesn't squash as it hits and bounces
+		// off, nor stuck; one that isn't squashes a moment.
+		for (bool hard : {true, false})
+			for (float stick : {0.0f, 0.6f}) {
+				React r(18);
+				Throw t;
+				t.picture = 0;
+				t.three_d = true;
+				t.stick = stick;
+				t.look.hard = hard;
+				r.throw_at(t);
+				ReactOut o = step_to_hit(r);
+				float most = 0;
+				auto widest = [&](const ReactOut &q) {
+					for (const Flying &f : q.flying)
+						most = std::max({most, std::fabs(f.squash_x - 1), std::fabs(f.squash_y - 1),
+								 std::fabs(f.squash_z - 1)});
+				};
+				widest(o);
+				run(r, 1.0f, view, widest);
+				if (hard)
+					CHECK(most < 1e-6f);
+				else
+					CHECK(most > 0.2f);
+			}
+	}
+	{
 		// What a thing that stays whole leaves lies nearly level (a fish's
 		// smear along it, slime sagging down); a broken one's, any way.
 		float whole_most = 0, broken_most = 0;

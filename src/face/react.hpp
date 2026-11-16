@@ -185,6 +185,9 @@ struct HitLook {
 	// down: on its head like a hat) it comes down as made, and slides off
 	// to its side, toppling that way.
 	bool steady = false;
+	// 0.12.0: it is hard (a pinecone): it doesn't squash as it hits, nor
+	// while it's stuck.
+	bool hard = false;
 };
 constexpr float MOST_MARK = 15;
 // At most this many left on its face at once (one more and the oldest
