@@ -2059,6 +2059,37 @@ static void test_whole_point_wobble_rise()
 			}
 	}
 	{
+		// A hard thing that breaks (a handful of coins) isn't crushed: no
+		// squash, gone in a frame or two as its pieces take over; a soft
+		// one is crushed flat and fades over CRUSH.
+		for (bool hard : {true, false}) {
+			React r(19);
+			Throw t;
+			t.picture = 0;
+			t.three_d = true;
+			t.look.effect = Effect::Pieces;
+			t.look.hard = hard;
+			r.throw_at(t);
+			ReactOut o = step_to_hit(r);
+			float most = 0, shown_at = 0;
+			float at = 0;
+			auto look = [&](const ReactOut &q) {
+				at += FRAME;
+				for (const Flying &f : q.flying) {
+					most = std::max({most, std::fabs(f.squash_x - 1), std::fabs(f.squash_z - 1)});
+					if (f.opacity > 0.05f)
+						shown_at = at;
+				}
+			};
+			look(o);
+			run(r, 0.3f, view, look);
+			if (hard)
+				CHECK(most < 1e-6f && shown_at <= 0.04f);
+			else
+				CHECK(most > 0.2f && shown_at > 0.04f);
+		}
+	}
+	{
 		// What a thing that stays whole leaves lies nearly level (a fish's
 		// smear along it, slime sagging down); a broken one's, any way.
 		float whole_most = 0, broken_most = 0;

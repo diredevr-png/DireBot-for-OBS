@@ -1396,7 +1396,11 @@ ReactOut React::step(float dt, const ReactView &view)
 			// a 3D one wider every way and thin towards you.
 			const float u = clamp01((it.at - it.hit_at) / CRUSH);
 			f.opacity = 1 - smooth(u);
-			if (it.t.three_d) {
+			if (it.t.look.hard) {
+				// (A hard one - a handful of coins - isn't crushed: it
+				// flies apart at once, its pieces taking over.)
+				f.opacity = 1 - smooth(u * 3);
+			} else if (it.t.three_d) {
 				f.squash_x = f.squash_y = 1.25f + 0.4f * u;
 				f.squash_z = 0.45f - 0.3f * u;
 			} else {
