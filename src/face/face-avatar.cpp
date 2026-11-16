@@ -2873,6 +2873,15 @@ struct FaceAvatar {
 			p.place = moved(world_of(fl.x, fl.y)) * squash * matrix_of(axis_angle(fl.axis, -fl.angle)) *
 				  scaled(fl.size / across) * moved((lo + hi) * -0.5f);
 			p.opacity = fl.opacity;
+			// Its wobble (0.12.0): its "wobble" shape, or "wobble back".
+			const int wob = prop->shape("wobble"), back = prop->shape("wobble back");
+			if (wob >= 0 || back >= 0) {
+				p.shapes.assign((size_t)std::max(wob, back) + 1, 0);
+				if (wob >= 0)
+					p.shapes[wob] = std::max(0.0f, fl.wobble);
+				if (back >= 0)
+					p.shapes[back] = std::max(0.0f, -fl.wobble);
+			}
 			with.push_back(p);
 		}
 		// 3D pieces thrown off as things hit (0.12.0): sized by their
@@ -5245,12 +5254,18 @@ struct FaceAvatar {
 					look.squishy = hit.value("squishy", false);
 					// 0.12.0: wet and glossy ("mark_bump", "drip_bump": height
 					// maps; "shine", 0 to 1.5), and 3D pieces: [{"file": a
-					// .glb, "way": "chunk" | "drop" | "crown", "count": n or
+					// .glb, "way": "chunk" | "drop" | "crown" | "flutter" |
+					// "rise", "count": n or
 					// [least, most], "size": heads across}].
 					look.mark_bump = number(hit.value("mark_bump", json()));
 					look.drip_bump = number(hit.value("drip_bump", json()));
 					const json shine = hit.value("shine", json());
 					look.shine = shine.is_number() ? clampf(shine.get<float>(), 0, 1.5f) : 1.0f;
+					// It stays whole ("whole": a pie's tin), it flies point
+					// first ("point": a dart).
+					const json whole = hit.value("whole", json()), point = hit.value("point", json());
+					look.whole = whole.is_boolean() && whole.get<bool>();
+					look.point = point.is_boolean() && point.get<bool>();
 					const json pieces = hit.value("pieces", json());
 					if (pieces.is_array())
 						for (const json &pc : pieces) {
@@ -6438,7 +6453,8 @@ struct FaceAvatar {
 				// pictures for that are loaded.
 				json hit;
 				if (i < throw_looks.size() &&
-				    (throw_looks[i].effect != Effect::None || !throw_looks[i].pieces.empty())) {
+				    (throw_looks[i].effect != Effect::None || !throw_looks[i].pieces.empty() ||
+				     throw_looks[i].whole || throw_looks[i].point)) {
 					const HitLook &look = throw_looks[i];
 					bool all = true;
 					for (int n : {look.mark, look.drip, look.puff, look.mark_bump, look.drip_bump})
@@ -6447,6 +6463,10 @@ struct FaceAvatar {
 					for (int n : look.bits)
 						all = all && n < (int)effect_pics.size() && loaded(effect_pics[n]);
 					hit = {{"effect", effect_name(look.effect)}, {"loaded", all}};
+					if (look.whole)
+						hit["whole"] = true;
+					if (look.point)
+						hit["point"] = true;
 					// 0.12.0: its 3D pieces, loaded (or why not).
 					if (!look.pieces.empty()) {
 						json pieces = json::array();

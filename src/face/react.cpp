@@ -113,6 +113,18 @@ constexpr float CROWN_OPEN = 0.07f, CROWN_GROW = 0.08f, CROWN_SETTLE = 0.12f, CR
 // ...longer on the way the thing was going (times this), and showing this
 // much (a thin sheet).
 constexpr float CROWN_LONG = 1.25f, CROWN_SHOWS = 0.9f;
+// 0.12.0: a thing that flies point first (a dart) lands this high on its
+// face (heads, its forehead; up to a tenth lower), and stuck, its tail
+// swings up to POINT_WOBBLE radians this fast (radians a second), dying
+// away over about POINT_SETTLE seconds.
+constexpr float POINT_HIGH = -0.36f, POINT_WOBBLE = 0.32f, POINT_WOBBLE_W = 38.0f, POINT_SETTLE = 0.35f;
+// A 3D thing's wobble (its "wobble" shapes): as it flies and falls, this
+// fast (radians a second); as it hits, flopping this fast, dying away over
+// about WOBBLE_SETTLE seconds.
+constexpr float WOBBLE_W = 26.0f, WOBBLE_HIT_W = 17.0f, WOBBLE_SETTLE = 0.7f;
+// Rising puffs (a stink): one after another over this long (seconds),
+// each rising this fast (heads a second), lasting about RISE_LIFE.
+constexpr float RISE_OVER = 1.3f, RISE_UP = 0.32f, RISE_LIFE = 1.8f;
 constexpr float MIST_LIFE = 0.23f;
 // Fluttering pieces: slowed by the air (how quickly), falling no faster
 // than FLUTTER_FALL heads a second, rocking up to FLUTTER_ROCK radians.
@@ -172,6 +184,8 @@ const char *piece_way_name(PieceWay w)
 		return "crown";
 	case PieceWay::Flutter:
 		return "flutter";
+	case PieceWay::Rise:
+		return "rise";
 	default:
 		return "chunk";
 	}
@@ -182,7 +196,7 @@ bool piece_way_named(const std::string &name, PieceWay &way)
 	std::string n;
 	for (char c : name)
 		n += (char)std::tolower((unsigned char)c);
-	for (PieceWay w : {PieceWay::Chunk, PieceWay::Drop, PieceWay::Crown, PieceWay::Flutter})
+	for (PieceWay w : {PieceWay::Chunk, PieceWay::Drop, PieceWay::Crown, PieceWay::Flutter, PieceWay::Rise})
 		if (n == piece_way_name(w)) {
 			way = w;
 			return true;
@@ -404,8 +418,8 @@ float React::throw_at(const Throw &t)
 	it.t.stick = finite(t.stick) ? clampf(t.stick, 0, MOST_STICK) : 0.0f;
 	HitLook &look = it.t.look;
 	look.seconds = finite(look.seconds) ? clampf(look.seconds, 0.5f, MOST_MARK) : 4.0f;
-	// Broken as it hits: it can't stick.
-	if (look.effect == Effect::Splat || look.effect == Effect::Pieces)
+	// Broken as it hits: it can't stick (0.12.0: unless it stays whole).
+	if ((look.effect == Effect::Splat || look.effect == Effect::Pieces) && !look.whole)
 		it.t.stick = 0;
 	waiting_.push_back(it);
 	return leaves + FLY_TIME;
@@ -529,6 +543,9 @@ void React::stop()
 	for (BitItem &b : bits_)
 		if (b.fade_at < 0)
 			b.fade_at = b.at;
+	// (Puffs still waiting their turn never come.)
+	pieces_.erase(std::remove_if(pieces_.begin(), pieces_.end(), [](const PieceItem &p) { return p.at < 0; }),
+		      pieces_.end());
 	for (PieceItem &p : pieces_)
 		if (p.fade_at < 0)
 			p.fade_at = p.at;
@@ -590,6 +607,16 @@ void React::launch(Item &it, const ReactView &view)
 	it.angle = random(-PI_F, PI_F);
 	// A 3D one tumbles about a way of its own, mostly end over end.
 	it.axis = normalized(V3{random(-0.4f, 0.4f), random(-1, 1), 1}, {0, 0, 1});
+	if (t.look.point) {
+		// Point first, not turning, at its forehead (0.12.0).
+		it.spin = 0;
+		it.angle = 0;
+		it.axis = {0, 0, 1};
+		it.x1 = random(-0.16f, 0.16f);
+		it.y1 = random(POINT_HIGH, POINT_HIGH + 0.1f);
+		it.touch_y = it.y1;
+		it.arc *= 0.6f;
+	}
 	it.x = it.x0;
 	it.y = it.y0;
 	it.size = big;
@@ -655,7 +682,7 @@ void React::hit(Item &it, ReactOut &out)
 	it.x = it.x1;
 	it.y = it.y1;
 	effect(it, it.x1, it.touch_y, ux, uy);
-	if (t.look.effect == Effect::Splat || t.look.effect == Effect::Pieces) {
+	if ((t.look.effect == Effect::Splat || t.look.effect == Effect::Pieces) && !t.look.whole) {
 		// Broken against it: no bouncing off.
 		it.broke = true;
 		it.vx = it.vy = 0;
@@ -672,6 +699,11 @@ void React::hit(Item &it, ReactOut &out)
 		it.stuck_from = it.angle;
 		const float tilt = random(-STICK_TILT, STICK_TILT);
 		it.stuck_angle = it.angle - std::remainder(it.angle - tilt, 2 * PI_F);
+		if (t.look.point) {
+			// Stuck as it flew, its tail swinging side to side.
+			it.stuck_from = it.stuck_angle = 0;
+			it.axis = {0, 1, 0};
+		}
 	}
 }
 
@@ -685,6 +717,13 @@ void React::unstick(Item &it)
 	it.vx = random(-0.3f, 0.3f);
 	it.vy = 0.4f;
 	it.spin = random(-3.0f, 3.0f);
+	if (it.t.look.point) {
+		// Popping off: out and up a little, tumbling.
+		it.vx = random(-0.6f, 0.6f);
+		it.vy = -random(1.0f, 1.6f);
+		it.spin = random(6.0f, 10.0f) * (random01() < 0.5f ? -1 : 1);
+		it.axis = normalized(V3{random(-1, 1), random(-1, 1), random(-0.3f, 0.3f)}, {1, 0, 0});
+	}
 }
 
 int React::stuck() const
@@ -919,6 +958,23 @@ void React::effect(const Item &it, float x, float y, float ux, float uy)
 				p.sway_w = random(2.6f, 4.4f);
 				p.sway_at = random(0, 2 * PI_F);
 				p.life = random(2.6f, 4.0f);
+			} else if (pl.way == PieceWay::Rise) {
+				// One after another from round where it hit (waiting its
+				// turn: `at` below 0), rising, a little towards you,
+				// swaying and slowly turning.
+				p.x = x + random(-0.16f, 0.16f) * k;
+				p.y = y + random(-0.1f, 0.06f) * k;
+				p.z = random(0.08f, 0.3f);
+				p.vx = random(-0.08f, 0.08f);
+				p.vy = -RISE_UP * random(0.8f, 1.25f) * rk;
+				p.axis = {0, 0, 1};
+				p.angle = random(-PI_F, PI_F);
+				p.spin = random(-0.8f, 0.8f);
+				p.sway = random(0.04f, 0.09f) * k;
+				p.sway_w = random(2.2f, 3.6f);
+				p.sway_at = random(0, 2 * PI_F);
+				p.at = -random(0, RISE_OVER);
+				p.life = RISE_LIFE * random(0.85f, 1.15f);
 			} else {
 				// Spreading out along its face where it burst, a little on
 				// the way it was going and longer that way (its own x
@@ -938,8 +994,14 @@ void React::step_pieces(float dt, const ReactView &view, ReactOut &out)
 {
 	for (PieceItem &p : pieces_) {
 		p.at += dt;
-		if (p.way == PieceWay::Crown)
+		if (p.way == PieceWay::Crown || p.at < 0)
 			continue;
+		if (p.way == PieceWay::Rise) {
+			p.x += p.vx * dt;
+			p.y += p.vy * dt;
+			p.angle += p.spin * dt;
+			continue;
+		}
 		if (p.way == PieceWay::Flutter) {
 			// The air slows it at once; then it drifts down.
 			const float drag = std::exp(-FLUTTER_DRAG * dt);
@@ -966,6 +1028,8 @@ void React::step_pieces(float dt, const ReactView &view, ReactOut &out)
 				     }),
 		      pieces_.end());
 	for (const PieceItem &p : pieces_) {
+		if (p.at < 0)
+			continue;
 		Piece3D o;
 		o.thing = p.thing;
 		o.x = p.x;
@@ -985,6 +1049,15 @@ void React::step_pieces(float dt, const ReactView &view, ReactOut &out)
 			o.x += p.sway * grows * std::sin(ph);
 			o.turn = axis_angle({0, 0, 1}, FLUTTER_ROCK * grows * std::cos(ph)) * axis_angle(p.axis, p.angle);
 			o.size *= left;
+		} else if (p.way == PieceWay::Rise) {
+			// Growing as it rises, swaying, coming and thinning away.
+			const float u = clamp01(p.at / p.life);
+			o.x += p.sway * std::sin(p.sway_w * p.at + p.sway_at);
+			o.size *= 0.55f + 0.75f * (1 - sq(1 - u));
+			o.turn = axis_angle(p.axis, p.angle);
+			o.opacity = smooth(p.at / 0.25f) * (1 - smooth((u - 0.45f) / 0.55f));
+			if (p.fade_at >= 0)
+				o.opacity *= 1 - smooth((p.at - p.fade_at) / STOP_SHRINK);
 		} else if (p.way == PieceWay::Drop) {
 			// Its front the way it goes (the world's y is up), stretched
 			// by its speed and thinner for it.
@@ -1186,6 +1259,11 @@ ReactOut React::step(float dt, const ReactView &view)
 			it.y = it.y1 + STICK_DROP * slide * slide;
 			it.angle = it.stuck_from +
 				   (it.stuck_angle - it.stuck_from) * smooth((it.at - it.hit_at) / STICK_TURN);
+			if (it.t.look.point) {
+				// Its tail swinging side to side, dying away.
+				const float s = it.at - it.hit_at;
+				it.angle = POINT_WOBBLE * std::exp(-s / POINT_SETTLE) * std::sin(s * POINT_WOBBLE_W);
+			}
 			if (it.at >= it.stuck_till)
 				unstick(it);
 		} else {
@@ -1223,6 +1301,18 @@ ReactOut React::step(float dt, const ReactView &view)
 		f.axis = it.axis;
 		f.hit = it.hit;
 		f.stuck = it.stuck;
+		// Its wobble (a 3D one's "wobble" shapes): as it flies; flopping
+		// hard as it hits and dying away while it's stuck; flopping a
+		// little as it falls.
+		if (!it.hit) {
+			f.wobble = 0.8f * std::sin(it.at * WOBBLE_W);
+		} else {
+			const float s = it.at - it.hit_at;
+			if (it.stuck || it.broke)
+				f.wobble = std::exp(-s / WOBBLE_SETTLE) * std::cos(s * WOBBLE_HIT_W);
+			else
+				f.wobble = 0.55f * std::sin(s * WOBBLE_W);
+		}
 		if (it.stuck) {
 			// Squashed flat against it a moment, then a little flat while
 			// it's stuck there.
@@ -1523,8 +1613,22 @@ ReactOut React::step(float dt, const ReactView &view)
 		for (Flying &f : out.flying) {
 			// (out.flying is in flying_'s order.)
 			const Item &it = flying_[n++];
-			if (f.stuck)
+			if (f.stuck && it.t.look.point) {
+				// (A dart: its head's tilt in the picture, then its own
+				// swing about its up - as one turn.)
+				float tilt = 0;
+				follow(f.x, f.y, tilt, roll_now_ - it.stuck_roll);
+				const Quat q = axis_angle({0, 0, 1}, -tilt) * axis_angle(f.axis, -f.angle);
+				const float half = std::acos(clampf(q.w, -1, 1)), s = std::sin(half);
+				if (s > 1e-5f) {
+					f.axis = {q.x / s, q.y / s, q.z / s};
+					f.angle = -2 * half;
+				} else {
+					f.angle = 0;
+				}
+			} else if (f.stuck) {
 				follow(f.x, f.y, f.angle, roll_now_ - it.stuck_roll);
+			}
 		}
 		// What's left on its face: a splat spreading out as it lands, a
 		// touch past its size, settling; its drips running down; at the

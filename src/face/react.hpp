@@ -129,10 +129,13 @@ Effect effect_named(const std::string &name);
 //     spread out) and settling flat into what's left on its face;
 //   - Flutter: light things burst out all round (feathers, confetti,
 //     glitter), slowed by the air at once, then drifting down for a few
-//     seconds, swaying, rocking and turning over.
-enum class PieceWay { Chunk, Drop, Crown, Flutter };
-// As DireBot names them ("chunk", "drop", "crown", "flutter"), and back (false if
-// it isn't one).
+//     seconds, swaying, rocking and turning over;
+//   - Rise: puffs rising from where it hit, one after another over a
+//     second or so (a stinky sock's stink), swaying, growing and thinning
+//     away as they go.
+enum class PieceWay { Chunk, Drop, Crown, Flutter, Rise };
+// As DireBot names them ("chunk", "drop", "crown", "flutter", "rise"), and
+// back (false if it isn't one).
 const char *piece_way_name(PieceWay w);
 bool piece_way_named(const std::string &name, PieceWay &way);
 // Pieces of one 3D thing: how many (at random, `least` to `most`), and
@@ -166,6 +169,14 @@ struct HitLook {
 	std::vector<PieceLook> pieces;
 	int mark_bump = -1, drip_bump = -1;
 	float shine = 1;
+	// 0.12.0: it stays whole as it hits (a pie's tin, a slime ball, a
+	// pizza slice): what it leaves and throws off as a splat or pieces do,
+	// but it isn't broken - it sticks (Throw::stick) or bounces off.
+	bool whole = false;
+	// 0.12.0: it flies point first, not turning (a suction dart: as made,
+	// its point away from you), at its forehead; stuck, its tail swings
+	// side to side, and it pops off as it falls.
+	bool point = false;
 };
 constexpr float MOST_MARK = 15;
 // At most this many left on its face at once (one more and the oldest
@@ -250,6 +261,10 @@ struct Flying {
 	V3 axis{0, 0, 1};
 	// Stuck to it now (Throw::stick).
 	bool stuck = false;
+	// 0.12.0: how it wobbles (-1 to 1): a 3D one's "wobble" shape as much
+	// (or its "wobble back", less than 0) - a water balloon as it flies, a
+	// fish flopping as it hits and as it falls, a limp rubber chicken.
+	float wobble = 0;
 };
 
 // The patting hand: shown, its picture, the side it comes from (-1 the

@@ -61,7 +61,7 @@ static bool finite_out(const ReactOut &o)
 		good = good && ok(b.x) && ok(b.y) && ok(b.size) && ok(b.angle) && ok(b.opacity) && b.size > 0 &&
 		       b.opacity > 0 && b.opacity <= 1;
 	for (const Flying &f : o.flying)
-		good = good && ok(f.squash_z) && f.squash_z > 0;
+		good = good && ok(f.squash_z) && f.squash_z > 0 && ok(f.wobble) && f.wobble >= -1 && f.wobble <= 1;
 	for (const Piece3D &p : o.pieces)
 		good = good && ok(p.x) && ok(p.y) && ok(p.z) && ok(p.size) && ok(p.open) && ok(p.opacity) &&
 		       ok(p.turn.x) && ok(p.turn.y) && ok(p.turn.z) && ok(p.turn.w) && ok(p.shape.x) &&
@@ -1474,8 +1474,9 @@ static void test_pieces()
 	CHECK(piece_way_named("DROP", w) && w == PieceWay::Drop);
 	CHECK(piece_way_named("crown", w) && w == PieceWay::Crown);
 	CHECK(!piece_way_named("blob", w) && w == PieceWay::Crown && !piece_way_named("", w));
-	for (PieceWay v : {PieceWay::Chunk, PieceWay::Drop, PieceWay::Crown, PieceWay::Flutter})
+	for (PieceWay v : {PieceWay::Chunk, PieceWay::Drop, PieceWay::Crown, PieceWay::Flutter, PieceWay::Rise})
 		CHECK(piece_way_named(piece_way_name(v), w) && w == v);
+	CHECK(piece_way_named("Rise", w) && w == PieceWay::Rise);
 	// (Room below for all of it to fall and shrink away in sight.)
 	ReactView view;
 	view.bottom = 6;
@@ -1742,6 +1743,202 @@ static void test_pieces()
 	}
 }
 
+// 0.12.0: a thing that stays whole with a splat (a pie's tin), one that
+// flies point first (a dart), wobbling 3D things, rising puffs (a stink).
+static void test_whole_point_wobble_rise()
+{
+	ReactView view;
+	view.bottom = 6;
+	auto step_to_hit = [&](React &r) {
+		ReactOut o;
+		for (int i = 0; i < 200 && !o.hits; i++)
+			o = r.step(FRAME, view);
+		return o;
+	};
+	{
+		// A pie: a splat with pieces, its tin whole and stuck a moment, then
+		// sliding off and falling; a splat broken as before without `whole`.
+		for (uint32_t seed : {1u, 2u, 3u}) {
+			React r(seed);
+			Throw t;
+			t.picture = 0;
+			t.three_d = true;
+			t.stick = 0.4f;
+			t.look.effect = Effect::Splat;
+			t.look.mark = 1;
+			t.look.whole = true;
+			PieceLook lump;
+			lump.thing = 2;
+			lump.least = lump.most = 3;
+			t.look.pieces = {lump};
+			CHECK(r.throw_at(t) > 0);
+			ReactOut o = step_to_hit(r);
+			CHECK(o.hits == 1 && finite_out(o));
+			CHECK(o.flying.size() == 1 && o.flying[0].stuck && o.flying[0].squash_z == 1);
+			CHECK(o.marks.size() == 1 && o.pieces.size() == 3);
+			// (Moving with its head as the hit knocks it: never far.)
+			const float x = o.flying[0].x, y = o.flying[0].y;
+			run(r, 0.3f, view, [&](const ReactOut &q) {
+				CHECK(q.flying.size() == 1 && q.flying[0].stuck && q.flying[0].opacity > 0.99f);
+				CHECK(std::hypot(q.flying[0].x - x, q.flying[0].y - y) < 0.35f);
+			});
+			bool fell = false;
+			run(r, 1.5f, view, [&](const ReactOut &q) {
+				fell = fell || (q.flying.size() == 1 && !q.flying[0].stuck);
+				CHECK(finite_out(q));
+			});
+			CHECK(fell && r.flying() == 0 && r.step(FRAME, view).marks.size() == 1);
+		}
+		// Not whole: broken as before, never stuck.
+		React r(4);
+		Throw t;
+		t.picture = 0;
+		t.three_d = true;
+		t.stick = 2;
+		t.look.effect = Effect::Splat;
+		t.look.mark = 1;
+		r.throw_at(t);
+		ReactOut o = step_to_hit(r);
+		CHECK(o.flying.size() == 1 && !o.flying[0].stuck && o.flying[0].squash_z < 0.5f);
+		// Whole and not sticking: it bounces off, its splat left all the same.
+		React r2(5);
+		t.stick = 0;
+		t.look.whole = true;
+		r2.throw_at(t);
+		o = step_to_hit(r2);
+		CHECK(o.flying.size() == 1 && !o.flying[0].stuck && o.flying[0].squash_z == 1 && o.marks.size() == 1);
+		run(r2, 0.2f, view, [](const ReactOut &) {});
+		o = r2.step(FRAME, view);
+		CHECK(o.flying.size() == 1 && o.flying[0].y < o.marks[0].y);
+	}
+	{
+		// A dart: point first, never turning on its way, at its forehead;
+		// stuck, its tail swings side to side (about its up), dying away;
+		// it pops off up and out, tumbling.
+		for (uint32_t seed : {6u, 7u, 8u, 9u}) {
+			React r(seed);
+			Throw t;
+			t.picture = 0;
+			t.three_d = true;
+			t.stick = 1.5f;
+			t.look.point = true;
+			r.throw_at(t);
+			ReactOut o;
+			for (int i = 0; i < 200 && !o.hits; i++) {
+				o = r.step(FRAME, view);
+				if (!o.hits && o.flying.size() == 1) {
+					CHECK(o.flying[0].angle == 0);
+					CHECK(o.flying[0].axis.z == 1);
+				}
+			}
+			CHECK(o.flying.size() == 1 && o.flying[0].stuck);
+			CHECK(o.flying[0].y <= -0.25f && o.flying[0].y >= -0.37f && std::fabs(o.flying[0].x) <= 0.17f);
+			float early = 0, late = 0;
+			int sign_changes = 0;
+			float last = 0;
+			run(r, 1.2f, view, [&](const ReactOut &q) {
+				if (q.flying.size() != 1 || !q.flying[0].stuck)
+					return;
+				// (About its up, give or take its head's tilt.)
+				const Flying &f = q.flying[0];
+				CHECK(std::fabs(f.axis.y) > 0.8f || std::fabs(f.angle) < 0.12f);
+				CHECK(std::fabs(f.angle) <= 0.42f);
+				const float swing = f.angle * f.axis.y;
+				if (swing * last < 0)
+					sign_changes++;
+				last = swing;
+				if (sign_changes < 2)
+					early = std::max(early, std::fabs(swing));
+				else if (sign_changes > 6)
+					late = std::max(late, std::fabs(swing));
+			});
+			CHECK(early > 0.1f && late < early * 0.5f && sign_changes >= 6);
+			bool up = false, tumbles = false;
+			float y0 = 0;
+			run(r, 1.0f, view, [&](const ReactOut &q) {
+				if (q.flying.size() != 1 || q.flying[0].stuck)
+					return;
+				if (y0 == 0)
+					y0 = q.flying[0].y;
+				up = up || q.flying[0].y < y0 - 0.02f;
+				tumbles = tumbles || std::fabs(q.flying[0].axis.y) < 0.999f;
+			});
+			CHECK(up && tumbles);
+		}
+	}
+	{
+		// Wobble: as it flies (both ways), flopping as it hits and dying
+		// away while stuck, a little as it falls.
+		React r(10);
+		Throw t;
+		t.picture = 0;
+		t.three_d = true;
+		t.stick = 2;
+		r.throw_at(t);
+		float lo = 0, hi = 0;
+		ReactOut o;
+		for (int i = 0; i < 200 && !o.hits; i++) {
+			o = r.step(FRAME, view);
+			if (!o.hits)
+				for (const Flying &f : o.flying) {
+					lo = std::min(lo, f.wobble);
+					hi = std::max(hi, f.wobble);
+				}
+		}
+		CHECK(lo < -0.5f && hi > 0.5f && finite_out(o));
+		CHECK(o.flying.size() == 1 && o.flying[0].wobble > 0.9f);
+		float later = 0;
+		run(r, 1.5f, view, [&](const ReactOut &q) {
+			CHECK(finite_out(q));
+			if (q.flying.size() == 1 && q.flying[0].stuck)
+				later = std::fabs(q.flying[0].wobble);
+		});
+		CHECK(later < 0.2f);
+	}
+	{
+		// A stink: puffs rising one after another over a second or so -
+		// none yet as it hits, growing as they rise, thinning away; stopped,
+		// those still to come never come.
+		React r(11);
+		Throw t;
+		t.picture = 0;
+		t.three_d = true;
+		t.stick = 2;
+		PieceLook puff;
+		puff.thing = 7;
+		puff.way = PieceWay::Rise;
+		puff.least = puff.most = 8;
+		puff.size = 0.2f;
+		t.look.pieces = {puff};
+		r.throw_at(t);
+		ReactOut o = step_to_hit(r);
+		const float hit_y = o.flying[0].y;
+		CHECK(o.pieces.size() <= 2 && finite_out(o));
+		int most = 0;
+		float highest = 1e9f, biggest = 0;
+		bool thin = false;
+		run(r, 1.0f, view, [&](const ReactOut &q) {
+			CHECK(finite_out(q));
+			most = std::max(most, (int)q.pieces.size());
+			for (const Piece3D &p : q.pieces) {
+				highest = std::min(highest, p.y);
+				biggest = std::max(biggest, p.size);
+				thin = thin || p.opacity < 0.5f;
+			}
+		});
+		CHECK(most >= 5 && highest < hit_y - 0.15f && biggest > 0.2f && thin);
+		r.stop();
+		run(r, 0.25f, view, [](const ReactOut &) {});
+		run(r, 2.0f, view, [&](const ReactOut &q) { CHECK(q.pieces.empty()); });
+		// Left alone, all gone by RISE_OVER + its life.
+		React r2(12);
+		r2.throw_at(t);
+		step_to_hit(r2);
+		run(r2, 3.6f, view, [](const ReactOut &) {});
+		CHECK(r2.step(FRAME, view).pieces.empty());
+	}
+}
+
 // After 0.10.0: a move that stays (a ride) has its idle cross-faded in
 // under it while the move shows whole - done as the move begins to ease
 // out, so the idle before it never shows through the move easing out over
@@ -1795,6 +1992,7 @@ int main()
 	test_all_at_once();
 	test_effects();
 	test_pieces();
+	test_whole_point_wobble_rise();
 	test_stay_swap();
 	std::printf("unit_react: %d passed, %d failed\n", passes, failures);
 	return failures ? 1 : 0;

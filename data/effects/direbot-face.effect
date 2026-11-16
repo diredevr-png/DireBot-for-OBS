@@ -129,7 +129,10 @@ float4 PSWetStain(VertData v_in) : TARGET
 	float lit = 0.8 + 0.3 * dot(n, l);
 	float gloss = pow(saturate(dot(n, h)), 60.0) * wet_look.x;
 	float a = c.a * opacity;
-	return float4((c.rgb * lit + float3(gloss, gloss, gloss)) * a, a);
+	// A clear liquid (egg white, water: hardly any colour) shines as much
+	// as a thick one: its highlight over all of it, however see-through.
+	float wet = saturate(c.a * 4.0) * opacity;
+	return float4(c.rgb * lit * a + float3(gloss, gloss, gloss) * wet, a);
 }
 
 // ---- Colour (avatar2d.cpp's lab_of and rgb_of) ----
