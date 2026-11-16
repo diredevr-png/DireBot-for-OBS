@@ -161,7 +161,8 @@ struct HitLook {
 	int puff = -1;
 	// How long what's left on its face stays (seconds, up to MOST_MARK).
 	float seconds = 4;
-	// Squashed much flatter as it hits, and wobbling back (a rubber duck).
+	// Squashed much flatter as it hits, and wobbling back (a rubber duck);
+	// stuck, staying a flattened mound (slime).
 	bool squishy = false;
 	// 0.12.0: its 3D pieces; a splat's quick mist (`puff`); and what's left
 	// on its face wet and glossy - the splat's and the drips' height maps
@@ -177,6 +178,13 @@ struct HitLook {
 	// its point away from you), at its forehead; stuck, its tail swings
 	// side to side, and it pops off as it falls.
 	bool point = false;
+	// 0.12.0: it flies as made, not turning (a cream pie: its cream away
+	// from you, onto its face) - leaving tipped back a little, so you see
+	// its top, and tipping forward as it comes - and sticks so; falling
+	// off, it tips on over. Dropped from above (an ice cream, upside
+	// down: on its head like a hat) it comes down as made, and slides off
+	// to its side, toppling that way.
+	bool steady = false;
 };
 constexpr float MOST_MARK = 15;
 // At most this many left on its face at once (one more and the oldest
@@ -450,6 +458,9 @@ private:
 		// `stuck_at`, when it stuck (for the oldest to go first).
 		bool stuck = false;
 		float stuck_till = 0, stuck_at = 0;
+		// Come off after being stuck: it falls as it was, not squashed
+		// again as if it had just hit.
+		bool came_off = false;
 		// Its turn as it stuck, and the one it settles to.
 		float stuck_from = 0, stuck_angle = 0;
 		float vx = 0, vy = 0, x = 0, y = 0, size0 = 1, size = 1;

@@ -118,6 +118,19 @@ constexpr float CROWN_LONG = 1.25f, CROWN_SHOWS = 0.9f;
 // swings up to POINT_WOBBLE radians this fast (radians a second), dying
 // away over about POINT_SETTLE seconds.
 constexpr float POINT_HIGH = -0.36f, POINT_WOBBLE = 0.32f, POINT_WOBBLE_W = 38.0f, POINT_SETTLE = 0.35f;
+// A steady thing (a pie) leaves tipped back STEADY_TIP radians (about its
+// own x: showing you its top - a pie made to land cream first leaves side
+// on; the renderer's way round, so less than none) and tips forward as it
+// flies, landing as made; falling off,
+// it tips on over (its top edge coming away first), this fast (radians a
+// second, the same way round).
+constexpr float STEADY_TIP = -1.15f, STEADY_FALL_SPIN = -3.0f;
+// ...holding that tip for this much of its way (it comes into view about
+// half way), then turning.
+constexpr float STEADY_HOLD = 0.58f;
+// Come off after being stuck, it springs back round over this long
+// (seconds) as it falls.
+constexpr float UNSTICK_ROUND = 0.25f;
 // A 3D thing's wobble (its "wobble" shapes): as it flies and falls, this
 // fast (radians a second); as it hits, flopping this fast, dying away over
 // about WOBBLE_SETTLE seconds.
@@ -157,6 +170,22 @@ bool finite(float v)
 float envelope(float u, float length)
 {
 	return smooth(u / move_ease_in(length)) * smooth((length - u) / move_ease_out(length));
+}
+
+// How squashed a thing is while stuck: `e` 1 as it hits, 0 settled. A
+// squishy one (slime) stays a flattened mound, thin towards you; the rest
+// a little flat.
+void stuck_squash(const Throw &t, float e, float &sx, float &sy, float &sz)
+{
+	if (t.look.squishy) {
+		sx = 1.16f + 0.19f * e;
+		sy = 0.84f - 0.14f * e;
+		sz = 0.62f - 0.12f * e;
+	} else {
+		sx = 1.06f + 0.29f * e;
+		sy = 0.95f - 0.25f * e;
+		sz = 1;
+	}
 }
 
 } // namespace
@@ -607,15 +636,22 @@ void React::launch(Item &it, const ReactView &view)
 	it.angle = random(-PI_F, PI_F);
 	// A 3D one tumbles about a way of its own, mostly end over end.
 	it.axis = normalized(V3{random(-0.4f, 0.4f), random(-1, 1), 1}, {0, 0, 1});
-	if (t.look.point) {
-		// Point first, not turning, at its forehead (0.12.0).
+	if (t.look.point || t.look.steady) {
+		// As made, not turning (0.12.0); point first at its forehead.
 		it.spin = 0;
 		it.angle = 0;
 		it.axis = {0, 0, 1};
+		it.arc *= 0.6f;
+	}
+	if (t.look.steady) {
+		// Tipped back as it leaves, tipping forward onto its face.
+		it.axis = {1, 0, 0};
+		it.angle = STEADY_TIP;
+	}
+	if (t.look.point) {
 		it.x1 = random(-0.16f, 0.16f);
 		it.y1 = random(POINT_HIGH, POINT_HIGH + 0.1f);
 		it.touch_y = it.y1;
-		it.arc *= 0.6f;
 	}
 	it.x = it.x0;
 	it.y = it.y0;
@@ -703,6 +739,8 @@ void React::hit(Item &it, ReactOut &out)
 			// Stuck as it flew, its tail swinging side to side.
 			it.stuck_from = it.stuck_angle = 0;
 			it.axis = {0, 1, 0};
+		} else if (t.look.steady) {
+			it.stuck_from = it.stuck_angle = 0;
 		}
 	}
 }
@@ -712,6 +750,7 @@ void React::unstick(Item &it)
 	if (!it.stuck)
 		return;
 	it.stuck = false;
+	it.came_off = true;
 	// Falling from where it is now (its fade starts again).
 	it.hit_at = it.at;
 	it.vx = random(-0.3f, 0.3f);
@@ -723,6 +762,17 @@ void React::unstick(Item &it)
 		it.vy = -random(1.0f, 1.6f);
 		it.spin = random(6.0f, 10.0f) * (random01() < 0.5f ? -1 : 1);
 		it.axis = normalized(V3{random(-1, 1), random(-1, 1), random(-0.3f, 0.3f)}, {1, 0, 0});
+	} else if (it.t.look.steady && it.t.above) {
+		// Off the top of its head (an ice cream): sliding off to its
+		// side, toppling that way.
+		it.axis = {0, 0, 1};
+		it.vx = it.side * random(0.5f, 0.9f);
+		it.vy = -random(0.2f, 0.5f);
+		it.spin = it.side * random(2.5f, 4.0f);
+	} else if (it.t.look.steady) {
+		// Peeling off its face: tipping on over as it falls.
+		it.axis = normalized(V3{1, random(-0.25f, 0.25f), 0}, {1, 0, 0});
+		it.spin = STEADY_FALL_SPIN * random(0.8f, 1.2f);
 	}
 }
 
@@ -1241,6 +1291,12 @@ ReactOut React::step(float dt, const ReactView &view)
 				// Smaller as it goes away from you, towards its face.
 				it.size = it.size0 / (0.4f + 0.6f * u);
 				it.angle += it.spin * dt;
+				if (it.t.look.steady) {
+					// (Side on while it comes into view, turning over
+					// the last of its way.)
+					const float w = clamp01((u - STEADY_HOLD) / (1 - STEADY_HOLD));
+					it.angle = STEADY_TIP * (1 - w * w * (3 - 2 * w));
+				}
 			}
 			if (it.at >= FLY_TIME) {
 				it.hit = true;
@@ -1315,11 +1371,11 @@ ReactOut React::step(float dt, const ReactView &view)
 		}
 		if (it.stuck) {
 			// Squashed flat against it a moment, then a little flat while
-			// it's stuck there.
+			// it's stuck there (a squishy one, slime: staying a flattened
+			// mound, thin towards you).
 			const float e = std::max(0.0f, 1 - (it.at - it.hit_at) / 0.14f);
 			f.opacity = 1;
-			f.squash_x = 1.06f + 0.29f * e;
-			f.squash_y = 0.95f - 0.25f * e;
+			stuck_squash(it.t, e, f.squash_x, f.squash_y, f.squash_z);
 		} else if (it.broke) {
 			// Crushed flat against it, then gone (what it left takes over):
 			// a 3D one wider every way and thin towards you.
@@ -1335,7 +1391,15 @@ ReactOut React::step(float dt, const ReactView &view)
 		} else if (it.hit) {
 			const float tt = it.at - it.hit_at;
 			f.opacity = 1 - smooth((tt - (it.dropped ? 0.0f : 0.25f)) / (it.dropped ? 0.3f : FALL_TIME - 0.25f));
-			if (!it.dropped && it.t.look.squishy) {
+			if (it.came_off) {
+				// As it was stuck, springing back round as it falls.
+				const float e = smooth(tt / UNSTICK_ROUND);
+				float sx, sy, sz;
+				stuck_squash(it.t, 0, sx, sy, sz);
+				f.squash_x = sx + (1 - sx) * e;
+				f.squash_y = sy + (1 - sy) * e;
+				f.squash_z = sz + (1 - sz) * e;
+			} else if (!it.dropped && it.t.look.squishy) {
 				// Squashed flat, wobbling back as it bounces off.
 				const float e = std::exp(-tt / SQUISH_SETTLE) * std::cos(tt * SQUISH_WOBBLE);
 				f.squash_x = 1 + SQUISH_FLAT * e;
@@ -1613,9 +1677,10 @@ ReactOut React::step(float dt, const ReactView &view)
 		for (Flying &f : out.flying) {
 			// (out.flying is in flying_'s order.)
 			const Item &it = flying_[n++];
-			if (f.stuck && it.t.look.point) {
+			if (f.stuck && (it.t.look.point || it.t.look.steady)) {
 				// (A dart: its head's tilt in the picture, then its own
-				// swing about its up - as one turn.)
+				// swing about its up - as one turn; a pie the same, its
+				// own turn about its x.)
 				float tilt = 0;
 				follow(f.x, f.y, tilt, roll_now_ - it.stuck_roll);
 				const Quat q = axis_angle({0, 0, 1}, -tilt) * axis_angle(f.axis, -f.angle);

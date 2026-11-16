@@ -5262,10 +5262,12 @@ struct FaceAvatar {
 					const json shine = hit.value("shine", json());
 					look.shine = shine.is_number() ? clampf(shine.get<float>(), 0, 1.5f) : 1.0f;
 					// It stays whole ("whole": a pie's tin), it flies point
-					// first ("point": a dart).
-					const json whole = hit.value("whole", json()), point = hit.value("point", json());
+					// first ("point": a dart) or as made ("steady": a pie).
+					const json whole = hit.value("whole", json()), point = hit.value("point", json()),
+						   steady = hit.value("steady", json());
 					look.whole = whole.is_boolean() && whole.get<bool>();
 					look.point = point.is_boolean() && point.get<bool>();
+					look.steady = steady.is_boolean() && steady.get<bool>();
 					const json pieces = hit.value("pieces", json());
 					if (pieces.is_array())
 						for (const json &pc : pieces) {
@@ -6454,7 +6456,7 @@ struct FaceAvatar {
 				json hit;
 				if (i < throw_looks.size() &&
 				    (throw_looks[i].effect != Effect::None || !throw_looks[i].pieces.empty() ||
-				     throw_looks[i].whole || throw_looks[i].point)) {
+				     throw_looks[i].whole || throw_looks[i].point || throw_looks[i].steady)) {
 					const HitLook &look = throw_looks[i];
 					bool all = true;
 					for (int n : {look.mark, look.drip, look.puff, look.mark_bump, look.drip_bump})
@@ -6467,6 +6469,8 @@ struct FaceAvatar {
 						hit["whole"] = true;
 					if (look.point)
 						hit["point"] = true;
+					if (look.steady)
+						hit["steady"] = true;
 					// 0.12.0: its 3D pieces, loaded (or why not).
 					if (!look.pieces.empty()) {
 						json pieces = json::array();

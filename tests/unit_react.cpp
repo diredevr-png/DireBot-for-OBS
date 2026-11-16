@@ -1867,6 +1867,144 @@ static void test_whole_point_wobble_rise()
 		}
 	}
 	{
+		// Steady (a pie): tipped back a little as it leaves (about its own
+		// x), tipping forward all the way to as made as it lands, stuck so;
+		// it lands where a throw does (not at its forehead); falling off,
+		// it tips on over.
+		for (uint32_t seed : {13u, 14u, 15u}) {
+			React r(seed);
+			Throw t;
+			t.picture = 0;
+			t.three_d = true;
+			t.stick = 0.4f;
+			t.look.effect = Effect::Splat;
+			t.look.mark = 1;
+			t.look.whole = true;
+			t.look.steady = true;
+			r.throw_at(t);
+			ReactOut o;
+			float last = 1e9f, first = 1;
+			bool tips_forward = true;
+			for (int i = 0; i < 200 && !o.hits; i++) {
+				o = r.step(FRAME, view);
+				for (const Flying &f : o.flying)
+					if (!f.hit) {
+						CHECK(f.axis.x == 1 && f.axis.y == 0 && f.axis.z == 0);
+						if (first > 0)
+							first = f.angle;
+						tips_forward = tips_forward && std::fabs(f.angle) <= last + 1e-6f;
+						last = std::fabs(f.angle);
+					}
+			}
+			// (Less than none: the renderer's way round, showing its top.)
+			CHECK(first < -0.9f && first > -1.3f && tips_forward && last < 0.05f);
+			// (Stuck, it tips with its head as the hit knocks it.)
+			CHECK(o.flying.size() == 1 && o.flying[0].stuck);
+			CHECK(o.flying[0].y >= -0.3f && o.flying[0].y <= 0.2f);
+			run(r, 0.3f, view, [&](const ReactOut &q) {
+				if (q.flying.size() == 1 && q.flying[0].stuck)
+					CHECK(std::fabs(q.flying[0].angle) < 0.1f);
+			});
+			// Falling off, tipping on over about its own x, mostly.
+			float most = 0;
+			run(r, 0.6f, view, [&](const ReactOut &q) {
+				for (const Flying &f : q.flying)
+					if (!f.stuck) {
+						CHECK(std::fabs(f.axis.x) > 0.9f);
+						most = std::max(most, -f.angle);
+					}
+			});
+			CHECK(most > 0.5f);
+		}
+	}
+	{
+		// Steady from above (an ice cream, made upside down): it comes down
+		// as a bonk does (turning only in the picture), sits on its head
+		// as made, then slides off to its side, toppling that way.
+		for (float side : {-1.0f, 1.0f}) {
+			React r(16);
+			Throw t;
+			t.picture = 0;
+			t.three_d = true;
+			t.above = true;
+			t.side = side;
+			t.stick = 0.5f;
+			t.look.effect = Effect::Splat;
+			t.look.mark = 1;
+			t.look.whole = true;
+			t.look.steady = true;
+			r.throw_at(t);
+			ReactOut o;
+			for (int i = 0; i < 200 && !o.hits; i++) {
+				o = r.step(FRAME, view);
+				for (const Flying &f : o.flying)
+					CHECK(std::fabs(f.axis.x) < 1e-5f && std::fabs(f.axis.y) < 1e-5f &&
+					      std::fabs(f.axis.z) > 0.9999f);
+			}
+			CHECK(o.flying.size() == 1 && o.flying[0].stuck);
+			const float sat_x = o.flying[0].x;
+			run(r, 0.3f, view, [&](const ReactOut &q) {
+				if (q.flying.size() == 1 && q.flying[0].stuck)
+					CHECK(std::fabs(q.flying[0].angle) < 0.1f);
+			});
+			float went = 0, toppled = 0;
+			bool round_z = true;
+			run(r, 0.6f, view, [&](const ReactOut &q) {
+				for (const Flying &f : q.flying)
+					if (!f.stuck) {
+						round_z = round_z && std::fabs(f.axis.z) > 0.999f;
+						went = (f.x - sat_x) * side;
+						toppled = std::max(toppled, f.angle * side);
+					}
+			});
+			CHECK(round_z && went > 0.15f && toppled > 0.5f);
+		}
+	}
+	{
+		// Stuck, a squishy one (slime) stays a flattened mound, thin towards
+		// you; one that isn't, only a little flat. Coming off, neither is
+		// squashed again as if it had just hit: each springs back round as
+		// it falls, from as it was.
+		for (bool squishy : {true, false}) {
+			React r(17);
+			Throw t;
+			t.picture = 0;
+			t.three_d = true;
+			t.stick = 0.6f;
+			t.look.squishy = squishy;
+			r.throw_at(t);
+			step_to_hit(r);
+			Flying last;
+			run(r, 0.5f, view, [&](const ReactOut &q) {
+				if (q.flying.size() == 1 && q.flying[0].stuck)
+					last = q.flying[0];
+			});
+			CHECK(last.stuck);
+			if (squishy)
+				CHECK(last.squash_x > 1.1f && last.squash_y < 0.9f && last.squash_z < 0.7f);
+			else
+				CHECK(last.squash_x < 1.1f && last.squash_y > 0.9f && last.squash_z == 1);
+			float widest = 0, prev_x = last.squash_x, jump = 0;
+			Flying end;
+			bool fell = false;
+			run(r, 0.5f, view, [&](const ReactOut &q) {
+				if (q.flying.size() == 1 && !q.flying[0].stuck) {
+					const Flying &f = q.flying[0];
+					if (!fell)
+						jump = std::fabs(f.squash_x - prev_x);
+					fell = true;
+					widest = std::max(widest, f.squash_x);
+					end = f;
+				} else if (q.flying.size() == 1) {
+					prev_x = q.flying[0].squash_x;
+				}
+			});
+			CHECK(fell && jump < 0.05f && widest <= prev_x + 1e-4f);
+			CHECK(std::fabs(end.squash_x - 1) < 0.02f && std::fabs(end.squash_y - 1) < 0.02f &&
+			      std::fabs(end.squash_z - 1) < 0.02f);
+		}
+	}
+	{
 		// Wobble: as it flies (both ways), flopping as it hits and dying
 		// away while stuck, a little as it falls.
 		React r(10);
