@@ -193,6 +193,12 @@ struct HitLook {
 	// MOST_PUFF; 0: a snowball's quick puff of powder, about 0.6) - a
 	// glitter bomb's cloud of glitter dust lingers.
 	float puff_seconds = 0;
+	// 0.12.0: strings of melted cheese (a pizza slice): as it slides off
+	// its face, a few strands of this picture (drawn hanging from its top,
+	// stretched) stretch from where it was stuck to it as it goes, snap,
+	// spring back and hang there, staying as what it left does; and their
+	// height map (wet and glossy, as the splat's).
+	int string = -1, string_bump = -1;
 };
 constexpr float MOST_PUFF = 4;
 constexpr float MOST_MARK = 15;
@@ -472,6 +478,10 @@ private:
 		bool came_off = false;
 		// Its turn as it stuck, and the one it settles to.
 		float stuck_from = 0, stuck_angle = 0;
+		// Its number (for the strings stretching to it), and whether its
+		// strings have come yet (0.12.0).
+		int id = 0;
+		bool strung = false;
 		float vx = 0, vy = 0, x = 0, y = 0, size0 = 1, size = 1;
 		// Where it touches as it hits, for the flash (a bonk: the top of
 		// its head, under its bottom; else its middle).
@@ -498,6 +508,16 @@ private:
 		int id = 0;     // a splat's number; a drip's, its splat's
 		int bump = -1;  // wet: its height map (0.12.0)
 		float shine = 1;
+		// A string of cheese (0.12.0, a drip of a kind): stretching from
+		// here to the thing (Item::id) it's `follow`ing, `off` across it
+		// (-0.5 to 0.5), until it reaches `reach` heads (or the thing's
+		// gone) and snaps; how long it is now and its turn (0 hanging
+		// straight down; clockwise); and, snapped, when, how long and
+		// turned it was.
+		bool string = false;
+		int follow = -1;
+		float off = 0, reach = 0, len = 0, turn = 0;
+		float snap_at = -1, snap_len = 0, snap_turn = 0;
 	};
 	// A bit thrown off it: how it moves (a mist: a splat's, quick).
 	enum class BitKind { Drop, Feather, Chunk, Puff, Mist };
@@ -588,6 +608,10 @@ private:
 	std::vector<PieceItem> pieces_;
 	float roll_now_ = 0; // ReactView::roll this step
 	int mark_ids_ = 0;
+	int item_ids_ = 0;
+	// Strings of cheese from a thing sliding off its face (0.12.0).
+	void add_strings(const Item &it);
+	void step_strings(float dt);
 };
 
 } // namespace direbot::face

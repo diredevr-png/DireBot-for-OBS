@@ -5259,6 +5259,10 @@ struct FaceAvatar {
 					// [least, most], "size": heads across}].
 					look.mark_bump = number(hit.value("mark_bump", json()));
 					look.drip_bump = number(hit.value("drip_bump", json()));
+					// ...and strings of cheese as it slides off ("string": a
+					// pizza slice's; "string_bump", their height map).
+					look.string = number(hit.value("string", json()));
+					look.string_bump = number(hit.value("string_bump", json()));
 					const json shine = hit.value("shine", json());
 					look.shine = shine.is_number() ? clampf(shine.get<float>(), 0, 1.5f) : 1.0f;
 					// It stays whole ("whole": a pie's tin), it flies point
@@ -6469,7 +6473,8 @@ struct FaceAvatar {
 				     throw_looks[i].hard)) {
 					const HitLook &look = throw_looks[i];
 					bool all = true;
-					for (int n : {look.mark, look.drip, look.puff, look.mark_bump, look.drip_bump})
+					for (int n : {look.mark, look.drip, look.puff, look.mark_bump, look.drip_bump, look.string,
+						      look.string_bump})
 						all = all && (n < 0 ||
 							      (n < (int)effect_pics.size() && loaded(effect_pics[n])));
 					for (int n : look.bits)

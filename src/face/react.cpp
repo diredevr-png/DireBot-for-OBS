@@ -134,6 +134,13 @@ constexpr float UNSTICK_ROUND = 0.25f;
 // What a thing that stays whole leaves on its face lies nearly level: up
 // to this far turned (radians) either way.
 constexpr float MARK_LEVEL = 0.25f;
+// Strings of cheese (a pizza slice): this many as it slides off; each as
+// wide as this much of it and stretching up to this much of its size
+// before it snaps; snapped, springing back (seconds) to this much of how
+// long it was, swinging down to hang straight.
+constexpr int STRINGS_LEAST = 2, STRINGS_MOST = 3;
+constexpr float STRING_WIDE = 0.075f, STRING_REACH_LO = 0.55f, STRING_REACH_HI = 0.95f;
+constexpr float STRING_BACK = 0.12f, STRING_HANG = 0.5f, STRING_SWING = 0.3f;
 // A 3D thing's wobble (its "wobble" shapes): as it flies and falls, this
 // fast (radians a second); as it hits, flopping this fast, dying away over
 // about WOBBLE_SETTLE seconds.
@@ -750,6 +757,68 @@ void React::hit(Item &it, ReactOut &out)
 	}
 }
 
+void React::add_strings(const Item &it)
+{
+	const HitLook &look = it.t.look;
+	const int n = STRINGS_LEAST + (int)(random01() * (STRINGS_MOST - STRINGS_LEAST + 1));
+	for (int i = 0; i < std::min(n, STRINGS_MOST); i++) {
+		MarkItem m;
+		m.picture = look.string;
+		m.bump = look.string_bump;
+		m.shine = look.shine;
+		m.drip = true;
+		m.string = true;
+		m.follow = it.id;
+		// Spread across it, never two together.
+		m.off = 0.7f * ((i + 0.5f) / n - 0.5f) + random(-0.05f, 0.05f);
+		m.x = it.x + m.off * it.size;
+		m.y = it.y + random(0.0f, 0.12f) * it.size;
+		m.size = it.size * STRING_WIDE * random(0.75f, 1.25f);
+		m.reach = it.size * random(STRING_REACH_LO, STRING_REACH_HI);
+		// (Staying as long as the rest of what it left.)
+		m.stay = std::max(0.5f, look.seconds - (it.at - it.hit_at));
+		m.roll = roll_now_;
+		marks_.push_back(m);
+	}
+}
+
+void React::step_strings(float dt)
+{
+	(void)dt;
+	for (MarkItem &m : marks_) {
+		if (!m.string)
+			continue;
+		if (m.follow >= 0) {
+			const Item *to = nullptr;
+			for (const Item &it : flying_)
+				if (it.id == m.follow)
+					to = &it;
+			if (to) {
+				// To its place across the thing, a little up it.
+				const float dx = to->x + m.off * to->size * 0.8f - m.x;
+				const float dy = to->y - 0.05f * to->size - m.y;
+				m.len = std::sqrt(dx * dx + dy * dy);
+				// (The picture hangs down from its top: turned so its
+				// down points at the thing.)
+				m.turn = m.len > 1e-4f ? std::atan2(-dx, std::max(dy, 0.0f) + 1e-4f) : 0;
+			}
+			if (!to || m.len >= m.reach || m.fade_at >= 0) {
+				m.follow = -1;
+				m.snap_at = m.at;
+				m.snap_len = std::min(m.len, m.reach);
+				m.snap_turn = m.turn;
+			}
+		}
+		if (m.follow < 0 && m.snap_at >= 0) {
+			// Snapped: springing back up, swinging down to hang straight.
+			const float t = m.at - m.snap_at;
+			const float hang = m.snap_len * STRING_HANG;
+			m.len = hang + (m.snap_len - hang) * std::exp(-t / STRING_BACK) * std::cos(t * 16.0f);
+			m.turn = m.snap_turn * std::exp(-t / STRING_SWING) * std::cos(t * 9.0f);
+		}
+	}
+}
+
 void React::unstick(Item &it)
 {
 	if (!it.stuck)
@@ -1245,6 +1314,7 @@ void React::step_effects(float dt, const ReactView &view, ReactOut &out)
 	// What's left on its face.
 	for (MarkItem &m : marks_)
 		m.at += dt;
+	step_strings(dt);
 	marks_.erase(std::remove_if(marks_.begin(), marks_.end(),
 				    [&](const MarkItem &m) {
 					    return m.at >= m.stay + MARK_FADE ||
@@ -1270,6 +1340,7 @@ ReactOut React::step(float dt, const ReactView &view)
 	while (!waiting_.empty() && coming < MOST_FLYING && since_launch_ >= THROW_GAP - 1e-4f) {
 		Item it = waiting_.front();
 		waiting_.erase(waiting_.begin());
+		it.id = ++item_ids_;
 		launch(it, view);
 		flying_.push_back(it);
 		since_launch_ = 0;
@@ -1324,6 +1395,11 @@ ReactOut React::step(float dt, const ReactView &view)
 			const float slide = 1 - smooth((it.stuck_till - it.at) / STICK_SLIDE);
 			it.x = it.x1;
 			it.y = it.y1 + STICK_DROP * slide * slide;
+			// (Its strings of cheese as it starts to slide off.)
+			if (!it.strung && it.t.look.string >= 0 && it.stuck_till - it.at <= STICK_SLIDE) {
+				it.strung = true;
+				add_strings(it);
+			}
 			it.angle = it.stuck_from +
 				   (it.stuck_angle - it.stuck_from) * smooth((it.at - it.hit_at) / STICK_TURN);
 			if (it.t.look.point) {
@@ -1734,7 +1810,12 @@ ReactOut React::step(float dt, const ReactView &view)
 			}
 			if (m.fade_at >= 0)
 				fade = std::min(fade, 1 - smooth((m.at - m.fade_at) / m.fade_time));
-			if (m.drip) {
+			if (m.string) {
+				o.from_top = true;
+				o.angle = m.turn;
+				o.length = std::max(o.size * 0.6f, m.len);
+				fade *= smooth(m.at / 0.06f);
+			} else if (m.drip) {
 				const float q = clamp01((m.at - m.wait) / m.run_time);
 				if (q <= 0)
 					continue;

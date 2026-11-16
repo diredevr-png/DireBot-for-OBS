@@ -2059,6 +2059,77 @@ static void test_whole_point_wobble_rise()
 			}
 	}
 	{
+		// A pizza slice: stuck, no strings yet; as it slides off, 2-3
+		// strings of cheese stretch from where it was to it (pointing at
+		// it), snap before they're too long, spring back and swing down
+		// to hang straight, and stay as long as what it left; none
+		// without a string picture.
+		for (bool strings : {true, false}) {
+			React r(21);
+			Throw t;
+			t.picture = 0;
+			t.three_d = true;
+			t.stick = 1.0f;
+			t.look.effect = Effect::Splat;
+			t.look.whole = true;
+			t.look.mark = 1;
+			t.look.seconds = 4;
+			if (strings) {
+				t.look.string = 7;
+				t.look.string_bump = 8;
+			}
+			r.throw_at(t);
+			ReactOut o = step_to_hit(r);
+			auto count = [](const ReactOut &q) {
+				int n = 0;
+				for (const Mark &m : q.marks)
+					n += m.picture == 7;
+				return n;
+			};
+			CHECK(count(o) == 0);
+			run(r, 0.3f, view, [&](const ReactOut &q) { CHECK(count(q) == 0); });
+			// The slide (its last STICK_SLIDE stuck) and its fall.
+			float longest = 0;
+			int most = 0;
+			bool all_toward = true;
+			run(r, 1.2f, view, [&](const ReactOut &q) {
+				most = std::max(most, count(q));
+				for (const Mark &m : q.marks) {
+					if (m.picture != 7)
+						continue;
+					CHECK(m.from_top && m.bump == 8 && finite(m.length) && finite(m.angle));
+					longest = std::max(longest, m.length);
+					if (!q.flying.empty() && q.flying[0].stuck) {
+						// Pointing down at it (its down, turned, towards it).
+						const float dx = q.flying[0].x - m.x, dy = q.flying[0].y - m.y;
+						if (dy > 0.05f && -std::sin(m.angle) * dx < -0.02f)
+							all_toward = false;
+					}
+				}
+			});
+			if (strings) {
+				CHECK(most >= 2 && most <= 3);
+				CHECK(longest > 0.1f && longest < 1.0f);
+				CHECK(all_toward);
+			} else {
+				CHECK(most == 0);
+				continue;
+			}
+			// Long after: snapped and hanging nearly straight, shorter.
+			run(r, 1.0f, view, [](const ReactOut &) {});
+			o = r.step(FRAME, view);
+			CHECK(count(o) >= 2);
+			for (const Mark &m : o.marks)
+				if (m.picture == 7) {
+					CHECK(std::fabs(m.angle) < 0.08f);
+					CHECK(m.length < longest * 0.8f && m.length > 0.01f);
+				}
+			// ...and gone with the rest of what it left.
+			run(r, 4.0f, view, [](const ReactOut &) {});
+			CHECK(count(r.step(FRAME, view)) == 0);
+		}
+	}
+	{
 		// A hard thing that breaks (a handful of coins) isn't crushed: no
 		// squash, gone in a frame or two as its pieces take over; a soft
 		// one is crushed flat and fades over CRUSH.
