@@ -8,11 +8,14 @@ Run as tests/test_real_obs.py says (DIREBOT_OBS_PLUGIN=... python3 -m pytest
 tests/test_real_throws.py); DIREBOT_FACE_SHOTS=<folder> keeps the pictures.
 """
 
+import base64
 import json
 import math
 import os
 import shutil
+import struct
 import time
+import zlib
 
 import pytest
 
@@ -379,5 +382,129 @@ def test_a_face_avatar_on_that_camera_sees_it_plain_and_3d_things_land(run):
         assert seen > 60
         keep_shot(max(shots, key=lambda s: middle_of(s[1], green)[2])[1], "3D thing at the camera")
         assert cue(do="stop")["ok"]
+    finally:
+        c.disconnect()
+
+
+def read_png(data):
+    """A PNG (8 bits, RGB or RGBA) as rows of (r, g, b, a)."""
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    at, idat, w = 8, bytearray(), 0
+    while at < len(data):
+        n, kind = struct.unpack_from(">I4s", data, at)
+        body = data[at + 8:at + 8 + n]
+        if kind == b"IHDR":
+            w, h, depth, colour = struct.unpack_from(">IIBB", body)
+            assert depth == 8 and colour in (2, 6), (depth, colour)
+            step = 4 if colour == 6 else 3
+        elif kind == b"IDAT":
+            idat += body
+        at += 12 + n
+    raw, line = zlib.decompress(bytes(idat)), w * step
+    rows, prev = [], bytearray(line)
+    for y in range(h):
+        kind, cur = raw[y * (line + 1)], bytearray(raw[y * (line + 1) + 1:(y + 1) * (line + 1)])
+        for i in range(line):
+            a = cur[i - step] if i >= step else 0
+            b, c = prev[i], prev[i - step] if i >= step else 0
+            if kind == 1:
+                cur[i] = (cur[i] + a) & 255
+            elif kind == 2:
+                cur[i] = (cur[i] + b) & 255
+            elif kind == 3:
+                cur[i] = (cur[i] + (a + b) // 2) & 255
+            elif kind == 4:
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                cur[i] = (cur[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        rows.append([tuple(cur[x * step:x * step + step]) + ((255,) if step == 3 else ()) for x in range(w)])
+        prev = cur
+    return rows
+
+
+def test_a_3d_thing_fading_shows_only_its_front(run):
+    """0.12.0: a solid 3D thing fading is evenly see-through - its front
+    alone, never its own insides or far side through it (a pinecone's
+    inner scales, a snowball's back). A red ball with a green ball inside
+    it, as the puffs a hit sends rising (each fading in, then slowly out:
+    over a second or more see-through), big enough to rise past the
+    character's edge into the clear air round it - where the picture's
+    alpha is the thing's own: the red is caught part see-through there,
+    the green inside it never shows."""
+    from test_real_face import ball_points, write_glb
+    face_png = os.path.join(run.home, "camera.png")
+    if not os.path.exists(face_png):
+        camera_picture(face_png)
+    body_png = os.path.join(run.home, "fx-character.png")
+    character_picture(body_png)
+    f = pictures(run.home)
+    ball = os.path.join(run.home, "fx-ball-in-ball.glb")
+    # (The inside one first in the file: drawn first, it would show through
+    # a red one blended over it.)
+    write_glb(ball, [ball_points(0, 0, 0, 0.075, 0.075, 0.075) + ((0.02, 0.75, 0.02), 0.5),
+                     ball_points(0, 0, 0, 0.1, 0.1, 0.1) + ((0.8, 0.02, 0.02), 0.5)])
+    things = [{"file": f["tomato"], "hit": {"effect": "none",
+                                            "pieces": [{"file": ball, "way": "rise", "count": 4, "size": 0.6}]}}]
+    settings = {"source": "Fade camera", "width": 240, "height": 240, "size": 60, "mirror": False,
+                "smoothing": 100, "follow_move": 0, "follow_grow": 0, "follow_tilt": 0, "bend": 0,
+                **STILL, "character": body_png, "style": "drawn", "spots": json.dumps(SPOTS),
+                "react_items": json.dumps(things)}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+
+    def st():
+        return vendor(c, "FaceGetState", {"source": "Fade fx"})["react"]
+    try:
+        send(c, "CreateScene", {"sceneName": "Fade"})
+        send(c, "CreateInput", {"sceneName": "Fade", "inputName": "Fade camera",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        send(c, "CreateInput", {"sceneName": "Fade", "inputName": "Fade fx",
+                                "inputKind": "direbot_face_avatar", "inputSettings": settings})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Fade"})
+        assert wait_for(lambda: vendor(c, "FaceGetState", {"source": "Fade fx"})["shown"] == 1, 30, 0.2)
+        assert wait_for(lambda: st()["items"][0].get("hit", {}).get("loaded"), 10, 0.1), st()
+
+        def shot():
+            data = send(c, "GetSourceScreenshot", {"sourceName": "Fade fx", "imageFormat": "png"})["imageData"]
+            return base64.b64decode(data.split(",", 1)[1])
+        rest = read_png(shot())
+        # The clear air: well away from the character (a hit knocks its head
+        # a little way), in blocks of 4 pixels.
+        body = {(x // 4 + i, y // 4 + j) for y, row in enumerate(rest) for x, px in enumerate(row) if px[3]
+                for i in range(-3, 4) for j in range(-3, 4)}
+        clear = [[(x // 4, y // 4) not in body for x in range(len(row))] for y, row in enumerate(rest)]
+        air = sum(map(sum, clear))
+        assert air > 2000, air
+        assert vendor(c, "FaceReact", {"source": "Fade fx", "do": "throw", "item": 0, "side": 1})["ok"]
+        raw, t0 = [], time.time()
+        while time.time() - t0 < 3.5:
+            raw.append(shot())
+        thin = solid = green = 0
+        best = None
+        for data in raw:
+            rows = read_png(data)
+            n_thin = 0
+            for y, row in enumerate(rows):
+                for x, (r, g, b, a) in enumerate(row):
+                    if not clear[y][x] or a < 8:
+                        continue
+                    # (In the clear air: what's there is the thing alone. Red
+                    # lit has as much green as blue in it - white light on it
+                    # adds both alike; green from inside it shows as more.)
+                    if g > b + 25:
+                        green += 1
+                    elif r > g + 60 and r > b + 60:
+                        if a < 215:
+                            n_thin += 1
+                        else:
+                            solid += 1
+            thin += n_thin
+            if best is None or n_thin > best[0]:
+                best = (n_thin, rows)
+        print(f"{len(raw)} shots: red in the air part see-through {thin} spots, whole {solid}; "
+              f"green (its inside) {green}")
+        if best and best[0]:
+            keep_shot([[px[:3] for px in row] for row in best[1]], "A 3D thing fading")
+        assert thin > 150, (thin, solid)
+        assert green == 0
+        assert wait_for(lambda: st()["pieces"] == 0, 4, 0.1), st()
     finally:
         c.disconnect()

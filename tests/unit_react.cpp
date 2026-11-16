@@ -1890,6 +1890,17 @@ static void test_whole_point_wobble_rise()
 			}
 			CHECK(o.flying.size() == 1 && o.flying[0].stuck);
 			CHECK(o.flying[0].y <= -0.25f && o.flying[0].y >= -0.37f && std::fabs(o.flying[0].x) <= 0.17f);
+			// (Staying put where it stuck, straight out, until it pops off:
+			// never sliding down its face, 0.12.0 - once its head has
+			// settled from the knock, it doesn't move.)
+			float since = 0, low = 1e9f, high = -1e9f;
+			auto still = [&](const ReactOut &q) {
+				since += FRAME;
+				if (since >= 0.8f && q.flying.size() == 1 && q.flying[0].stuck) {
+					low = std::min(low, q.flying[0].y);
+					high = std::max(high, q.flying[0].y);
+				}
+			};
 			float early = 0, late = 0;
 			int sign_changes = 0;
 			float last = 0;
@@ -1897,6 +1908,7 @@ static void test_whole_point_wobble_rise()
 				if (q.flying.size() != 1 || !q.flying[0].stuck)
 					return;
 				// (About its up, give or take its head's tilt.)
+				still(q);
 				const Flying &f = q.flying[0];
 				CHECK(std::fabs(f.axis.y) > 0.8f || std::fabs(f.angle) < 0.12f);
 				CHECK(std::fabs(f.angle) <= 0.42f);
@@ -1913,6 +1925,7 @@ static void test_whole_point_wobble_rise()
 			bool up = false, tumbles = false;
 			float y0 = 0;
 			run(r, 1.0f, view, [&](const ReactOut &q) {
+				still(q);
 				if (q.flying.size() != 1 || q.flying[0].stuck)
 					return;
 				if (y0 == 0)
@@ -1921,6 +1934,7 @@ static void test_whole_point_wobble_rise()
 				tumbles = tumbles || std::fabs(q.flying[0].axis.y) < 0.999f;
 			});
 			CHECK(up && tumbles);
+			CHECK(high >= low && high - low < 0.015f);
 		}
 	}
 	{
@@ -2362,6 +2376,87 @@ static void test_whole_point_wobble_rise()
 		step_to_hit(r2);
 		run(r2, 3.6f, view, [](const ReactOut &) {});
 		CHECK(r2.step(FRAME, view).pieces.empty());
+	}
+	{
+		// 0.12.0: a squishy one bouncing off (a rubber duck) takes about
+		// half a second, as a real one does: held flat against its face
+		// first (not moving), flattest at about 0.09 s, back to its shape
+		// at 0.2-0.35 s, on past it (taller) and wobbling once or twice
+		// more, settled by 0.6 s - showing whole till 0.4 s.
+		for (uint32_t seed : {7u, 8u, 9u}) {
+			React r(seed);
+			Throw t;
+			t.picture = 0;
+			t.three_d = true;
+			t.look.squishy = true;
+			t.look.whole = true;
+			r.throw_at(t);
+			const ReactOut o = step_to_hit(r);
+			CHECK(o.flying.size() == 1);
+			const float x0 = o.flying[0].x, y0 = o.flying[0].y;
+			float at = 0, flattest = 0, flattest_at = 0, back_at = -1, last = 0, tallest = 0, late = 0;
+			float shows = 1;
+			int crossings = 0;
+			bool held = true;
+			run(r, 0.7f, view, [&](const ReactOut &q) {
+				at += FRAME;
+				if (q.flying.empty())
+					return;
+				const Flying &f = q.flying[0];
+				const float e = f.squash_x - 1;
+				if (at < 0.08f)
+					held = held && std::fabs(f.x - x0) < 1e-4f && std::fabs(f.y - y0) < 1e-4f;
+				if (e > flattest) {
+					flattest = e;
+					flattest_at = at;
+				}
+				if (back_at < 0 && flattest > 0.5f && e <= 0)
+					back_at = at;
+				if (e * last < 0)
+					crossings++;
+				last = e;
+				tallest = std::max(tallest, f.squash_y - 1);
+				if (at >= 0.6f)
+					late = std::max(late, std::fabs(e));
+				if (at < 0.4f)
+					shows = std::min(shows, f.opacity);
+			});
+			CHECK(held);
+			CHECK(flattest > 0.55f && flattest_at > 0.06f && flattest_at < 0.12f);
+			CHECK(back_at > 0.2f && back_at < 0.35f);
+			CHECK(crossings >= 3 && tallest > 0.07f && late < 0.02f);
+			CHECK(shows > 0.99f);
+		}
+	}
+	{
+		// 0.12.0: a hard one bouncing off (a bone) ricochets back and down
+		// at once - never up - tumbling on.
+		for (uint32_t seed : {3u, 4u, 5u, 6u})
+			for (float side : {-1.0f, 1.0f}) {
+				React r(seed);
+				Throw t;
+				t.picture = 0;
+				t.three_d = true;
+				t.side = side;
+				t.look.hard = true;
+				t.look.whole = true;
+				r.throw_at(t);
+				const ReactOut o = step_to_hit(r);
+				CHECK(o.flying.size() == 1);
+				const float x0 = o.flying[0].x, y0 = o.flying[0].y, a0 = o.flying[0].angle;
+				bool never_up = true;
+				float back = 0, fell = 0, turned = 0;
+				run(r, 0.5f, view, [&](const ReactOut &q) {
+					if (q.flying.empty())
+						return;
+					const Flying &f = q.flying[0];
+					never_up = never_up && f.y >= y0 - 1e-4f;
+					back = std::max(back, (f.x - x0) * side);
+					fell = std::max(fell, f.y - y0);
+					turned = std::max(turned, std::fabs(f.angle - a0));
+				});
+				CHECK(never_up && back > 0.15f && fell > 0.3f && turned > 1.0f);
+			}
 	}
 }
 

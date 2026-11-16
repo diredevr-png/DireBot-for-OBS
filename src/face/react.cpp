@@ -98,9 +98,14 @@ constexpr float DRIP_ACROSS = 0.11f;
 // Bits fall this fast (heads a second, each second); a feather drifts
 // down at about FEATHER_FALL (heads a second), slowed by the air.
 constexpr float BIT_GRAVITY = 8.5f, FEATHER_FALL = 0.55f, FEATHER_DRAG = 3.2f;
-// A squishy thing (a rubber duck): how flat it squashes, and its wobble
-// back (how fast it settles, seconds; how fast it wobbles).
-constexpr float SQUISH_FLAT = 0.6f, SQUISH_SETTLE = 0.12f, SQUISH_WOBBLE = 30.0f;
+// A squishy thing (a rubber duck): how flat it squashes. Bouncing off
+// (0.12.0), it buckles flat against its face over SQUISH_IN (seconds; held
+// there meanwhile), springs back to its shape over SQUISH_BACK, on past it
+// and wobbles a couple of times - a wobble every SQUISH_WOBBLE seconds -
+// dying away over about SQUISH_SETTLE: about half a second in all, as a
+// real one does. Its fade waits SQUISH_FADE (seconds after it hit).
+constexpr float SQUISH_FLAT = 0.6f, SQUISH_IN = 0.09f, SQUISH_BACK = 0.17f, SQUISH_WOBBLE = 0.19f,
+		SQUISH_SETTLE = 0.12f, SQUISH_FADE = 0.4f;
 // 0.12.0's 3D pieces: they shrink away over the last part of their life
 // (a share of it; stopped, over STOP_SHRINK seconds), rather than fade. A
 // crown spreads open in CROWN_OPEN seconds and to its size in CROWN_GROW,
@@ -160,6 +165,7 @@ float clamp01(float v)
 {
 	return v < 0 ? 0 : v > 1 ? 1 : v;
 }
+
 float clampf(float v, float lo, float hi)
 {
 	return v < lo ? lo : v > hi ? hi : v;
@@ -176,6 +182,22 @@ float sq(float v)
 bool finite(float v)
 {
 	return std::isfinite(v);
+}
+
+// How squashed a squishy thing bouncing off is, `t` seconds after it hit:
+// 1 flat, 0 as made, below 0 springing on past it (taller).
+float squish_back(float t)
+{
+	if (!(t > 0))
+		return 0;
+	if (t < SQUISH_IN)
+		return smooth(t / SQUISH_IN);
+	const float r = t - SQUISH_IN;
+	if (r < SQUISH_BACK)
+		return std::cos(PI_F / 2 * r / SQUISH_BACK);
+	// Through its shape as fast as it was coming back, then wobbling.
+	const float w = 2 * PI_F / SQUISH_WOBBLE, s = r - SQUISH_BACK;
+	return -(PI_F / 2 / SQUISH_BACK) / w * std::sin(w * s) * std::exp(-s / SQUISH_SETTLE);
 }
 
 // How much a move shows `u` seconds into it, `length` long: eased in and
@@ -725,6 +747,12 @@ void React::hit(Item &it, ReactOut &out)
 		it.vx = it.side * random(0.6f, 1.2f);
 		it.vy = -random(2.0f, 2.8f);
 		it.spin = it.side * random(4.0f, 8.0f);
+	} else if (t.look.hard) {
+		// A hard one (a bone, a pinecone) ricochets back and down at
+		// once, tumbling on (0.12.0).
+		it.vx = -ux * random(0.9f, 1.6f) * (0.6f + 0.4f * k);
+		it.vy = random(0.2f, 0.9f);
+		it.spin = -it.spin * random(0.8f, 1.1f);
 	} else {
 		it.vx = -ux * random(0.8f, 1.6f) * (0.6f + 0.4f * k);
 		it.vy = -random(1.6f, 2.6f);
@@ -1405,7 +1433,10 @@ ReactOut React::step(float dt, const ReactView &view)
 		} else if (it.stuck) {
 			// Stuck where it hit; sliding down a little at the end, then
 			// falling.
-			const float slide = 1 - smooth((it.stuck_till - it.at) / STICK_SLIDE);
+			// (One that flew point first - a suction dart - stays put,
+			// sticking straight out, until it pops off.)
+			const float slide =
+				it.t.look.point ? 0.0f : 1 - smooth((it.stuck_till - it.at) / STICK_SLIDE);
 			it.x = it.x1;
 			it.y = it.y1 + STICK_DROP * slide * slide;
 			// (Its strings of cheese as it starts to slide off.)
@@ -1422,6 +1453,10 @@ ReactOut React::step(float dt, const ReactView &view)
 			}
 			if (it.at >= it.stuck_till)
 				unstick(it);
+		} else if (!it.dropped && !it.came_off && it.t.look.squishy && it.at - it.hit_at < SQUISH_IN) {
+			// A squishy one buckling flat against its face first.
+			it.x = it.x1;
+			it.y = it.y1;
 		} else {
 			it.vy += 9.0f * dt;
 			it.x += it.vx * dt;
@@ -1506,7 +1541,10 @@ ReactOut React::step(float dt, const ReactView &view)
 			}
 		} else if (it.hit) {
 			const float tt = it.at - it.hit_at;
-			f.opacity = 1 - smooth((tt - (it.dropped ? 0.0f : 0.25f)) / (it.dropped ? 0.3f : FALL_TIME - 0.25f));
+			const float from = it.dropped ? 0.0f
+					 : (it.t.look.squishy && !it.came_off) ? SQUISH_FADE
+										  : 0.25f;
+			f.opacity = 1 - smooth((tt - from) / (it.dropped ? 0.3f : FALL_TIME - from));
 			if (it.came_off) {
 				// As it was stuck, springing back round as it falls.
 				const float e = smooth(tt / UNSTICK_ROUND);
@@ -1516,8 +1554,8 @@ ReactOut React::step(float dt, const ReactView &view)
 				f.squash_y = sy + (1 - sy) * e;
 				f.squash_z = sz + (1 - sz) * e;
 			} else if (!it.dropped && it.t.look.squishy) {
-				// Squashed flat, wobbling back as it bounces off.
-				const float e = std::exp(-tt / SQUISH_SETTLE) * std::cos(tt * SQUISH_WOBBLE);
+				// Squashed flat, springing back and wobbling as it bounces off.
+				const float e = squish_back(tt);
 				f.squash_x = 1 + SQUISH_FLAT * e;
 				f.squash_y = 1 - SQUISH_FLAT * 0.8f * e;
 			} else if (!it.dropped && !it.t.look.hard) {
