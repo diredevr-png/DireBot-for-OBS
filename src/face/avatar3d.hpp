@@ -455,6 +455,10 @@ private:
 	// A thing's parts: its solid ones, or its see-through ones (or all of
 	// it, while it fades) - or (depth_only) its solid ones' distances.
 	void draw_prop(Prop3D &prop, const View3D &v, bool see_through, bool depth_only = false);
+	// (One go over its parts: as always, or a fading thing's distances
+	// laid with no colour, or it drawn on them.)
+	enum class PropPass { Plain, Lay, OnLaid };
+	void draw_prop_parts(Prop3D &prop, const View3D &v, bool see_through, bool depth_only, PropPass pass);
 
 	gs_effect_t *effect_ = nullptr;
 	gs_eparam_t *p_cam = nullptr, *p_base_map = nullptr, *p_shade_map = nullptr, *p_emissive_map = nullptr,

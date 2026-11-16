@@ -1580,10 +1580,28 @@ void Avatar3D::draw_prop(Prop3D &prop, const View3D &v, bool see_through, bool d
 	// see-through as it is.)
 	if (depth_only && prop.opacity_ < 0.999f)
 		return;
-	static const Material plain;
-	const Model &m = *prop.model_;
 	const float was = opacity_;
 	opacity_ = v.opacity * std::min(1.0f, prop.opacity_);
+	const bool fading = opacity_ < 0.999f;
+	// A solid thing fading (0.12.0): its front alone shows, evenly
+	// see-through - its distances laid first with no colour, then drawn
+	// where it's nearest - never its own insides and far side through it
+	// (a pinecone's scales, a snowball's back).
+	if (see_through && fading && !depth_only) {
+		gs_enable_color(false, false, false, false);
+		draw_prop_parts(prop, v, see_through, false, PropPass::Lay);
+		gs_enable_color(true, true, true, true);
+		draw_prop_parts(prop, v, see_through, false, PropPass::OnLaid);
+	} else {
+		draw_prop_parts(prop, v, see_through, depth_only, PropPass::Plain);
+	}
+	opacity_ = was;
+}
+
+void Avatar3D::draw_prop_parts(Prop3D &prop, const View3D &v, bool see_through, bool depth_only, PropPass pass)
+{
+	static const Material plain;
+	const Model &m = *prop.model_;
 	const bool fading = opacity_ < 0.999f;
 	for (size_t i = 0; i < prop.parts_.size(); i++) {
 		Prop3D::Part &part = prop.parts_[i];
@@ -1591,10 +1609,15 @@ void Avatar3D::draw_prop(Prop3D &prop, const View3D &v, bool see_through, bool d
 			continue;
 		const int mi = part.prim->material;
 		Material mat = mi >= 0 && mi < (int)m.materials.size() ? m.materials[mi] : plain;
+		// (Laid first: only its solid parts - one see-through by itself,
+		// or glowing, is drawn as it always is.)
+		const bool solid = mat.alpha != AlphaMode::Blend && !mat.glow && !part.prim->strands;
+		if (pass == PropPass::Lay && !solid)
+			continue;
 		if (depth_only) {
 			// Its solid parts' distances, for the hairs behind them
 			// (strands in a thing aren't drawn at all).
-			if (mat.alpha == AlphaMode::Blend || mat.glow || part.prim->strands)
+			if (!solid)
 				continue;
 			set_depth_material(mat, &prop.textures_);
 			gs_set_cull_mode(cull_of(mat, prop.handed_));
@@ -1623,22 +1646,23 @@ void Avatar3D::draw_prop(Prop3D &prop, const View3D &v, bool see_through, bool d
 		gs_set_cull_mode(cull_of(mat, prop.handed_));
 		// A glowing part (0.9.0): all of it at its middle's depth.
 		const V3 middle = point(prop.place_, part.middle);
-		if (mat.glow) {
+		if (mat.glow)
 			set_flat(&middle);
+		// (Drawn on what was laid: just where it's nearest.)
+		const bool lequal = mat.glow || (pass == PropPass::OnLaid && solid);
+		if (lequal)
 			gs_depth_function(GS_LEQUAL);
-		}
 		gs_load_vertexbuffer(part.vb);
 		gs_load_indexbuffer(part.ib);
 		check_(technique);
 		while (gs_effect_loop(effect_, technique))
 			gs_draw(GS_TRIS, 0, 0);
-		if (mat.glow) {
+		if (mat.glow)
 			set_flat(nullptr);
+		if (lequal)
 			gs_depth_function(GS_LESS);
-		}
 		gs_set_cull_mode(GS_NEITHER);
 	}
-	opacity_ = was;
 }
 
 Prop3D::Prop3D(std::shared_ptr<const Model> model, const std::vector<ModelPicture> &pictures)
