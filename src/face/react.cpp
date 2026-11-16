@@ -131,6 +131,9 @@ constexpr float STEADY_HOLD = 0.58f;
 // Come off after being stuck, it springs back round over this long
 // (seconds) as it falls.
 constexpr float UNSTICK_ROUND = 0.25f;
+// What a thing that stays whole leaves on its face lies nearly level: up
+// to this far turned (radians) either way.
+constexpr float MARK_LEVEL = 0.25f;
 // A 3D thing's wobble (its "wobble" shapes): as it flies and falls, this
 // fast (radians a second); as it hits, flopping this fast, dying away over
 // about WOBBLE_SETTLE seconds.
@@ -829,7 +832,9 @@ void React::effect(const Item &it, float x, float y, float ux, float uy)
 		m.x = x + random(-0.03f, 0.03f);
 		m.y = y + random(-0.02f, 0.03f);
 		m.size = SPLAT_ACROSS * it.size0;
-		m.angle = random(-PI_F, PI_F);
+		// (Turned any way; left by a thing that stays whole - a fish's
+		// wet smear along it, slime sagging down - nearly level.)
+		m.angle = look.whole ? random(-MARK_LEVEL, MARK_LEVEL) : random(-PI_F, PI_F);
 		m.stay = look.seconds;
 		m.grow = 0;
 		m.roll = roll_now_;

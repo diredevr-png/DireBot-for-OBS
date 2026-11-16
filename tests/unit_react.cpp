@@ -1961,6 +1961,29 @@ static void test_whole_point_wobble_rise()
 		}
 	}
 	{
+		// What a thing that stays whole leaves lies nearly level (a fish's
+		// smear along it, slime sagging down); a broken one's, any way.
+		float whole_most = 0, broken_most = 0;
+		for (uint32_t seed = 30; seed < 50; seed++)
+			for (bool whole : {true, false}) {
+				React r(seed);
+				Throw t;
+				t.picture = 0;
+				t.three_d = true;
+				t.stick = 0.5f;
+				t.look.effect = Effect::Splat;
+				t.look.mark = 1;
+				t.look.whole = whole;
+				r.throw_at(t);
+				const ReactOut o = step_to_hit(r);
+				CHECK(o.marks.size() == 1);
+				if (o.marks.size() == 1)
+					(whole ? whole_most : broken_most) =
+						std::max(whole ? whole_most : broken_most, std::fabs(o.marks[0].angle));
+			}
+		CHECK(whole_most < 0.35f && broken_most > 1.5f);
+	}
+	{
 		// Stuck, a squishy one (slime) stays a flattened mound, thin towards
 		// you; one that isn't, only a little flat. Coming off, neither is
 		// squashed again as if it had just hit: each springs back round as
