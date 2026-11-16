@@ -139,7 +139,7 @@ constexpr float MARK_LEVEL = 0.25f;
 // before it snaps; snapped, springing back (seconds) to this much of how
 // long it was, swinging down to hang straight.
 constexpr int STRINGS_LEAST = 2, STRINGS_MOST = 3;
-constexpr float STRING_WIDE = 0.075f, STRING_REACH_LO = 0.55f, STRING_REACH_HI = 0.95f;
+constexpr float STRING_WIDE = 0.12f, STRING_REACH_LO = 0.55f, STRING_REACH_HI = 0.95f;
 constexpr float STRING_BACK = 0.12f, STRING_HANG = 0.5f, STRING_SWING = 0.3f;
 // A 3D thing's wobble (its "wobble" shapes): as it flies and falls, this
 // fast (radians a second); as it hits, flopping this fast, dying away over
@@ -907,8 +907,15 @@ void React::effect(const Item &it, float x, float y, float ux, float uy)
 		m.y = y + random(-0.02f, 0.03f);
 		m.size = SPLAT_ACROSS * it.size0;
 		// (Turned any way; left by a thing that stays whole - a fish's
-		// wet smear along it, slime sagging down - nearly level.)
+		// wet smear along it, slime sagging down - nearly level; by one
+		// that comes steady and sticks so - a pizza slice's print - just
+		// where and as it stuck.)
 		m.angle = look.whole ? random(-MARK_LEVEL, MARK_LEVEL) : random(-PI_F, PI_F);
+		if (look.whole && look.steady) {
+			m.x = x;
+			m.y = y;
+			m.angle = 0;
+		}
 		m.stay = look.seconds;
 		m.grow = 0;
 		m.roll = roll_now_;

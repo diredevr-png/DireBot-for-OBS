@@ -2184,6 +2184,32 @@ static void test_whole_point_wobble_rise()
 		CHECK(whole_most < 0.35f && broken_most > 1.5f);
 	}
 	{
+		// A whole thing that comes steady (a pizza slice) leaves its print
+		// just where and as it stuck: level, right under it.
+		for (uint32_t seed = 30; seed < 40; seed++) {
+			React r(seed);
+			Throw t;
+			t.picture = 0;
+			t.three_d = true;
+			t.stick = 0.5f;
+			t.look.effect = Effect::Splat;
+			t.look.mark = 1;
+			t.look.whole = true;
+			t.look.steady = true;
+			r.throw_at(t);
+			const ReactOut o = step_to_hit(r);
+			CHECK(o.marks.size() == 1 && o.flying.size() == 1);
+			if (o.marks.size() == 1 && o.flying.size() == 1) {
+				// (Both tipped with its head as it's knocked: the thing
+				// about its z, either way round.)
+				CHECK(std::fabs(o.marks[0].angle - o.flying[0].angle * o.flying[0].axis.z) < 1e-3f);
+				CHECK(std::fabs(o.flying[0].axis.z) > 0.999f || std::fabs(o.flying[0].angle) < 1e-4f);
+				CHECK(std::fabs(o.marks[0].x - o.flying[0].x) < 1e-3f);
+				CHECK(std::fabs(o.marks[0].y - o.flying[0].y) < 1e-3f);
+			}
+		}
+	}
+	{
 		// Stuck, a squishy one (slime) stays a flattened mound, thin towards
 		// you; one that isn't, only a little flat. Coming off, neither is
 		// squashed again as if it had just hit: each springs back round as

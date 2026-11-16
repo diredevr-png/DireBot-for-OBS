@@ -183,7 +183,8 @@ struct HitLook {
 	// its top, and tipping forward as it comes - and sticks so; falling
 	// off, it tips on over. Dropped from above (an ice cream, upside
 	// down: on its head like a hat) it comes down as made, and slides off
-	// to its side, toppling that way.
+	// to its side, toppling that way. What it leaves (whole: a pizza
+	// slice's print) lies just where and as it stuck.
 	bool steady = false;
 	// 0.12.0: it is hard (a pinecone): it doesn't squash as it hits, nor
 	// while it's stuck; broken (a handful of coins), it isn't crushed
