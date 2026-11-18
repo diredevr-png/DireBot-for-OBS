@@ -308,6 +308,36 @@ def test_face_avatar_pictures_open(obs):
         c.disconnect()
 
 
+def memory_of(pid):
+    """A process's memory, from Windows: (private MB - what only it
+    holds - and MB of it in memory now)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                    ("PrivateUsage", ctypes.c_size_t)]
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+    k32.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+    handle = k32.OpenProcess(0x1000, False, pid)    # (reads numbers only)
+    assert handle, ctypes.get_last_error()
+    try:
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        assert k32.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+        return round(counters.PrivateUsage / 1048576, 1), round(counters.WorkingSetSize / 1048576, 1)
+    finally:
+        k32.CloseHandle(handle)
+
+
 def test_3d_things_stay_on_the_graphics_card(obs):
     """0.12.0's speed fix, on Direct3D (tests/test_real_throws.py's
     things_on_the_card): 3D things thrown are sent to the graphics card
@@ -345,6 +375,35 @@ def test_3d_things_stay_on_the_graphics_card(obs):
         things_on_the_card(c, "Things avatar", files, points, shots, log=obs.log)
         log = obs.log()
         assert "3D effect" not in log, log
+
+        # What OBS holds while the pictures things are drawn into are
+        # there, and once they're let go of: a full-screen source's (about
+        # 70 MB of them).
+        def things():
+            return vendor(c, "FaceGetState", {"source": "Things avatar"})["react"]["things"]
+
+        def held():
+            # (The least of a few looks: OBS's own ups and downs aside.)
+            looks = []
+            for _ in range(5):
+                looks.append(memory_of(obs.proc.pid))
+                time.sleep(0.4)
+            return min(a for a, _ in looks), min(b for _, b in looks)
+        c.send("SetInputSettings", {"inputName": "Things avatar",
+                                    "inputSettings": {"width": 1920, "height": 1080}}, raw=True)
+        assert wait_for(lambda: things()["drawn_into_bytes"] == 0, 60, 0.5), things()
+        time.sleep(3)
+        before = held()
+        assert vendor(c, "FaceReact", {"source": "Things avatar", "do": "throw", "item": 0, "side": 1})["ok"]
+        assert wait_for(lambda: things()["drawn_into_bytes"] > 20e6, 30, 0.1), things()
+        time.sleep(3)
+        pictures = things()["drawn_into_bytes"] / 1048576
+        there = held()
+        assert wait_for(lambda: things()["drawn_into_bytes"] == 0, 60, 0.5), things()
+        time.sleep(3)
+        gone = held()
+        print(f"pictures things are drawn into: {pictures:.1f} MB. OBS's memory (private, in memory) before "
+              f"{before}, with them {there}, let go of {gone}")
     finally:
         try:
             c.send("RemoveInput", {"inputName": "Things avatar"}, raw=True)
