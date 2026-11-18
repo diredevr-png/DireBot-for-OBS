@@ -97,7 +97,8 @@ again, because some parts are then drawn by other code.
 - Things over the character are drawn into pictures of their own, twice the source's size each way while smooth
   edges are on (a 1920 x 1080 source: about 66 MB on the card for colours and depth, and 8 MB more for the halved
   one). They used to be kept from the first throw on. Now they're let go of 30 seconds after the last thing was
-  drawn (`OVERLAY_KEEP_NS`) and made again at the next throw.
+  drawn (`OVERLAY_KEEP_NS`) and made again at the next throw. Whether the card's memory goes down then is the
+  driver's business (section 6).
 
 `FaceGetState`'s `react.things` says what's held: `loaded` (things on the card), `points`, `triangles`, `bytes`
 (the card's, not counting pictures), `warm` (warming is on), `warmed`, `to_warm`, `drawn_into_bytes` (the pictures
@@ -138,7 +139,51 @@ What this table shows and doesn't:
   run-to-run spread. A real card does those points in well under a millisecond. So the saving of section 1's
   first point only shows on a real card.
 
-**On a real card:** not measured yet. Section 7 says how; the numbers go here when they're in.
+**On a real card** (OBS 33.0.1 on Windows, Direct3D 11, an AMD Radeon RX 9070 XT, 1920 x 1080 at 60 fps, a
+1920 x 1080 face avatar, the same twenty things; each column one fresh OBS). The frame times are OBS's own
+(`averageFrameRenderTime`): in the middle of the stretch, and at its worst. "A storm" is eight pizzas thrown
+every half second for twelve seconds. Memory is what the things added to OBS over the same OBS with none (OBS
+itself held between 4.4 and 8.3 GB here: its scenes had a 3D character with hair in another source):
+its private bytes, and its memory on the card.
+
+| | 0.12.0 as first built | now | now, warming off |
+|---|---|---|---|
+| **a picture for a character** | | | |
+| frame time with nothing thrown | 0.40 ms | 0.37 ms | 0.42 ms |
+| sixteen pizzas at once | 1.47 ms, 3.01 ms | 0.45 ms, 0.56 ms | 0.52 ms, 0.62 ms |
+| sixteen different things at once | 1.26 ms, 2.18 ms | 0.84 ms, 1.22 ms | 0.80 ms, 1.17 ms |
+| a storm | 4.46 ms, 5.07 ms | 0.76 ms, 0.82 ms | 0.76 ms, 0.82 ms |
+| OBS's share of a CPU in the storm, as it says | 1.63% | 0.99% | 1.00% |
+| the first throw: frame time at its worst, frames skipped | 0.53 ms, 0 | 0.47 ms, 0 | 0.47 ms, 0 |
+| the other nineteen, each thrown once | 0.65 ms, 0 | 0.54 ms, 0 | 0.55 ms, 0 |
+| loading them; all warmed; frames skipped meanwhile | 0.32 s; -; 5 | 0.36 s; 1.44 s; 3 | 0.36 s; -; 4 |
+| memory added with the things loaded: private, on the card | 221 MB, 96 MB | 133 MB, 57 MB | 119 MB, 56 MB |
+| after each has been thrown | 300 MB, 180 MB | 207 MB, 139 MB | 196 MB, 138 MB |
+| after the storm | 338 MB, 209 MB | 228 MB, 148 MB | 217 MB, 147 MB |
+| **a 3D character** (12.8 ms a frame by itself) | | | |
+| sixteen pizzas at once | 13.47 ms, 15.63 ms | 13.46 ms, 14.12 ms | |
+| a storm, frames skipped | 16.51 ms, 17.06 ms, 7 | 12.98 ms, 13.64 ms, 0 | |
+| memory added with the things loaded | 209 MB, 96 MB | 126 MB, 58 MB | |
+| after the storm | 330 MB, 207 MB | 218 MB, 150 MB | |
+
+What it shows:
+
+- **Things in the air cost a real card almost nothing now.** A storm took OBS from 0.4 ms a frame to 4.5 ms
+  before, and takes it to 0.8 ms now: what's left of `Prop3D::place` is gone, and the points are no longer sent
+  each frame. Beside a 3D character that already takes most of a 60 fps frame, that was the difference between
+  seven frames skipped in the storm and none.
+- **Memory**: the things cost about 40% less loaded and a third less after throwing, in OBS's own memory and on
+  the card. `points_sent` stood still through every throw.
+- **The first throw didn't stutter on this card, before or after** (no frame skipped; the worst frame 0.53 ms
+  against 0.47 ms). The warming is for slower cards and software drawing, where the first throw skipped 22
+  frames. Here it costs a second more until the last thing is warmed, about 13 MB, and no frames.
+- **Letting go of the pictures things are drawn into** (71 MB for this source, section 5): the add-on let go of
+  them half a minute after the last throw (`drawn_into_bytes` 0), but Windows' counters for OBS didn't move in
+  the ten seconds after, in its own memory or on the card. It isn't the add-on or OBS holding on: with
+  Direct3D's software driver (GitHub's Windows machines) OBS's private bytes go up by those 71 MB while the
+  pictures are there and come all the way back when they're let go of (258.7, 330.0, 258.7 MB;
+  `tests/test_real_windows.py` checks it), and in software drawing on Linux the same. So on this card the driver
+  keeps what's freed, for a while or to use again. How long wasn't measured.
 
 ## 7. How to measure it again
 
@@ -156,7 +201,8 @@ What this table shows and doesn't:
   test-only change and isn't in the code.
 - `tests/test_real_throws.py` (`things_on_the_card`) runs in a real OBS: sent once, warmed, shapes on the card
   (whichever of the two a shape is), the pictures let go of and made again. `tests/test_real_windows.py` runs the
-  same on Direct3D.
+  same on Direct3D, and looks at OBS's memory while a full-screen source's pictures are there and once they're
+  let go of.
 
 ## 8. Not done, and why
 

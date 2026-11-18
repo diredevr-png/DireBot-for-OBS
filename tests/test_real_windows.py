@@ -404,6 +404,10 @@ def test_3d_things_stay_on_the_graphics_card(obs):
         gone = held()
         print(f"pictures things are drawn into: {pictures:.1f} MB. OBS's memory (private, in memory) before "
               f"{before}, with them {there}, let go of {gone}")
+        # (Direct3D's software driver keeps a picture in OBS's own memory:
+        # they're all there while held, and all given back.)
+        assert there[0] - before[0] > pictures * 0.5, (pictures, before, there, gone)
+        assert gone[0] - before[0] < pictures * 0.3, (pictures, before, there, gone)
     finally:
         try:
             c.send("RemoveInput", {"inputName": "Things avatar"}, raw=True)
