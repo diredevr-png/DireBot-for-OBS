@@ -113,6 +113,7 @@ target_sources(
     src/face/voice.cpp
     src/face/setup.cpp
     src/face/pictures.cpp
+    src/face/prop-mesh.cpp
     src/face/avatar3d.cpp
     src/face/card-picture.cpp
     src/face/face-avatar.cpp

@@ -2,7 +2,7 @@
 # Builds and runs the tests for DireBot for OBS that don't need OBS:
 # the unit tests (the link's, the vertical picture's, Follow me's, clean recordings', the face tracker's,
 # the face avatar's 2D and 3D characters' and their hair strands', following your hands and arms, hand signs and face moves, your face from a
-# phone, moves from another tracker app (VMC), gaming hands, how their pictures shrink, what it does on cue, the mouth from your mic's), then the link's
+# phone, moves from another tracker app (VMC), gaming hands, how their pictures shrink, what it does on cue, 3D things made ready for the graphics card, the mouth from your mic's), then the link's
 # network tests through obsws-python.
 # (tests/test_real_obs.py runs it inside a real OBS - see its top.)
 #   pip install pytest obsws-python websocket-client
@@ -82,6 +82,11 @@ done
 "$out/unit-game"
 "$cxx" "${flags[@]}" -o "$out/unit-react" "$here/tests/unit_react.cpp" "$here/src/face/react.cpp"
 "$out/unit-react"
+# 3D things made ready for the graphics card (0.12.0): what's kept of a
+# file, and the card's sums for where a point goes against the CPU's.
+"$cxx" "${flags[@]}" -o "$out/unit-prop" "$here/tests/unit_prop.cpp" "$here/src/face/prop-mesh.cpp" \
+	"$here/src/face/model.cpp" "$out/mikktspace.o"
+"$out/unit-prop"
 # A companion beside the 3D character (0.9.0): its comings and goings and
 # where it goes, over a real (made-up) file.
 "$cxx" "${flags[@]}" -DDIREBOT_SOURCE_DIR="\"$here\"" -o "$out/unit-companion" "$here/tests/unit_companion.cpp" \

@@ -61,15 +61,6 @@ std::string extension_of(const ModelImage &img)
 	return ".png";
 }
 
-void srgb_bytes(const float *c, uint8_t *out)
-{
-	for (int k = 0; k < 3; k++) {
-		const float v = std::min(1.0f, std::max(0.0f, c[k]));
-		out[k] = (uint8_t)std::lround(std::pow(v, 1 / 2.2f) * 255);
-	}
-	out[3] = (uint8_t)std::lround(std::min(1.0f, std::max(0.0f, c[3])) * 255);
-}
-
 matrix4 obs_matrix(const M4 &m)
 {
 	// Column after column with points as columns is, in memory, OBS's
@@ -265,10 +256,10 @@ void PropLoader::want(const std::vector<std::string> &paths)
 	wake_.notify_all();
 }
 
-std::vector<std::shared_ptr<ModelPack>> PropLoader::take()
+std::vector<std::shared_ptr<PropPack>> PropLoader::take()
 {
 	std::lock_guard<std::mutex> l(lock_);
-	std::vector<std::shared_ptr<ModelPack>> out;
+	std::vector<std::shared_ptr<PropPack>> out;
 	out.swap(done_);
 	return out;
 }
@@ -299,23 +290,27 @@ void PropLoader::run()
 				return;
 			stamps_[path] = stamp;
 		}
-		auto pack = std::make_shared<ModelPack>();
+		auto pack = std::make_shared<PropPack>();
 		pack->path = path;
-		auto model = std::make_shared<Model>();
 		std::string problem;
-		// (Hair strands in a thing aren't drawn: none kept.)
-		LoadOptions options;
-		options.strand_points = options.strand_points_bare = 0;
-		if (load_model(path, *model, &problem, options)) {
-			if (model->points > MOST_PROP_POINTS) {
-				pack->problem = "it's too detailed to throw (" + std::to_string(model->points) +
-						" points; at most " + std::to_string(MOST_PROP_POINTS) + ")";
+		{
+			// The file as read is only needed here: made ready for the
+			// card (prop-mesh.hpp), then let go of.
+			Model model;
+			// (Hair strands in a thing aren't drawn: none kept.)
+			LoadOptions options;
+			options.strand_points = options.strand_points_bare = 0;
+			if (load_model(path, model, &problem, options)) {
+				if (model.points > MOST_PROP_POINTS) {
+					pack->problem = "it's too detailed to throw (" + std::to_string(model.points) +
+							" points; at most " + std::to_string(MOST_PROP_POINTS) + ")";
+				} else {
+					pack->pictures = read_pictures(model);
+					pack->mesh = std::make_shared<const PropMesh>(make_prop_mesh(model));
+				}
 			} else {
-				pack->pictures = read_pictures(*model);
-				pack->model = model;
+				pack->problem = problem.empty() ? "it couldn't be read" : problem;
 			}
-		} else {
-			pack->problem = problem.empty() ? "it couldn't be read" : problem;
 		}
 		if (!pack->problem.empty())
 			obs_log(LOG_WARNING, "DireBot Face Avatar: a 3D thing didn't load: %s", pack->problem.c_str());
@@ -390,6 +385,10 @@ Avatar3D::Avatar3D()
 		p_spots = param("spot_moves");
 		p_bones = param("bone_cols");
 		p_skin = param("skin_info");
+		p_turn = param("turn");
+		p_thing = param("thing");
+		// Things put by the card, where the effect has it.
+		can_things_ = gs_effect_get_technique(effect_, "Thing") != nullptr && p_turn && p_thing;
 		// Posing on the graphics card, where the effect has it (an older
 		// effect file beside a newer add-on: as before).
 		// (DIREBOT_FACE_CPU_POSE=1: posed by the CPU anyway - the tests
@@ -432,9 +431,7 @@ Avatar3D::~Avatar3D()
 	gs_texture_destroy(white_);
 	gs_texture_destroy(black_);
 	gs_texture_destroy(flat_);
-	gs_texrender_destroy(scene_);
-	gs_texrender_destroy(out_);
-	gs_texrender_destroy(depth_);
+	free_targets();
 	for (HairClock &c : clocks_) {
 		if (c.depth)
 			gs_timer_destroy(c.depth);
@@ -1580,9 +1577,23 @@ void Avatar3D::draw_prop(Prop3D &prop, const View3D &v, bool see_through, bool d
 	// see-through as it is.)
 	if (depth_only && prop.opacity_ < 0.999f)
 		return;
+	if (!can_things_) {
+		if (!said_no_things_)
+			obs_log(LOG_WARNING, "DireBot Face Avatar: the 3D effect is older than the add-on (it has no "
+					     "Thing technique): 3D things aren't drawn");
+		said_no_things_ = true;
+		return;
+	}
 	const float was = opacity_;
 	opacity_ = v.opacity * std::min(1.0f, prop.opacity_);
 	const bool fading = opacity_ < 0.999f;
+	// The card puts it where it is: its place in OBS's own matrix (so in
+	// the effect's ViewProj) and in `cam`, its points as they were made.
+	const M4 cam_was = cam_;
+	cam_ = v.view * prop.place_;
+	gs_matrix_push();
+	const matrix4 place = obs_matrix(prop.place_);
+	gs_matrix_mul(&place);
 	// A solid thing fading (0.12.0): its front alone shows, evenly
 	// see-through - its distances laid first with no colour, then drawn
 	// where it's nearest - never its own insides and far side through it
@@ -1595,36 +1606,56 @@ void Avatar3D::draw_prop(Prop3D &prop, const View3D &v, bool see_through, bool d
 	} else {
 		draw_prop_parts(prop, v, see_through, depth_only, PropPass::Plain);
 	}
+	gs_matrix_pop();
+	cam_ = cam_was;
 	opacity_ = was;
+}
+
+void Avatar3D::set_thing(const Prop3D &prop, const M4 &view)
+{
+	// Its facings' turn (prop-mesh.hpp), handed over turned
+	// rows-for-columns, as `cam` is.
+	matrix4 t = obs_matrix(prop_turn(view, prop.place_));
+	matrix4_transpose(&t, &t);
+	gs_effect_set_matrix4(p_turn, &t);
+	set_vec4(p_thing, prop.shapes_.size() > 0 ? prop.shapes_[0] : 0.0f,
+		 prop.shapes_.size() > 1 ? prop.shapes_[1] : 0.0f, prop.handed_, 0.0f);
 }
 
 void Avatar3D::draw_prop_parts(Prop3D &prop, const View3D &v, bool see_through, bool depth_only, PropPass pass)
 {
 	static const Material plain;
-	const Model &m = *prop.model_;
 	const bool fading = opacity_ < 0.999f;
+	// (Any of its shapes showing: its shaped parts through the techniques
+	// that add them - else as its other parts, their shapes' numbers left
+	// unread.)
+	bool shape_shows = false;
+	for (float amount : prop.shapes_)
+		shape_shows = shape_shows || amount > 0;
 	for (size_t i = 0; i < prop.parts_.size(); i++) {
 		Prop3D::Part &part = prop.parts_[i];
 		if (!part.vb || !part.ib)
 			continue;
-		const int mi = part.prim->material;
-		Material mat = mi >= 0 && mi < (int)m.materials.size() ? m.materials[mi] : plain;
+		const int mi = part.material;
+		Material mat = mi >= 0 && mi < (int)prop.materials_.size() ? prop.materials_[mi] : plain;
+		const bool shaped = part.shaped && shape_shows;
 		// (Laid first: only its solid parts - one see-through by itself,
 		// or glowing, is drawn as it always is.)
-		const bool solid = mat.alpha != AlphaMode::Blend && !mat.glow && !part.prim->strands;
+		const bool solid = mat.alpha != AlphaMode::Blend && !mat.glow;
 		if (pass == PropPass::Lay && !solid)
 			continue;
 		if (depth_only) {
-			// Its solid parts' distances, for the hairs behind them
-			// (strands in a thing aren't drawn at all).
+			// Its solid parts' distances, for the hairs behind them.
 			if (!solid)
 				continue;
 			set_depth_material(mat, &prop.textures_);
+			set_thing(prop, v.view);
 			gs_set_cull_mode(cull_of(mat, prop.handed_));
 			gs_load_vertexbuffer(part.vb);
 			gs_load_indexbuffer(part.ib);
-			check_("Depth");
-			while (gs_effect_loop(effect_, "Depth"))
+			const char *technique = shaped ? "ThingDepthShaped" : "ThingDepth";
+			check_(technique);
+			while (gs_effect_loop(effect_, technique))
 				gs_draw(GS_TRIS, 0, 0);
 			gs_set_cull_mode(GS_NEITHER);
 			continue;
@@ -1639,15 +1670,17 @@ void Avatar3D::draw_prop_parts(Prop3D &prop, const View3D &v, bool see_through, 
 		}
 		const bool skin = mat.name.find("skin") != std::string::npos;
 		const bool flat_look = v.look == 3 || (v.look == 0 && mat.shading == Shading::Unlit);
-		const char *technique =
-			part.bumped && v.detail && !flat_look && mat.normal_map.used() ? "DrawBumped" : "Draw";
-		part_distance_ = part.distance;
+		const bool bumped = part.bumped && v.detail && !flat_look && mat.normal_map.used();
+		const char *technique = bumped ? (shaped ? "ThingBumpedShaped" : "ThingBumped")
+					       : (shaped ? "ThingShaped" : "Thing");
+		part_distance_ = 1;
 		set_material(mat, v, false, skin, sides_shown(mat, prop.handed_) == Sides::Front, &prop.textures_);
+		set_thing(prop, v.view);
 		gs_set_cull_mode(cull_of(mat, prop.handed_));
-		// A glowing part (0.9.0): all of it at its middle's depth.
-		const V3 middle = point(prop.place_, part.middle);
+		// A glowing part (0.9.0): all of it at its middle's depth (as
+		// made: the card puts it with the rest).
 		if (mat.glow)
-			set_flat(&middle);
+			set_flat(&part.middle);
 		// (Drawn on what was laid: just where it's nearest.)
 		const bool lequal = mat.glow || (pass == PropPass::OnLaid && solid);
 		if (lequal)
@@ -1665,8 +1698,171 @@ void Avatar3D::draw_prop_parts(Prop3D &prop, const View3D &v, bool see_through, 
 	}
 }
 
-Prop3D::Prop3D(std::shared_ptr<const Model> model, const std::vector<ModelPicture> &pictures)
-	: model_(std::move(model))
+// How big a thing's drawn to warm it (pixels each way).
+static constexpr uint32_t WARM_PX = 32;
+
+int Avatar3D::warm(Prop3D &prop, const View3D &like)
+{
+	if (!effect_ || !can_things_ || prop.parts_.empty())
+		return 0;
+	if (!warm_)
+		warm_ = gs_texrender_create(GS_RGBA, GS_Z24_S8);
+	if (!warm_depth_)
+		warm_depth_ = gs_texrender_create(GS_R32F, GS_Z24_S8);
+	if (!warm_ || !warm_depth_)
+		return 0;
+	// A view of its own: all of it, in the middle of a small square.
+	View3D v = like;
+	v.w = v.h = WARM_PX;
+	v.opacity = 1;
+	v.skin = nullptr;
+	v.hide_behind_head = false;
+	const V3 lo = prop.low_, hi = prop.high_;
+	const float across = std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 1e-6f});
+	const float dist = across * 0.75f / std::tan(v.fov / 2);
+	v.view = moved({0, 0, -dist});
+	v.near = dist * 0.2f;
+	v.far = dist * 5;
+	const M4 place = moved((lo + hi) * -0.5f);
+	// (What a draw sets of its own.)
+	const float opacity_was = opacity_, outline_was = outline_share_, height_was = height_,
+		    scale_was = world_scale_, fov_was = fov_;
+	const M4 cam_was = cam_;
+	opacity_ = 1;
+	outline_share_ = 0;
+	height_ = v.height;
+	world_scale_ = v.world_scale;
+	fov_ = v.fov;
+	cam_ = v.view;
+	// (And the thing's own.)
+	const M4 place_was = prop.place_;
+	const float shown_was = prop.opacity_, handed_was = prop.handed_;
+	const std::vector<float> shapes_was = prop.shapes_;
+	bool shaped = false;
+	for (const Prop3D::Part &part : prop.parts_)
+		shaped = shaped || part.shaped;
+	const matrix4 view = obs_matrix(obs_view(v.view));
+	int ways = 0;
+	auto with_shapes = [&](int on) {
+		for (float &amount : prop.shapes_)
+			amount = on ? 1.0f : 0.0f;
+	};
+	// Its distances, as they're laid for hairs (Avatar3D::draw).
+	gs_texrender_reset(warm_depth_);
+	if (gs_texrender_begin(warm_depth_, WARM_PX, WARM_PX)) {
+		vec4 far_away;
+		vec4_set(&far_away, 1e9f, 0.0f, 0.0f, 1.0f);
+		gs_clear(GS_CLEAR_COLOR | GS_CLEAR_DEPTH, &far_away, 1.0f, 0);
+		gs_perspective(v.fov * 180 / 3.14159265f, 1.0f, v.near, v.far);
+		gs_matrix_set(&view);
+		const gs_cull_mode cull = gs_get_cull_mode();
+		gs_set_cull_mode(GS_NEITHER);
+		gs_enable_depth_test(true);
+		gs_depth_function(GS_LESS);
+		gs_blend_state_push();
+		gs_enable_blending(false);
+		for (int on = 0; on < (shaped ? 2 : 1); on++) {
+			with_shapes(on);
+			prop.place(place, 1);
+			draw_prop(prop, v, false, true);
+			ways++;
+		}
+		gs_blend_state_pop();
+		gs_enable_depth_test(false);
+		gs_set_cull_mode(cull);
+		gs_texrender_end(warm_depth_);
+	}
+	// It drawn: whole, then fading.
+	gs_texrender_reset(warm_);
+	if (gs_texrender_begin(warm_, WARM_PX, WARM_PX)) {
+		vec4 clear_colour;
+		vec4_zero(&clear_colour);
+		gs_clear(GS_CLEAR_COLOR | GS_CLEAR_DEPTH, &clear_colour, 1.0f, 0);
+		gs_perspective(v.fov * 180 / 3.14159265f, 1.0f, v.near, v.far);
+		gs_matrix_set(&view);
+		const gs_cull_mode cull = gs_get_cull_mode();
+		gs_set_cull_mode(GS_NEITHER);
+		gs_enable_depth_test(true);
+		gs_depth_function(GS_LESS);
+		gs_blend_state_push();
+		gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+		for (int on = 0; on < (shaped ? 2 : 1); on++) {
+			with_shapes(on);
+			prop.place(place, 1);
+			draw_prop(prop, v, false);
+			draw_prop(prop, v, true);
+			prop.place(place, 0.5f);
+			draw_prop(prop, v, true);
+			ways += 3;
+		}
+		gs_blend_state_pop();
+		gs_enable_depth_test(false);
+		gs_set_cull_mode(cull);
+		gs_texrender_end(warm_);
+	}
+	prop.shapes_ = shapes_was;
+	prop.place_ = place_was;
+	prop.opacity_ = shown_was;
+	prop.handed_ = handed_was;
+	opacity_ = opacity_was;
+	outline_share_ = outline_was;
+	height_ = height_was;
+	world_scale_ = scale_was;
+	fov_ = fov_was;
+	cam_ = cam_was;
+	return ways;
+}
+
+bool Avatar3D::free_targets()
+{
+	const bool any = scene_ || out_ || depth_ || warm_ || warm_depth_;
+	for (gs_texrender_t **target : {&scene_, &out_, &depth_, &warm_, &warm_depth_}) {
+		gs_texrender_destroy(*target);
+		*target = nullptr;
+	}
+	return any;
+}
+
+size_t Avatar3D::target_bytes() const
+{
+	// (Four bytes a pixel each: its colours, or one distance - and the
+	// depth beside, where it has one.)
+	size_t sum = 0;
+	const std::pair<gs_texrender_t *, bool> targets[] = {{scene_, true},
+							     {out_, false},
+							     {depth_, true},
+							     {warm_, true},
+							     {warm_depth_, true}};
+	for (const auto &target : targets) {
+		gs_texture_t *tex = target.first ? gs_texrender_get_texture(target.first) : nullptr;
+		if (tex)
+			sum += (size_t)gs_texture_get_width(tex) * gs_texture_get_height(tex) * (target.second ? 8 : 4);
+	}
+	return sum;
+}
+
+namespace {
+
+std::atomic<uint64_t> prop_points_sent{0};
+
+// OBS's own copy of some numbers (it frees them with the buffer).
+template<typename T> T *obs_copy(const std::vector<T> &from)
+{
+	return static_cast<T *>(bmemdup(from.data(), from.size() * sizeof(T)));
+}
+
+} // namespace
+
+uint64_t Prop3D::points_sent()
+{
+	return prop_points_sent.load();
+}
+
+Prop3D::Prop3D(const PropMesh &mesh, const std::vector<ModelPicture> &pictures)
+	: materials_(mesh.materials),
+	  shape_names_(mesh.shape_names),
+	  low_(mesh.low),
+	  high_(mesh.high)
 {
 	for (const ModelPicture &pic : pictures) {
 		gs_texture_t *tex = nullptr;
@@ -1678,104 +1874,53 @@ Prop3D::Prop3D(std::shared_ptr<const Model> model, const std::vector<ModelPictur
 		}
 		textures_.push_back(tex);
 	}
-	const Model &m = *model_;
-	tints_.assign(m.materials.size(), V3{1, 1, 1});
-	const std::vector<M4> world = rest_world(m);
-	bool any = false;
-	for (size_t ni = 0; ni < m.nodes.size(); ni++) {
-		const Node &node = m.nodes[ni];
-		if (node.mesh < 0 || node.mesh >= (int)m.meshes.size())
+	tints_.assign(materials_.size(), V3{1, 1, 1});
+	shapes_.assign(mesh.shapes, 0);
+	// Each part's points to the card as they were made (prop-mesh.hpp),
+	// in buffers that never change: OBS's points and facings are four
+	// numbers each, as the mesh has them.
+	static_assert(sizeof(vec3) == sizeof(float) * 4, "OBS's points are four numbers");
+	for (const PropMesh::Part &made : mesh.parts) {
+		const size_t n = made.points;
+		if (!n || !made.corners() || made.pos.size() != n * 4 || made.normal.size() != n * 4 ||
+		    made.uv.size() != n * 2 || made.colour.size() != n * 4)
 			continue;
-		const Mesh &mesh = m.meshes[node.mesh];
-		const Skin *skin = node.skin >= 0 && node.skin < (int)m.skins.size() ? &m.skins[node.skin] : nullptr;
-		for (const Primitive &p : mesh.parts) {
-			Part part;
-			part.prim = &p;
-			part.points = p.pos.size();
-			if (!part.points || p.index.empty())
-				continue;
-			const bool weighted = skin && p.joints.size() == part.points * 4 && p.weights.size() == part.points * 4;
-			// Where each point's node (a bound one: its strongest bone, as
-			// it was bound) puts it.
-			auto at = [&](size_t k) -> M4 {
-				if (weighted) {
-					int best = 0;
-					for (int j = 1; j < 4; j++)
-						if (p.weights[k * 4 + j] > p.weights[k * 4 + best])
-							best = j;
-					const uint16_t joint = p.joints[k * 4 + best];
-					if (joint < skin->joints.size() && joint < skin->inverse_bind.size()) {
-						const int bone = skin->joints[joint];
-						if (bone >= 0 && bone < (int)world.size())
-							return world[bone] * skin->inverse_bind[joint];
-					}
-				}
-				return world[ni];
-			};
-			part.bumped = p.tangent.size() == part.points * 4;
-			part.pos.resize(part.points);
-			part.normal.resize(part.points);
-			if (part.bumped)
-				part.tangent.resize(part.points);
-			for (size_t k = 0; k < part.points; k++) {
-				const M4 w = at(k);
-				part.pos[k] = point(w, p.pos[k]);
-				part.normal[k] =
-					normalized(direction(w, k < p.normal.size() ? p.normal[k] : V3{0, 0, 1}), {0, 0, 1});
-				if (part.bumped)
-					part.tangent[k] = normalized(
-						direction(w, {p.tangent[k * 4], p.tangent[k * 4 + 1], p.tangent[k * 4 + 2]}),
-						{1, 0, 0});
-				const V3 q = part.pos[k];
-				if (!any) {
-					low_ = high_ = q;
-					any = true;
-				}
-				low_ = {std::min(low_.x, q.x), std::min(low_.y, q.y), std::min(low_.z, q.z)};
-				high_ = {std::max(high_.x, q.x), std::max(high_.y, q.y), std::max(high_.z, q.z)};
-				part.middle = part.middle + q * (1.0f / (float)part.points);
-			}
-			for (const MorphTarget &t : p.morphs) {
-				std::vector<V3> dp(part.points), dn;
-				for (size_t i = 0; i < t.at.size(); i++)
-					if (t.at[i] < part.points)
-						dp[t.at[i]] = direction(at(t.at[i]), t.pos[i]);
-				if (!t.normal.empty()) {
-					dn.resize(part.points);
-					for (size_t i = 0; i < t.normal.size(); i++)
-						if (t.at[i] < part.points)
-							dn[t.at[i]] = direction(at(t.at[i]), t.normal[i]);
-				}
-				part.morph_pos.push_back(std::move(dp));
-				part.morph_normal.push_back(std::move(dn));
-			}
-			part.vb = make_vb(part.points, true, nullptr, part.bumped);
-			part.ib = make_ib(p.index);
-			if (part.vb) {
-				gs_vb_data *d = gs_vertexbuffer_get_data(part.vb);
-				float *uv = static_cast<float *>(d->tvarray[0].array);
-				for (size_t k = 0; k < part.points; k++) {
-					if (p.uv.size() >= (k + 1) * 2) {
-						uv[k * 2] = p.uv[k * 2];
-						uv[k * 2 + 1] = p.uv[k * 2 + 1];
-					}
-					uint8_t c[4] = {255, 255, 255, 255};
-					if (p.colour.size() >= (k + 1) * 4)
-						srgb_bytes(&p.colour[k * 4], c);
-					std::memcpy(&d->colors[k], c, 4);
-				}
-				gs_vertexbuffer_flush(part.vb);
-			}
-			if (shape_names_.size() < mesh.morph_names.size())
-				shape_names_ = mesh.morph_names;
-			parts_.push_back(std::move(part));
+		Part part;
+		part.material = made.material;
+		part.bumped = made.bumped && made.tangent.size() == n * 4;
+		part.shaped = made.shaped && made.shapes.size() == n * PROP_SHAPE_NUMBERS;
+		part.middle = made.middle;
+		gs_vb_data *d = gs_vbdata_create();
+		d->num = n;
+		d->points = reinterpret_cast<vec3 *>(obs_copy(made.pos));
+		d->normals = reinterpret_cast<vec3 *>(obs_copy(made.normal));
+		if (part.bumped)
+			d->tangents = reinterpret_cast<vec3 *>(obs_copy(made.tangent));
+		d->colors = reinterpret_cast<uint32_t *>(obs_copy(made.colour));
+		// Its UVs, and (a shaped part) its shapes' three fours a point.
+		d->num_tex = part.shaped ? 1 + PROP_SHAPE_NUMBERS / 4 : 1;
+		d->tvarray = static_cast<gs_tvertarray *>(bzalloc(sizeof(gs_tvertarray) * d->num_tex));
+		d->tvarray[0].width = 2;
+		d->tvarray[0].array = obs_copy(made.uv);
+		for (size_t t = 1; t < d->num_tex; t++) {
+			float *four = static_cast<float *>(bmalloc(sizeof(float) * 4 * n));
+			for (size_t k = 0; k < n; k++)
+				std::memcpy(&four[k * 4], &made.shapes[k * PROP_SHAPE_NUMBERS + (t - 1) * 4],
+					    sizeof(float) * 4);
+			d->tvarray[t].width = 4;
+			d->tvarray[t].array = four;
 		}
+		part.vb = gs_vertexbuffer_create(d, 0);
+		part.ib = made.index16.empty() ? gs_indexbuffer_create(GS_UNSIGNED_LONG, obs_copy(made.index32),
+								       made.index32.size(), 0)
+					       : gs_indexbuffer_create(GS_UNSIGNED_SHORT, obs_copy(made.index16),
+								       made.index16.size(), 0);
+		points_ += n;
+		triangles_ += made.corners() / 3;
+		bytes_ += made.bytes();
+		prop_points_sent += n;
+		parts_.push_back(part);
 	}
-	size_t shapes = shape_names_.size();
-	for (const Part &part : parts_)
-		shapes = std::max(shapes, part.morph_pos.size());
-	shapes_.assign(shapes, 0);
-	place(M4());
 }
 
 Prop3D::~Prop3D()
@@ -1812,49 +1957,7 @@ void Prop3D::place(const M4 &to_world, float opacity)
 {
 	place_ = to_world;
 	opacity_ = std::isfinite(opacity) ? std::min(1.0f, std::max(0.0f, opacity)) : 0.0f;
-	const V3 ax = direction(to_world, {1, 0, 0}), ay = direction(to_world, {0, 1, 0}),
-		 az = direction(to_world, {0, 0, 1});
-	handed_ = dot(cross(ax, ay), az) < 0 ? -1.0f : 1.0f;
-	// Normals turn as the inverse's rows-for-columns would (the same, for
-	// a turn and an even size), sized back to length 1 as they're used.
-	const M4 normals = inverse(to_world);
-	auto normal_of = [&normals](V3 n) {
-		return normalized(V3{normals.m[0] * n.x + normals.m[1] * n.y + normals.m[2] * n.z,
-				     normals.m[4] * n.x + normals.m[5] * n.y + normals.m[6] * n.z,
-				     normals.m[8] * n.x + normals.m[9] * n.y + normals.m[10] * n.z},
-				  {0, 0, 1});
-	};
-	for (Part &part : parts_) {
-		if (!part.vb)
-			continue;
-		gs_vb_data *d = gs_vertexbuffer_get_data(part.vb);
-		const bool tangents = part.bumped && d->tangents;
-		for (size_t k = 0; k < part.points; k++) {
-			V3 p = part.pos[k], n = part.normal[k];
-			for (size_t s = 0; s < part.morph_pos.size() && s < shapes_.size(); s++) {
-				const float w = shapes_[s];
-				if (w <= 0)
-					continue;
-				p = p + part.morph_pos[s][k] * w;
-				if (!part.morph_normal[s].empty())
-					n = n + part.morph_normal[s][k] * w;
-			}
-			const V3 wp = point(to_world, p), wn = normal_of(n);
-			vec3_set(&d->points[k], wp.x, wp.y, wp.z);
-			vec3_set(&d->normals[k], wn.x, wn.y, wn.z);
-			if (tangents) {
-				const V3 t = normalized(direction(to_world, part.tangent[k]), {1, 0, 0});
-				vec3_set(&d->tangents[k], t.x, t.y, t.z);
-				d->tangents[k].w = part.prim->tangent[k * 4 + 3] * handed_;
-			}
-		}
-		gs_vb_data moved = {};
-		moved.num = d->num;
-		moved.points = d->points;
-		moved.normals = d->normals;
-		moved.tangents = tangents ? d->tangents : nullptr;
-		gs_vertexbuffer_flush_direct(part.vb, &moved);
-	}
+	handed_ = prop_handed(to_world);
 }
 
 bool Avatar3D::upload(const Rig *rig)
@@ -2280,16 +2383,12 @@ gs_texture_t *Avatar3D::draw(const Rig *rig, const View3D &v, const std::vector<
 			return false;
 		return !(dr.strands && !dr.a->parts_[i].strands && material_of(dr, i).hair_standin);
 	};
-	// Anything with it put where it goes (the same one may be in several
-	// places: its points are worked out again for each).
-	std::map<Prop3D *, const PropAt *> put_at;
-	auto put = [&](const PropAt &at) {
-		const PropAt *&last = put_at[at.prop];
-		if (last == &at)
-			return;
-		last = &at;
-		for (size_t n = 0; n < at.shapes.size(); n++)
-			at.prop->set_shape((int)n, at.shapes[n]);
+	// Anything with it told where it goes and its shapes (those left out:
+	// as made), just before each time it's drawn - the same one may be in
+	// several places, each a few numbers for the card.
+	auto put = [](const PropAt &at) {
+		for (size_t n = 0; n < at.prop->shapes_.size(); n++)
+			at.prop->set_shape((int)n, n < at.shapes.size() ? at.shapes[n] : 0.0f);
 		at.prop->place(at.place, at.opacity);
 	};
 	// The camera's view as OBS's 3D wants it: y down, looking along -z.

@@ -38,6 +38,7 @@ from test_real_hair import (LIFT, MAGENTA, WIDE_HAIR, Strands, add_strands, hair
                             hair_over_body, magenta, open_glb, per_metre, save_glb, settles, top_of, white,
                             world_of, yellow)
 from test_real_obs import VERSION, check_page_clicks, free_port, vendor, wait_for  # noqa: E402
+from test_real_throws import card_items, card_things, things_on_the_card  # noqa: E402
 
 ROOT = os.environ.get("DIREBOT_OBS_ROOT", "")
 ZIP = os.environ.get("DIREBOT_OBS_ZIP", "")
@@ -304,6 +305,51 @@ def test_face_avatar_pictures_open(obs):
         assert "couldn't open a picture" not in obs.log()
         assert "no picture loader" not in obs.log()
     finally:
+        c.disconnect()
+
+
+def test_3d_things_stay_on_the_graphics_card(obs):
+    """0.12.0's speed fix, on Direct3D (tests/test_real_throws.py's
+    things_on_the_card): 3D things thrown are sent to the graphics card
+    once and put where they are by it - their shapes too - drawn once out
+    of sight as they're loaded, and the pictures they're drawn into are
+    let go of a while after the last throw."""
+    camera = os.path.join(obs.home, "camera.png")
+    still = os.path.join(obs.home, "character.png")
+    camera_picture(camera)
+    character_picture(still)
+    files, points = card_things(obs.home)
+    c = obs.client()
+    try:
+        c.send("CreateScene", {"sceneName": "Things"}, raw=True)
+        c.send("CreateInput", {"sceneName": "Things", "inputName": "Things camera",
+                               "inputKind": "image_source", "inputSettings": {"file": camera}}, raw=True)
+        c.send("CreateInput", {"sceneName": "Things", "inputName": "Things avatar",
+                               "inputKind": "direbot_face_avatar",
+                               "inputSettings": {"source": "Things camera", "character": still, "width": 300,
+                                                 "height": 300, "size": 60, "mirror": False, "smoothing": 100,
+                                                 "follow_move": 0, "follow_grow": 0, "follow_tilt": 0,
+                                                 "bend": 0, "breathing": 0, "sway": 0, "eye_moves": False,
+                                                 "style": "drawn",
+                                                 "react_items": json.dumps(card_items(files))}}, raw=True)
+        c.send("SetCurrentProgramScene", {"sceneName": "Things"}, raw=True)
+        assert wait_for(lambda: vendor(c, "FaceGetState", {"source": "Things avatar"})["shown"] == 1,
+                        60, 0.2), obs.log()
+
+        def shots(seconds):
+            raw, until = [], time.time() + seconds
+            while time.time() < until:
+                raw.append(c.send("GetSourceScreenshot", {"sourceName": "Things avatar", "imageFormat": "bmp"},
+                                  raw=True)["imageData"])
+            return [read_bmp(base64.b64decode(data.split(",", 1)[1])) for data in raw]
+        things_on_the_card(c, "Things avatar", files, points, shots, log=obs.log)
+        log = obs.log()
+        assert "3D effect" not in log, log
+    finally:
+        try:
+            c.send("RemoveInput", {"inputName": "Things avatar"}, raw=True)
+        except Exception:
+            pass
         c.disconnect()
 
 

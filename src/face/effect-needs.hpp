@@ -61,6 +61,32 @@ inline const std::vector<EffectNeeds> &face_3d_needs()
 		  "eye_pos", "strand", "strand_lod", "strand_view", "depth_map"}},
 		{"Hull", {"cam", "eye_pos", "strand", "strand_lod"}},
 		{"Down", {"image", "texel"}},
+		// Things put by the card (0.12.0): what Draw, DrawBumped and Depth
+		// read, and its facings' turn - with its shapes and which way
+		// round it is where those are read.
+		{"Thing",
+		 {"cam", "uv_place", "base_map", "shade_map", "emissive_map", "metal_map", "matcap_map", "base_colour",
+		  "look", "surface", "emissive", "toon", "shade_colour", "rim_colour", "matcap_colour", "occlusion_map",
+		  "detail", "key_dir", "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light",
+		  "key_tint", "room_tint", "gas", "flat_at", "turn"}},
+		{"ThingBumped",
+		 {"cam", "uv_place", "base_map", "shade_map", "emissive_map", "metal_map", "matcap_map", "base_colour",
+		  "look", "surface", "emissive", "toon", "shade_colour", "rim_colour", "matcap_colour", "occlusion_map",
+		  "detail", "key_dir", "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light",
+		  "key_tint", "room_tint", "normal_map", "gas", "flat_at", "turn", "thing"}},
+		{"ThingDepth", {"cam", "uv_place", "flat_at", "base_map", "surface", "base_colour", "turn"}},
+		{"ThingShaped",
+		 {"cam", "uv_place", "base_map", "shade_map", "emissive_map", "metal_map", "matcap_map", "base_colour",
+		  "look", "surface", "emissive", "toon", "shade_colour", "rim_colour", "matcap_colour", "occlusion_map",
+		  "detail", "key_dir", "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light",
+		  "key_tint", "room_tint", "gas", "flat_at", "turn", "thing"}},
+		{"ThingBumpedShaped",
+		 {"cam", "uv_place", "base_map", "shade_map", "emissive_map", "metal_map", "matcap_map", "base_colour",
+		  "look", "surface", "emissive", "toon", "shade_colour", "rim_colour", "matcap_colour", "occlusion_map",
+		  "detail", "key_dir", "key_colour", "fill_dir", "fill_colour", "room_up", "room_down", "rim_light",
+		  "key_tint", "room_tint", "normal_map", "gas", "flat_at", "turn", "thing"}},
+		{"ThingDepthShaped",
+		 {"cam", "uv_place", "flat_at", "base_map", "surface", "base_colour", "turn", "thing"}},
 	};
 	return needs;
 }

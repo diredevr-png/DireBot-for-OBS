@@ -25,6 +25,7 @@ from test_real_obs import Obs, vendor, wait_for  # noqa: E402
 from test_real_obs import pytestmark  # noqa: E402,F401
 from test_real_face import (STILL, SPOTS, camera_picture, character_picture, disc_picture,  # noqa: E402
                             keep_shot, middle_of, quick_shots, screenshot, send, write_png)
+from test_real_hair import add_numbers, open_glb, save_glb  # noqa: E402
 
 TOMATO = (230, 20, 20)
 MARK = (230, 0, 230)      # the splat left on it
@@ -346,14 +347,21 @@ def test_a_face_avatar_on_that_camera_sees_it_plain_and_3d_things_land(run):
                                        "filterSettings": {"react_items": json.dumps(things),
                                                           "camera_shake": True}})
         assert wait_for(lambda: cam_st()["react"]["items"][0].get("hit", {}).get("loaded"), 10, 0.1)
+        # (Its 3D thing on the graphics card and drawn once out of sight:
+        # the 3D effect is built for that, a long frame - not while the
+        # throws are watched.)
+        assert wait_for(lambda: cam_st()["react"]["things"]["loaded"] == 1
+                        and cam_st()["react"]["things"]["to_warm"] == 0, 10, 0.1), cam_st()["react"]
         rest = screenshot(c, "Worn fx")
         # A barrage of tomatoes at the camera: the camera shows them, the
         # worn face avatar over it never does.
         assert cue(do="throw", item=0, side=1, count=4, strength=2)["ok"]
         cam_marked = avatar_marked = 0
         avatar_moved = 0
+        # (On a slow machine one look takes over a second, and the first is
+        # before anything has hit: it looks on until the splat has shown.)
         end = time.time() + 1.6
-        while time.time() < end:
+        while time.time() < end or (cam_marked <= 200 and time.time() < end + 6):
             cam_marked = max(cam_marked, middle_of(screenshot(c, "Shared cam"), near(MARK))[2])
             shot = screenshot(c, "Worn fx")
             avatar_marked = max(avatar_marked, middle_of(shot, near(MARK))[2])
@@ -506,5 +514,148 @@ def test_a_3d_thing_fading_shows_only_its_front(run):
         assert thin > 150, (thin, solid)
         assert green == 0
         assert wait_for(lambda: st()["pieces"] == 0, 4, 0.1), st()
+    finally:
+        c.disconnect()
+
+
+def with_shapes(path, shapes):
+    """Shapes (glTF's morph targets) on a .glb's first part: [(name, each
+    point's move (x, y, z))]."""
+    doc, blob = open_glb(path)
+    part = doc["meshes"][0]["primitives"][0]
+    part["targets"] = []
+    for _, moves in shapes:
+        raw = struct.pack("<%df" % (len(moves) * 3), *[c for m in moves for c in m])
+        bounds = {"min": [min(m[k] for m in moves) for k in range(3)],
+                  "max": [max(m[k] for m in moves) for k in range(3)]}
+        part["targets"].append({"POSITION": add_numbers(doc, blob, raw, "VEC3", len(moves), 5126, more=bounds)})
+    doc["meshes"][0]["weights"] = [0.0] * len(shapes)
+    doc["meshes"][0]["extras"] = {"targetNames": [name for name, _ in shapes]}
+    save_glb(path, doc, blob)
+
+
+def card_things(home):
+    """3D things for things_on_the_card: a red ball to throw, and three
+    green pieces a hit throws off it (a piece's "open" shape shows all
+    its life, unless it's a crown) - a ball as made; the same with an
+    "open" shape that makes it three times as big; and that one again
+    with its "open" shape second (the first, were it shown, would shrink
+    it to nothing). Their files, and how many points they have in all."""
+    from test_real_face import ball_points, write_glb
+    files = {name: os.path.join(home, f"card-{name}.glb") for name in ("ball", "made", "opens", "opens-second")}
+    ball = ball_points(0, 0, 0, 0.1, 0.1, 0.1)
+    write_glb(files["ball"], [ball + ((0.8, 0.02, 0.02), 0.5)])
+    piece = ball_points(0, 0, 0, 0.05, 0.05, 0.05)
+    grow = [(2 * x, 2 * y, 2 * z) for x, y, z in piece[0]]
+    gone = [(-x, -y, -z) for x, y, z in piece[0]]
+    for name in ("made", "opens", "opens-second"):
+        write_glb(files[name], [piece + ((0.02, 0.75, 0.02), 0.5)])
+    with_shapes(files["opens"], [("open", grow)])
+    with_shapes(files["opens-second"], [("spare", gone), ("open", grow)])
+    return files, len(ball[0]) + 3 * len(piece[0])
+
+
+def card_items(files):
+    return [{"file": files["ball"], "hit": {"effect": "none", "pieces": [
+        {"file": files[piece], "way": "chunk", "count": 2, "size": 0.2}]}}
+        for piece in ("made", "opens", "opens-second")]
+
+
+def things_on_the_card(c, source, files, points, shots, log=lambda: "", wait_free=True):
+    """0.12.0's speed fix, for a face avatar `source` that has card_items:
+    3D things are sent to the graphics card once, as they're loaded, and
+    drawn once out of sight then; thrown, they're put where they are by
+    the card - its shapes and all - with nothing more sent; and the
+    pictures they're drawn into are let go of when none has been thrown
+    for a while. `shots(seconds)`: pictures of the source for that long,
+    rows of (r, g, b). (Shared with tests/test_real_windows.py: the same
+    on OpenGL and Direct3D.)"""
+    def things():
+        return vendor(c, "FaceGetState", {"source": source})["react"]["things"]
+
+    def react():
+        return vendor(c, "FaceGetState", {"source": source})["react"]
+
+    def green(rows):
+        return sum(1 for row in rows for px in row if px[1] > px[0] + 50 and px[1] > px[2] + 50)
+
+    def red(rows):
+        return sum(1 for row in rows for px in row if px[0] > px[1] + 90 and px[0] > px[2] + 90)
+
+    assert wait_for(lambda: all(i.get("loaded") and i.get("hit", {}).get("loaded")
+                                for i in react()["items"]) and len(react()["items"]) == 3, 30, 0.1), (react(), log())
+    # On the card: all four files' points, each drawn once out of sight.
+    assert wait_for(lambda: things()["loaded"] == 4 and things()["to_warm"] == 0, 30, 0.1), (things(), log())
+    was = things()
+    print("things:", was)
+    assert was["points"] == points and was["triangles"] > 0 and was["bytes"] > points * 40, was
+    assert was["warm"] is True and was["warmed"] == 4, was
+    sent = was["points_sent"]
+    assert sent >= points, was
+    seen = {}
+    for item, piece in enumerate(("made", "opens", "opens-second")):
+        # (Still: nothing in the air or coming off it.)
+        assert wait_for(lambda: react()["flying"] == 0 and react()["pieces"] == 0, 10, 0.1), react()
+        assert vendor(c, "FaceReact", {"source": source, "do": "throw", "item": item, "side": 1})["ok"]
+        rows = shots(2.2)
+        seen[piece] = (max(red(r) for r in rows), max(green(r) for r in rows))
+    print("the most seen of the ball and its piece (red, green):", seen)
+    # The ball flew in, each time; a piece came off it.
+    for piece, (ball, bit) in seen.items():
+        assert ball > 150, (piece, seen, log())
+        assert bit > 40, (piece, seen, log())
+    # Its "open" shape shows: three times as big across, so about nine
+    # times as much of it seen (each piece flies its own way, some nearer:
+    # give or take) - whichever of its shapes "open" is, and the one
+    # before it not shown (it would be gone).
+    made, opens, second = seen["made"][1], seen["opens"][1], seen["opens-second"][1]
+    assert 4 * made < opens < 16 * made, (seen, log())
+    assert 4 * made < second < 16 * made, (seen, log())
+    # Nothing more was sent to the card for any of that.
+    now = things()
+    assert now["points_sent"] == sent, (was, now)
+    assert now["drawn_into_bytes"] > 0, now
+    assert "aren't drawn" not in log()
+    if not wait_free:
+        return
+    # A while after the last of them, the pictures they were drawn into
+    # are let go of - and made again when the next one's thrown.
+    assert wait_for(lambda: things()["drawn_into_bytes"] == 0, 45, 0.5), things()
+    assert vendor(c, "FaceReact", {"source": source, "do": "throw", "item": 1, "side": -1})["ok"]
+    rows = shots(2.2)
+    again = (max(red(r) for r in rows), max(green(r) for r in rows))
+    print("thrown again (red, green):", again)
+    assert again[0] > 150 and 4 * made < again[1] < 16 * made, (again, seen, log())
+    assert things()["drawn_into_bytes"] > 0 and things()["points_sent"] == sent, things()
+
+
+def test_3d_things_stay_on_the_graphics_card(run):
+    """0.12.0's speed fix: see things_on_the_card."""
+    face_png = os.path.join(run.home, "camera.png")
+    body_png = os.path.join(run.home, "character.png")
+    camera_picture(face_png)
+    character_picture(body_png)
+    files, points = card_things(run.home)
+    settings = {"source": "Card camera", "width": 300, "height": 300, "size": 60, "mirror": False,
+                "smoothing": 100, "follow_move": 0, "follow_grow": 0, "follow_tilt": 0, "bend": 0,
+                **STILL, "character": body_png, "style": "drawn", "spots": json.dumps(SPOTS),
+                "react_items": json.dumps(card_items(files))}
+    c = obsws.ReqClient(host="127.0.0.1", port=run.ws_port, password="", timeout=10)
+    try:
+        send(c, "CreateScene", {"sceneName": "Card"})
+        send(c, "CreateInput", {"sceneName": "Card", "inputName": "Card camera",
+                                "inputKind": "image_source", "inputSettings": {"file": face_png}})
+        send(c, "CreateInput", {"sceneName": "Card", "inputName": "Card fx",
+                                "inputKind": "direbot_face_avatar", "inputSettings": settings})
+        send(c, "SetCurrentProgramScene", {"sceneName": "Card"})
+        assert wait_for(lambda: vendor(c, "FaceGetState", {"source": "Card fx"})["shown"] == 1, 30, 0.2)
+
+        def shots(seconds):
+            got = [rows for _, rows in quick_shots(c, "Card fx", seconds)]
+            keep_shot(max(got, key=lambda rows: sum(1 for row in rows for px in row
+                                                    if px[1] > px[0] + 50 and px[1] > px[2] + 50)),
+                      "A piece off a 3D thing")
+            return got
+        things_on_the_card(c, "Card fx", files, points, shots)
     finally:
         c.disconnect()

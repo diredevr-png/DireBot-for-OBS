@@ -24,7 +24,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <cctype>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -135,6 +137,10 @@ constexpr float HAND_HEAD = 0.22f, HAND_OVER = 0.0f, HAND_BACK = 0.05f, HAND_REA
 constexpr float HAND_3D_TALL = 0.8f;
 // 3D things over the character: drawn nearly straight on (a narrow view).
 constexpr float OVERLAY_FOV = 0.35f;
+// How long after the last of them was drawn the pictures they're drawn
+// into are kept on the graphics card (twice the source's size each way:
+// a lot of its memory, for something that's only there now and then).
+constexpr uint64_t OVERLAY_KEEP_NS = 30'000'000'000ULL;
 // How steep a wet splat's bumps are (0.12.0): its height map's change
 // between two points read, times this.
 constexpr float WET_STEEP = 9.0f;
@@ -203,15 +209,20 @@ bool rect_from(const json &j, Rect &r)
 struct Picture {
 	std::string path;
 	PictureFile image;
-	// A small copy of it (straight colour, 4 bytes a point), for its shape.
+	// A small copy of it (straight colour, 4 bytes a point), for its shape:
+	// only of a picture whose shape is read (`shape`: a character's picture
+	// and what it wears, shape_for). One that's only ever drawn - a thing
+	// thrown, a splat, a hand - keeps none (0.12.0: its twenty things' forty
+	// pictures would hold 20 MB of them).
 	std::vector<uint8_t> small;
 	int small_w = 0, small_h = 0;
 	bool small_bgra = false;
 
-	explicit Picture(const std::string &file) : path(file)
+	explicit Picture(const std::string &file, bool shape = false) : path(file)
 	{
 		image.open(path.c_str());
-		keep_small();
+		if (shape)
+			keep_small();
 		obs_enter_graphics();
 		image.init_texture();
 		obs_leave_graphics();
@@ -279,13 +290,14 @@ struct Picture {
 };
 using PicturePtr = std::shared_ptr<Picture>;
 
-// The same picture again if it's the same file, a new one if not.
-PicturePtr load_picture(const PicturePtr &old, const char *want)
+// The same picture again if it's the same file, a new one if not
+// (`shape`: with its small copy, for a picture whose shape is read).
+PicturePtr load_picture(const PicturePtr &old, const char *want, bool shape = false)
 {
 	const std::string file = want ? want : "";
 	if (old && old->path == file)
 		return old;
-	return file.empty() ? nullptr : std::make_shared<Picture>(file);
+	return file.empty() ? nullptr : std::make_shared<Picture>(file, shape);
 }
 
 bool loaded(const PicturePtr &p)
@@ -1650,6 +1662,17 @@ struct FaceAvatar {
 	std::map<std::string, std::unique_ptr<Prop3D>> props3d;
 	std::unique_ptr<Avatar3D> overlay3d;
 	gs_texture_t *overlay_tex = nullptr;
+	// Things newly on the graphics card, still to be drawn once out of
+	// sight (warm_things), and how many have been; the look they were
+	// warmed for. (DIREBOT_FACE_NO_WARM=1: none are - for measuring what
+	// it saves.)
+	std::deque<std::string> props_to_warm;
+	int props_warmed = 0, warm_look = -1;
+	bool warm_on = true;
+	// When the things over the character were last drawn (their pictures
+	// are let go of a while after), and what the card holds for them now.
+	uint64_t overlay_drawn_ns = 0;
+	size_t overlay_bytes = 0;
 	struct NamedMotion {
 		std::string name, file, problem;
 		std::shared_ptr<const Motion> motion;
@@ -1735,6 +1758,8 @@ struct FaceAvatar {
 			      data_file("face/palm_detection_full.tflite", false))
 	{
 		skin_colour = lab_of(0.8f, 0.62f, 0.5f);
+		const char *no_warm = std::getenv("DIREBOT_FACE_NO_WARM");
+		warm_on = !(no_warm && *no_warm && *no_warm != '0');
 		char *path = obs_module_file("effects/direbot-face.effect");
 		obs_enter_graphics();
 		if (path)
@@ -2539,13 +2564,14 @@ struct FaceAvatar {
 	// (graphics thread, pictures_lock held).
 	void pick_props()
 	{
-		for (const std::shared_ptr<ModelPack> &pack : prop_loader.take()) {
+		for (const std::shared_ptr<PropPack> &pack : prop_loader.take()) {
 			props3d.erase(pack->path);
 			props_ready.erase(pack->path);
 			prop_problems.erase(pack->path);
-			if (pack->model) {
-				props3d[pack->path] = std::make_unique<Prop3D>(pack->model, pack->pictures);
+			if (pack->mesh) {
+				props3d[pack->path] = std::make_unique<Prop3D>(*pack->mesh, pack->pictures);
 				props_ready.insert(pack->path);
+				props_to_warm.push_back(pack->path);
 			} else {
 				prop_problems[pack->path] = pack->problem;
 			}
@@ -2562,6 +2588,63 @@ struct FaceAvatar {
 			}
 			props_ready.erase(it->first);
 			it = props3d.erase(it);
+		}
+	}
+
+	// The lights and look things over the character are drawn with.
+	View3D overlay_look() const
+	{
+		View3D v;
+		v.fov = OVERLAY_FOV;
+		v.lights = look3d.lights;
+		v.look = model_now ? look3d.look : 0;
+		v.smooth = !easy;
+		v.soft_skin = 0.5f;
+		return v;
+	}
+
+	// Newly loaded 3D things drawn once out of sight (Avatar3D::warm), one
+	// a frame: by the time one's thrown, the graphics card has done what
+	// it only does the first time it draws something (0.12.0: the first
+	// throw of each thing stuttered). Then, once nothing's been drawn over
+	// the character for a while, the pictures that's drawn into are let go
+	// of - made again at the next throw. Graphics thread, pictures_lock
+	// held, before this frame's draw_overlay.
+	void warm_things()
+	{
+		const uint64_t now = os_gettime_ns();
+		if (!warm_on) {
+			props_to_warm.clear();
+		} else {
+			// (Another look: other drawing code for some - all again.)
+			const int look = overlay_look().look;
+			if (look != warm_look) {
+				warm_look = look;
+				props_to_warm.clear();
+				for (const auto &kept : props3d)
+					props_to_warm.push_back(kept.first);
+			}
+			if (!props_to_warm.empty() && !overlay3d) {
+				// (Its effect read and built, the first there is: a frame's
+				// work of its own.)
+				overlay3d = std::make_unique<Avatar3D>();
+			} else {
+				while (!props_to_warm.empty()) {
+					auto it = props3d.find(props_to_warm.front());
+					props_to_warm.pop_front();
+					if (it == props3d.end())
+						continue;
+					if (overlay3d->warm(*it->second, overlay_look()))
+						props_warmed++;
+					overlay_drawn_ns = now;
+					break;
+				}
+			}
+		}
+		if (overlay3d) {
+			if (!overlay_tex && props_to_warm.empty() && now - overlay_drawn_ns > OVERLAY_KEEP_NS)
+				overlay3d->free_targets();
+			overlay_bytes = overlay3d->target_bytes();
 		}
 	}
 
@@ -2634,7 +2717,7 @@ struct FaceAvatar {
 			p.shapes.assign((size_t)lift + 1, 0);
 			p.shapes[lift] = h.lift;
 		}
-		const std::vector<Material> &mats = hand.model().materials;
+		const std::vector<Material> &mats = hand.materials();
 		for (size_t i = 0; i < mats.size(); i++) {
 			const std::string &n = mats[i].name;
 			hand.tint((int)i, n.find("skin") != std::string::npos     ? hand_skin
@@ -2915,19 +2998,15 @@ struct FaceAvatar {
 			return;
 		if (!overlay3d)
 			overlay3d = std::make_unique<Avatar3D>();
-		View3D v;
+		View3D v = overlay_look();
 		v.w = w;
 		v.h = h;
-		v.fov = OVERLAY_FOV;
 		const float dist = (h * k * 0.5f) / std::tan(OVERLAY_FOV / 2);
 		v.view = moved({0, 0, -dist});
 		v.near = dist * 0.2f;
 		v.far = dist * 5;
-		v.lights = look3d.lights;
-		v.look = model_now ? look3d.look : 0;
-		v.smooth = !easy;
-		v.soft_skin = 0.5f;
 		overlay_tex = overlay3d->draw(nullptr, v, with);
+		overlay_drawn_ns = os_gettime_ns();
 	}
 
 	// A newly loaded 3D character onto the graphics card, and its rig
@@ -4079,6 +4158,7 @@ struct FaceAvatar {
 			return;
 		std::lock_guard<std::mutex> l(pictures_lock);
 		pick_props();
+		warm_things();
 		place_on_camera(cw, ch);
 		draw_overlay(cw, ch, true);
 		if (!out)
@@ -4126,6 +4206,7 @@ struct FaceAvatar {
 		pick_companion();
 		apply_stay();
 		pick_props();
+		warm_things();
 		upload_masks();
 		if (rig && model_now) {
 			draw_3d(cam, cw, ch, w, h, o, wear);
@@ -5054,6 +5135,7 @@ struct FaceAvatar {
 			if (as_filter) {
 				// The throws filter's 3D things, ready before they're thrown.
 				pick_props();
+				warm_things();
 			} else {
 				pick_model();
 				pick_companion();
@@ -5158,9 +5240,9 @@ struct FaceAvatar {
 			std::copy(mouths, mouths + MOUTH_LOOKS, next_mouths);
 			next_layers = layers;
 		}
-		next_body = load_picture(next_body, obs_data_get_string(settings, "character"));
-		next_left = load_picture(next_left, obs_data_get_string(settings, "character_left"));
-		next_right = load_picture(next_right, obs_data_get_string(settings, "character_right"));
+		next_body = load_picture(next_body, obs_data_get_string(settings, "character"), true);
+		next_left = load_picture(next_left, obs_data_get_string(settings, "character_left"), true);
+		next_right = load_picture(next_right, obs_data_get_string(settings, "character_right"), true);
 		next_face = load_picture(next_face, obs_data_get_string(settings, "own_face"));
 		Rect eye_at[EYE_LOOKS], mouth_at[MOUTH_LOOKS];
 		for (int i = 0; i < EYE_LOOKS; i++) {
@@ -5186,7 +5268,7 @@ struct FaceAvatar {
 					if (old.picture && old.picture->path == file)
 						layer.picture = old.picture;
 				if (!layer.picture)
-					layer.picture = load_picture(nullptr, file.c_str());
+					layer.picture = load_picture(nullptr, file.c_str(), true);
 				layer.behind = row.value("behind", false);
 				wearing.push_back(layer);
 			}
@@ -6428,7 +6510,7 @@ struct FaceAvatar {
 		json holes = json::object();
 		bool shaped;
 		json lights_json, views_json = json::array();
-		json react_moves_json = json::array(), react_items_json = json::array();
+		json react_moves_json = json::array(), react_items_json = json::array(), react_things_json;
 		bool react_hand_ok = false, react_hit_ok = false, react_hand_3d = false;
 		std::string react_hand_problem;
 		int react_emotes = 0;
@@ -6521,6 +6603,30 @@ struct FaceAvatar {
 				if (why != prop_problems.end())
 					row["problem"] = why->second;
 				react_items_json.push_back(row);
+			}
+			// The 3D things on the graphics card (0.12.0): how many, their
+			// points and triangles, the bytes of them it holds (OBS keeps as
+			// many again in memory), how many have been drawn once out of
+			// sight and how many still wait to be; the bytes of the pictures
+			// things over the character are drawn into; and how many points
+			// have ever been sent to the card for things (each thing's once:
+			// it stays what it is while they're thrown).
+			{
+				size_t points = 0, triangles = 0, bytes = 0;
+				for (const auto &kept : props3d) {
+					points += kept.second->points();
+					triangles += kept.second->triangles();
+					bytes += kept.second->bytes();
+				}
+				react_things_json = {{"loaded", props3d.size()},
+						     {"points", points},
+						     {"triangles", triangles},
+						     {"bytes", bytes},
+						     {"warm", warm_on},
+						     {"warmed", props_warmed},
+						     {"to_warm", props_to_warm.size()},
+						     {"drawn_into_bytes", overlay_bytes},
+						     {"points_sent", Prop3D::points_sent()}};
 			}
 			react_hand_ok = loaded(hand_pic);
 			react_hand_3d = !hand3d_file.empty() && props_ready.count(hand3d_file) > 0;
@@ -6817,6 +6923,7 @@ struct FaceAvatar {
 					   {"vrm_moves", rs.motions},
 					   {"moves", react_moves_json},
 					   {"items", react_items_json},
+					   {"things", react_things_json},
 					   {"hand", react_hand_ok},
 					   {"hand_3d", react_hand_3d},
 					   {"emotes", react_emotes},

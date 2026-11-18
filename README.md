@@ -521,6 +521,21 @@ tall its picture or model is - its head nodded down and squished. `count` (1-16)
 throws a barrage of it, one after another; `stop` makes what's stuck fall
 off.
 
+**3D things on the graphics card (0.12.0).** A 3D thing's points are sent
+to the graphics card once, as it's loaded, and the card puts them where
+the thing is each frame - turned, squashed, mirrored, its shapes (a
+wobble, a splash opening) added there too - so a thing in the air costs
+the CPU a few numbers, however many are thrown. Each is drawn once out of
+sight as it's loaded, so the first throw doesn't stutter while the card
+does its first-time work, and the pictures things are drawn into are let
+go of half a minute after the last one. `FaceGetState`'s `react` says
+`things`: `loaded` (3D things on the card), `points`, `triangles`,
+`bytes` (of them on the card; OBS keeps as many in memory), `warm`,
+`warmed`, `to_warm` (drawn once out of sight, and still to be),
+`drawn_into_bytes` and `points_sent` (it stands still while things are
+thrown). How it works, what it cost before, and how to measure it again:
+[docs/things.md](docs/things.md).
+
 **What a thing does as it hits, and throws at your camera (0.9.0).** A
 row of `react_items` can say what it does as it hits (`hit`: JSON,
 `effect` `splat`, `feathers` or `pieces`, and each picture by its full

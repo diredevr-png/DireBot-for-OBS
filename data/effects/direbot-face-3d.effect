@@ -25,9 +25,15 @@
 //   Depth    a solid part's distance from the camera, for that picture
 //   Hull     the inner layers of the hairs into that picture too
 //   Down     the picture drawn twice the size, halved: smooth edges
-// Points come already moved by the bones and expressions, in the world;
-// `cam` takes them to the camera's view (x right, y up, looking along -z)
-// for the light. Colours are worked in linear light and written as sRGB,
+//   Thing, ThingBumped, ThingDepth  Draw, DrawBumped and Depth for
+//            something 3D put somewhere (a headpat's hand, things thrown):
+//            its points come as its file has them, sent to the card once,
+//            and the card puts them (see `turn` below)
+//   ThingShaped, ThingBumpedShaped, ThingDepthShaped  the same, with its
+//            shapes (a thing's wobble, a splash opening) added here too
+// A character's points come already moved by the bones and expressions, in
+// the world; `cam` takes them to the camera's view (x right, y up, looking
+// along -z) for the light. Colours are worked in linear light and written as sRGB,
 // premultiplied - a see-through part's shine, in the glossy look, on top
 // (see shade_point's end).
 
@@ -106,6 +112,15 @@ uniform float3 room_down;
 uniform float4 rim_light;
 uniform float3 key_tint;
 uniform float3 room_tint;
+// A thing put somewhere (the Thing techniques): OBS's own matrix has its
+// place in it (so ViewProj puts its points) and so has `cam` (straight to
+// the camera's view); `turn` takes its facings there - the inverse of its
+// place, rows for columns, so a thing squashed or mirrored is lit right -
+// each made length 1 again after. `thing`: how much of its first and
+// second shape shows (x, y), and -1 for one mirrored (z: its tangents'
+// which-way-up turns over), else 1.
+uniform float4x4 turn;
+uniform float4 thing;
 
 sampler_state wrapSampler {
 	Filter    = Linear;
@@ -218,6 +233,96 @@ VertOut outline_out(float3 pos, float3 norm, float4 col, float2 uv)
 VertOut VSOutline(VertIn v)
 {
 	return outline_out(v.pos.xyz, v.norm.xyz, v.col, v.uv);
+}
+
+// ---- Things put by the card (the Thing techniques) ----
+// The CPU's old sums (0.12.0's Prop3D::place), number for number: a point
+// by its place, its facing by the place's inverse turned rows for columns
+// and its tangent by the place, both made length 1.
+float3 unit(float3 v, float3 otherwise)
+{
+	float l = length(v);
+	return l > 0.000000000001 ? v / l : otherwise;
+}
+
+VertOut thing_out(float3 pos, float3 norm, float4 col, float2 uv)
+{
+	VertOut o;
+	o.pos = flattened(mul(float4(pos, 1.0), ViewProj));
+	o.col = col;
+	o.uv = uv * uv_place.zw + uv_place.xy;
+	o.vpos = mul(float4(pos, 1.0), cam).xyz;
+	o.vnrm = unit(mul(float4(norm, 0.0), turn).xyz, float3(0.0, 0.0, 1.0));
+	return o;
+}
+
+BumpOut thing_bumped_out(float3 pos, float3 norm, float4 tang, float4 col, float2 uv)
+{
+	BumpOut o;
+	o.pos = flattened(mul(float4(pos, 1.0), ViewProj));
+	o.col = col;
+	o.uv = uv * uv_place.zw + uv_place.xy;
+	o.vpos = mul(float4(pos, 1.0), cam).xyz;
+	o.vnrm = unit(mul(float4(norm, 0.0), turn).xyz, float3(0.0, 0.0, 1.0));
+	o.vtan = float4(unit(mul(float4(tang.xyz, 0.0), cam).xyz, float3(1.0, 0.0, 0.0)), tang.w * thing.z);
+	return o;
+}
+
+VertOut VSThing(VertIn v)
+{
+	return thing_out(v.pos.xyz, v.norm.xyz, v.col, v.uv);
+}
+
+BumpOut VSThingBumped(BumpIn v)
+{
+	return thing_bumped_out(v.pos.xyz, v.norm.xyz, v.tang, v.col, v.uv);
+}
+
+// A shaped part's points: with each, how far its two shapes move it and
+// turn its facing (src/face/prop-mesh.hpp's twelve numbers):
+//   s0  move 0 (x y z), facing 0 (x)     s1  facing 0 (y z), move 1 (x y)
+//   s2  move 1 (z), facing 1 (x y z)
+struct ShapedIn {
+	float4 pos  : POSITION;
+	float4 norm : NORMAL;
+	float4 col  : COLOR;
+	float2 uv   : TEXCOORD0;
+	float4 s0   : TEXCOORD1;
+	float4 s1   : TEXCOORD2;
+	float4 s2   : TEXCOORD3;
+};
+
+struct ShapedBumpIn {
+	float4 pos  : POSITION;
+	float4 norm : NORMAL;
+	float4 col  : COLOR;
+	float4 tang : TANGENT;
+	float2 uv   : TEXCOORD0;
+	float4 s0   : TEXCOORD1;
+	float4 s1   : TEXCOORD2;
+	float4 s2   : TEXCOORD3;
+};
+
+float3 shaped_pos(float3 pos, float4 s0, float4 s1, float4 s2)
+{
+	return pos + s0.xyz * thing.x + float3(s1.z, s1.w, s2.x) * thing.y;
+}
+
+float3 shaped_norm(float3 norm, float4 s0, float4 s1, float4 s2)
+{
+	return norm + float3(s0.w, s1.x, s1.y) * thing.x + s2.yzw * thing.y;
+}
+
+VertOut VSThingShaped(ShapedIn v)
+{
+	return thing_out(shaped_pos(v.pos.xyz, v.s0, v.s1, v.s2), shaped_norm(v.norm.xyz, v.s0, v.s1, v.s2), v.col,
+			 v.uv);
+}
+
+BumpOut VSThingBumpedShaped(ShapedBumpIn v)
+{
+	return thing_bumped_out(shaped_pos(v.pos.xyz, v.s0, v.s1, v.s2),
+				shaped_norm(v.norm.xyz, v.s0, v.s1, v.s2), v.tang, v.col, v.uv);
 }
 
 float3 lin(float3 c)
@@ -745,6 +850,60 @@ technique Depth
 	pass
 	{
 		vertex_shader = VSDraw(v);
+		pixel_shader  = PSDepth(v);
+	}
+}
+
+technique Thing
+{
+	pass
+	{
+		vertex_shader = VSThing(v);
+		pixel_shader  = PSDraw(v);
+	}
+}
+
+technique ThingBumped
+{
+	pass
+	{
+		vertex_shader = VSThingBumped(v);
+		pixel_shader  = PSDrawBumped(v);
+	}
+}
+
+technique ThingDepth
+{
+	pass
+	{
+		vertex_shader = VSThing(v);
+		pixel_shader  = PSDepth(v);
+	}
+}
+
+technique ThingShaped
+{
+	pass
+	{
+		vertex_shader = VSThingShaped(v);
+		pixel_shader  = PSDraw(v);
+	}
+}
+
+technique ThingBumpedShaped
+{
+	pass
+	{
+		vertex_shader = VSThingBumpedShaped(v);
+		pixel_shader  = PSDrawBumped(v);
+	}
+}
+
+technique ThingDepthShaped
+{
+	pass
+	{
+		vertex_shader = VSThingShaped(v);
 		pixel_shader  = PSDepth(v);
 	}
 }

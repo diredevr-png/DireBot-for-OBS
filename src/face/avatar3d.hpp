@@ -46,6 +46,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "model.hpp"
 #include "pictures.hpp"
 #include "hair.hpp"
+#include "prop-mesh.hpp"
 #include "rig.hpp"
 
 namespace direbot::face {
@@ -121,14 +122,19 @@ struct View3D {
 // node puts it), its shapes (morph targets) set by name, put anywhere,
 // any size, mirrored or not, its materials tinted. Made, placed and drawn
 // on OBS's graphics thread.
+// Its points go to the graphics card once, as made (prop-mesh.hpp), and
+// stay there untouched: where it is and how much of its shapes show are a
+// few numbers a draw, and the card does the rest (the effect's Thing
+// techniques) - so the same thing can be drawn in any number of places a
+// frame, each with its own shapes, for no work a point here.
 class Prop3D {
 public:
-	Prop3D(std::shared_ptr<const Model> model, const std::vector<ModelPicture> &pictures);
+	Prop3D(const PropMesh &mesh, const std::vector<ModelPicture> &pictures);
 	~Prop3D();
 	Prop3D(const Prop3D &) = delete;
 	Prop3D &operator=(const Prop3D &) = delete;
 
-	const Model &model() const { return *model_; }
+	const std::vector<Material> &materials() const { return materials_; }
 	// The box round it as made (its file's units), and the middle of it.
 	V3 low() const { return low_; }
 	V3 high() const { return high_; }
@@ -138,26 +144,32 @@ public:
 	// Its material's colour times this (linear: 1, 1, 1 as made).
 	void tint(int material, V3 times);
 	// Where it is: its file's units -> the world (mirrored if it turns it
-	// inside out), and how much it shows (0 to 1). Its points worked out
-	// now, for the next draw (Avatar3D::draw does it, for each PropAt).
+	// inside out), and how much it shows (0 to 1), for the next draw
+	// (Avatar3D::draw does it, for each PropAt).
 	void place(const M4 &to_world, float opacity = 1);
 	float opacity() const { return opacity_; }
 	bool mirrored() const { return handed_ < 0; }
+	// What it holds: its points and triangles; and the bytes of them the
+	// card has (OBS keeps the same again in memory, to make them anew if
+	// the card is lost) - its pictures not counted.
+	size_t points() const { return points_; }
+	size_t triangles() const { return triangles_; }
+	size_t bytes() const { return bytes_; }
+	// How many points have been sent to the card for every thing, ever
+	// (each thing's once, as it's made: tests look that it stays so).
+	static uint64_t points_sent();
 
 private:
 	friend class Avatar3D;
 	struct Part {
-		const Primitive *prim = nullptr;
-		std::vector<V3> pos, normal, tangent; // as made, in its file's space
-		std::vector<std::vector<V3>> morph_pos, morph_normal;
+		int material = -1;
 		gs_vertbuffer_t *vb = nullptr;
 		gs_indexbuffer_t *ib = nullptr;
-		size_t points = 0;
-		bool bumped = false;
-		float distance = 1;
-		V3 middle; // its points' middle, as made (a glowing part's depth)
+		bool bumped = false; // its points carry tangents
+		bool shaped = false; // and its shapes
+		V3 middle;           // its points' middle, as made (a glowing part's depth)
 	};
-	std::shared_ptr<const Model> model_;
+	std::vector<Material> materials_;
 	std::vector<gs_texture_t *> textures_;
 	std::vector<Part> parts_;
 	std::vector<std::string> shape_names_;
@@ -166,6 +178,7 @@ private:
 	V3 low_, high_;
 	M4 place_;
 	float opacity_ = 1, handed_ = 1;
+	size_t points_ = 0, triangles_ = 0, bytes_ = 0;
 };
 
 // Something 3D to draw: where (its file's units -> the world), how much
@@ -180,8 +193,16 @@ struct PropAt {
 
 // Things 3D (a headpat's hand, things to throw) loaded on a thread of
 // their own, so OBS never waits: asked for as a list of files, each
-// picked up once it's ready. One too detailed to draw quickly is said so.
+// picked up once it's ready - made ready for the card there too
+// (prop-mesh.hpp), the file as read let go of at once. One too detailed
+// to draw quickly is said so.
 constexpr size_t MOST_PROP_POINTS = 400000;
+struct PropPack {
+	std::string path;
+	std::shared_ptr<const PropMesh> mesh; // null: it didn't load
+	std::vector<ModelPicture> pictures;
+	std::string problem;
+};
 class PropLoader {
 public:
 	PropLoader();
@@ -192,7 +213,7 @@ public:
 	// loaded, in turn.
 	void want(const std::vector<std::string> &paths);
 	// Those loaded since the last call.
-	std::vector<std::shared_ptr<ModelPack>> take();
+	std::vector<std::shared_ptr<PropPack>> take();
 
 private:
 	void run();
@@ -200,7 +221,7 @@ private:
 	std::condition_variable wake_;
 	std::vector<std::string> want_;
 	std::map<std::string, std::string> stamps_; // loaded (or tried): its file's stamp then
-	std::vector<std::shared_ptr<ModelPack>> done_;
+	std::vector<std::shared_ptr<PropPack>> done_;
 	bool stop_ = false;
 	std::thread thread_;
 };
@@ -291,6 +312,22 @@ public:
 	// Parts a rig hides (Rig::Part::hidden) aren't drawn.
 	gs_texture_t *draw(const Rig *rig, const View3D &v, const std::vector<PropAt> &props = {},
 			   const std::vector<Other> &others = {});
+	// A thing drawn once, small and out of sight, every way it can be
+	// drawn (solid, see-through, fading with only its front showing, its
+	// distances for the hairs behind it; with its shapes and without):
+	// what a graphics card and its driver only do the first time
+	// something's drawn - its drawing code built, its points and pictures
+	// made ready - is done here, as the thing's loaded, not as it's first
+	// thrown (a stutter then). `like`: the lights, look and detail it will
+	// be drawn with. Its place and shapes are left as they were. How many
+	// ways it was drawn (0: it couldn't be).
+	int warm(Prop3D &prop, const View3D &like);
+	// The pictures it draws into let go of (made again as it next draws):
+	// one that draws only now and then - things thrown - holds none in
+	// between. Whether it had any.
+	bool free_targets();
+	// The bytes of those pictures the card holds for it now.
+	size_t target_bytes() const;
 
 private:
 	// A strand part's layout being made off the drawing thread (the .cpp).
@@ -454,11 +491,16 @@ private:
 	void set_depth_material(const Material &m, const std::vector<gs_texture_t *> *textures = nullptr);
 	// A thing's parts: its solid ones, or its see-through ones (or all of
 	// it, while it fades) - or (depth_only) its solid ones' distances.
+	// Put where it is by the card: its place in OBS's own matrix and in
+	// `cam`, for as long as it's drawn.
 	void draw_prop(Prop3D &prop, const View3D &v, bool see_through, bool depth_only = false);
 	// (One go over its parts: as always, or a fading thing's distances
 	// laid with no colour, or it drawn on them.)
 	enum class PropPass { Plain, Lay, OnLaid };
 	void draw_prop_parts(Prop3D &prop, const View3D &v, bool see_through, bool depth_only, PropPass pass);
+	// What the Thing techniques read of a thing: its facings' turn (`view`:
+	// the world -> the camera's view) and its shapes.
+	void set_thing(const Prop3D &prop, const M4 &view);
 
 	gs_effect_t *effect_ = nullptr;
 	gs_eparam_t *p_cam = nullptr, *p_base_map = nullptr, *p_shade_map = nullptr, *p_emissive_map = nullptr,
@@ -471,7 +513,11 @@ private:
 		    *p_room_down = nullptr, *p_rim_light = nullptr, *p_key_tint = nullptr, *p_room_tint = nullptr,
 		    *p_glow = nullptr, *p_flat_at = nullptr, *p_eye = nullptr, *p_strand = nullptr,
 		    *p_strand_lod = nullptr, *p_strand_view = nullptr, *p_depth_map = nullptr, *p_spots = nullptr,
-		    *p_bones = nullptr, *p_skin = nullptr;
+		    *p_bones = nullptr, *p_skin = nullptr, *p_turn = nullptr, *p_thing = nullptr;
+	// Whether the effect can put things itself (an older effect file
+	// beside a newer add-on can't: they aren't drawn, and OBS's log says so
+	// once).
+	bool can_things_ = false, said_no_things_ = false;
 	EffectCheck check_;
 	M4 cam_;
 	gs_texture_t *white_ = nullptr, *black_ = nullptr, *flat_ = nullptr;
@@ -480,6 +526,8 @@ private:
 	std::vector<Part> parts_;
 	Part head_;
 	gs_texrender_t *scene_ = nullptr, *out_ = nullptr, *depth_ = nullptr;
+	// (Where things are warmed: as `scene_` and `depth_` are, small.)
+	gs_texrender_t *warm_ = nullptr, *warm_depth_ = nullptr;
 	// Hair: its plan and budget, what was drawn, and the graphics card's
 	// clocks - one set a frame, read four frames on (asked sooner, OBS
 	// waits for the card).
